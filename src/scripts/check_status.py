@@ -6,4 +6,4 @@ with db_manager.get_cursor() as cursor:
     cursor.execute('SELECT DISTINCT status FROM mi_trade_order')
     print([r['status'] for r in cursor.fetchall()])
     cursor.execute('SELECT COUNT(*) as cnt FROM mi_trade_order')
-    print('Total rows:', cursor.fetchone()['cnt'])
+    print('   Total rows:', cursor.fetchone()['cnt'])
