@@ -1,0 +1,116 @@
+/* 订单簿表格：无竖线、紧凑、深色卡片内嵌 */
+.orderbook-grid.ag-theme-quartz,
+.orderbook-grid {
+  --ag-font-size: 12px;
+  --ag-header-font-size: 12px;
+}
+
+.orderbook-grid .ag-root-wrapper {
+  border: 1px solid #333;
+  border-radius: 2px;
+}
+
+.orderbook-grid .ag-header-cell {
+  border-right: 1px solid #3a3f44;
+}
+
+.orderbook-grid .ag-header-cell:last-child {
+  border-right: none;
+}
+
+.orderbook-grid .ag-cell {
+  border-right: none !important;
+  line-height: 32px;
+}
+
+.orderbook-grid .ag-row {
+  border-bottom: 1px solid #2a2f33;
+}
+
+.orderbook-grid .ag-row-selected::before {
+  background-color: #1b3a57;
+}
+
+.orderbook-grid .ag-menu {
+  font-size: 12px;
+}
+
+.orderbook-grid .ag-tabs-header {
+  background-color: #2a2f33;
+}
+
+.orderbook-grid .ag-tab-selected {
+  border-bottom-color: #2196f3;
+}
+
+/* 深色卡片：状态栏 + 表格区，与 ag-grid 配色一致 */
+.status-card.el-card,
+.grid-card.el-card {
+  --el-card-bg-color: var(--app-surface);
+  --el-card-border-color: var(--app-border);
+  border: 1px solid var(--app-border);
+  background-color: var(--app-surface);
+}
+
+.status-card .el-card__body {
+  background-color: var(--app-surface);
+}
+
+.grid-card .el-card__header {
+  background: var(--app-surface-elevated);
+  border-bottom: 1px solid var(--app-border);
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 10px 16px;
+}
+
+.grid-card .el-card__body {
+  padding: 0;
+  background: var(--app-surface);
+}
+
+/* ── 右键复制/导出菜单 ── */
+.ag-copy-context-menu {
+  position: absolute;
+  z-index: 99999;
+  min-width: 150px;
+  background: #23272b;
+  border: 1px solid #3a3f44;
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  padding: 4px 0;
+  font-size: 13px;
+  user-select: none;
+}
+
+.ag-copy-context-menu-item {
+  padding: 7px 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #e8eaed;
+  transition: background 0.12s;
+}
+
+.ag-copy-context-menu-item:hover {
+  background: #1b3a57;
+}
+
+.ag-copy-context-menu-item.disabled {
+  color: #555;
+  cursor: default;
+  pointer-events: none;
+}
+
+.ag-copy-context-menu-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.ag-copy-context-menu-separator {
+  height: 1px;
+  background: #3a3f44;
+  margin: 4px 0;
+}

@@ -1,0 +1,550 @@
+# coding: utf-8
+"""
+平仓执行器模块
+- ClosingExecutor: 平仓条件检查 + 平仓订单生成 + 持久化
+- 成交引擎通过 ExecutorClient (HTTP) 调用独立的执行器服务（虚拟/实盘），实现虚实分离
+
+平仓触发条件（按优先级）：
+  1. 资金费次数 >= max_funding_payments
+  2. 止盈: 总盈亏bps(基差收敛 + 已收资金费) >= 24h资金费率bps * multiplier + 手续费bps
+  3. 资金费率为负: 根据距下次结算时间选用不同 close_basis_pX 阈值，不足15分钟无条件平仓
+"""
+import uuid
+from datetime import datetime
+from typing import List, Dict
+
+from common.database import db_manager
+from common.config import config
+from common.logger import get_logger
+from calc.executor_client import ExecutorClient
+
+logger = get_logger(__name__)
+
+
+class ClosingExecutor:
+    """平仓执行器（条件判断 + 订单生成 + 持久化，通过 ExecutorClient 调用成交引擎服务）"""
+
+    def __init__(self, contract_meta: Dict, spot_meta: Dict):
+        """
+        Args:
+            contract_meta: base_asset -> {quanto_multiplier, ...}
+            spot_meta:     base_asset -> {step_size, min_qty, ...}
+        """
+        self.contract_meta = contract_meta
+        self.spot_meta = spot_meta
+
+        executor_url = config.get('trade.executor.url', 'http://localhost:8081')
+        executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
+        self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
+
+        self.take_profit_multiplier = config.get_float('trade.take_profit_days_multiplier', 6.0)
+        self.max_funding_payments = config.get_int('trade.max_funding_payments', 30)
+
+        # 手续费率（用于止盈阈值计算）
+        self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
+        self.fee_spot_close = config.get_float('trade.fee.spot_close', 0.00075)
+        self.fee_future_open = config.get_float('trade.fee.future_open', 0.00075)
+        self.fee_future_close = config.get_float('trade.fee.future_close', 0.00075)
+
+        # 谷底反弹止盈策略
+        self.valley_rebound_pct = config.get_float('trade.valley_rebound_pct', 0.10)
+        self.valley_monitor_timeout_sec = config.get_int('trade.valley_monitor_timeout_sec', 60)
+        self._valley_state: Dict[str, Dict] = {}  # base_asset -> {valley_bps, start_time, open_spread_bps}
+
+    # ──────────────────────────────────────────────────────────────────
+    # 公共入口
+    # ──────────────────────────────────────────────────────────────────
+
+    def check_and_close(
+        self,
+        positions: List[Dict],
+        close_vwap_threshold_meta: Dict[str, Dict],
+        orderbook_rows_by_asset: Dict[str, Dict],
+    ) -> List[Dict]:
+        """
+        检查所有持仓并执行平仓
+
+        Args:
+            positions: 已由 calculate_realtime_pnl 富化的持仓列表
+                       （含 current_spread_bps / funding_rate_24h / funding_next_apply）
+            close_vwap_threshold_meta: base_asset ->
+                {close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40}
+            orderbook_rows_by_asset: base_asset -> merged orderbook row（传给成交引擎）
+
+        Returns:
+            平仓执行结果列表 [{base_asset, success, close_reason, order_uuid, message}, ...]
+        """
+        results = []
+
+        for pos in positions:
+            if pos.get('status') != 'holding':
+                continue
+
+            ba = pos.get('base_asset', '')
+            current_spread_bps = pos.get('current_spread_bps')
+
+            if current_spread_bps is None:
+                continue  # 无盘口数据，跳过
+
+            # ── 按优先级检查平仓条件 ──
+            close_reason = None
+            close_reason_detail = None
+
+            if self._check_funding_count(pos):
+                close_reason = 'funding_count'
+                count = int(pos.get('funding_payments_count') or 0)
+                close_reason_detail = (
+                    f"资金费次数|{count}次/{self.max_funding_payments}次"
+                    f"(~{count // 3}天)"
+                )
+                # 强制平仓，清除谷底状态
+                self._valley_state.pop(ba, None)
+            elif self._check_take_profit(pos, current_spread_bps):
+                # 止盈条件满足，进入谷底反弹确认
+                if self._pass_valley_check(ba, current_spread_bps, pos):
+                    close_reason = 'take_profit'
+                    close_reason_detail = self._build_take_profit_detail(pos, current_spread_bps)
+                # else: 谷底监控中，不平仓
+            else:
+                # 止盈不再满足，清除谷底监控状态
+                self._valley_state.pop(ba, None)
+                threshold_data = close_vwap_threshold_meta.get(ba, {})
+                if self._check_negative_funding(pos, current_spread_bps, threshold_data):
+                    close_reason = 'negative_funding'
+                    close_reason_detail = self._build_negative_funding_detail(
+                        pos, current_spread_bps, threshold_data
+                    )
+
+            if not close_reason:
+                continue
+
+            # ── 执行平仓 ──
+            orderbook_row = orderbook_rows_by_asset.get(ba)
+            if not orderbook_row:
+                logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
+                continue
+
+            try:
+                result = self._execute_close(pos, close_reason, close_reason_detail, orderbook_row)
+                results.append(result)
+                if result.get('success'):
+                    # 平仓成功，清除谷底监控状态
+                    self._valley_state.pop(ba, None)
+                    logger.info(
+                        f"平仓成功 | {ba} | reason={close_reason} | "
+                        f"spread_bps={current_spread_bps:.2f}"
+                    )
+                else:
+                    logger.warning(
+                        f"平仓失败 | {ba} | reason={close_reason} | "
+                        f"msg={result.get('message')}"
+                    )
+            except Exception as e:
+                logger.error(f"平仓执行异常 {ba}: {e}", exc_info=True)
+                results.append({'base_asset': ba, 'success': False, 'message': str(e)})
+
+        return results
+
+    # ──────────────────────────────────────────────────────────────────
+    # 条件检查
+    # ──────────────────────────────────────────────────────────────────
+
+    def _check_funding_count(self, pos: Dict) -> bool:
+        """检查资金费次数是否达到上限"""
+        count = int(pos.get('funding_payments_count') or 0)
+        return count >= self.max_funding_payments
+
+    def _check_take_profit(self, pos: Dict, current_spread_bps: float) -> bool:
+        """
+        止盈条件（仅资金费率为正时适用）：
+            总盈亏bps(基差收敛 + 已收资金费) >= 24h资金费率(bps) * take_profit_days_multiplier + 手续费成本(bps)
+
+        take_profit_days_multiplier 作用于24h资金费率，N=10 表示止盈目标为10天的资金费收入。
+        """
+        funding_rate_24h = pos.get('funding_rate_24h')
+        if funding_rate_24h is None:
+            return False
+        funding_rate_24h_val = float(funding_rate_24h)
+        if funding_rate_24h_val <= 0:
+            return False  # 费率为负时不适用止盈条件
+
+        open_spread_bps = float(pos.get('open_spread_bps') or 0)
+        # 基差收敛利润 = 开仓基差 - 当前基差（收敛则为正）
+        spread_profit_bps = open_spread_bps - current_spread_bps
+        # 已实现资金费收益(bps)
+        funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
+        # 总盈亏 = 基差收敛 + 已收资金费
+        total_pnl_bps = spread_profit_bps + funding_earned_bps
+
+        # funding_rate_24h 是24小时总费率（如 0.0003 = 0.03%/天），转为 bps
+        funding_rate_bps = funding_rate_24h_val * 10000
+        # 止盈阈值 = N天资金费等价收益 + 全部开平仓手续费成本(bps)
+        fee_cost_bps = (self.fee_spot_open + self.fee_spot_close +
+                        self.fee_future_open + self.fee_future_close) * 10000
+        threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
+        return total_pnl_bps >= threshold
+
+    def _check_negative_funding(
+        self, pos: Dict, current_spread_bps: float, threshold_data: Dict
+    ) -> bool:
+        """
+        资金费率为负时的平仓条件：
+        - 资金费率 >= 0 则不触发
+        - 根据距下次资金支付剩余时间选用不同阈值列
+        - 不足 15 分钟无条件平仓
+        """
+        funding_rate_24h = pos.get('funding_rate_24h')
+        if funding_rate_24h is None or float(funding_rate_24h) >= 0:
+            return False
+
+        # 解析下次资金支付时间
+        funding_next_str = pos.get('funding_next_apply')
+        if not funding_next_str:
+            return False
+
+        try:
+            if isinstance(funding_next_str, datetime):
+                next_time = funding_next_str
+            else:
+                next_time = datetime.strptime(str(funding_next_str)[:19], '%Y-%m-%d %H:%M:%S')
+        except (ValueError, TypeError):
+            logger.warning(f"无法解析 funding_next_apply: {funding_next_str}")
+            return False
+
+        minutes_to_next = (next_time - datetime.now()).total_seconds() / 60
+
+        # 不足 15 分钟，无条件平仓
+        if minutes_to_next <= 15:
+            return True
+
+        # 根据剩余时间选择对应分位阈值
+        if minutes_to_next > 180:       # 超过 3 小时
+            col = 'close_basis_p10'
+        elif minutes_to_next > 120:     # 2~3 小时
+            col = 'close_basis_p20'
+        elif minutes_to_next > 60:      # 1~2 小时
+            col = 'close_basis_p30'
+        else:                           # 15 分钟 ~ 1 小时
+            col = 'close_basis_p40'
+
+        threshold = threshold_data.get(col)
+        if threshold is None:
+            return False
+
+        return current_spread_bps <= float(threshold)
+
+    def _pass_valley_check(self, base_asset: str, current_spread_bps: float, pos: Dict) -> bool:
+        """
+        谷底反弹确认逻辑（止盈时等待基差见底再平仓，捕捉更多收敛利润）:
+        - 止盈首次满足: 记录当前 spread 为谷底, 返回 False(等待)
+        - spread 继续下降: 更新谷底, 返回 False(继续等待)
+        - spread 从谷底反弹 X%: 返回 True(确认平仓)
+        - 超时: 返回 True(直接平仓)
+        """
+        now = datetime.now()
+        state = self._valley_state.get(base_asset)
+
+        if state is None:
+            # 首次进入监控，记录谷底和开始时间
+            open_spread_bps = float(pos.get('open_spread_bps') or 0)
+            self._valley_state[base_asset] = {
+                'valley_bps': current_spread_bps,
+                'start_time': now,
+                'open_spread_bps': open_spread_bps,
+                'trigger': None,
+            }
+            logger.info(
+                f"止盈谷底监控开始 | {base_asset} | "
+                f"spread={current_spread_bps:.2f}bps"
+            )
+            return False
+
+        # 更新谷底
+        if current_spread_bps < state['valley_bps']:
+            state['valley_bps'] = current_spread_bps
+
+        # 检查超时
+        elapsed_sec = (now - state['start_time']).total_seconds()
+        if elapsed_sec >= self.valley_monitor_timeout_sec:
+            state['trigger'] = 'timeout'
+            logger.info(
+                f"止盈谷底监控超时，直接平仓 | {base_asset} | "
+                f"valley={state['valley_bps']:.2f} | current={current_spread_bps:.2f} | "
+                f"elapsed={elapsed_sec:.0f}s"
+            )
+            return True
+
+        # 检查反弹确认: 基差从谷底回升超过 X%
+        # 使用开仓基差与谷底的差值作为参考范围，避免小值/零值问题
+        # rebound_threshold = valley + (open_spread - valley) * rebound_pct
+        open_spread_bps = state['open_spread_bps']
+        convergence_range = open_spread_bps - state['valley_bps']
+        if convergence_range > 0:
+            rebound_threshold = state['valley_bps'] + convergence_range * self.valley_rebound_pct
+        else:
+            # 异常: 谷底高于开仓基差，直接平仓
+            return True
+
+        if current_spread_bps >= rebound_threshold:
+            state['trigger'] = 'rebound'
+            logger.info(
+                f"止盈谷底反弹确认，执行平仓 | {base_asset} | "
+                f"valley={state['valley_bps']:.2f} | current={current_spread_bps:.2f} | "
+                f"rebound_thr={rebound_threshold:.2f}"
+            )
+            return True
+
+        return False
+
+    def _build_take_profit_detail(self, pos: Dict, current_spread_bps: float) -> str:
+        """构建止盈平仓的详细原因字符串"""
+        ba = pos.get('base_asset', '')
+        open_spread_bps = float(pos.get('open_spread_bps') or 0)
+        spread_profit_bps = open_spread_bps - current_spread_bps
+        funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
+        total_pnl_bps = spread_profit_bps + funding_earned_bps
+
+        funding_rate_24h_val = float(pos.get('funding_rate_24h') or 0)
+        funding_rate_bps = funding_rate_24h_val * 10000
+        fee_cost_bps = (self.fee_spot_open + self.fee_spot_close +
+                        self.fee_future_open + self.fee_future_close) * 10000
+        threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
+
+        detail = (
+            f"止盈|总盈亏{total_pnl_bps:.1f}bps"
+            f"(收敛{spread_profit_bps:.1f}+资金费{funding_earned_bps:.1f})"
+            f">={threshold:.1f}bps"
+            f"({funding_rate_bps:.1f}×{self.take_profit_multiplier:.0f}+{fee_cost_bps:.0f}费)"
+        )
+
+        # 附加谷底反弹信息
+        valley_state = self._valley_state.get(ba)
+        if valley_state:
+            valley_bps = valley_state.get('valley_bps', 0)
+            trigger = valley_state.get('trigger', 'unknown')
+            if trigger == 'rebound':
+                detail += f"|谷底反弹(谷{valley_bps:.1f}→当前{current_spread_bps:.1f})"
+            elif trigger == 'timeout':
+                elapsed = (datetime.now() - valley_state['start_time']).total_seconds()
+                detail += f"|谷底超时(谷{valley_bps:.1f},{elapsed:.0f}s)"
+
+        return detail
+
+    def _build_negative_funding_detail(
+        self, pos: Dict, current_spread_bps: float, threshold_data: Dict
+    ) -> str:
+        """构建资金费率为负平仓的详细原因字符串"""
+        funding_rate_24h = float(pos.get('funding_rate_24h') or 0)
+        rate_pct = funding_rate_24h * 100
+
+        funding_next_str = pos.get('funding_next_apply')
+        minutes_to_next = None
+        if funding_next_str:
+            try:
+                if isinstance(funding_next_str, datetime):
+                    next_time = funding_next_str
+                else:
+                    next_time = datetime.strptime(str(funding_next_str)[:19], '%Y-%m-%d %H:%M:%S')
+                minutes_to_next = (next_time - datetime.now()).total_seconds() / 60
+            except (ValueError, TypeError):
+                pass
+
+        if minutes_to_next is not None and minutes_to_next <= 15:
+            return (
+                f"费率为负|费率{rate_pct:.4f}%"
+                f"|剩余{minutes_to_next:.0f}min(<15min无条件平仓)"
+            )
+
+        # 确定使用了哪个分位阈值
+        col = 'close_basis_p40'
+        if minutes_to_next is not None:
+            if minutes_to_next > 180:
+                col = 'close_basis_p10'
+            elif minutes_to_next > 120:
+                col = 'close_basis_p20'
+            elif minutes_to_next > 60:
+                col = 'close_basis_p30'
+
+        threshold_val = threshold_data.get(col)
+        thr_str = f"{float(threshold_val):.1f}" if threshold_val is not None else '?'
+        min_str = f"{minutes_to_next:.0f}" if minutes_to_next is not None else '?'
+
+        return (
+            f"费率为负|费率{rate_pct:.4f}%"
+            f"|剩余{min_str}min"
+            f"|基差{current_spread_bps:.1f}<={thr_str}({col})"
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # 订单构建与执行
+    # ──────────────────────────────────────────────────────────────────
+
+    def _execute_close(self, pos: Dict, close_reason: str, close_reason_detail: str, orderbook_row: Dict) -> Dict:
+        """构建平仓订单组 → 调用成交引擎 → 持久化"""
+        ba = pos.get('base_asset', '')
+        order_group = self._build_close_order_group(pos)
+        exec_result = self.executor_client.execute(order_group, orderbook_row)
+        self._save_close(pos, order_group, exec_result, close_reason, close_reason_detail)
+        return {
+            'base_asset': ba,
+            'success': exec_result['success'],
+            'order_uuid': order_group['order_uuid'],
+            'close_reason': close_reason,
+            'message': exec_result.get('message'),
+        }
+
+    def _build_close_order_group(self, pos: Dict) -> Dict:
+        """
+        生成平仓订单组：
+          现货 sell（bid 侧）+ 期货 buy（ask 侧），方向与开仓相反
+        """
+        order_uuid = str(uuid.uuid4())
+        ba = pos.get('base_asset', '')
+        spot_symbol = pos.get('spot_symbol') or f"{ba}USDT"
+        future_contract = pos.get('future_contract', '')
+        target_amount = config.get_float('trade.open_amount_usdt', 500)
+
+        spot_order = {
+            'order_uuid': order_uuid,
+            'base_asset': ba,
+            'spot_symbol': spot_symbol,
+            'future_contract': None,
+            'order_side': 'close',
+            'market_type': 'spot',
+            'trade_direction': 'sell',
+            'status': 'pending',
+            'target_qty': float(pos.get('spot_open_qty') or 0),
+            'target_amount': target_amount,
+        }
+
+        future_order = {
+            'order_uuid': order_uuid,
+            'base_asset': ba,
+            'spot_symbol': None,
+            'future_contract': future_contract,
+            'order_side': 'close',
+            'market_type': 'future',
+            'trade_direction': 'buy',
+            'status': 'pending',
+            'target_qty': float(pos.get('future_open_qty') or 0),
+            'target_amount': target_amount,
+        }
+
+        return {
+            'order_uuid': order_uuid,
+            'base_asset': ba,
+            'spot_symbol': spot_symbol,
+            'future_contract': future_contract,
+            'spot_order': spot_order,
+            'future_order': future_order,
+        }
+
+    # ──────────────────────────────────────────────────────────────────
+    # 持久化
+    # ──────────────────────────────────────────────────────────────────
+
+    def _save_close(
+        self, pos: Dict, order_group: Dict, exec_result: Dict,
+        close_reason: str, close_reason_detail: str
+    ):
+        """插入 2 笔平仓订单到 mi_trade_order，成功时更新 mi_trade_position 状态"""
+        position_id = pos.get('id')
+
+        # 计算平仓基差（仅成交成功时）
+        spot_close_price = future_close_price = None
+        spot_close_amount = future_close_amount = close_spread_bps = None
+
+        if exec_result.get('success'):
+            spot_exec = exec_result.get('spot_order') or {}
+            future_exec = exec_result.get('future_order') or {}
+            spot_close_price = spot_exec.get('exec_price')
+            future_close_price = future_exec.get('exec_price')
+            spot_close_amount = spot_exec.get('exec_amount')
+            future_close_amount = future_exec.get('exec_amount')
+            if spot_close_price and future_close_price:
+                s, f = float(spot_close_price), float(future_close_price)
+                if s != 0:
+                    close_spread_bps = round((f - s) / s * 10000, 2)
+
+        # ── 插入平仓订单 ──
+        insert_sql = """
+            INSERT INTO mi_trade_order (
+                order_uuid, position_id, base_asset, spot_symbol, future_contract,
+                order_side, market_type, trade_direction, status, channel,
+                reject_reason, target_qty, target_amount,
+                exec_price, exec_qty, exec_amount, coverage_ratio,
+                open_coverage, open_vwap_basis_bps, risk_relief_bps,
+                open_marginal_basis_bps, funding_rate_24h, executed_at
+            ) VALUES (
+                %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s,
+                %(future_contract)s, %(order_side)s, %(market_type)s,
+                %(trade_direction)s, %(status)s, %(channel)s,
+                %(reject_reason)s, %(target_qty)s, %(target_amount)s,
+                %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
+                %(open_coverage)s, %(open_vwap_basis_bps)s, %(risk_relief_bps)s,
+                %(open_marginal_basis_bps)s, %(funding_rate_24h)s, %(executed_at)s
+            )
+        """
+
+        for market_key in ['spot_order', 'future_order']:
+            order = order_group[market_key].copy()
+            order['position_id'] = position_id
+            order['channel'] = 'Mock'
+            # 平仓订单无开仓风控指标，置 None
+            order['open_coverage'] = None
+            order['open_vwap_basis_bps'] = None
+            order['risk_relief_bps'] = None
+            order['open_marginal_basis_bps'] = None
+            order['funding_rate_24h'] = pos.get('funding_rate_24h')
+            # 将平仓详细原因写入 reject_reason 字段，供前端复盘查看
+            order['reject_reason'] = close_reason_detail
+
+            if exec_result.get('success'):
+                exec_data = exec_result[market_key] or {}
+                order['status'] = 'executed'
+                order['exec_price'] = exec_data.get('exec_price')
+                order['exec_qty'] = exec_data.get('exec_qty')
+                order['exec_amount'] = exec_data.get('exec_amount')
+                order['coverage_ratio'] = exec_data.get('coverage_ratio')
+                order['executed_at'] = datetime.now()
+            else:
+                order['status'] = 'rejected'
+                order['exec_price'] = None
+                order['exec_qty'] = None
+                order['exec_amount'] = None
+                order['coverage_ratio'] = None
+                order['executed_at'] = None
+
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(insert_sql, order)
+
+        # ── 更新持仓状态为 closed（仅成交成功时）──
+        if exec_result.get('success'):
+            update_sql = """
+                UPDATE mi_trade_position SET
+                    status            = 'closed',
+                    closed_at         = %(closed_at)s,
+                    close_reason      = %(close_reason)s,
+                    spot_close_price  = %(spot_close_price)s,
+                    future_close_price= %(future_close_price)s,
+                    spot_close_amount = %(spot_close_amount)s,
+                    future_close_amount = %(future_close_amount)s,
+                    close_spread_bps  = %(close_spread_bps)s
+                WHERE id = %(position_id)s
+            """
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(update_sql, {
+                    'closed_at':            datetime.now(),
+                    'close_reason':         close_reason_detail,
+                    'spot_close_price':     spot_close_price,
+                    'future_close_price':   future_close_price,
+                    'spot_close_amount':    spot_close_amount,
+                    'future_close_amount':  future_close_amount,
+                    'close_spread_bps':     close_spread_bps,
+                    'position_id':          position_id,
+                })
+
+            logger.info(
+                f"持仓状态更新为 closed | position_id={position_id} | "
+                f"close_spread_bps={close_spread_bps}"
+            )

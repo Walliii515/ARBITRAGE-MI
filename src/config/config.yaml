@@ -1,0 +1,74 @@
+# 跨交易所订单簿服务配置文件
+# 通过 src/common/config.py 加载，支持点路径访问，如 cfg.get('orderbook.settle')
+
+orderbook:
+  # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
+  settle: usdt
+
+  # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
+  broadcast_throttle_sec: 1.0
+  # 启动阶段批量加载 REST 初始快照时，每批合约数量
+  snapshot_batch_size: 40
+  # 单批快照加载的最大并发线程数
+  snapshot_batch_workers: 40
+
+trade:
+  # 成交引擎服务配置（虚拟/实盘）
+  # 切换实盘时，只需将 url 指向实盘执行器服务地址
+  executor:
+    url: http://localhost:8081    # 成交引擎服务地址
+    timeout_sec: 5                # HTTP 请求超时（秒）
+  # 每次开仓金额（计价币种 USDT），用于前端展示及后续下单/风控
+  open_amount_usdt: 500
+    # 盘口覆盖阈值（开仓盘口覆盖 <= 此值时显示绿色）
+  orderbook_coverage_threshold: 0.8
+  # 风险缓释（bps），用于开仓边际基差计算
+  risk_relief_bps: -5
+  # 开仓VWAP基差阈值（bps），无按标的阈值时的全局回退阈值
+  # 和按标的模式统一，均与纯基差（open_vwap_basis_bps）对比
+  open_vwap_basis_threshold_bps: 20
+  # market taker fee rate
+  fee:
+    spot_open: 0.00075
+    spot_close: 0.00075
+    future_open: 0.00075
+    future_close: 0.00075
+  # 资金费率阈值百分位（对应 mi_gate_future_funding_rate_threshold 表的字段名）
+  # 可选值: percentile_20, percentile_30, percentile_40 等
+  funding_rate_threshold_percentile: percentile_30
+  # 元数据定时 ETL 刷新间隔（分钟）
+  meta_refresh_interval_min: 15
+  # 开仓检查间隔(秒)
+  open_check_interval_sec: 5
+  # 开仓冷却期(秒) - 同一合约1小时内不重复开仓
+  open_cooldown_sec: 3600
+  # 持仓资金费更新间隔(秒) - 1小时
+  position_funding_update_sec: 3600
+  # 持仓实时数据推送间隔(秒)
+  position_push_interval_sec: 5
+  # VWAP基差快照采样间隔(秒)
+  vwap_snapshot_interval_sec: 10
+  # VWAP基差快照保留天数
+  vwap_snapshot_retention_days: 14
+  # VWAP基差阈值回溯天数(用于每日统计分析)
+  vwap_threshold_lookback_days: 7
+  # VWAP开仓基差阈值使用的分位字段名
+  # 可选值: open_basis_p10 / open_basis_p20 / open_basis_p30 / open_basis_p40
+  # 含义: 从大到小前 X% 的分界点，基差 >= 阈值才开仓
+  vwap_open_threshold_percentile: open_basis_p20
+  # VWAP平仓基差阈值使用的分位字段名
+  # 可选值: close_basis_p10 / close_basis_p20 / close_basis_p30 / close_basis_p40
+  # 含义: 升序第 X 分位，基差 <= 阈值才平仓（价差已收敛）
+  vwap_close_threshold_percentile: close_basis_p20
+  # 平仓检查间隔(秒)
+  close_check_interval_sec: 5
+  # 止盈倍数 - 总盈亏bps(基差收敛+已收资金费) >= 24h资金费率bps * 此倍数 + 手续费bps 时止盈
+  take_profit_days_multiplier: 10
+  # 最大资金费支付次数 - 超过此次数强制平仓
+  max_funding_payments: 30
+  # 峰值回落开仓策略 - 基差超阈值后监控峰值，回落确认后开仓
+  peak_pullback_pct: 0.10          # 从峰值回落百分比(10%)确认开仓
+  peak_monitor_timeout_sec: 60     # 监控超时(秒)，超时后直接开仓
+  # 谷底反弹止盈策略 - 止盈条件满足后监控基差谷底，反弹确认后平仓
+  valley_rebound_pct: 0.10         # 从谷底反弹百分比(10%)确认平仓(基于收敛范围)
+  valley_monitor_timeout_sec: 60   # 监控超时(秒)，超时后直接平仓

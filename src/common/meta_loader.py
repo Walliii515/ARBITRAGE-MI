@@ -1,0 +1,65 @@
+"""
+元数据加载模块
+
+从数据库加载合约元数据和现货元数据，供 orderbook_server 和 executor_service 等多个服务共用。
+"""
+from typing import Dict
+
+from common.database import db_manager
+from common.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def fetch_contract_meta() -> Dict[str, Dict]:
+    """
+    从 mi_gate_future_contracts 加载合约元数据，按 base_asset 索引
+
+    Returns:
+        base_asset -> {quanto_multiplier, order_price_round, order_size_min,
+                       enable_decimal, funding_rate_24h, volume_24h_settle, funding_next_apply}
+    """
+    sql = "SELECT base_asset, quanto_multiplier, order_price_round, order_size_min, enable_decimal, funding_rate_24h, volume_24h_settle, funding_next_apply FROM mi_gate_future_contracts"
+    result = {}
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            for row in rows:
+                result[row['base_asset']] = {
+                    'quanto_multiplier': float(row['quanto_multiplier']),
+                    'order_price_round': float(row['order_price_round']) if row.get('order_price_round') is not None else None,
+                    'order_size_min': int(row['order_size_min']),
+                    'enable_decimal': bool(row['enable_decimal']),
+                    'funding_rate_24h': float(row['funding_rate_24h']) if row.get('funding_rate_24h') is not None else None,
+                    'volume_24h_settle': float(row['volume_24h_settle']) if row.get('volume_24h_settle') is not None else None,
+                    'funding_next_apply': row.get('funding_next_apply'),
+                }
+    except Exception as e:
+        logger.error(f'加载合约元数据失败: {e}', exc_info=True)
+    return result
+
+
+def fetch_spot_meta() -> Dict[str, Dict]:
+    """
+    从 mi_binance_spot_info 加载现货元数据，按 base_asset 索引
+
+    Returns:
+        base_asset -> {step_size, tick_size, min_qty, quote_volume}
+    """
+    sql = "SELECT base_asset, step_size, tick_size, min_qty, quote_volume FROM mi_binance_spot_info"
+    result = {}
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            for row in rows:
+                result[row['base_asset']] = {
+                    'step_size': float(row['step_size']),
+                    'tick_size': float(row['tick_size']),
+                    'min_qty': float(row['min_qty']),
+                    'quote_volume': float(row['quote_volume']) if row.get('quote_volume') is not None else None,
+                }
+    except Exception as e:
+        logger.error(f'加载现货元数据失败: {e}', exc_info=True)
+    return result
