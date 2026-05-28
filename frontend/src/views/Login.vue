@@ -12,8 +12,7 @@ const loginForm = ref({
 })
 const loading = ref(false)
 
-// 使用环境变量
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:19876'
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
 async function handleLogin() {
   if (!loginForm.value.username || !loginForm.value.password) {
