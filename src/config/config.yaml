@@ -1,6 +1,13 @@
 # 跨交易所订单簿服务配置文件
 # 通过 src/common/config.py 加载，支持点路径访问，如 cfg.get('orderbook.settle')
 
+# 用户认证配置
+auth:
+  # Token 签名密钥 (生产环境务必修改为强随机字符串)
+  secret_key: 'arbitrage-mi-secret-key-2026'
+  # Token 有效期 (秒)，默认 1 小时
+  token_expire_seconds: 3600
+
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
   settle: usdt

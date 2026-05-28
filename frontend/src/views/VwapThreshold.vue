@@ -12,6 +12,7 @@ import type {
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
+import { get, post } from '../utils/request'
 
 /* ───── 类型 ───── */
 interface ThresholdRow {
@@ -188,7 +189,7 @@ function loadColumnState() {
 /* ───── 数据加载 ───── */
 async function fetchLatestDate() {
   try {
-    const res = await fetch('/api/trading/threshold/latest-date')
+    const res = await get('/api/trading/threshold/latest-date')
     if (!res.ok) return
     const data = await res.json()
     latestCalcDate.value = data.latest_date || '—'
@@ -199,7 +200,7 @@ async function fetchLatestDate() {
 
 async function fetchDates() {
   try {
-    const res = await fetch('/api/trading/threshold/dates')
+    const res = await get('/api/trading/threshold/dates')
     if (!res.ok) return
     const dates: string[] = await res.json()
     dateOptions.value = dates
@@ -214,7 +215,7 @@ async function fetchDates() {
 
 async function fetchAssets() {
   try {
-    const res = await fetch('/api/trading/threshold/assets')
+    const res = await get('/api/trading/threshold/assets')
     if (!res.ok) return
     assetOptions.value = await res.json()
   } catch {
@@ -229,7 +230,7 @@ async function fetchData() {
     if (selectedDate.value) params.set('calc_date', selectedDate.value)
     if (selectedAsset.value) params.set('base_asset', selectedAsset.value)
 
-    const res = await fetch(`/api/trading/threshold/data?${params}`)
+    const res = await get(`/api/trading/threshold/data?${params}`)
     if (!res.ok) {
       showError('获取阈值数据失败')
       return
@@ -247,7 +248,7 @@ async function fetchData() {
 async function triggerCalculate() {
   calculating.value = true
   try {
-    const res = await fetch('/api/trading/threshold/calculate', { method: 'POST' })
+    const res = await post('/api/trading/threshold/calculate')
     if (!res.ok) {
       showError('触发计算失败')
       return

@@ -14,6 +14,7 @@ import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
+import { get } from '../utils/request'
 
 /* ───── 类型 ───── */
 interface OrderRow {
@@ -809,7 +810,7 @@ async function fetchOrders() {
     }
     const query = params.toString()
     const url = `/api/trading/orders${query ? '?' + query : ''}`
-    const res = await fetch(url)
+    const res = await get(url)
     if (!res.ok) {
       showError('获取订单数据失败')
       return

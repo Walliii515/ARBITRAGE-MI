@@ -11,10 +11,13 @@ import type {
   ColumnState,
 } from 'ag-grid-community'
 import { ElDrawer } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess, showWarning } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import type { OrderBookRow } from './orderbookTypes'
+import { get, post } from '../utils/request'
+import { getToken } from '../utils/auth'
 
 interface WsMessage {
   type: string
@@ -141,6 +144,51 @@ const openVwapBasisThresholdBps = ref<number>(0)
 /** 开仓边际基差过滤开关（默认开启） */
 const filterByMarginalBasis = ref<boolean>(true)
 
+/** 标的资产过滤 */
+const assetFilterKeyword = ref<string>('')
+const assetFilterVisible = ref<boolean>(false)
+
+/** 获取所有唯一的标的资产列表 */
+const uniqueAssets = computed(() => {
+  const assets = new Set<string>()
+  rowData.value.forEach(row => {
+    if (row.base_asset) {
+      assets.add(row.base_asset)
+    }
+  })
+  return Array.from(assets).sort()
+})
+
+/** 过滤后的标的资产选项 */
+const filteredAssetOptions = computed(() => {
+  if (!assetFilterKeyword.value) {
+    return uniqueAssets.value
+  }
+  const keyword = assetFilterKeyword.value.toLowerCase()
+  return uniqueAssets.value.filter(asset => 
+    asset.toLowerCase().includes(keyword)
+  )
+})
+
+/** 选择标的资产 */
+function selectAsset(asset: string) {
+  assetFilterKeyword.value = asset
+  assetFilterVisible.value = false
+}
+
+/** 清除标的资产过滤 */
+function clearAssetFilter() {
+  assetFilterKeyword.value = ''
+}
+
+/** 点击外部关闭下拉框 */
+function handleOutsideClick(event: MouseEvent) {
+  const target = event.target as HTMLElement
+  if (!target.closest('.asset-filter-container')) {
+    assetFilterVisible.value = false
+  }
+}
+
 /** AG Grid 外部过滤函数：资金费率过滤 */
 function fundingRateFilterFunc(params: any): boolean {
   if (!filterByFundingRate.value) {
@@ -205,9 +253,19 @@ function marginalBasisFilterFunc(params: any): boolean {
   return openVwapBasis >= openVwapBasisThresholdBps.value
 }
 
+/** 标的资产过滤函数 */
+function assetFilterFunc(params: any): boolean {
+  if (!assetFilterKeyword.value) return true
+  const data = params.data as OrderBookRow
+  if (!data) return true
+  const baseAsset = data.base_asset
+  if (!baseAsset) return true
+  return baseAsset.toLowerCase().includes(assetFilterKeyword.value.toLowerCase())
+}
+
 /** 组合过滤函数 */
 function combinedFilterFunc(params: any): boolean {
-  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params)
+  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && assetFilterFunc(params)
 }
 
 /** WebSocket 实例提升到模块级，避免 HMR 时断开 */
@@ -297,7 +355,7 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
   const percentileField = fundingThresholdPercentile.value
   
   return [
-    { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90 },
+    { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90, sort: 'asc' },
     {
       headerName: '开仓金额(USDT)',
       field: 'open_amount_usdt',
@@ -605,7 +663,6 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
     enableCellChangeFlash: true,
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
-    sort: 'desc',
     valueFormatter: (p) => {
       if (p.value == null) return '—'
       return Number(p.value).toFixed(2)
@@ -787,7 +844,7 @@ function applySnapshotRows(rows: unknown, serverTime?: string, forceFull = false
 
 async function fetchOrderbookSnapshot(forceFull = false) {
   try {
-    const res = await fetch('/api/orderbook/snapshot')
+    const res = await get('/api/orderbook/snapshot')
     if (!res.ok) return
     const data = await res.json()
     if (data.rows?.length) {
@@ -843,7 +900,8 @@ function progressStatus(p: ProgressInfo): '' | 'success' {
 
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws/orderbook`
+  const token = getToken()
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}`
 }
 
 function connectWs() {
@@ -938,7 +996,7 @@ function applyServiceStatus(data: ServiceStatus) {
 
 async function fetchServiceStatus() {
   try {
-    const res = await fetch('/api/service/status')
+    const res = await get('/api/service/status')
     if (!res.ok) return
     const data: ServiceStatus = await res.json()
     applyServiceStatus(data)
@@ -959,7 +1017,7 @@ async function startService() {
     serviceState.value = 'starting'
     clearGridData()
     resetProgress()
-    const res = await fetch('/api/service/start', { method: 'POST' })
+    const res = await post('/api/service/start')
     const body = await res.json().catch(() => ({}))
     if (!res.ok) {
       serviceBusy.value = false
@@ -978,7 +1036,7 @@ async function stopService() {
   try {
     serviceBusy.value = true
     serviceState.value = 'stopping'
-    const res = await fetch('/api/service/stop', { method: 'POST' })
+    const res = await post('/api/service/stop')
     const body = await res.json().catch(() => ({}))
     if (!res.ok) {
       serviceBusy.value = false
@@ -1033,6 +1091,9 @@ onMounted(() => {
     wsStatus.value = 'connected'
   }
   
+  // 点击外部关闭资产下拉框
+  document.addEventListener('click', handleOutsideClick)
+  
   fetchServiceStatus().then(() => {
     if (serviceState.value === 'running' || serviceState.value === 'starting') {
       fetchOrderbookSnapshot()
@@ -1048,6 +1109,9 @@ onUnmounted(() => {
   if (statusInterval) clearInterval(statusInterval)
   // 注释掉 socket?.close()，让 HMR 时连接保持活跃
   // socket?.close()
+  
+  // 清理事件监听
+  document.removeEventListener('click', handleOutsideClick)
 })
 
 function onGridReady(params: GridReadyEvent<OrderBookRow>) {
@@ -1130,7 +1194,33 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
     <el-card shadow="never" class="grid-card">
       <template #header>
         <div class="grid-header">
-          <span>5档盘口（Gate 永续 + Binance 现货，实时）</span>
+          <!-- 标的资产模糊搜索下拉框 -->
+          <div class="asset-filter-container">
+            <el-input
+              v-model="assetFilterKeyword"
+              placeholder="搜索标的资产 (如: BTC, ETH)"
+              clearable
+              size="small"
+              style="width: 240px"
+              @focus="assetFilterVisible = true"
+              @clear="clearAssetFilter"
+            >
+              <template #prefix>
+                <el-icon><Search /></el-icon>
+              </template>
+            </el-input>
+            <!-- 下拉选项列表 -->
+            <div v-if="assetFilterVisible && filteredAssetOptions.length > 0" class="asset-dropdown">
+              <div
+                v-for="asset in filteredAssetOptions.slice(0, 10)"
+                :key="asset"
+                class="asset-option"
+                @click="selectAsset(asset)"
+              >
+                {{ asset }}
+              </div>
+            </div>
+          </div>
           <div class="header-actions">
             <div class="filter-group">
               <el-switch
@@ -1405,6 +1495,40 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
+}
+
+.asset-filter-container {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.asset-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  background: var(--app-sidebar);
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  max-height: 300px;
+  overflow-y: auto;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.asset-option {
+  padding: 8px 12px;
+  cursor: pointer;
+  color: var(--app-text);
+  font-size: 13px;
+  transition: background-color 0.2s;
+}
+
+.asset-option:hover {
+  background-color: rgba(33, 150, 243, 0.12);
+  color: #2196f3;
 }
 
 .header-actions {

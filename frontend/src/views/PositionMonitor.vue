@@ -14,6 +14,8 @@ import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
+import { get } from '../utils/request'
+import { getToken } from '../utils/auth'
 
 /** 开仓金额，与后端 config.yaml trade.open_amount_usdt 保持一致，用于前端兜底计算 funding_pnl_bps */
 const OPEN_AMOUNT_USDT = 500
@@ -84,7 +86,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws/orderbook`
+  const token = getToken()
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}`
 }
 
 function connectWs() {
@@ -526,40 +529,41 @@ function doesExternalFilterPass(params: any): boolean {
 }
 
 /* ───── 汇总统计 ───── */
-const holdingPositions = computed(() =>
-  rowData.value.filter((r) => r.status === 'holding'),
-)
-
 const summaryStats = computed(() => {
-  const holdings = holdingPositions.value
-  const totalHoldingCount = holdings.length
-  const totalHoldingAmount = holdings.reduce(
-    (sum, r) => sum + (r.current_spot_price ?? 0),
+  const all = rowData.value
+  const holdingCount = all.filter((r) => r.status === 'holding').length
+  const closedCount = all.filter((r) => r.status === 'closed').length
+  const totalCount = all.length
+  const totalFloatingPnl = all.reduce(
+    (sum, r) => sum + (r.floating_pnl_total ?? 0),
     0,
   )
-  const totalFundingPnl = rowData.value.reduce(
+  const totalRealizedPnl = all.reduce(
+    (sum, r) => sum + (r.realized_pnl ?? 0),
+    0,
+  )
+  const totalFundingPnl = all.reduce(
     (sum, r) => sum + (r.funding_total_pnl ?? 0),
     0,
   )
-  const totalPnl = rowData.value.reduce(
+  const totalPnl = all.reduce(
     (sum, r) => sum + (r.total_pnl ?? 0),
     0,
   )
   return {
-    totalHoldingCount,
-    totalHoldingAmount,
+    holdingCount,
+    closedCount,
+    totalCount,
+    totalFloatingPnl,
+    totalRealizedPnl,
     totalFundingPnl,
     totalPnl,
   }
 })
 
-function formatUsdt(value: number): string {
-  return value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
-
 function formatPnl(value: number): string {
   const prefix = value >= 0 ? '+' : ''
-  return prefix + value.toFixed(4)
+  return prefix + value.toFixed(2)
 }
 
 /* ───── pinned 汇总行 ───── */
@@ -594,9 +598,9 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     funding_pnl_bps: null,
     funding_rate_24h: null,
     funding_next_apply: null,
-    funding_total_pnl: null,
+    funding_total_pnl: sumField('funding_total_pnl'),
     funding_payments_count: null,
-    realized_pnl_bps: sumField('realized_pnl_bps'),
+    realized_pnl_bps: null,
     realized_pnl: sumField('realized_pnl'),
     total_pnl_bps: null,
     total_pnl: sumField('total_pnl'),
@@ -605,7 +609,7 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
 async function fetchPositions() {
   loading.value = true
   try {
-    const res = await fetch('/api/trading/positions')
+    const res = await get('/api/trading/positions')
     if (!res.ok) {
       showError('获取持仓数据失败')
       return
@@ -700,27 +704,47 @@ onUnmounted(() => {
 
 <template>
   <div class="monitor-page">
-    <!-- 汇总统计卡片 -->
-    <div class="summary-cards">
-      <div class="summary-card">
-        <div class="summary-label">总持仓数</div>
-        <div class="summary-value">{{ summaryStats.totalHoldingCount }}</div>
+    <!-- 汇总统计栏 -->
+    <div class="summary-bar">
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">持仓中</span>
+          <span class="summary-value">{{ summaryStats.holdingCount }}</span>
+        </span>
+        <span class="summary-divider">/</span>
+        <span class="summary-item">
+          <span class="summary-label">已平仓</span>
+          <span class="summary-value">{{ summaryStats.closedCount }}</span>
+        </span>
+        <span class="summary-divider">/</span>
+        <span class="summary-item">
+          <span class="summary-label">总持仓</span>
+          <span class="summary-value">{{ summaryStats.totalCount }}</span>
+        </span>
       </div>
-      <div class="summary-card">
-        <div class="summary-label">持仓金额(USDT)</div>
-        <div class="summary-value">{{ formatUsdt(summaryStats.totalHoldingAmount) }}</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">实时浮动盈亏</span>
+          <span class="summary-value" :class="summaryStats.totalFloatingPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalFloatingPnl) }}</span>
+        </span>
       </div>
-      <div class="summary-card">
-        <div class="summary-label">累计资金费收益</div>
-        <div class="summary-value" :class="summaryStats.totalFundingPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">
-          {{ formatPnl(summaryStats.totalFundingPnl) }}
-        </div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">已实现盈亏</span>
+          <span class="summary-value" :class="summaryStats.totalRealizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalRealizedPnl) }}</span>
+        </span>
       </div>
-      <div class="summary-card">
-        <div class="summary-label">总盈亏</div>
-        <div class="summary-value" :class="summaryStats.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">
-          {{ formatPnl(summaryStats.totalPnl) }}
-        </div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">累计资金费</span>
+          <span class="summary-value" :class="summaryStats.totalFundingPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalFundingPnl) }}</span>
+        </span>
+      </div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">总盈亏</span>
+          <span class="summary-value" :class="summaryStats.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalPnl) }}</span>
+        </span>
       </div>
     </div>
 
@@ -818,39 +842,55 @@ onUnmounted(() => {
   gap: 12px;
 }
 
-/* ───── 汇总卡片 ───── */
-.summary-cards {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-}
-
-.summary-card {
+/* ───── 汇总栏 ───── */
+.summary-bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
   background: var(--app-surface);
   border: 1px solid var(--app-border);
   border-radius: 4px;
-  padding: 14px 18px;
+  padding: 10px 18px;
+  flex-wrap: wrap;
+}
+
+.summary-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.summary-divider {
+  color: var(--app-text-muted);
+  font-size: 12px;
+  margin: 0 2px;
+  opacity: 0.5;
+}
+
+.summary-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
 }
 
 .summary-label {
   font-size: 12px;
   color: var(--app-text-muted);
-  margin-bottom: 6px;
 }
 
 .summary-value {
-  font-size: 20px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--app-text);
   font-variant-numeric: tabular-nums;
 }
 
 .summary-value.pnl-positive {
-  color: #f56c6c;  /* 盈利红色 */
+  color: #f56c6c;
 }
 
 .summary-value.pnl-negative {
-  color: #67c23a;  /* 亏损绿色 */
+  color: #67c23a;
 }
 
 /* ───── 过滤栏 ───── */

@@ -8,9 +8,16 @@ import App from './App.vue'
 import router from './router'
 import './style.css'
 import './styles/ag-grid-orderbook.css'
+import { updateActivityTime } from './utils/auth'
 
 ModuleRegistry.registerModules([AllCommunityModule])
 
 document.documentElement.classList.add('dark')
+
+// 全局用户活动监听 (click, keydown, mousemove, scroll)
+const activityEvents = ['click', 'keydown', 'mousemove', 'scroll']
+activityEvents.forEach(event => {
+  window.addEventListener(event, updateActivityTime, { passive: true })
+})
 
 createApp(App).use(ElementPlus).use(router).mount('#app')

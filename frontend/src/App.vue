@@ -1,14 +1,53 @@
 <script setup lang="ts">
-import { Monitor, List, TrendCharts, DataAnalysis, Setting } from '@element-plus/icons-vue'
+import { ref, computed } from 'vue'
+import { useRoute } from 'vue-router'
+import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
+import { removeToken } from './utils/auth'
+import { ElMessage } from 'element-plus'
+import { post } from './utils/request'
+
+const route = useRoute()
+const router = useRouter()
+const isCollapsed = ref(false)
+
+// 判断是否为登录页
+const isLoginPage = computed(() => route.name === 'login')
+
+async function handleLogout() {
+  try {
+    // 调用后端登出接口 (可选)
+    await post('/api/auth/logout')
+  } catch {
+    // 忽略错误
+  }
+  
+  removeToken()
+  ElMessage.success('已登出')
+  router.push({ name: 'login' })
+}
+
+function toggleMenu() {
+  isCollapsed.value = !isCollapsed.value
+}
 </script>
 
 <template>
-  <el-container class="app-container">
-    <el-aside width="200px" class="app-aside">
-      <div class="logo">Arbitrage-Mi</div>
+  <!-- 登录页不显示侧边栏 -->
+  <router-view v-if="isLoginPage" />
+  
+  <!-- 其他页面显示完整布局 -->
+  <el-container v-else class="app-container">
+    <el-aside :width="isCollapsed ? '64px' : '200px'" class="app-aside">
+      <div class="logo">
+        <span v-if="!isCollapsed">Arbitrage-Mi</span>
+        <span v-else>Ai</span>
+      </div>
+      
       <el-menu
         :default-active="$route.path"
         router
+        :collapse="isCollapsed"
         class="app-menu"
         background-color="transparent"
         text-color="#9aa0a6"
@@ -16,15 +55,15 @@ import { Monitor, List, TrendCharts, DataAnalysis, Setting } from '@element-plus
       >
         <el-menu-item index="/">
           <el-icon><Monitor /></el-icon>
-          <span>订单簿监控</span>
+          <template #title>订单簿监控</template>
         </el-menu-item>
         <el-menu-item index="/orders">
           <el-icon><List /></el-icon>
-          <span>订单管理</span>
+          <template #title>订单管理</template>
         </el-menu-item>
         <el-menu-item index="/positions">
           <el-icon><TrendCharts /></el-icon>
-          <span>持仓监控</span>
+          <template #title>持仓监控</template>
         </el-menu-item>
         <el-sub-menu index="settings">
           <template #title>
@@ -33,10 +72,30 @@ import { Monitor, List, TrendCharts, DataAnalysis, Setting } from '@element-plus
           </template>
           <el-menu-item index="/settings/threshold">
             <el-icon><DataAnalysis /></el-icon>
-            <span>VWAP基差阈值设置</span>
+            <template #title>VWAP基差阈值设置</template>
           </el-menu-item>
         </el-sub-menu>
       </el-menu>
+      
+      <!-- 折叠/展开按钮 -->
+      <div class="collapse-btn" @click="toggleMenu">
+        <el-icon><Fold v-if="!isCollapsed" /><Expand v-else /></el-icon>
+        <span v-if="!isCollapsed" class="collapse-text">收起菜单</span>
+        <span v-else class="collapse-text">展开</span>
+      </div>
+      
+      <!-- 登出按钮 -->
+      <div class="logout-section">
+        <el-button
+          type="danger"
+          :icon="SwitchButton"
+          @click="handleLogout"
+          plain
+          size="small"
+        >
+          <span v-if="!isCollapsed">退出登录</span>
+        </el-button>
+      </div>
     </el-aside>
     <el-main class="app-main">
       <router-view />
@@ -53,6 +112,10 @@ import { Monitor, List, TrendCharts, DataAnalysis, Setting } from '@element-plus
 .app-aside {
   background-color: var(--app-sidebar);
   border-right: 1px solid var(--app-border);
+  transition: width 0.3s ease;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .logo {
@@ -64,10 +127,37 @@ import { Monitor, List, TrendCharts, DataAnalysis, Setting } from '@element-plus
   font-weight: 600;
   letter-spacing: 0.02em;
   border-bottom: 1px solid var(--app-border);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.collapse-btn {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  color: #9aa0a6;
+  border-top: 1px solid var(--app-border);
+  border-bottom: 1px solid var(--app-border);
+  transition: all 0.3s ease;
+  user-select: none;
+}
+
+.collapse-btn:hover {
+  background-color: rgba(33, 150, 243, 0.12);
+  color: #2196f3;
+}
+
+.collapse-text {
+  font-size: 13px;
+  white-space: nowrap;
 }
 
 .app-menu {
   border-right: none;
+  flex: 1;
 }
 
 .app-menu :deep(.el-menu-item) {
@@ -99,5 +189,14 @@ import { Monitor, List, TrendCharts, DataAnalysis, Setting } from '@element-plus
   padding: 16px;
   background-color: var(--app-bg);
   overflow: auto;
+}
+
+.logout-section {
+  padding: 16px;
+  border-top: 1px solid var(--app-border);
+}
+
+.logout-section .el-button {
+  width: 100%;
 }
 </style>

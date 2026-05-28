@@ -1,7 +1,9 @@
 pymysql==1.1.0
+cryptography>=42.0.0
 python-dotenv==1.0.0
 requests==2.31.0
 websocket-client==1.6.4
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 PyYAML>=6.0
+itsdangerous>=2.1.0

@@ -16,7 +16,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -30,6 +30,7 @@ from common.logger import get_logger, log_print, setup_logging
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
 
 from api.trading_api import router as trading_router
+from api.auth import router as auth_router, verify_token_dependency, verify_ws_token
 from calc.trading_executor import TradingExecutor
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
@@ -388,6 +389,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title='Cross-Exchange OrderBook Monitor', lifespan=lifespan)
 app.include_router(trading_router)
+app.include_router(auth_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -398,7 +400,7 @@ app.add_middleware(
 )
 
 
-@app.get('/api/health')
+@app.get('/api/health', dependencies=[Depends(verify_token_dependency)])
 async def health():
     status = svc.get_status() if svc else {}
     return {
@@ -412,17 +414,17 @@ async def health():
     }
 
 
-@app.get('/api/service/status')
+@app.get('/api/service/status', dependencies=[Depends(verify_token_dependency)])
 async def service_status():
     return svc.get_status() if svc else {'state': SERVICE_IDLE}
 
 
-@app.get('/api/orderbook/snapshot')
+@app.get('/api/orderbook/snapshot', dependencies=[Depends(verify_token_dependency)])
 async def orderbook_snapshot():
     return build_payload()
 
 
-@app.post('/api/service/start')
+@app.post('/api/service/start', dependencies=[Depends(verify_token_dependency)])
 async def service_start():
     ok, message = svc.start()
     if not ok:
@@ -430,7 +432,7 @@ async def service_start():
     return {'ok': True, 'message': message}
 
 
-@app.post('/api/service/stop')
+@app.post('/api/service/stop', dependencies=[Depends(verify_token_dependency)])
 async def service_stop():
     ok, message = svc.stop()
     if not ok:
@@ -439,7 +441,14 @@ async def service_stop():
 
 
 @app.websocket('/ws/orderbook')
-async def ws_orderbook(websocket: WebSocket):
+async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
+    # 验证 token
+    try:
+        verify_ws_token(token)
+    except HTTPException as e:
+        await websocket.close(code=4001, reason=e.detail)
+        return
+    
     await websocket.accept()
     ws_clients.add(websocket)
 
