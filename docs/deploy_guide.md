@@ -1,0 +1,358 @@
+# 阿里云香港节点部署指南
+
+> 目标：将套利系统部署到阿里云香港 ECS（试用），通过公网 IP 在本地电脑访问前端页面
+
+---
+
+## 前置条件
+
+- 阿里云 ECS 已创建（香港节点，Ubuntu 22.04，2核4G）
+- 服务器公网 IP：`47.86.13.224`（下文以此 IP 为例）
+- 本地已有 SSH 密钥或密码可登录服务器
+
+---
+
+## 第一步：SSH 登录服务器
+
+```bash
+ssh root@47.86.13.224
+```
+
+首次登录建议修改 root 密码并创建工作用户（可选）：
+```bash
+adduser deploy
+usermod -aG sudo deploy
+```
+
+---
+
+## 第二步：系统基础环境
+
+```bash
+apt update && apt upgrade -y
+
+# 安装 Python 3 + 虚拟环境 + 编译依赖
+apt install -y python3 python3-pip python3-venv build-essential libffi-dev
+
+# 安装 MySQL 8.0
+apt install -y mysql-server
+
+# 安装 Nginx（做反向代理 + 静态文件托管）
+apt install -y nginx
+
+# 安装 Node.js 20（用于构建前端）
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+# 安装 Git
+apt install -y git
+```
+
+---
+
+## 第三步：配置 MySQL
+
+```bash
+# 启动并设置开机自启
+systemctl enable mysql
+systemctl start mysql
+
+# 安全初始化
+mysql_secure_installation
+```
+
+登录 MySQL 创建数据库和用户：
+```bash
+mysql -u root -p 123456Aa.
+```
+
+```sql
+CREATE DATABASE crypto_arbitrage CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'arb_app'@'localhost' IDENTIFIED BY '123456Aa.';
+GRANT ALL PRIVILEGES ON crypto_arbitrage.* TO 'arb_app'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
+```
+
+> 如果本地 Mac 有数据需要迁移，在 Mac 终端执行：
+> ```bash
+> # Mac 本地执行（用 root 导出数据库到桌面）
+> /usr/local/mysql-9.6.0-macos15-arm64/bin/mysqldump -u root -p --set-gtid-purged=OFF --single-transaction crypto_arbitrage > ~/Desktop/arbitrage_dump.sql
+> ```
+>
+> 然后通过 Navicat 连接服务器 MySQL 导入：
+> 1. 服务器上修改 MySQL 监听地址：
+>    ```bash
+>    nano /etc/mysql/mysql.conf.d/mysqld.cnf
+>    # 将 bind-address 改为 0.0.0.0
+>    systemctl restart mysql
+>    ```
+> 2. 服务器 MySQL 中授权远程 root：
+>    ```sql
+>    CREATE USER 'root'@'%' IDENTIFIED BY '123456Aa.';
+>    GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+>    FLUSH PRIVILEGES;
+>    ```
+> 3. 阿里云安全组临时开放 3306 端口（授权对象 `0.0.0.0/0`）
+> 4. 用 Navicat 连接 `47.86.13.224:3306`，选择 crypto_arbitrage 库，运行 SQL 文件导入
+> 5. **导入完成后立即删除安全组 3306 规则 + 将 bind-address 改回 `127.0.0.1` 并重启 MySQL**
+>
+> 如果 Mac 上路径有变化，可用 `find / -name mysqldump 2>/dev/null` 查找。
+> 导入完成后可直接在桌面删除 `arbitrage_dump.sql`。
+
+---
+
+## 第四步：部署项目代码
+
+### 方式 A：从 GitHub 拉取（推荐）
+```bash
+cd /opt
+git clone https://github.com/Walliii515/ARBITRAGE-MI.git
+cd ARBITRAGE-MI
+```
+
+---
+
+## 第五步：配置 Python 环境
+
+```bash
+cd /opt/ARBITRAGE-MI
+
+# 创建虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+---
+
+## 第六步：配置环境变量
+
+编辑 `.env` 文件，更新 MySQL 连接信息：
+```bash
+nano /opt/ARBITRAGE-MI/.env
+```
+
+修改为：
+```env
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DATABASE=crypto_arbitrage
+MYSQL_USER=arb_app
+MYSQL_PASSWORD=123456Aa.
+```
+
+> 交易所 API Key 保持不变，直接用现有的即可。
+
+---
+
+## 第七步：构建前端
+
+```bash
+cd /opt/ARBITRAGE-MI/frontend
+
+npm install
+npx vite build
+```
+
+构建产物在 `frontend/dist/` 目录。
+
+---
+
+## 第八步：配置 Nginx
+
+创建 Nginx 配置：
+```bash
+nano /etc/nginx/sites-available/arbitrage
+```
+
+写入以下内容：
+```nginx
+server {
+    listen 80;
+    server_name 47.86.13.224;
+
+    # 前端静态文件
+    root /opt/ARBITRAGE-MI/frontend/dist;
+    index index.html;
+
+    # Vue Router history 模式兜底
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API 反向代理
+    location /api/ {
+        proxy_pass http://127.0.0.1:19876;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 300s;
+    }
+
+    # WebSocket 反向代理
+    location /ws {
+        proxy_pass http://127.0.0.1:19876;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 86400s;  # WebSocket 长连接不超时
+        proxy_send_timeout 86400s;
+    }
+}
+```
+
+启用配置：
+```bash
+ln -s /etc/nginx/sites-available/arbitrage /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+
+# 检查配置语法
+nginx -t
+
+# 重载
+systemctl reload nginx
+```
+
+---
+
+## 第九步：创建 systemd 服务
+
+### 主服务 - 订单簿服务 (orderbook_server)
+
+```bash
+nano /etc/systemd/system/arbitrage-orderbook.service
+```
+
+```ini
+[Unit]
+Description=Arbitrage Orderbook Server
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ARBITRAGE-MI/src
+Environment=PATH=/opt/ARBITRAGE-MI/.venv/bin:/usr/bin
+ExecStart=/opt/ARBITRAGE-MI/.venv/bin/python -m api.orderbook_server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 成交引擎服务 (executor_service)
+
+```bash
+nano /etc/systemd/system/arbitrage-executor.service
+```
+
+```ini
+[Unit]
+Description=Arbitrage Executor Service
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ARBITRAGE-MI/src
+Environment=PATH=/opt/ARBITRAGE-MI/.venv/bin:/usr/bin
+ExecStart=/opt/ARBITRAGE-MI/.venv/bin/python -m uvicorn api.executor_service:app --host 127.0.0.1 --port 8081
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用并启动服务：
+```bash
+systemctl daemon-reload
+
+systemctl enable arbitrage-orderbook
+systemctl enable arbitrage-executor
+
+systemctl start arbitrage-orderbook
+systemctl start arbitrage-executor
+```
+
+---
+
+## 第十步：配置安全组
+
+在阿里云控制台 → ECS → 安全组，添加入方向规则：
+
+| 端口 | 协议 | 授权对象 | 用途 |
+|------|------|----------|------|
+| 22 | TCP | 你的本地IP/32 | SSH 登录 |
+| 80 | TCP | 你的本地IP/32 | 网页访问 |
+
+> **安全提醒**：授权对象不要设为 `0.0.0.0/0`，只填你家/公司的出口 IP，避免公网暴露。
+> 查看你的出口 IP：浏览器访问 https://ifconfig.me
+
+---
+
+## 第十一步：访问验证
+
+在你的电脑浏览器打开：
+```
+http://47.86.13.224
+```
+
+你应该能看到套利系统的前端页面。
+
+### 检查服务状态
+
+```bash
+# 查看服务运行状态
+systemctl status arbitrage-orderbook
+systemctl status arbitrage-executor
+
+# 查看日志
+journalctl -u arbitrage-orderbook -f --no-pager
+journalctl -u arbitrage-executor -f --no-pager
+```
+
+---
+
+## 常用运维命令
+
+```bash
+# 重启服务
+systemctl restart arbitrage-orderbook
+systemctl restart arbitrage-executor
+
+# 更新代码后重新部署
+cd /opt/ARBITRAGE-MI
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 重新构建前端
+cd frontend && npm run build
+
+# 重启后端
+systemctl restart arbitrage-orderbook
+systemctl restart arbitrage-executor
+```
+
+---
+
+## 注意事项
+
+1. **试用期限**：阿里云免费试用通常 1-3 个月，到期前记得备份数据或续费
+2. **数据备份**：建议每天定时备份 MySQL
+   ```bash
+   # 加入 crontab
+   crontab -e
+   # 每天凌晨 3 点备份
+   0 3 * * * mysqldump -u arb_app -p'密码' crypto_arbitrage | gzip > /opt/backup/db_$(date +\%Y\%m\%d).sql.gz
+   ```
+3. **日志清理**：项目日志在 `src/log/` 下，建议配置 logrotate 避免磁盘撑满
+4. **WebSocket 稳定性**：香港节点到东京（交易所）延迟约 40-60ms，一般够用；如果发现频繁断线，考虑迁移到日本节点
