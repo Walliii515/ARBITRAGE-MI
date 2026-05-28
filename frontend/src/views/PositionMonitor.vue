@@ -690,6 +690,10 @@ function onGridReady(params: GridReadyEvent<PositionRow>) {
   setupGridCopy(params.api)
 }
 
+function triggerFilterChanged() {
+  gridApi?.onFilterChanged()
+}
+
 /* ───── 生命周期 ───── */
 onMounted(() => {
   fetchPositions()
@@ -751,7 +755,7 @@ onUnmounted(() => {
     <el-card shadow="never" class="status-card">
       <div class="filter-row">
         <span class="filter-label">状态过滤：</span>
-        <el-radio-group v-model="statusFilter" size="small" @change="() => gridApi?.onFilterChanged()">
+        <el-radio-group v-model="statusFilter" size="small" @change="triggerFilterChanged">
           <el-radio-button
             v-for="opt in statusOptions"
             :key="opt.value"
