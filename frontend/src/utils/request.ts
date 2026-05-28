@@ -2,7 +2,8 @@ import { removeToken, getToken, updateActivityTime } from './auth'
 import { ElMessage } from 'element-plus'
 import router from '../router'
 
-const API_BASE = 'http://localhost:19876'
+// 使用环境变量,开发环境默认 localhost,生产环境需配置
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:19876'
 
 interface RequestOptions extends RequestInit {
   baseURL?: string
