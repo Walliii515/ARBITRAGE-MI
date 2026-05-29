@@ -9,6 +9,51 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 
+def calc_vwap(prices: List[Optional[float]], volumes: List[Optional[float]],
+              target_qty: float, qty_multiplier: float = 1.0) -> Optional[float]:
+    """
+    按多档盘口计算 VWAP（市价单真实成交均价）
+
+    逻辑：
+    - 市价单按盘口逐档成交，VWAP是加权平均价的计算结果
+    - VWAP不需要满足交易所tick_size规则（那是限价单的要求）
+    - 例如：VWAP可能=0.011655，这是真实成交均价，不是提交的限价
+
+    Args:
+        prices: 各档价格列表（ask 侧升序，bid 侧降序）
+        volumes: 各档数量列表（原始单位）
+        target_qty: 目标成交量（标的资产数量）
+        qty_multiplier: 数量单位换算乘数（Gate期货张数 -> 标的资产数量）
+
+    Returns:
+        加权均价，若无任何有效数据则返回 None
+    """
+    total_cost = 0.0
+    total_filled = 0.0
+    remaining = target_qty
+
+    for price, vol in zip(prices, volumes):
+        if price is None or vol is None:
+            continue
+        price = float(price)
+        vol = float(vol) * qty_multiplier  # 换算为标的资产数量
+
+        if remaining <= 0:
+            break
+        if vol <= 0:
+            continue
+
+        # 本档实际可用数量
+        fill = min(vol, remaining)
+        total_cost += price * fill
+        total_filled += fill
+        remaining -= fill
+
+    if total_filled <= 0:
+        return None
+    return total_cost / total_filled
+
+
 @dataclass
 class EnrichConfig:
     """富化所需的配置参数（从 config.yaml 读取，一次构造多处复用）"""

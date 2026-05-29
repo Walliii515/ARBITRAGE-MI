@@ -12,10 +12,8 @@ from common.config import config
 from common.logger import get_logger
 
 logger = get_logger(__name__)
-from common.tools import (
-    format_price_precision, format_qty_precision,
-    format_binance_order_params, format_gate_order_params
-)
+from common.tools import format_binance_order_params, format_gate_order_params
+from calc.orderbook_enricher import calc_vwap_basis_bps
 from calc.executor_client import ExecutorClient
 
 
@@ -59,6 +57,10 @@ class TradingExecutor:
         # 盈利性守卫使用的平仓基差分位字段名
         self.close_threshold_col = config.get_str('trade.vwap_close_threshold_percentile', 'close_basis_p20')
 
+        # 24小时成交量过滤阈值（USDT）
+        self.min_spot_volume = config.get_float('trade.min_spot_volume_24h_usdt', 0)
+        self.min_future_volume = config.get_float('trade.min_future_volume_24h_usdt', 0)
+
         # 峰值回落开仓策略
         self.peak_pullback_pct = config.get_float('trade.peak_pullback_pct', 0.10)
         self.peak_monitor_timeout_sec = config.get_int('trade.peak_monitor_timeout_sec', 60)
@@ -82,6 +84,12 @@ class TradingExecutor:
             try:
                 base_asset = row.get('base_asset', '')
                 
+                # 0. 数据完整性检查：缺少有效盘口数据时跳过
+                if row.get('spot_qty') is None or row.get('open_vwap_basis_bps') is None:
+                    # 数据不完整时清除峰值状态，避免数据恢复后误触发超时开仓
+                    self._peak_state.pop(base_asset, None)
+                    continue
+                
                 # 1. 风控检查
                 if not self._pass_risk_check(row):
                     # 风控不通过，清除该标的峰值监控状态（基差已跌回阈值下）
@@ -95,7 +103,7 @@ class TradingExecutor:
                     continue
                 
                 # 3. 峰值回落确认
-                open_vwap_basis = float(row.get('open_vwap_basis_bps') or 0)
+                open_vwap_basis = float(row.get('open_vwap_basis_bps'))
                 if not self._pass_peak_check(base_asset, open_vwap_basis):
                     continue
                 
@@ -185,6 +193,18 @@ class TradingExecutor:
             if close_threshold is not None:
                 if float(open_vwap_basis) <= float(close_threshold) + self.fee_cost_bps:
                     return False
+        
+        # 24小时成交量检查（期货）
+        if self.min_future_volume > 0 and base_asset in self.contract_meta:
+            volume_24h_settle = self.contract_meta[base_asset].get('volume_24h_settle')
+            if volume_24h_settle is not None and volume_24h_settle < self.min_future_volume:
+                return False
+        
+        # 24小时成交量检查（现货）
+        if self.min_spot_volume > 0 and base_asset in self.spot_meta:
+            quote_volume = self.spot_meta[base_asset].get('quote_volume')
+            if quote_volume is not None and quote_volume < self.min_spot_volume:
+                return False
         
         return True
     
@@ -276,6 +296,19 @@ class TradingExecutor:
             close_thr = close_data.get(self.close_threshold_col)
             if close_thr is not None:
                 parts.append(f"守卫({open_vwap_basis:.1f}>{float(close_thr):.1f}+{self.fee_cost_bps:.0f}费)")
+
+        # 5. 24h成交量（现货/期货）
+        vol_parts = []
+        if base_asset in self.spot_meta:
+            qv = self.spot_meta[base_asset].get('quote_volume')
+            if qv is not None:
+                vol_parts.append(f"现货{qv/10000:.0f}w")
+        if base_asset in self.contract_meta:
+            fv = self.contract_meta[base_asset].get('volume_24h_settle')
+            if fv is not None:
+                vol_parts.append(f"期货{fv/10000:.0f}w")
+        if vol_parts:
+            parts.append(f"量({'|'.join(vol_parts)})")
 
         return '|'.join(parts)
 
@@ -372,8 +405,9 @@ class TradingExecutor:
         if exec_result['success']:
             spot_exec_price = float(exec_result['spot_order']['exec_price'])
             future_exec_price = float(exec_result['future_order']['exec_price'])
-            if spot_exec_price and spot_exec_price != 0:
-                actual_basis_bps = round((future_exec_price - spot_exec_price) / spot_exec_price * 10000, 2)
+            actual_basis_bps = calc_vwap_basis_bps(spot_exec_price, future_exec_price)
+            if actual_basis_bps is not None:
+                actual_basis_bps = round(actual_basis_bps, 2)
             else:
                 actual_basis_bps = order_group.get('open_vwap_basis_bps')
             order_group['open_vwap_basis_bps'] = actual_basis_bps
@@ -453,7 +487,7 @@ class TradingExecutor:
         # 计算开仓价差 bps
         spot_price = float(spot_exec['exec_price'])
         future_price = float(future_exec['exec_price'])
-        open_spread_bps = ((future_price - spot_price) / spot_price) * 10000
+        open_spread_bps = calc_vwap_basis_bps(spot_price, future_price) or 0
         
         sql = """
             INSERT INTO mi_trade_position (

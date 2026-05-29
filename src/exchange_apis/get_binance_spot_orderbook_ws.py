@@ -111,13 +111,22 @@ class BinanceSpotOrderBookWS:
         self._should_reconnect = False  # 主动关闭，禁止重连
         self.is_running = False
         self._connected_event.clear()
+        # 强制关闭底层 socket（绕过可能阻塞的 close 握手）
         if self.ws:
+            try:
+                # 先标记 keep_running=False 让 run_forever 退出
+                self.ws.keep_running = False
+                # 强制关闭底层 socket，唤醒阻塞在 recv 的线程
+                if self.ws.sock:
+                    self.ws.sock.abort()
+            except Exception:
+                pass
             try:
                 self.ws.close()
             except Exception:
                 pass
         if self.ws_thread and self.ws_thread.is_alive():
-            self.ws_thread.join(timeout=5)
+            self.ws_thread.join(timeout=3)
         self.ws = None
         self.ws_thread = None
         self.subscriptions.clear()

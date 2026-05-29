@@ -11,7 +11,7 @@ import type {
   ColumnState,
 } from 'ag-grid-community'
 import { ElDrawer } from 'element-plus'
-import { Search } from '@element-plus/icons-vue'
+import { Search, Refresh } from '@element-plus/icons-vue'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess, showWarning } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
@@ -27,16 +27,24 @@ interface WsMessage {
   error?: string | null
   gate_ws_connected?: boolean
   binance_ws_connected?: boolean
-  snapshot?: ProgressInfo
-  subscribe?: ProgressInfo
+  gate_ws_latency_ms?: number | null
+  binance_ws_latency_ms?: number | null
+  gate_snapshot?: ProgressInfo
+  gate_ws?: ProgressInfo
+  binance_ws?: ProgressInfo
+  binance_data?: ProgressInfo
   funding_threshold_percentile?: string
   orderbook_coverage_threshold?: number
   risk_relief_bps?: number
   open_vwap_basis_threshold_bps?: number
+  min_spot_volume_24h_usdt?: number
+  min_future_volume_24h_usdt?: number
+  ts?: number  // pong 回复的时间戳
 }
 
 interface ProgressInfo {
-  current: number
+  success: number
+  failed?: number
   total: number
   percent: number
 }
@@ -46,8 +54,10 @@ interface ServiceStatus {
   error: string | null
   gate_ws_connected: boolean
   binance_ws_connected: boolean
-  snapshot: ProgressInfo
-  subscribe: ProgressInfo
+  gate_snapshot: ProgressInfo
+  gate_ws: ProgressInfo
+  binance_ws: ProgressInfo
+  binance_data: ProgressInfo
   contracts: string[]
   spot_symbols: string[]
 }
@@ -60,11 +70,14 @@ const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected'
 const lastUpdate = ref('--')
 const gateWsConnected = ref(false)
 const binanceWsConnected = ref(false)
+const wsLatencyMs = ref<number | null>(null)
+const gateWsLatencyMs = ref<number | null>(null)
+const binanceWsLatencyMs = ref<number | null>(null)
 const contracts = ref<string[]>([])
 const spotSymbols = ref<string[]>([])
 
-/** 列状态持久化 */
-const COLUMN_STATE_STORAGE_KEY = 'orderbook_column_state'
+/** 列状态持久化（数据库版） */
+const PAGE_KEY = 'orderbook_monitor'
 
 /** 列选择面板：当前列的可见性快照 */
 interface ColumnVisibility {
@@ -104,30 +117,42 @@ function toggleColumnVisibility(colId: string, visible: boolean) {
   }
 }
 
-function saveColumnState() {
+/** 保存列配置到数据库 */
+async function saveColumnState() {
   if (!gridApi) return
   const columnState = gridApi.getColumnState()
-  localStorage.setItem(COLUMN_STATE_STORAGE_KEY, JSON.stringify(columnState))
-  showSuccess('列配置已保存')
+  try {
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
+    const data = await res.json()
+    if (data?.success) {
+      showSuccess('列配置已保存')
+    } else {
+      showError(data?.message || '保存列配置失败')
+    }
+  } catch (e) {
+    showError('保存列配置失败')
+  }
 }
 
-function loadColumnState() {
+/** 从数据库加载列配置 */
+async function loadColumnState() {
   if (!gridApi) return
-  const saved = localStorage.getItem(COLUMN_STATE_STORAGE_KEY)
-  if (!saved) return
-  
   try {
-    const columnState = JSON.parse(saved) as ColumnState[]
-    gridApi.applyColumnState({ state: columnState, applyOrder: true })
-  } catch {
-    // ignore parse errors
+    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const data = await res.json()
+    if (data?.columnState && Array.isArray(data.columnState)) {
+      gridApi.applyColumnState({ state: data.columnState, applyOrder: true })
+    }
+  } catch (e) {
+    console.warn('Failed to load column config from server:', e)
   }
 }
 
 const serviceState = ref<ServiceStatus['state']>('idle')
 const serviceError = ref<string | null>(null)
-const snapshotProgress = ref<ProgressInfo>({ current: 0, total: 0, percent: 0 })
-const subscribeProgress = ref<ProgressInfo>({ current: 0, total: 0, percent: 0 })
+const gateSnapshotProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
+const gateWsProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
+const binanceDataProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
 const serviceBusy = ref(false)
 /** 资金费率阈值百分位字段名，从后端动态获取 */
 const fundingThresholdPercentile = ref<string>('percentile_30')
@@ -143,6 +168,12 @@ const riskReliefBps = ref<number>(10)
 const openVwapBasisThresholdBps = ref<number>(0)
 /** 开仓边际基差过滤开关（默认开启） */
 const filterByMarginalBasis = ref<boolean>(true)
+/** 成交量过滤开关（默认开启） */
+const filterByVolume = ref<boolean>(true)
+/** 现货24h成交量阈值（USDT） */
+const minSpotVolume24h = ref<number>(5000000)
+/** 期货24h成交量阈值（USDT） */
+const minFutureVolume24h = ref<number>(3000000)
 
 /** 标的资产过滤 */
 const assetFilterKeyword = ref<string>('')
@@ -253,6 +284,30 @@ function marginalBasisFilterFunc(params: any): boolean {
   return openVwapBasis >= openVwapBasisThresholdBps.value
 }
 
+/** AG Grid 外部过滤函数：24小时成交量过滤 */
+function volumeFilterFunc(params: any): boolean {
+  if (!filterByVolume.value) {
+    return true // 不过滤，显示所有
+  }
+  
+  const data = params.data as OrderBookRow
+  if (!data) return true
+  
+  // 现货24h成交量检查
+  const quoteVolume = data.quote_volume
+  if (quoteVolume != null && minSpotVolume24h.value > 0) {
+    if (quoteVolume < minSpotVolume24h.value) return false
+  }
+  
+  // 期货24h成交量检查
+  const volume24hSettle = data.volume_24h_settle
+  if (volume24hSettle != null && minFutureVolume24h.value > 0) {
+    if (volume24hSettle < minFutureVolume24h.value) return false
+  }
+  
+  return true
+}
+
 /** 标的资产过滤函数 */
 function assetFilterFunc(params: any): boolean {
   if (!assetFilterKeyword.value) return true
@@ -265,15 +320,18 @@ function assetFilterFunc(params: any): boolean {
 
 /** 组合过滤函数 */
 function combinedFilterFunc(params: any): boolean {
-  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && assetFilterFunc(params)
+  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && volumeFilterFunc(params) && assetFilterFunc(params)
 }
 
 /** WebSocket 实例提升到模块级，避免 HMR 时断开 */
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let statusInterval: ReturnType<typeof setInterval> | null = null
+let pingInterval: ReturnType<typeof setInterval> | null = null
 /** 标记是否已初始化过，HMR 时复用连接 */
 let wsInitialized = false
+/** 页面可见性：页面隐藏时跳过 WS 消息处理和 ping，降低 CPU 开销 */
+let pageVisible = true
 
 /** 按实际精度展示数值，去掉多余尾随 0（不固定 2 位小数） */
 function formatDecimal(value: number, maxDecimals = 12): string {
@@ -886,16 +944,19 @@ const showProgress = computed(
     serviceBusy.value ||
     serviceState.value === 'starting' ||
     serviceState.value === 'stopping' ||
-    snapshotProgress.value.total > 0,
+    gateSnapshotProgress.value.total > 0,
 )
 
 function formatProgress(p: ProgressInfo): string {
   if (p.total <= 0) return '—'
-  return `${p.current}/${p.total} (${p.percent}%)`
+  const failStr = p.failed ? ` ✘${p.failed}` : ''
+  return `${p.success}/${p.total}${failStr} (${p.percent}%)`
 }
 
-function progressStatus(p: ProgressInfo): '' | 'success' {
-  return p.total > 0 && p.percent >= 100 ? 'success' : ''
+function progressStatus(p: ProgressInfo): '' | 'success' | 'warning' {
+  if (p.total > 0 && p.percent >= 100) return 'success'
+  if (p.failed && p.failed > 0) return 'warning'
+  return ''
 }
 
 function getWsUrl(): string {
@@ -914,6 +975,18 @@ function connectWs() {
 
   socket.onopen = () => {
     wsStatus.value = 'connected'
+    wsLatencyMs.value = null
+    // 每 10 秒发送一次 ping 测量延迟（仅页面可见时）
+    if (pingInterval) clearInterval(pingInterval)
+    if (pageVisible) {
+      pingInterval = setInterval(() => {
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+        }
+      }, 10000)
+      // 立即发一次 ping
+      socket!.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+    }
     fetchServiceStatus().then(() => {
       if (serviceState.value === 'running' || serviceState.value === 'starting') {
         fetchOrderbookSnapshot()
@@ -922,19 +995,31 @@ function connectWs() {
   }
 
   socket.onmessage = (ev) => {
+    // 页面隐藏时跳过所有快照消息处理，避免无用 CPU 开销
+    if (!pageVisible) return
     const msg: WsMessage = JSON.parse(ev.data)
     if (msg.type === 'ping') return
+    if (msg.type === 'pong' && msg.ts) {
+      wsLatencyMs.value = Date.now() - msg.ts
+      return
+    }
     if (msg.type === 'service_progress') {
       if (msg.state) serviceState.value = msg.state
       if (msg.error !== undefined) serviceError.value = msg.error
       if (msg.gate_ws_connected !== undefined) gateWsConnected.value = msg.gate_ws_connected
       if (msg.binance_ws_connected !== undefined) binanceWsConnected.value = msg.binance_ws_connected
-      if (msg.snapshot) snapshotProgress.value = msg.snapshot
-      if (msg.subscribe) subscribeProgress.value = msg.subscribe
+      if (msg.gate_ws_latency_ms !== undefined) gateWsLatencyMs.value = msg.gate_ws_latency_ms
+      if (msg.binance_ws_latency_ms !== undefined) binanceWsLatencyMs.value = msg.binance_ws_latency_ms
+      if (msg.gate_snapshot) gateSnapshotProgress.value = msg.gate_snapshot
+      if (msg.gate_ws) gateWsProgress.value = msg.gate_ws
+      if (msg.binance_data) binanceDataProgress.value = msg.binance_data
       serviceBusy.value = msg.state === 'starting' || msg.state === 'stopping'
       return
     }
     if (msg.type === 'snapshot' && msg.rows) {
+      // 更新交易所 WS 延迟
+      if (msg.gate_ws_latency_ms !== undefined) gateWsLatencyMs.value = msg.gate_ws_latency_ms
+      if (msg.binance_ws_latency_ms !== undefined) binanceWsLatencyMs.value = msg.binance_ws_latency_ms
       // 更新资金费率阈值百分位配置
       if (msg.funding_threshold_percentile) {
         fundingThresholdPercentile.value = msg.funding_threshold_percentile
@@ -951,17 +1036,27 @@ function connectWs() {
       if (msg.open_vwap_basis_threshold_bps != null) {
         openVwapBasisThresholdBps.value = msg.open_vwap_basis_threshold_bps
       }
+      // 更新成交量阈值配置
+      if (msg.min_spot_volume_24h_usdt != null) {
+        minSpotVolume24h.value = msg.min_spot_volume_24h_usdt
+      }
+      if (msg.min_future_volume_24h_usdt != null) {
+        minFutureVolume24h.value = msg.min_future_volume_24h_usdt
+      }
       applySnapshotRows(msg.rows, msg.server_time ?? '--')
     }
   }
 
   socket.onclose = () => {
     wsStatus.value = 'disconnected'
+    wsLatencyMs.value = null
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
     scheduleReconnect()
   }
 
   socket.onerror = () => {
     wsStatus.value = 'disconnected'
+    wsLatencyMs.value = null
   }
 }
 
@@ -980,8 +1075,10 @@ function applyServiceStatus(data: ServiceStatus) {
   binanceWsConnected.value = data.binance_ws_connected ?? false
   contracts.value = data.contracts ?? []
   spotSymbols.value = data.spot_symbols ?? []
-  snapshotProgress.value = data.snapshot ?? { current: 0, total: 0, percent: 0 }
-  subscribeProgress.value = data.subscribe ?? { current: 0, total: 0, percent: 0 }
+  const emptyP: ProgressInfo = { success: 0, total: 0, percent: 0 }
+  gateSnapshotProgress.value = data.gate_snapshot ?? emptyP
+  gateWsProgress.value = data.gate_ws ?? emptyP
+  binanceDataProgress.value = data.binance_data ?? emptyP
   serviceBusy.value = data.state === 'starting' || data.state === 'stopping'
   const contractCount = data.contracts?.length ?? 0
   const rowCount = rowData.value.length
@@ -1007,8 +1104,10 @@ async function fetchServiceStatus() {
 }
 
 function resetProgress() {
-  snapshotProgress.value = { current: 0, total: 0, percent: 0 }
-  subscribeProgress.value = { current: 0, total: 0, percent: 0 }
+  const emptyP: ProgressInfo = { success: 0, total: 0, percent: 0 }
+  gateSnapshotProgress.value = emptyP
+  gateWsProgress.value = emptyP
+  binanceDataProgress.value = emptyP
 }
 
 async function startService() {
@@ -1081,6 +1180,12 @@ watch(filterByMarginalBasis, () => {
   }
 })
 
+watch(filterByVolume, () => {
+  if (gridApi) {
+    gridApi.onFilterChanged()
+  }
+})
+
 onMounted(() => {
   // HMR 时复用已有的 WebSocket 连接，不重新创建
   if (!wsInitialized || socket?.readyState === WebSocket.CLOSED) {
@@ -1094,6 +1199,9 @@ onMounted(() => {
   // 点击外部关闭资产下拉框
   document.addEventListener('click', handleOutsideClick)
   
+  // 页面可见性监听：隐藏时停止 ping，可见时恢复
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  
   fetchServiceStatus().then(() => {
     if (serviceState.value === 'running' || serviceState.value === 'starting') {
       fetchOrderbookSnapshot()
@@ -1102,16 +1210,37 @@ onMounted(() => {
   restartStatusPolling()
 })
 
+function handleVisibilityChange() {
+  pageVisible = !document.hidden
+  if (pageVisible) {
+    // 恢复可见时重启 ping
+    if (pingInterval) clearInterval(pingInterval)
+    pingInterval = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+      }
+    }, 10000)
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+    }
+  } else {
+    // 隐藏时停止 ping
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
+  }
+}
+
 onUnmounted(() => {
   // HMR 时不关闭 WebSocket，保持连接
   // 只有在页面真正关闭/导航时才清理
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (statusInterval) clearInterval(statusInterval)
+  if (pingInterval) clearInterval(pingInterval)
   // 注释掉 socket?.close()，让 HMR 时连接保持活跃
   // socket?.close()
   
   // 清理事件监听
   document.removeEventListener('click', handleOutsideClick)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 
 function onGridReady(params: GridReadyEvent<OrderBookRow>) {
@@ -1140,19 +1269,26 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
         </div>
         <span class="status-item">
           前端 WS：
-          <el-tag :type="statusTagType" size="small">{{ statusText }}</el-tag>
+          <el-tag v-if="wsStatus === 'connected'" type="success" size="small">
+            {{ wsLatencyMs != null ? `${wsLatencyMs}ms` : '已连接' }}
+          </el-tag>
+          <el-tag v-else :type="wsStatus === 'connecting' ? 'warning' : 'danger'" size="small">
+            {{ wsStatus === 'connecting' ? '连接中' : '已断开' }}
+          </el-tag>
         </span>
         <span class="status-item">
           Gate WS：
-          <el-tag :type="gateWsConnected ? 'success' : 'danger'" size="small">
-            {{ gateWsConnected ? '已连接' : '未连接' }}
+          <el-tag v-if="gateWsConnected" type="success" size="small">
+            {{ gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接' }}
           </el-tag>
+          <el-tag v-else type="danger" size="small">未连接</el-tag>
         </span>
         <span class="status-item">
           Binance WS：
-          <el-tag :type="binanceWsConnected ? 'success' : 'danger'" size="small">
-            {{ binanceWsConnected ? '已连接' : '未连接' }}
+          <el-tag v-if="binanceWsConnected" type="success" size="small">
+            {{ binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接' }}
           </el-tag>
+          <el-tag v-else type="danger" size="small">未连接</el-tag>
         </span>
         <span class="status-item">合约数：{{ contracts.length }}</span>
         <span class="status-item">现货数：{{ spotSymbols.length }}</span>
@@ -1161,32 +1297,47 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
       <div v-if="showProgress" class="progress-row">
         <div class="progress-block">
           <div class="progress-label">
-            <span>快照加载</span>
-            <span :class="{ 'progress-done': progressStatus(snapshotProgress) === 'success' }">
-              {{ formatProgress(snapshotProgress) }}
+            <span>Gate 快照</span>
+            <span :class="{ 'progress-done': progressStatus(gateSnapshotProgress) === 'success' }">
+              {{ formatProgress(gateSnapshotProgress) }}
             </span>
           </div>
           <el-progress
-            :percentage="snapshotProgress.percent"
-            :status="progressStatus(snapshotProgress)"
+            :percentage="gateSnapshotProgress.percent"
+            :status="progressStatus(gateSnapshotProgress)"
             :stroke-width="8"
             :show-text="false"
           />
         </div>
         <div class="progress-block">
           <div class="progress-label">
-            <span>WS 订阅</span>
-            <span :class="{ 'progress-done': progressStatus(subscribeProgress) === 'success' }">
-              {{ formatProgress(subscribeProgress) }}
+            <span>Gate WS</span>
+            <span :class="{ 'progress-done': progressStatus(gateWsProgress) === 'success' }">
+              {{ formatProgress(gateWsProgress) }}
             </span>
           </div>
           <el-progress
-            :percentage="subscribeProgress.percent"
-            :status="progressStatus(subscribeProgress)"
+            :percentage="gateWsProgress.percent"
+            :status="progressStatus(gateWsProgress)"
             :stroke-width="8"
             :show-text="false"
           />
         </div>
+        <div class="progress-block">
+          <div class="progress-label">
+            <span>Binance</span>
+            <span :class="{ 'progress-done': progressStatus(binanceDataProgress) === 'success' }">
+              {{ formatProgress(binanceDataProgress) }}
+            </span>
+          </div>
+          <el-progress
+            :percentage="binanceDataProgress.percent"
+            :status="progressStatus(binanceDataProgress)"
+            :stroke-width="8"
+            :show-text="false"
+          />
+        </div>
+        <el-button size="small" @click="fetchServiceStatus" style="margin-left: 8px" :icon="Refresh" circle />
         <span v-if="serviceError" class="status-error">{{ serviceError }}</span>
       </div>
     </el-card>
@@ -1247,6 +1398,14 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
                 inactive-text="VWAP基差阈值过滤"
                 style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
               />
+              <el-switch
+                v-model="filterByVolume"
+                class="filter-switch"
+                inline-prompt
+                active-text="成交量过滤"
+                inactive-text="成交量过滤"
+                style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
+              />
             </div>
             <div class="column-actions">
               <el-popover
@@ -1292,7 +1451,7 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
         :locale-text="localeText"
         :header-height="32"
         :row-height="32"
-        :isExternalFilterPresent="() => filterByFundingRate || filterByCoverage || filterByMarginalBasis"
+        :isExternalFilterPresent="() => filterByFundingRate || filterByCoverage || filterByMarginalBasis || filterByVolume"
         :doesExternalFilterPass="combinedFilterFunc"
         @grid-ready="onGridReady"
       />

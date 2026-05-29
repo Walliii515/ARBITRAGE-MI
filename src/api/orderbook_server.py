@@ -5,7 +5,6 @@
 支持前端控制 WS 服务的启动/终止及进度查询
 """
 import asyncio
-import concurrent.futures
 import json
 import os
 import sys
@@ -16,6 +15,12 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Set
 
+try:
+    import orjson
+    _HAS_ORJSON = True
+except ImportError:
+    _HAS_ORJSON = False
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -23,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from calc.calculate_hedge_metrics import calculate_hedge_metrics
 from calc.merge_cross_exchange_orderbook import merge_orderbook_records
-from calc.etl_pipeline import run_etl_pipeline, start_daily_schedulers, stop_daily_schedulers
+from calc.etl_pipeline import start_daily_schedulers, stop_daily_schedulers, ETL_TASKS, _etl_config
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger, log_print, setup_logging
@@ -43,17 +48,31 @@ logger = get_logger(__name__)
 
 
 def _json_dumps(data) -> str:
-    """安全 JSON 序列化，兜底处理 Decimal/datetime 等不可序列化类型"""
-    def _default(obj):
-        if isinstance(obj, Decimal):
-            return float(obj)
-        if isinstance(obj, datetime):
-            return obj.strftime('%Y-%m-%d %H:%M:%S')
-        raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
-    return json.dumps(data, default=_default, ensure_ascii=False)
+    """高性能 JSON 序列化（优先使用 orjson，回退 stdlib json）"""
+    if _HAS_ORJSON:
+        # orjson 原生支持 float/int/str/None/datetime，Decimal 需转 float
+        return orjson.dumps(
+            data,
+            default=_orjson_default,
+            option=orjson.OPT_NON_STR_KEYS,
+        ).decode('utf-8')
+    else:
+        def _default(obj):
+            if isinstance(obj, Decimal):
+                return float(obj)
+            if isinstance(obj, datetime):
+                return obj.strftime('%Y-%m-%d %H:%M:%S')
+            raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
+        return json.dumps(data, default=_default, ensure_ascii=False)
 
-_etl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='etl')
-_meta_update_time: str = ''  # 上次 ETL 完成时间
+
+def _orjson_default(obj):
+    """orjson 的 default 回调（仅处理 Decimal）"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
+
+_meta_update_time: str = ''  # 上次缓存刷新时间
 
 # 以下参数从 src/config/config.yaml 加载，环境变量可覆盖
 SETTLE = config.get_str('orderbook.settle', 'usdt', env='ORDERBOOK_SETTLE')
@@ -70,6 +89,9 @@ ORDERBOOK_COVERAGE_THRESHOLD = config.get_float('trade.orderbook_coverage_thresh
 RISK_RELIEF_BPS = config.get_float('trade.risk_relief_bps', 10)
 # 开仓边际基差阈值（bps）
 OPEN_VWAP_BASIS_THRESHOLD_BPS = config.get_float('trade.open_vwap_basis_threshold_bps', -60)
+# 24小时成交量过滤阈值（USDT）
+MIN_SPOT_VOLUME_24H_USDT = config.get_float('trade.min_spot_volume_24h_usdt', 0)
+MIN_FUTURE_VOLUME_24H_USDT = config.get_float('trade.min_future_volume_24h_usdt', 0)
 # 费率配置（bps 计算用）
 SPOT_OPEN_FEE = config.get_float('trade.fee.spot_open', 0.00075)
 SPOT_CLOSE_FEE = config.get_float('trade.fee.spot_close', 0.00075)
@@ -121,6 +143,10 @@ _closing_executor: Optional['ClosingExecutor'] = None
 # 合并+对冲指标缓存（避免多个后台循环重复计算）
 _cached_merged_rows: List[Dict] = []
 _cached_merged_ts: float = 0.0
+
+# 完整广播 payload 缓存（预序列化 JSON 字符串，避免多客户端重复序列化）
+_cached_payload_json: str = ''
+_cached_payload_ts: float = 0.0
 
 
 def _get_merged_rows() -> List[Dict]:
@@ -229,6 +255,8 @@ def build_payload() -> dict:
     """构建 WebSocket 推送载荷（Gate + Binance 合并宽表，附带开仓金额）"""
     rows = _get_merged_rows()
 
+    # 重要：enrich_snapshot_fields 会就地修改 rows，但由于 _cached_merged_rows
+    # 每秒重建一次，这里的就地修改不影响其他消费者
     enrich_snapshot_fields(
         rows, _contract_meta, _spot_meta, _threshold_meta,
         _vwap_threshold_meta, _enrich_cfg, _meta_update_time
@@ -242,8 +270,25 @@ def build_payload() -> dict:
         'orderbook_coverage_threshold': ORDERBOOK_COVERAGE_THRESHOLD,
         'risk_relief_bps': RISK_RELIEF_BPS,
         'open_vwap_basis_threshold_bps': OPEN_VWAP_BASIS_THRESHOLD_BPS,
+        'min_spot_volume_24h_usdt': MIN_SPOT_VOLUME_24H_USDT,
+        'min_future_volume_24h_usdt': MIN_FUTURE_VOLUME_24H_USDT,
+        'gate_ws_latency_ms': svc._calc_gate_data_age_ms() if svc else None,
+        'binance_ws_latency_ms': svc._calc_binance_data_age_ms() if svc else None,
         'rows': rows,
     }
+
+
+def build_payload_json() -> str:
+    """构建并预序列化广播载荷 JSON 字符串（缓存复用，避免重复序列化）"""
+    global _cached_payload_json, _cached_payload_ts
+    now = time.time()
+    # 与 merged_rows 缓存同步：同一秒内复用已序列化的 JSON
+    if _cached_payload_json and (now - _cached_payload_ts) < BROADCAST_THROTTLE_SEC:
+        return _cached_payload_json
+    payload = build_payload()
+    _cached_payload_json = _json_dumps(payload)
+    _cached_payload_ts = now
+    return _cached_payload_json
 
 
 def schedule_broadcast():
@@ -283,10 +328,15 @@ def _delayed_broadcast():
 async def broadcast_worker():
     while True:
         payload = await broadcast_queue.get()
+        # 预序列化一次，所有客户端共享同一份 JSON 字符串
+        if isinstance(payload, str):
+            text = payload  # 已经是预序列化的 JSON
+        else:
+            text = _json_dumps(payload)
         dead_clients = []
         for ws in list(ws_clients):
             try:
-                await ws.send_text(_json_dumps(payload))
+                await ws.send_text(text)
             except Exception:
                 dead_clients.append(ws)
         for ws in dead_clients:
@@ -300,6 +350,7 @@ async def _orderbook_broadcast_loop():
     - 彻底解耦「数据更新」与「广播推送」，消除 callback 风暴
     - 固定频率重建 payload，无论 WS 消息量多少，广播开销恒定
     - 无前端连接时自动跳过计算，降低空负CPU
+    - 预序列化 JSON，多客户端共享同一份字符串
     """
     while True:
         await asyncio.sleep(BROADCAST_THROTTLE_SEC)
@@ -309,8 +360,9 @@ async def _orderbook_broadcast_loop():
             # 无前端连接时跳过计算
             if not ws_clients:
                 continue
-            payload = build_payload()
-            await broadcast_queue.put(payload)
+            # 直接放入预序列化的 JSON 字符串，broadcast_worker 无需再次序列化
+            payload_json = build_payload_json()
+            await broadcast_queue.put(payload_json)
         except Exception as e:
             logger.error(f"盘口广播失败: {e}")
 
@@ -332,16 +384,22 @@ async def lifespan(app: FastAPI):
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_print(f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条')
 
-    async def _refresh_meta_loop():
-        """定时执行 ETL 并刷新内存缓存"""
-        interval = config.get_int('trade.meta_refresh_interval_min', 15) * 60
+    async def _refresh_meta_cache_loop():
+        """定时刷新内存缓存（ETL由各任务的IntervalScheduler独立执行）"""
+        # 获取所有 interval 任务的最小间隔作为缓存刷新频率
+        interval_tasks = [t for t in ETL_TASKS if t.schedule == 'interval' and t.enabled]
+        if interval_tasks:
+            min_interval = min(t.interval_minutes for t in interval_tasks)
+        else:
+            min_interval = _etl_config.get('default_interval_minutes', 15)
+        
+        interval = min_interval * 60  # 转换为秒
+        
         while True:
             await asyncio.sleep(interval)
             try:
-                logger.info('开始定时 ETL 刷新...')
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(_etl_executor, run_etl_pipeline)
-                # ETL 完成后刷新内存缓存
+                logger.info(f'开始定时刷新内存缓存 (间隔: {min_interval} 分钟)...')
+                # 刷新内存缓存
                 global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _meta_update_time
                 _contract_meta = fetch_contract_meta()
                 _spot_meta = fetch_spot_meta()
@@ -349,15 +407,15 @@ async def lifespan(app: FastAPI):
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
                 _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
                 _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                logger.info(f'ETL 刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, 阈値 {len(_threshold_meta)} 条, VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条')
+                logger.info(f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, 阈値 {len(_threshold_meta)} 条, VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条')
                 # 重置执行器单例，下次循环用新元数据重建
                 global _trading_executor, _closing_executor
                 _trading_executor = None
                 _closing_executor = None
             except Exception as e:
-                logger.error(f'ETL 刷新失败: {e}')
+                logger.error(f'内存缓存刷新失败: {e}')
 
-    asyncio.create_task(_refresh_meta_loop())
+    asyncio.create_task(_refresh_meta_cache_loop())
     asyncio.create_task(_open_position_loop())
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
@@ -400,8 +458,9 @@ app.add_middleware(
 )
 
 
-@app.get('/api/health', dependencies=[Depends(verify_token_dependency)])
+@app.get('/api/health')
 async def health():
+    """健康检查接口（无需认证，用于系统监控）"""
     status = svc.get_status() if svc else {}
     return {
         'status': 'ok',
@@ -414,9 +473,39 @@ async def health():
     }
 
 
-@app.get('/api/service/status', dependencies=[Depends(verify_token_dependency)])
+@app.get('/api/service/status')
 async def service_status():
+    """获取服务运行状态（无需认证，用于前端健康检查）"""
     return svc.get_status() if svc else {'state': SERVICE_IDLE}
+
+
+@app.get('/api/service/connections')
+async def service_connections():
+    """获取逐标的资产 REST 快照 / WS 订阅状态（无需认证，用于连接监控）"""
+    if not svc:
+        return {'items': [], 'state': SERVICE_IDLE}
+    return {
+        'items': svc.get_connection_status(),
+        'state': svc.state,
+        'gate_ws_connected': svc._gate_ws_connected(),
+        'binance_ws_connected': svc._binance_ws_connected(),
+        'gate_ws_latency_ms': svc._calc_gate_data_age_ms(),
+        'binance_ws_latency_ms': svc._calc_binance_data_age_ms(),
+    }
+
+
+@app.post('/api/service/retry-snapshot', dependencies=[Depends(verify_token_dependency)])
+async def retry_snapshot(body: dict):
+    """手动重试单个标的的 REST 快照初始化 + WS 订阅"""
+    base_asset = (body.get('base_asset') or '').strip()
+    if not base_asset:
+        raise HTTPException(status_code=400, detail='base_asset 不能为空')
+    if not svc:
+        raise HTTPException(status_code=400, detail='服务未初始化')
+    ok, message = svc.retry_contract(base_asset)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {'ok': True, 'message': message}
 
 
 @app.get('/api/orderbook/snapshot', dependencies=[Depends(verify_token_dependency)])
@@ -453,13 +542,21 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
     ws_clients.add(websocket)
 
     try:
-        await websocket.send_text(_json_dumps(build_payload()))
+        # 初始连接时发送当前快照（复用缓存的 JSON）
+        await websocket.send_text(build_payload_json())
         if svc and svc.state in (SERVICE_STARTING, SERVICE_STOPPING):
             await websocket.send_text(_json_dumps(svc.get_progress_payload()))
 
         while True:
             try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                # 处理前端 ping 请求，回复 pong（用于延迟测量）
+                try:
+                    msg = json.loads(raw)
+                    if isinstance(msg, dict) and msg.get('type') == 'ping':
+                        await websocket.send_text(json.dumps({'type': 'pong', 'ts': msg.get('ts')}))
+                except (json.JSONDecodeError, TypeError):
+                    pass
             except asyncio.TimeoutError:
                 await websocket.send_json({'type': 'ping'})
     except WebSocketDisconnect:
@@ -519,16 +616,30 @@ async def _open_position_loop():
 
 
 async def _position_funding_loop():
-    """定时更新资金费收益"""
-    interval = config.get_int('trade.position_funding_update_sec', 28800)
+    """定时更新资金费收益（启动后立即执行一次，之后每小时检查）
+    结算完成后通过 WS 推送 funding_history_update 事件，前端按需更新。
+    """
+    interval = config.get_int('trade.position_funding_update_sec', 3600)
+
+    # 启动后等待服务就绪再执行第一次
+    await asyncio.sleep(10)
 
     while True:
         try:
-            await asyncio.sleep(interval)
             tracker = PositionTracker(_contract_meta)
             tracker.update_funding_pnl()
+            # 结算后推送一次性的资金费历史更新事件
+            histories = tracker.get_all_funding_histories()
+            if histories and broadcast_queue:
+                payload = {
+                    'type': 'funding_history_update',
+                    'funding_histories': histories,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                await broadcast_queue.put(payload)
         except Exception as e:
             logger.error(f"资金费更新失败: {e}")
+        await asyncio.sleep(interval)
 
 
 async def _close_position_loop():
@@ -604,7 +715,9 @@ async def _close_position_loop():
 
 
 async def _position_realtime_push():
-    """定时推送持仓实时数据（含已平仓，使用平仓 VWAP 作为实时价格）"""
+    """定时推送持仓实时数据（含已平仓，使用平仓 VWAP 作为实时价格）
+    注意：funding_history 不在此推送（低频数据），仅通过 REST 初始加载 + 结算后事件推送。
+    """
     interval = config.get_float('trade.position_push_interval_sec', 5.0)
 
     while True:
@@ -638,7 +751,7 @@ async def _position_realtime_push():
             # 计算实时盈亡（已平仓持仓用DB存储的价格，不依赖 close_vwaps）
             calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
 
-            # 推送
+            # 推送（不含 funding_history，保持消息精简）
             payload = {
                 'type': 'position_update',
                 'positions': positions,

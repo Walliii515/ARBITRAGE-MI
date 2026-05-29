@@ -55,8 +55,8 @@ const assetOptions = ref<string[]>([])
 /* 最新计算日期（BTC 基准） */
 const latestCalcDate = ref<string>('—')
 
-/** 列状态持久化 */
-const COLUMN_STATE_STORAGE_KEY = 'vwap_threshold_column_state'
+/** 列状态持久化（数据库版） */
+const PAGE_KEY = 'vwap_threshold'
 
 /* ───── 格式化 ───── */
 const bpsFormatter = (params: ValueFormatterParams) => {
@@ -167,22 +167,34 @@ function toggleColumnVisibility(colId: string, visible: boolean) {
   if (col) col.visible = visible
 }
 
-function saveColumnState() {
+/** 保存列配置到数据库 */
+async function saveColumnState() {
   if (!gridApi) return
   const columnState = gridApi.getColumnState()
-  localStorage.setItem(COLUMN_STATE_STORAGE_KEY, JSON.stringify(columnState))
-  showSuccess('列配置已保存')
+  try {
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
+    const data = await res.json()
+    if (data?.success) {
+      showSuccess('列配置已保存')
+    } else {
+      showError(data?.message || '保存列配置失败')
+    }
+  } catch (e) {
+    showError('保存列配置失败')
+  }
 }
 
-function loadColumnState() {
+/** 从数据库加载列配置 */
+async function loadColumnState() {
   if (!gridApi) return
-  const saved = localStorage.getItem(COLUMN_STATE_STORAGE_KEY)
-  if (!saved) return
   try {
-    const columnState = JSON.parse(saved) as ColumnState[]
-    gridApi.applyColumnState({ state: columnState, applyOrder: true })
-  } catch {
-    // ignore parse errors
+    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const data = await res.json()
+    if (data?.columnState && Array.isArray(data.columnState)) {
+      gridApi.applyColumnState({ state: data.columnState, applyOrder: true })
+    }
+  } catch (e) {
+    console.warn('Failed to load column config from server:', e)
   }
 }
 

@@ -11,6 +11,8 @@ auth:
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
   settle: usdt
+  # 最大订阅合约数（从 mi_base_asset 加载的上限）
+  max_contracts: 999
 
   # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
   broadcast_throttle_sec: 1.0
@@ -34,6 +36,11 @@ trade:
   # 开仓VWAP基差阈值（bps），无按标的阈值时的全局回退阈值
   # 和按标的模式统一，均与纯基差（open_vwap_basis_bps）对比
   open_vwap_basis_threshold_bps: 20
+  # 24小时成交量过滤阈值（USDT）
+  # 现货24h成交额（Binance quoteVolume）低于此值的标的不开仓
+  min_spot_volume_24h_usdt: 100000
+  # 期货24h成交额（Gate volume_24h_settle）低于此值的标的不开仓
+  min_future_volume_24h_usdt: 50000
   # market taker fee rate
   fee:
     spot_open: 0.00075
@@ -43,8 +50,6 @@ trade:
   # 资金费率阈值百分位（对应 mi_gate_future_funding_rate_threshold 表的字段名）
   # 可选值: percentile_20, percentile_30, percentile_40 等
   funding_rate_threshold_percentile: percentile_30
-  # 元数据定时 ETL 刷新间隔（分钟）
-  meta_refresh_interval_min: 15
   # 开仓检查间隔(秒)
   open_check_interval_sec: 5
   # 开仓冷却期(秒) - 同一合约1小时内不重复开仓

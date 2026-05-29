@@ -102,9 +102,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['current_future_price'] = current_future
 
             # 实时价差 (bps)
-            pos['current_spread_bps'] = round(
-                (current_future - current_spot) / current_spot * 10000, 2
-            ) if current_spot != 0 else None
+            basis = calc_vwap_basis_bps(current_spot, current_future)
+            pos['current_spread_bps'] = round(basis, 2) if basis is not None else None
 
             # 浮动盈亏 (bps) = 开仓价差 - 实时价差
             pos['floating_pnl_bps'] = round(

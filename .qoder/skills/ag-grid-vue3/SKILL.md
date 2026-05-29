@@ -13,6 +13,49 @@
 
 ## 关键实现
 
+### 0. 数据库表结构（统一列配置管理）
+
+**表名**：`ag_grid_column_config`
+
+```sql
+CREATE TABLE IF NOT EXISTS ag_grid_column_config (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+  user_id VARCHAR(64) NOT NULL COMMENT '用户ID（支持多用户个性化配置）',
+  page_key VARCHAR(64) NOT NULL COMMENT '页面标识，如 orderbook_monitor, position_monitor, order_management',
+  col_id VARCHAR(128) NOT NULL COMMENT '列ID（对应AG Grid column.field 或 column.colId）',
+  sort_order INT NOT NULL DEFAULT 0 COMMENT '显示顺序（升序排列）',
+  is_visible TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否显示：1=显示，0=隐藏',
+  width INT NULL COMMENT '列宽（px）',
+  pinned VARCHAR(16) NULL COMMENT '固定位置：left / right / null',
+  sort VARCHAR(16) NULL COMMENT '排序状态：asc / desc / null',
+  filter_model JSON NULL COMMENT '筛选条件（AG Grid FilterModel 序列化）',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
+  UNIQUE KEY uk_user_page_col (user_id, page_key, col_id),
+  INDEX idx_user_page (user_id, page_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AG Grid列配置表';
+```
+
+**设计说明**：
+- `user_id`：支持多用户各自的列配置偏好
+- `page_key`：标识不同的AG Grid页面（如 `orderbook_monitor`、`position_monitor`、`order_management`、`vwap_threshold`、`connection_status`）
+- `sort_order`：控制列的显示顺序
+- `is_visible`：控制列的显隐
+- `width` / `pinned` / `sort` / `filter_model`：完整的AG Grid列状态字段
+
+**初始化脚本示例**（可选）：
+```sql
+-- 为 orderbook_monitor 页面初始化默认列配置
+INSERT INTO ag_grid_column_config (user_id, page_key, col_id, sort_order, is_visible, width, pinned)
+VALUES 
+  ('default', 'orderbook_monitor', 'base_asset', 0, 1, 90, 'left'),
+  ('default', 'orderbook_monitor', 'open_amount_usdt', 1, 1, 120, NULL),
+  ('default', 'orderbook_monitor', 'spot_qty', 2, 1, 110, NULL),
+  ('default', 'orderbook_monitor', 'future_qty', 3, 1, 110, NULL),
+  ('default', 'orderbook_monitor', 'funding_rate_24h', 4, 1, 120, NULL)
+  -- ... 其他列
+ON DUPLICATE KEY UPDATE sort_order = VALUES(sort_order);
+```
+
 ### 1. 模块注册（main.ts）
 
 ```typescript
@@ -59,7 +102,144 @@ const defaultColDef: ColDef = {
 }
 ```
 
-### 4. 列状态持久化
+### 4. 列状态持久化（数据库版）
+
+**⚠️ 替换原 localStorage 方案，改用数据库API统一存储**
+
+#### 4.1 后端 API 实现
+
+**新增路由**：`src/api/trading_api.py`
+
+```python
+@router.get('/column-config/{page_key}')
+def get_column_config(page_key: str, current_user: dict = Depends(get_current_user)):
+    """获取指定页面的列配置"""
+    user_id = current_user.get('user_id', 'default')
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(
+            "SELECT col_id, sort_order, is_visible, width, pinned, sort, filter_model "
+            "FROM ag_grid_column_config "
+            "WHERE user_id = %s AND page_key = %s "
+            "ORDER BY sort_order ASC",
+            (user_id, page_key)
+        )
+        rows = cursor.fetchall()
+    
+    # 转换为AG Grid ColumnState格式
+    column_state = []
+    for row in rows:
+        state = {
+            'colId': row['col_id'],
+            'order': row['sort_order'],
+            'hide': not row['is_visible'],
+        }
+        if row['width'] is not None:
+            state['width'] = row['width']
+        if row['pinned']:
+            state['pinned'] = row['pinned']
+        if row['sort']:
+            state['sort'] = row['sort']
+        if row['filter_model']:
+            import json
+            state['filterModel'] = json.loads(row['filter_model'])
+        column_state.append(state)
+    
+    return {'columnState': column_state}
+
+@router.post('/column-config/{page_key}')
+def save_column_config(page_key: str, payload: dict, current_user: dict = Depends(get_current_user)):
+    """保存指定页面的列配置"""
+    user_id = current_user.get('user_id', 'default')
+    column_state = payload.get('columnState', [])
+    
+    with db_manager.get_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            # 批量 upsert
+            for item in column_state:
+                cursor.execute(
+                    "INSERT INTO ag_grid_column_config "
+                    "(user_id, page_key, col_id, sort_order, is_visible, width, pinned, sort, filter_model) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "sort_order = VALUES(sort_order), "
+                    "is_visible = VALUES(is_visible), "
+                    "width = VALUES(width), "
+                    "pinned = VALUES(pinned), "
+                    "sort = VALUES(sort), "
+                    "filter_model = VALUES(filter_model)",
+                    (
+                        user_id,
+                        page_key,
+                        item['colId'],
+                        item.get('order', 0),
+                        not item.get('hide', False),
+                        item.get('width'),
+                        item.get('pinned'),
+                        item.get('sort'),
+                        json.dumps(item.get('filterModel')) if item.get('filterModel') else None
+                    )
+                )
+            return {'success': True}
+        finally:
+            cursor.close()
+```
+
+#### 4.2 前端实现
+
+```typescript
+import { get, post } from '../utils/request'
+
+/** 从数据库加载列配置 */
+async function loadColumnState(pageKey: string) {
+  if (!gridApi) return
+  try {
+    const res = await get(`/api/column-config/${pageKey}`)
+    if (res?.columnState && Array.isArray(res.columnState)) {
+      gridApi.applyColumnState({ state: res.columnState, applyOrder: true })
+    }
+  } catch (e) {
+    console.warn('Failed to load column config from server:', e)
+  }
+}
+
+/** 保存列配置到数据库 */
+async function saveColumnState(pageKey: string) {
+  if (!gridApi) return
+  const columnState = gridApi.getColumnState()
+  try {
+    await post(`/api/column-config/${pageKey}`, { columnState })
+    showSuccess('列配置已保存')
+  } catch (e) {
+    showError('保存列配置失败')
+  }
+}
+
+// 在 gridReady 时调用
+function onGridReady(params: GridReadyEvent) {
+  gridApi = params.api
+  loadColumnState('orderbook_monitor') // 传入当前页面的 page_key
+}
+```
+
+**使用示例（各页面）**：
+```vue
+<!-- OrderBookMonitor.vue -->
+<el-button size="small" @click="saveColumnState('orderbook_monitor')">
+  保存列配置
+</el-button>
+
+<!-- PositionMonitor.vue -->
+<el-button size="small" @click="saveColumnState('position_monitor')">
+  保存列配置
+</el-button>
+```
+
+---
+
+### 4.x 列状态持久化（localStorage 旧版 - 已废弃）
+
+⚠️ **以下方案已被数据库方案替代，仅作为历史参考**
 
 ```typescript
 const COLUMN_STATE_STORAGE_KEY = 'orderbook_column_state'
@@ -507,3 +687,33 @@ function toggleColumnVisibility(colId: string, visible: boolean) {
 - `frontend/src/main.ts` - 模块注册
 - `frontend/src/ag-grid/useGridCopy.ts` - Cmd+C 复制 & 右键菜单组合式函数
 - `frontend/src/ag-grid/LongTextTooltip.vue` - 长文本自定义 Tooltip 组件
+- `src/api/trading_api.py` - 列配置API端点（GET/POST `/column-config/{page_key}`）
+- `src/common/database.py` - 数据库连接管理器
+
+## 迁移指南（从 localStorage 到数据库）
+
+### 步骤 1：创建数据库表
+
+在数据库中执行 SKILL.md 第 0 节中的建表 SQL。
+
+### 步骤 2：后端添加 API
+
+在 `src/api/trading_api.py` 中添加两个路由：
+- `GET /api/column-config/{page_key}` - 获取列配置
+- `POST /api/column-config/{page_key}` - 保存列配置
+
+### 步骤 3：前端替换持久化逻辑
+
+在每个使用 AG Grid 的页面（共5个）：
+1. 将 `loadColumnState()` 替换为异步版本，调用 `GET /api/column-config/{pageKey}`
+2. 将 `saveColumnState()` 替换为异步版本，调用 `POST /api/column-config/{pageKey}`
+3. 在 `onGridReady` 中传入对应的 `page_key`：
+   - `OrderBookMonitor.vue` → `'orderbook_monitor'`
+   - `PositionMonitor.vue` → `'position_monitor'`
+   - `OrderManagement.vue` → `'order_management'`
+   - `VwapThreshold.vue` → `'vwap_threshold'`
+   - `ConnectionStatus.vue` → `'connection_status'`
+
+### 步骤 4（可选）：初始化默认配置
+
+为每个页面插入默认列配置到数据库，作为新用户的首次加载默认值。

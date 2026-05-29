@@ -4,25 +4,53 @@ ETL 数据管道 - 统一调度所有数据采集、计算与清理任务
 
 通过 ETL_TASKS 注册表统一管理所有任务：
 - 每个任务定义名称、描述、执行函数、调度频率、是否启用
-- 支持两种调度频率：
-  · interval: 每隔 N 分钟执行（常规 ETL，由 orderbook_server 的 _refresh_meta_loop 驱动）
-  · daily:    每天指定时刻执行一次（由 DailyScheduler 守护线程驱动）
+- 支持两种调度模式：
+  · interval:  固定间隔执行（分钟），由 interval_minutes 控制，每个任务独立调度
+  · daily:     每天指定时刻执行一次（由 DailyScheduler 守护线程驱动）
 
 对外暴露：
-- run_etl_pipeline()          : 执行所有 interval 类型的已启用任务
-- start_daily_schedulers()    : 启动所有 daily 类型任务的定时调度器
-- stop_daily_schedulers()     : 停止所有 daily 定时调度器
+- run_etl_pipeline()          : 手动触发所有 interval 类型任务（仅用于调试）
+- start_daily_schedulers()    : 启动所有 interval 和 daily 类型任务的调度器
+- stop_daily_schedulers()     : 停止所有 interval 和 daily 类型任务的调度器
 """
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
+
+import yaml
 
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ETL 配置文件加载
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_ETL_CONFIG_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), '..', 'config', 'etl.yaml')
+)
+
+def load_etl_config() -> dict:
+    """加载 ETL 配置文件"""
+    if not os.path.isfile(_ETL_CONFIG_PATH):
+        logger.warning(f'ETL 配置文件不存在: {_ETL_CONFIG_PATH}，使用默认配置')
+        return {}
+    
+    try:
+        with open(_ETL_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            etl_config = yaml.safe_load(f) or {}
+        logger.info(f'已加载 ETL 配置文件: {_ETL_CONFIG_PATH}')
+        return etl_config
+    except Exception as e:
+        logger.error(f'加载 ETL 配置文件失败: {e}')
+        return {}
+
+_etl_config = load_etl_config()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -39,9 +67,10 @@ class ETLTask:
         description: 任务说明（做什么、写哪张表、更新策略）
         runner:      实际执行函数（无参数，阻塞执行）
         schedule:    调度类型
-                     - 'interval': 跟随常规 ETL 循环（每 N 分钟），
-                                   频率由 config trade.meta_refresh_interval_min 控制
-                     - 'daily':    每天固定时刻执行一次
+                     - 'interval': 固定间隔执行（分钟），由 interval_minutes 控制
+                     - 'daily':    每天固定时刻执行
+        interval_minutes: interval 模式的执行间隔（分钟），daily 模式忽略
+        run_on_startup: interval 模式启动时是否立即执行，daily 模式忽略
         daily_hour:  daily 模式的执行小时（0-23），interval 模式忽略
         daily_minute:daily 模式的执行分钟（0-59），interval 模式忽略
         enabled:     是否启用，False 则跳过执行
@@ -51,6 +80,8 @@ class ETLTask:
     description: str
     runner: Callable
     schedule: str = 'interval'           # 'interval' | 'daily'
+    interval_minutes: int = 0            # interval 模式的间隔分钟数
+    run_on_startup: bool = False         # interval 模式启动时是否立即执行
     daily_hour: int = 0
     daily_minute: int = 0
     enabled: bool = True
@@ -170,48 +201,62 @@ def _run_daily_vwap_analysis():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ETL_TASKS: List[ETLTask] = [
-    # ── interval 类型：跟随常规 ETL 循环（默认每 15 分钟） ──
+    # ── interval 类型：固定间隔执行 ──
     ETLTask(
         name='update_gate_contracts',
         description='Gate.io 永续合约信息 → mi_gate_future_contracts（全删全进）',
         runner=_run_update_gate_future_contracts,
         schedule='interval',
+        interval_minutes=_etl_config.get('tasks', {}).get('update_gate_contracts', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
+        run_on_startup=_etl_config.get('tasks', {}).get('update_gate_contracts', {}).get('run_on_startup', True),
+        enabled=_etl_config.get('tasks', {}).get('update_gate_contracts', {}).get('enabled', True),
     ),
     ETLTask(
         name='update_binance_spot',
         description='Binance 现货交易对信息 → mi_binance_spot_info（全删全进）',
         runner=_run_update_binance_spot_info,
         schedule='interval',
+        interval_minutes=_etl_config.get('tasks', {}).get('update_binance_spot', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
+        run_on_startup=_etl_config.get('tasks', {}).get('update_binance_spot', {}).get('run_on_startup', True),
+        enabled=_etl_config.get('tasks', {}).get('update_binance_spot', {}).get('enabled', True),
     ),
     ETLTask(
         name='update_funding_rate_history',
         description='Gate.io 历史资金费率 → mi_gate_future_his_funding_rates（增量）',
         runner=_run_update_gate_future_his_funding_rate,
         schedule='interval',
+        interval_minutes=_etl_config.get('tasks', {}).get('update_funding_rate_history', {}).get('interval_minutes', 60),
+        run_on_startup=_etl_config.get('tasks', {}).get('update_funding_rate_history', {}).get('run_on_startup', False),
+        enabled=_etl_config.get('tasks', {}).get('update_funding_rate_history', {}).get('enabled', True),
     ),
     ETLTask(
         name='calc_funding_rate_threshold',
-        description='资金费率分位阈值 → mi_gate_future_funding_rate_threshold（UPSERT）',
+        description='资金费率分位阈値 → mi_gate_future_funding_rate_threshold（UPSERT）',
         runner=_run_calculate_funding_rate_threshold,
         schedule='interval',
+        interval_minutes=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
+        run_on_startup=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('run_on_startup', True),
+        enabled=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('enabled', True),
     ),
     ETLTask(
         name='cleanup_vwap_snapshots',
         description='清理过期 VWAP 基差快照 ← mi_vwap_basis_snapshot（DELETE）',
         runner=_run_cleanup_vwap_snapshots,
         schedule='daily',
-        daily_hour=0,
-        daily_minute=0,
+        daily_hour=_etl_config.get('tasks', {}).get('cleanup_vwap_snapshots', {}).get('daily_hour', 0),
+        daily_minute=_etl_config.get('tasks', {}).get('cleanup_vwap_snapshots', {}).get('daily_minute', 0),
+        enabled=_etl_config.get('tasks', {}).get('cleanup_vwap_snapshots', {}).get('enabled', True),
     ),
 
     # ── daily 类型：每天固定时刻执行 ──
     ETLTask(
         name='daily_vwap_threshold',
-        description='VWAP 基差分位阈值每日统计 → mi_vwap_basis_threshold（UPSERT）',
+        description='VWAP 基差分位阈値每日统计 → mi_vwap_basis_threshold（UPSERT）',
         runner=_run_daily_vwap_analysis,
         schedule='daily',
-        daily_hour=0,
-        daily_minute=0,
+        daily_hour=_etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('daily_hour', 0),
+        daily_minute=_etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('daily_minute', 0),
+        enabled=_etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('enabled', True),
     ),
 ]
 
@@ -222,13 +267,13 @@ ETL_TASKS: List[ETLTask] = [
 
 def run_etl_pipeline():
     """
-    执行所有 schedule='interval' 且 enabled=True 的任务
-
-    由 orderbook_server 的 _refresh_meta_loop 在线程池中定时调用，
-    执行频率由 config trade.meta_refresh_interval_min 控制（默认 15 分钟）。
+    执行所有 interval 类型任务（由各自的 IntervalScheduler 独立调度）
+    
+    注意：此函数现在仅用于手动触发，常规调度由 IntervalScheduler 自动完成。
     """
     interval_tasks = [t for t in ETL_TASKS if t.schedule == 'interval' and t.enabled]
-    logger.info(f'开始常规 ETL 管道，共 {len(interval_tasks)} 个任务')
+    
+    logger.info(f'手动触发 ETL 管道，共 {len(interval_tasks)} 个任务')
 
     for task in interval_tasks:
         try:
@@ -238,7 +283,7 @@ def run_etl_pipeline():
             # 单个任务失败不影响后续任务执行
             logger.error(f'[ETL] 任务 {task.name} 失败: {e}', exc_info=True)
 
-    logger.info('常规 ETL 管道执行完毕')
+    logger.info('ETL 管道执行完毕')
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -308,11 +353,80 @@ class DailyScheduler:
         logger.info(f'[{self._name}] 每日调度器已停止')
 
 
+class IntervalScheduler:
+    """
+    固定间隔定时任务调度器
+
+    按指定的分钟间隔执行任务，通过后台守护线程驱动。
+    每 60 秒检查一次 stop 信号，确保能及时响应停止请求。
+    """
+
+    def __init__(self, target: Callable, interval_minutes: int = 15, name: str = 'interval', run_on_startup: bool = False):
+        self._target = target
+        self._interval_minutes = interval_minutes
+        self._name = name
+        self._run_on_startup = run_on_startup
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _next_run_time(self) -> datetime:
+        """计算下一次执行时间"""
+        now = datetime.now()
+        return now + timedelta(minutes=self._interval_minutes)
+
+    def _run_loop(self):
+        """守护线程主循环"""
+        # 如果配置为启动时执行，则立即执行一次
+        if self._run_on_startup:
+            logger.info(f'[{self._name}] 间隔调度器启动，立即执行首次任务...')
+            try:
+                self._target()
+            except Exception as e:
+                logger.error(f'[{self._name}] 任务执行失败: {e}', exc_info=True)
+        
+        while not self._stop_event.is_set():
+            next_run = self._next_run_time()
+            wait_seconds = (next_run - datetime.now()).total_seconds()
+            logger.info(f'[{self._name}] 下次执行时间: {next_run.strftime("%Y-%m-%d %H:%M:%S")} (间隔 {self._interval_minutes} 分钟，等待 {wait_seconds:.0f}s)')
+
+            while wait_seconds > 0 and not self._stop_event.is_set():
+                sleep_time = min(wait_seconds, 60)
+                self._stop_event.wait(sleep_time)
+                wait_seconds = (next_run - datetime.now()).total_seconds()
+
+            if self._stop_event.is_set():
+                break
+
+            logger.info(f'[{self._name}] 开始执行任务...')
+            try:
+                self._target()
+            except Exception as e:
+                logger.error(f'[{self._name}] 任务执行失败: {e}', exc_info=True)
+
+    def start(self):
+        """启动调度器守护线程"""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, name=f'scheduler-{self._name}', daemon=True)
+        self._thread.start()
+        logger.info(f'[{self._name}] 间隔调度器已启动 (间隔: {self._interval_minutes} 分钟, 启动执行: {self._run_on_startup})')
+
+    def stop(self):
+        """停止调度器"""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        logger.info(f'[{self._name}] 间隔调度器已停止')
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 每日调度器统一管理
+# 调度器统一管理
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _daily_schedulers: Dict[str, DailyScheduler] = {}
+_interval_schedulers: Dict[str, IntervalScheduler] = {}
 
 
 def start_daily_schedulers():
@@ -336,13 +450,53 @@ def start_daily_schedulers():
 
     logger.info(f'已启动 {len(_daily_schedulers)} 个每日调度器: {list(_daily_schedulers.keys())}')
 
+    # 同时启动 interval 类型任务的调度器
+    start_interval_schedulers()
+
 
 def stop_daily_schedulers():
     """
-    停止所有已启动的每日调度器
+    停止所有已启动的每日调度器和 interval 调度器
 
     在 orderbook_server lifespan 关闭时调用。
     """
     for name, scheduler in _daily_schedulers.items():
         scheduler.stop()
     _daily_schedulers.clear()
+
+    # 同时停止 interval 调度器
+    stop_interval_schedulers()
+
+
+def start_interval_schedulers():
+    """
+    根据 ETL_TASKS 注册表，启动所有 schedule='interval' 且 enabled=True 的任务调度器
+
+    在 orderbook_server lifespan 启动时由 start_daily_schedulers() 调用。
+    """
+    stop_interval_schedulers()  # 先清理旧的
+
+    interval_tasks = [t for t in ETL_TASKS if t.schedule == 'interval' and t.enabled]
+    for task in interval_tasks:
+        scheduler = IntervalScheduler(
+            target=task.runner,
+            interval_minutes=task.interval_minutes,
+            name=task.name,
+            run_on_startup=task.run_on_startup,
+        )
+        scheduler.start()
+        _interval_schedulers[task.name] = scheduler
+
+    if interval_tasks:
+        logger.info(f'已启动 {len(_interval_schedulers)} 个间隔调度器: {list(_interval_schedulers.keys())}')
+
+
+def stop_interval_schedulers():
+    """
+    停止所有已启动的 interval 调度器
+
+    在 orderbook_server lifespan 关闭时由 stop_daily_schedulers() 调用。
+    """
+    for name, scheduler in _interval_schedulers.items():
+        scheduler.stop()
+    _interval_schedulers.clear()

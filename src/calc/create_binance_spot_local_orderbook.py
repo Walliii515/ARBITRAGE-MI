@@ -171,13 +171,15 @@ class OrderBookManager:
         return list(self.orderbooks.keys())
 
     def to_records(self) -> List[Dict]:
-        """将订单簿转为 JSON 友好的 dict 列表"""
+        """将订单簿转为 JSON 友好的 dict 列表
+
+        注：Binance 订单簿的值已经是 float/int/str/None 原生类型
+        （update_from_partial_depth 中的 float() 转换保证了这一点），
+        无需额外的 _json_safe_scalar 检查。
+        """
         with self.lock:
             items = list(self.orderbooks.items())
-        return [
-            {k: _json_safe_scalar(v) for k, v in orderbook.to_dict_row().items()}
-            for _, orderbook in items
-        ]
+        return [orderbook.to_dict_row() for _, orderbook in items]
 
     def register_broadcast(self, callback: Callable[[], None]):
         """注册数据变更广播回调"""
@@ -209,7 +211,7 @@ class OrderBookManager:
             if not orderbook:
                 return
             orderbook.update_from_partial_depth(update_data)
-            self._notify_broadcast()
+            # 注：不再调用 _notify_broadcast()，广播已改为定时轮询模式
 
         self.ws_client.set_update_callback(on_update)
         self.ws_client.connect(symbols=symbols)

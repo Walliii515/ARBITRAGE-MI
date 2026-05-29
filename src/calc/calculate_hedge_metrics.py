@@ -3,10 +3,14 @@
 对冲指标计算模块
 为合并后的跨交易所订单簿行计算：对冲数量对齐、VWAP、盘口深度
 """
+from functools import lru_cache
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
-from math import gcd, floor
+from math import gcd
 from typing import Any, Dict, List, Optional
+
+from common.tools import truncate_to_precision
+from calc.orderbook_enricher import calc_vwap
 
 LEVEL = 5
 
@@ -17,33 +21,20 @@ def _lcm_fraction(a: Fraction, b: Fraction) -> Fraction:
                             a.denominator * b.denominator)
 
 
-def _precision_from_tick(tick_value) -> int:
-    """
-    从最小变动单位推导小数位数。
-    支持 float/str 输入，如 0.0001 -> 4, 0.01 -> 2
-    """
-    try:
-        d = Decimal(str(tick_value))
-        return max(0, -d.as_tuple().exponent)
-    except (InvalidOperation, ValueError):
-        return 8  # 安全默认值
+
+# truncate_to_precision 已统一到 common.tools，别名保留以减少下游修改
+_truncate_to_tick = truncate_to_precision
+# calc_vwap 已统一到 calc.orderbook_enricher，别名保留以减少下游修改
+_calc_vwap = calc_vwap
 
 
-def _truncate_to_tick(value: Optional[float], precision: int) -> Optional[float]:
-    """
-    按交易所精度截断价格（向下取整到 tick_size 粒度）。
-    使用 floor 截断而非 round 四舍五入，与交易所实际撮合行为一致。
-    """
-    if value is None:
-        return None
-    factor = 10 ** precision
-    return floor(value * factor) / factor
-
-
+@lru_cache(maxsize=512)
 def _calc_aligned_step(step_size: float, quanto_multiplier: float) -> float:
     """
     计算对齐步长：LCM(step_size, quanto_multiplier)
     使用 Fraction 避免浮点精度问题
+
+    结果按 (step_size, quanto_multiplier) 缓存，避免每秒重复计算。
     """
     f_step = Fraction(step_size).limit_denominator(10 ** 10)
     f_quant = Fraction(quanto_multiplier).limit_denominator(10 ** 10)
@@ -52,46 +43,6 @@ def _calc_aligned_step(step_size: float, quanto_multiplier: float) -> float:
         f_quant.numerator * f_step.denominator
     ), f_step.denominator * f_quant.denominator)
     return float(lcm)
-
-
-def _calc_vwap(prices: List[Optional[float]], volumes: List[Optional[float]],
-               target_qty: float, qty_multiplier: float = 1.0) -> Optional[float]:
-    """
-    按多档盘口计算 VWAP，累计到 target_qty 为止。
-
-    Args:
-        prices: 各档价格列表（ask 侧升序，bid 侧降序）
-        volumes: 各档数量列表（原始单位）
-        target_qty: 目标成交量（标的资产数量）
-        qty_multiplier: 数量单位换算乘数（Gate期货张数 -> 标的资产数量）
-
-    Returns:
-        加权均价，若无任何有效数据则返回 None
-    """
-    total_cost = 0.0
-    total_filled = 0.0
-    remaining = target_qty
-
-    for price, vol in zip(prices, volumes):
-        if price is None or vol is None:
-            continue
-        price = float(price)
-        vol = float(vol) * qty_multiplier  # 换算为标的资产数量
-
-        if remaining <= 0:
-            break
-        if vol <= 0:
-            continue
-
-        # 本档实际可用数量
-        fill = min(vol, remaining)
-        total_cost += price * fill
-        total_filled += fill
-        remaining -= fill
-
-    if total_filled <= 0:
-        return None
-    return total_cost / total_filled
 
 
 def _side_total_value(prices: List[Optional[float]], volumes: List[Optional[float]],
@@ -211,25 +162,19 @@ def calculate_hedge_metrics(
         # 合约 ask 侧（做空平仓买回用）
         future_ask_prices, future_ask_volumes = _get_side_data(row, 'future', 'ask')
 
-        # ---------- 3. VWAP 计算（按交易所精度截断） ----------
-        # 获取价格精度：现货从 tick_size 推导，期货从 order_price_round 推导
-        spot_tick = s_info.get('tick_size', 0.01)
-        future_tick = c_info.get('order_price_round', 0.01)
-        spot_precision = _precision_from_tick(spot_tick)
-        future_precision = _precision_from_tick(future_tick)
+        # ---------- 3. VWAP 计算（市价单真实成交均价，无需floor截断） ----------
+        # 说明：市价单按盘口逐档成交，VWAP是加权平均价的计算结果
+        # VWAP不需要满足交易所tick_size规则（那是限价单的要求）
+        # 例如：VWAP可能=0.011655，这是真实成交均价，不是提交的限价
 
         # 现货开仓 VWAP（买入用 ask 侧，无换算）
-        spot_open_vwap = _truncate_to_tick(
-            _calc_vwap(spot_ask_prices, spot_ask_volumes, hedged_qty, 1.0), spot_precision)
+        spot_open_vwap = _calc_vwap(spot_ask_prices, spot_ask_volumes, hedged_qty, 1.0)
         # 现货平仓 VWAP（卖出用 bid 侧，无换算）
-        spot_close_vwap = _truncate_to_tick(
-            _calc_vwap(spot_bid_prices, spot_bid_volumes, hedged_qty, 1.0), spot_precision)
+        spot_close_vwap = _calc_vwap(spot_bid_prices, spot_bid_volumes, hedged_qty, 1.0)
         # 合约开仓 VWAP（做空卖出用 bid 侧，volume 需乘 quanto_multiplier）
-        future_open_vwap = _truncate_to_tick(
-            _calc_vwap(future_bid_prices, future_bid_volumes, hedged_qty, quanto_multiplier), future_precision)
+        future_open_vwap = _calc_vwap(future_bid_prices, future_bid_volumes, hedged_qty, quanto_multiplier)
         # 合约平仓 VWAP（做空买回用 ask 侧，volume 需乘 quanto_multiplier）
-        future_close_vwap = _truncate_to_tick(
-            _calc_vwap(future_ask_prices, future_ask_volumes, hedged_qty, quanto_multiplier), future_precision)
+        future_close_vwap = _calc_vwap(future_ask_prices, future_ask_volumes, hedged_qty, quanto_multiplier)
 
         # ---------- 4. 盘口深度计算 ----------
         # 各侧5档总金额

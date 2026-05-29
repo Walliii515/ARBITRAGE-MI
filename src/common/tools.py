@@ -1,12 +1,14 @@
 # coding: utf-8
 """
 通用工具函数
-包含 Gate.io API 签名、时间戳转换、资金费率计算等公共功能
+包含 Gate.io API 签名、时间戳转换、资金费率计算、精度截断等公共功能
 """
 import time
 import hashlib
 import hmac
+from math import floor
 from datetime import datetime
+from typing import Optional
 
 
 def generate_signature(method, url, query_string="", body="", api_secret=""):
@@ -76,32 +78,56 @@ def calculate_24h_funding_rate(funding_rate, funding_interval):
         return 'N/A'
 
 
+def truncate_to_precision(value: Optional[float], precision: int) -> Optional[float]:
+    """
+    按交易所精度规则截断数值（向下取整到 tick/step 粒度）。
+
+    交易所规则：
+    - Binance: (price - minPrice) % tickSize == 0, (qty - minQty) % stepSize == 0
+    - Gate: price 必须是 order_price_round 的整数倍
+    使用 floor 截断（而非 round 四舍五入）确保：
+    - 价格不会因进位超出市场价
+    - 数量不会因进位超出可用余额
+
+    Args:
+        value: 原始数值（None 则直接透传）
+        precision: 小数位数（从 tick_size/step_size/order_price_round 推导）
+
+    Returns:
+        截断后的数值，输入 None 则返回 None
+    """
+    if value is None:
+        return None
+    factor = 10 ** precision
+    return floor(value * factor) / factor
+
+
 def format_price_precision(price: float, precision: int) -> float:
     """
-    按交易所规则格式化价格精度
-    
+    按交易所规则格式化价格精度（floor 截断）
+
     Args:
         price: 原始价格
-        precision: 小数位数(Binance现货通常2位, Gate期货从price_decimal获取)
-    
+        precision: 小数位数(Binance从tick_size推导, Gate从order_price_round推导)
+
     Returns:
-        格式化后的价格
+        截断后的价格
     """
-    return round(price, precision)
+    return truncate_to_precision(price, precision)
 
 
 def format_qty_precision(qty: float, precision: int) -> float:
     """
-    按交易所规则格式化数量精度
-    
+    按交易所规则格式化数量精度（floor 截断）
+
     Args:
         qty: 原始数量
         precision: 小数位数(Binance从step_size推导, Gate从size_decimal获取)
-    
+
     Returns:
-        格式化后的数量
+        截断后的数量
     """
-    return round(qty, precision)
+    return truncate_to_precision(qty, precision)
 
 
 def format_binance_order_params(base_asset: str, qty: float, qty_precision: int, order_uuid: str) -> dict:

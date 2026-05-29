@@ -17,6 +17,7 @@ from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
 from calc.executor_client import ExecutorClient
+from calc.orderbook_enricher import calc_vwap_basis_bps
 
 logger = get_logger(__name__)
 
@@ -462,9 +463,8 @@ class ClosingExecutor:
             spot_close_amount = spot_exec.get('exec_amount')
             future_close_amount = future_exec.get('exec_amount')
             if spot_close_price and future_close_price:
-                s, f = float(spot_close_price), float(future_close_price)
-                if s != 0:
-                    close_spread_bps = round((f - s) / s * 10000, 2)
+                basis = calc_vwap_basis_bps(float(spot_close_price), float(future_close_price))
+                close_spread_bps = round(basis, 2) if basis is not None else None
 
         # ── 插入平仓订单 ──
         insert_sql = """

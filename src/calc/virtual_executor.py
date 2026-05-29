@@ -8,7 +8,8 @@
 from typing import Dict
 
 from common.logger import get_logger
-from common.tools import format_price_precision, format_qty_precision
+from common.tools import truncate_to_precision
+from calc.orderbook_enricher import calc_vwap
 
 logger = get_logger(__name__)
 
@@ -119,30 +120,19 @@ class VirtualExecutor:
                 'coverage_ratio': coverage_ratio
             }
 
-        # 计算VWAP
-        total_cost = 0.0
-        total_filled = 0.0
-        remaining = target_qty
-
-        for price, vol in zip(prices, volumes):
-            if remaining <= 0:
-                break
-            fill_qty = min(vol * qty_multiplier, remaining)
-            total_cost += price * fill_qty
-            total_filled += fill_qty
-            remaining -= fill_qty
-
-        if total_filled <= 0:
+        # 计算VWAP（使用公共函数）
+        exec_price = calc_vwap(prices, volumes, target_qty, qty_multiplier)
+        if exec_price is None:
             return {'success': False, 'reason': 'VWAP计算失败'}
 
-        exec_price = total_cost / total_filled
-
-        # 按交易所规则保留精度
-        price_precision = self._get_price_precision(base_asset, market_type)
+        # VWAP = 加权平均价（市价单真实成交均价，无需floor截断）
+        # 说明：市价单按盘口逐档成交，VWAP是计算结果而非提交的限价
+        # 例如：VWAP可能=0.011655，这是真实成交均价，不需要满足tick_size规则
+        # exec_price 已经是 calc_vwap 返回的结果，直接使用
+        
+        # 数量需要floor截断（交易所对数量有精度要求）
         qty_precision = self._get_qty_precision(base_asset, market_type)
-
-        exec_price = format_price_precision(exec_price, price_precision)
-        exec_qty = format_qty_precision(total_filled, qty_precision)
+        exec_qty = truncate_to_precision(target_qty, qty_precision)
         exec_amount = round(exec_price * exec_qty, 2)
 
         coverage_ratio = target_qty / total_liquidity if total_liquidity > 0 else 0

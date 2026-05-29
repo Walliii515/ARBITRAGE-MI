@@ -1,9 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { isLoggedIn, isSessionExpired, removeToken } from '../utils/auth'
-import OrderBookMonitor from '../views/OrderBookMonitor.vue'
-import OrderManagement from '../views/OrderManagement.vue'
-import PositionMonitor from '../views/PositionMonitor.vue'
-import VwapThreshold from '../views/VwapThreshold.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -27,6 +23,11 @@ const router = createRouter({
       path: '/positions',
       name: 'positions',
       component: () => import('../views/PositionMonitor.vue'),
+    },
+    {
+      path: '/connections',
+      name: 'connections',
+      component: () => import('../views/ConnectionStatus.vue'),
     },
     {
       path: '/settings/threshold',

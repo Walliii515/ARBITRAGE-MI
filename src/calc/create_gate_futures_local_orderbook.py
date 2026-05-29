@@ -277,15 +277,30 @@ class OrderBookManager:
     ) -> List[str]:
         """
         批量添加合约：并发调用 REST 获取初始快照（锁外并发）
-        Gate.io /futures/{settle}/order_book 接口 contract 参数是单个字符串，
-        不支持一次传多个合约，只能通过 HTTP 并发提速
-        
-        Args:
-            contracts: 合约列表
-            max_workers: 最大并发数
         
         Returns:
             初始化成功的合约列表
+        """
+        success, _ = self.add_contracts_bulk_with_status(
+            contracts, max_workers=max_workers,
+            on_progress=on_progress, cancel_event=cancel_event
+        )
+        return success
+
+    def add_contracts_bulk_with_status(
+        self,
+        contracts: List[str],
+        max_workers: int = 20,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Tuple[List[str], List[Tuple[str, str]]]:
+        """
+        批量添加合约：并发调用 REST 获取初始快照（锁外并发）
+        
+        Returns:
+            (success_list, failed_details)
+            - success_list: 初始化成功的合约列表
+            - failed_details: 失败合约及原因 [(contract, error_message), ...]
         """
         # 1. 收集待拉快照的合约（成功后再写入 orderbooks，避免空行占位）
         with self.lock:
@@ -297,7 +312,7 @@ class OrderBookManager:
         if skipped:
             log_print(f"跳过 {skipped} 个已存在合约")
         if not new_contracts:
-            return []
+            return [], []
         
         log_print(f"▶ 并发拉取 {len(new_contracts)} 个合约的初始快照（并发数={max_workers}）...")
         
@@ -311,7 +326,7 @@ class OrderBookManager:
         
         # 2. 锁外并发 REST，每完成一个立即写入本地订单簿
         success: List[str] = []
-        failed: List[str] = []
+        failed_details: List[Tuple[str, str]] = []
         done_count = 0
         total_count = len(new_contracts)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -335,10 +350,18 @@ class OrderBookManager:
                             f" (id={snapshot.get('id')})"
                         )
                     else:
-                        failed.append(contract)
+                        failed_details.append((contract, 'REST快照返回空（合约可能已下架）'))
                         log_print(f"  ✗ {contract} 初始快照获取失败")
                 except Exception as e:
-                    failed.append(contract)
+                    error_msg = str(e)
+                    if 'CONTRACT_NOT_FOUND' in error_msg or '404' in error_msg:
+                        failed_details.append((contract, '合约已下架或不存在'))
+                    elif 'timeout' in error_msg.lower() or 'Timeout' in error_msg:
+                        failed_details.append((contract, 'REST请求超时'))
+                    elif 'Connection' in error_msg:
+                        failed_details.append((contract, '网络连接失败'))
+                    else:
+                        failed_details.append((contract, f'异常: {error_msg[:100]}'))
                     logger.exception(f"  ✗ {contract} 初始快照异常: {e}")
                 done_count += 1
                 if on_progress:
@@ -349,8 +372,8 @@ class OrderBookManager:
             for contract in success:
                 self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=LEVEL)
         
-        log_print(f"▶ 批量初始化完成：成功 {len(success)}，失败 {len(failed)}")
-        return success
+        log_print(f"▶ 批量初始化完成：成功 {len(success)}，失败 {len(failed_details)}")
+        return success, failed_details
                 
     def remove_contract(self, contract: str):
         """移除合约"""
@@ -370,13 +393,15 @@ class OrderBookManager:
         return list(self.orderbooks.keys())
     
     def to_records(self) -> List[Dict]:
-        """将订单簿转为 JSON 友好的 dict 列表（None 替代 NaN，标量转原生类型）"""
+        """将订单簿转为 JSON 友好的 dict 列表
+
+        注：Gate 订单簿的值已经是 float/int/str/None 原生类型
+        （apply_update 中的 float() 转换保证了这一点），
+        无需额外的 _json_safe_scalar 检查。
+        """
         with self.lock:
             items = list(self.orderbooks.items())
-        return [
-            {k: _json_safe_scalar(v) for k, v in orderbook.to_dict_row().items()}
-            for _, orderbook in items
-        ]
+        return [orderbook.to_dict_row() for _, orderbook in items]
 
     def register_broadcast(self, callback: Callable[[], None]):
         """注册数据变更广播回调"""
@@ -428,9 +453,7 @@ class OrderBookManager:
                 if snapshot:
                     orderbook.update_from_snapshot(snapshot)
                     log_print(f"✓ {contract} 快照重新加载成功")
-                    self._notify_broadcast()
-            else:
-                self._notify_broadcast()
+            # 注：不再调用 _notify_broadcast()，广播已改为定时轮询模式
         
         self.ws_client.set_update_callback(on_update)
         self.ws_client.connect()

@@ -14,7 +14,8 @@ import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
-import { get } from '../utils/request'
+import FundingHistoryTooltip from '../ag-grid/FundingHistoryTooltip.vue'
+import { get, post } from '../utils/request'
 import { getToken } from '../utils/auth'
 
 /** 开仓金额，与后端 config.yaml trade.open_amount_usdt 保持一致，用于前端兜底计算 funding_pnl_bps */
@@ -47,6 +48,7 @@ interface PositionRow {
   funding_next_apply: string | null
   funding_total_pnl: number | null
   funding_payments_count: number | null
+  funding_history: Array<{ seq: number; rate: number; rate_24h: number | null; pnl: number; notional: number | null; time: string | null }> | null
   realized_pnl_bps: number | null
   realized_pnl: number | null
   total_pnl_bps: number | null
@@ -67,9 +69,10 @@ let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)
 const statusFilter = ref<string>('')
 const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
+const wsLatencyMs = ref<number | null>(null)
 
-/** 列状态持久化 */
-const COLUMN_STATE_STORAGE_KEY = 'position_monitor_column_state'
+/** 列状态持久化（数据库版） */
+const PAGE_KEY = 'position_monitor'
 
 /** 列选择面板 */
 interface ColumnVisibility {
@@ -83,6 +86,9 @@ const columnVisibilities = ref<ColumnVisibility[]>([])
 /* ───── WebSocket ───── */
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let pingInterval: ReturnType<typeof setInterval> | null = null
+/** 页面可见性：隐藏时跳过消息处理和 ping */
+let pageVisible = true
 
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -99,14 +105,33 @@ function connectWs() {
 
   socket.onopen = () => {
     wsStatus.value = 'connected'
+    wsLatencyMs.value = null
+    // 每 10 秒发送一次 ping 测量延迟
+    if (pingInterval) clearInterval(pingInterval)
+    pingInterval = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+      }
+    }, 10000)
+    socket!.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
   }
 
   socket.onmessage = (ev) => {
+    // 页面隐藏时跳过消息处理，降低 CPU 开销
+    if (!pageVisible) return
     try {
       const msg: WsPositionMessage = JSON.parse(ev.data)
       if (msg.type === 'ping') return
+      if (msg.type === 'pong' && (msg as any).ts) {
+        wsLatencyMs.value = Date.now() - (msg as any).ts
+        return
+      }
       if (msg.type === 'position_update' && (msg.positions || msg.data)) {
         applyPositionUpdates(msg.positions || msg.data!)
+      }
+      // 资金费结算后的一次性历史更新事件
+      if (msg.type === 'funding_history_update' && (msg as any).funding_histories) {
+        applyFundingHistoryUpdate((msg as any).funding_histories)
       }
     } catch {
       // ignore parse errors
@@ -115,11 +140,14 @@ function connectWs() {
 
   socket.onclose = () => {
     wsStatus.value = 'disconnected'
+    wsLatencyMs.value = null
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
     scheduleReconnect()
   }
 
   socket.onerror = () => {
     wsStatus.value = 'disconnected'
+    wsLatencyMs.value = null
   }
 }
 
@@ -161,6 +189,28 @@ function applyPositionUpdates(updates: PositionRow[]) {
   if (add.length > 0 || update.length > 0) {
     gridApi.applyTransaction({ add, update })
     // 同步更新 rowData，触发 pinnedBottomRowData 重新计算
+    rowData.value = Array.from(positionMap.values())
+  }
+}
+
+/**
+ * 处理资金费结算历史更新事件（仅在结算后推送一次）
+ * 将 funding_histories 按 position_id 分配到对应行
+ */
+function applyFundingHistoryUpdate(histories: Record<number, any[]>) {
+  if (!histories) return
+  let changed = false
+  for (const [pidStr, history] of Object.entries(histories)) {
+    const pid = Number(pidStr)
+    const row = positionMap.get(pid)
+    if (row) {
+      row.funding_history = history
+      changed = true
+    }
+  }
+  if (changed && gridApi) {
+    // 触发列刷新
+    gridApi.refreshCells({ columns: ['funding_history'] })
     rowData.value = Array.from(positionMap.values())
   }
 }
@@ -419,6 +469,19 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     valueFormatter: intFormatter,
   },
   {
+    headerName: '资金费明细',
+    field: 'funding_history',
+    width: 130,
+    tooltipComponent: FundingHistoryTooltip,
+    tooltipValueGetter: (params: any) => params.data?.funding_history,
+    valueFormatter: (params: ValueFormatterParams) => {
+      const history = params.value as any[] | null
+      if (!history || history.length === 0) return '—'
+      const totalPnl = history.reduce((sum: number, item: any) => sum + (item.pnl || 0), 0)
+      return `${history.length}次 / ${totalPnl.toFixed(4)}`
+    },
+  },
+  {
     headerName: '已实现盈亏(bps)',
     field: 'realized_pnl_bps',
     width: 130,
@@ -600,6 +663,7 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     funding_next_apply: null,
     funding_total_pnl: sumField('funding_total_pnl'),
     funding_payments_count: null,
+    funding_history: null,
     realized_pnl_bps: null,
     realized_pnl: sumField('realized_pnl'),
     total_pnl_bps: null,
@@ -664,22 +728,34 @@ function toggleColumnVisibility(colId: string, visible: boolean) {
   if (col) col.visible = visible
 }
 
-function saveColumnState() {
+/** 保存列配置到数据库 */
+async function saveColumnState() {
   if (!gridApi) return
   const columnState = gridApi.getColumnState()
-  localStorage.setItem(COLUMN_STATE_STORAGE_KEY, JSON.stringify(columnState))
-  showSuccess('列配置已保存')
+  try {
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
+    const data = await res.json()
+    if (data?.success) {
+      showSuccess('列配置已保存')
+    } else {
+      showError(data?.message || '保存列配置失败')
+    }
+  } catch (e) {
+    showError('保存列配置失败')
+  }
 }
 
-function loadColumnState() {
+/** 从数据库加载列配置 */
+async function loadColumnState() {
   if (!gridApi) return
-  const saved = localStorage.getItem(COLUMN_STATE_STORAGE_KEY)
-  if (!saved) return
   try {
-    const columnState = JSON.parse(saved) as ColumnState[]
-    gridApi.applyColumnState({ state: columnState, applyOrder: true })
-  } catch {
-    // ignore parse errors
+    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const data = await res.json()
+    if (data?.columnState && Array.isArray(data.columnState)) {
+      gridApi.applyColumnState({ state: data.columnState, applyOrder: true })
+    }
+  } catch (e) {
+    console.warn('Failed to load column config from server:', e)
   }
 }
 
@@ -695,13 +771,35 @@ function triggerFilterChanged() {
 }
 
 /* ───── 生命周期 ───── */
+function handleVisibilityChange() {
+  pageVisible = !document.hidden
+  if (pageVisible) {
+    // 恢复可见时重启 ping
+    if (pingInterval) clearInterval(pingInterval)
+    pingInterval = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+      }
+    }, 10000)
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+    }
+  } else {
+    // 隐藏时停止 ping
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
+  }
+}
+
 onMounted(() => {
   fetchPositions()
   connectWs()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 onUnmounted(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (pingInterval) clearInterval(pingInterval)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
   // WebSocket 保持活跃，不主动关闭
 })
 </script>
@@ -777,8 +875,11 @@ onUnmounted(() => {
 
         <span class="filter-label" style="margin-left: auto;">
           WS：
-          <el-tag :type="wsStatus === 'connected' ? 'success' : wsStatus === 'connecting' ? 'warning' : 'danger'" size="small">
-            {{ wsStatus === 'connected' ? '已连接' : wsStatus === 'connecting' ? '连接中' : '已断开' }}
+          <el-tag v-if="wsStatus === 'connected'" type="success" size="small">
+            {{ wsLatencyMs != null ? `${wsLatencyMs}ms` : '已连接' }}
+          </el-tag>
+          <el-tag v-else :type="wsStatus === 'connecting' ? 'warning' : 'danger'" size="small">
+            {{ wsStatus === 'connecting' ? '连接中' : '已断开' }}
           </el-tag>
         </span>
       </div>
