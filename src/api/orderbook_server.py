@@ -683,6 +683,17 @@ async def _open_position_loop():
 
                 results = _trading_executor.check_and_open(merged_rows)
 
+                # 推送信号变化通知（有任何结果即表示信号表有新增/状态变化）
+                if results and broadcast_queue:
+                    signal_payload = {
+                        'type': 'signal_update',
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    if event_loop:
+                        asyncio.run_coroutine_threadsafe(
+                            broadcast_queue.put(signal_payload), event_loop
+                        )
+
                 # 推送开仓结果(如有成功)
                 if any(r.get('success') for r in results):
                     from calc.position_tracker import PositionTracker
@@ -695,6 +706,14 @@ async def _open_position_loop():
                         }
                         asyncio.run_coroutine_threadsafe(
                             broadcast_queue.put(payload), event_loop
+                        )
+                        # 同时通知订单变化
+                        order_payload = {
+                            'type': 'order_update',
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        asyncio.run_coroutine_threadsafe(
+                            broadcast_queue.put(order_payload), event_loop
                         )
 
         except Exception as e:
@@ -795,6 +814,12 @@ async def _close_position_loop():
                         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
                     await broadcast_queue.put(payload)
+                    # 同时通知订单变化
+                    order_payload = {
+                        'type': 'order_update',
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    await broadcast_queue.put(order_payload)
 
         except Exception as e:
             logger.error(f"平仓检查失败: {e}")

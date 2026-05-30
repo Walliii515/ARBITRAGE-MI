@@ -706,6 +706,18 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
     },
   },
   {
+    headerName: '平仓vwap基差阈值(bps)',
+    field: 'close_vwap_threshold_bps',
+    width: 160,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => {
+      if (p.value == null) return '—'
+      return Number(p.value).toFixed(2)
+    },
+  },
+  {
     headerName: '开仓费率(bps)',
     field: 'open_fee_bps',
     width: 120,

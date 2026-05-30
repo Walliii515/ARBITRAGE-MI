@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, computed, nextTick } from 'vue'
+import { ref, shallowRef, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -15,6 +15,7 @@ import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
 import { get, post } from '../utils/request'
+import { getToken } from '../utils/auth'
 
 /* ───── 类型 ───── */
 interface OrderRow {
@@ -953,12 +954,58 @@ const orderSideOptions = [
   { label: '平仓', value: 'close' },
 ]
 
+/* ───── WebSocket 自动刷新 ───── */
+let ws: WebSocket | null = null
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+function getWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = getToken()
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}`
+}
+
+function connectWs() {
+  if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
+
+  ws = new WebSocket(getWsUrl())
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data)
+      // 开仓结果、平仓结果、订单变化 → 重新加载订单列表
+      if (msg.type === 'order_update' || msg.type === 'open_position_result' || msg.type === 'close_position_result') {
+        fetchOrders()
+      }
+    } catch { /* ignore parse errors */ }
+  }
+
+  ws.onclose = () => {
+    ws = null
+    // 3秒后自动重连
+    wsReconnectTimer = setTimeout(connectWs, 3000)
+  }
+
+  ws.onerror = () => {
+    ws?.close()
+  }
+}
+
 /* ───── 生命周期 ───── */
 onMounted(() => {
   // 注册全局函数供 cellRenderer 使用
   ;(window as any).toggleGroupExpansion = toggleGroupExpansion
   
   fetchOrders()
+  connectWs()
+})
+
+onUnmounted(() => {
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (ws) {
+    ws.onclose = null // 避免触发重连
+    ws.close()
+    ws = null
+  }
 })
 </script>
 

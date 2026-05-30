@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, computed } from 'vue'
+import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type { ColDef, GridApi, GridReadyEvent } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -7,6 +7,7 @@ import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
 import { get, post } from '../utils/request'
 import { showSuccess, showError } from '../utils/message'
+import { getToken } from '../utils/auth'
 
 /* ───── 类型 ───── */
 interface SignalRow {
@@ -238,8 +239,54 @@ function formatDuration(sec: number): string {
   return `${Math.floor(sec / 60)}m ${sec % 60}s`
 }
 
+/* ───── WebSocket 自动刷新 ───── */
+let ws: WebSocket | null = null
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+function getWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = getToken()
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}`
+}
+
+function connectWs() {
+  if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
+
+  ws = new WebSocket(getWsUrl())
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data)
+      // 信号变化或开仓结果 → 重新加载信号列表
+      if (msg.type === 'signal_update' || msg.type === 'open_position_result') {
+        fetchSignals()
+      }
+    } catch { /* ignore parse errors */ }
+  }
+
+  ws.onclose = () => {
+    ws = null
+    // 3秒后自动重连
+    wsReconnectTimer = setTimeout(connectWs, 3000)
+  }
+
+  ws.onerror = () => {
+    ws?.close()
+  }
+}
+
 onMounted(() => {
   fetchSignals()
+  connectWs()
+})
+
+onUnmounted(() => {
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (ws) {
+    ws.onclose = null // 避免触发重连
+    ws.close()
+    ws = null
+  }
 })
 </script>
 
