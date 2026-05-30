@@ -45,6 +45,67 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null
 /* ───── 复制功能 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 
+/* ───── 列状态持久化 ───── */
+const PAGE_KEY = 'connection_status'
+
+interface ColumnVisibility {
+  colId: string
+  headerName: string
+  visible: boolean
+}
+const columnVisibilities = ref<ColumnVisibility[]>([])
+
+function refreshColumnVisibilities() {
+  if (!gridApi.value) return
+  const states = gridApi.value.getColumnState()
+  columnVisibilities.value = columnDefs
+    .filter((col) => col.field)
+    .map((col) => {
+      const state = states.find((s) => s.colId === (col.field ?? col.colId))
+      return {
+        colId: (col.field ?? col.colId) as string,
+        headerName: col.headerName ?? (col.field ?? ''),
+        visible: state?.hide !== true,
+      }
+    })
+}
+
+function toggleColumnVisibility(colId: string, visible: boolean) {
+  if (!gridApi.value) return
+  gridApi.value.setColumnsVisible([colId], visible)
+  const col = columnVisibilities.value.find((c) => c.colId === colId)
+  if (col) col.visible = visible
+}
+
+async function saveColumnState() {
+  if (!gridApi.value) return
+  const columnState = gridApi.value.getColumnState()
+  try {
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
+    const data = await res.json()
+    if (data?.success) {
+      showSuccess('列配置已保存')
+    } else {
+      showError(data?.message || '保存列配置失败')
+    }
+  } catch (e) {
+    showError('保存列配置失败')
+  }
+}
+
+async function loadColumnState() {
+  if (!gridApi.value) return
+  try {
+    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const data = await res.json()
+    if (data?.columnState && Array.isArray(data.columnState)) {
+      gridApi.value.applyColumnState({ state: data.columnState, applyOrder: true })
+    }
+  } catch (e) {
+    console.warn('Failed to load column config from server:', e)
+  }
+}
+
 /* ───── 统计 ───── */
 const stats = computed(() => {
   const total = rowData.value.length
@@ -290,6 +351,7 @@ async function fetchData() {
 function onGridReady(params: GridReadyEvent) {
   gridApi.value = params.api
   setupGridCopy(params.api)
+  loadColumnState()
 }
 
 function getRowId(params: GetRowIdParams) {
@@ -361,6 +423,21 @@ onUnmounted(() => {
         >
           一键重连
         </el-button>
+        <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities" style="margin-left: auto">
+          <template #reference>
+            <el-button size="small" style="margin-left: auto">列选择</el-button>
+          </template>
+          <div class="column-picker">
+            <div v-for="col in columnVisibilities" :key="col.colId" class="column-picker-item">
+              <el-checkbox
+                :model-value="col.visible"
+                @change="(val: boolean | string | number) => toggleColumnVisibility(col.colId, !!val)"
+              />
+              <span class="column-picker-label">{{ col.headerName }}</span>
+            </div>
+          </div>
+        </el-popover>
+        <el-button size="small" @click="saveColumnState">保存列配置</el-button>
       </div>
     </div>
 
@@ -447,6 +524,34 @@ onUnmounted(() => {
 .grid-wrapper {
   flex: 1;
   min-height: 0;
+}
+
+/* 列选择面板 */
+.column-picker {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 4px 8px;
+  margin-right: 4px;
+}
+
+.column-picker-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 4px;
+  gap: 8px;
+}
+
+.column-picker-item :deep(.el-checkbox) {
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+.column-picker-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 :deep(.retry-btn) {

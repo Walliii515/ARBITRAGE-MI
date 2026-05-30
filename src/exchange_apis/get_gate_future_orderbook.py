@@ -54,7 +54,7 @@ def get_futures_order_book(contract, settle='usdt', interval=0, limit=10, with_i
     full_url = host + prefix + url
     
     try:
-        response = requests.request('GET', full_url, headers=headers, params=params)
+        response = requests.request('GET', full_url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         
         order_book = response.json()

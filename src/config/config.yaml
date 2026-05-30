@@ -6,7 +6,7 @@ auth:
   # Token 签名密钥 (生产环境务必修改为强随机字符串)
   secret_key: 'arbitrage-mi-secret-key-2026'
   # Token 有效期 (秒)，默认 1 小时
-  token_expire_seconds: 3600
+  token_expire_seconds: 36000
 
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
@@ -24,67 +24,84 @@ orderbook:
   snapshot_batch_workers: 40
 
 trade:
-  # 成交引擎服务配置（虚拟/实盘）
-  # 切换实盘时，只需将 url 指向实盘执行器服务地址
+  # ─── 成交引擎 ───
   executor:
-    url: http://localhost:8081    # 成交引擎服务地址
+    url: http://localhost:8081    # 成交引擎服务地址（切换实盘时修改此URL）
     timeout_sec: 5                # HTTP 请求超时（秒）
-  # 每次开仓金额（计价币种 USDT），用于前端展示及后续下单/风控
-  open_amount_usdt: 100
-    # 盘口覆盖阈值（开仓盘口覆盖 <= 此值时显示绿色）
-  orderbook_coverage_threshold: 0.8
-  # 风险缓释（bps），用于开仓边际基差计算
-  risk_relief_bps: -5
-  # 开仓VWAP基差阈值（bps），无按标的阈值时的全局回退阈值
-  # 和按标的模式统一，均与纯基差（open_vwap_basis_bps）对比
-  open_vwap_basis_threshold_bps: 20
-  # 24小时成交量过滤阈值（USDT）
-  # 现货24h成交额（Binance quoteVolume）低于此值的标的不开仓
-  min_spot_volume_24h_usdt: 100000
-  # 期货24h成交额（Gate volume_24h_settle）低于此值的标的不开仓
-  min_future_volume_24h_usdt: 50000
-  # market taker fee rate
+
+  # ─── 手续费率 ───
   fee:
     spot_open: 0.00075
     spot_close: 0.00075
     future_open: 0.00075
     future_close: 0.00075
-  # 资金费率阈值百分位（对应 mi_gate_future_funding_rate_threshold 表的字段名）
-  # 可选值: percentile_20, percentile_30, percentile_40 等
-  funding_rate_threshold_percentile: percentile_30
-  # 开仓检查间隔(秒)
-  open_check_interval_sec: 5
-  # 开仓冷却期(秒) - 同一合约15秒内不重复开仓
-  open_cooldown_sec: 15
-  # 持仓资金费更新间隔(秒) - 1小时
-  position_funding_update_sec: 3600
-  # 持仓实时数据推送间隔(秒)
-  position_push_interval_sec: 5
-  # VWAP基差快照采样间隔(秒)
-  vwap_snapshot_interval_sec: 10
-  # VWAP基差快照保留天数
-  vwap_snapshot_retention_days: 60
-  # VWAP基差阈值回溯天数(用于每日统计分析)
-  vwap_threshold_lookback_days: 7
-  # VWAP开仓基差阈值使用的分位字段名
-  # 可选值: open_basis_p10 / open_basis_p20 / open_basis_p30 / open_basis_p40
-  # 含义: 从大到小前 X% 的分界点，基差 >= 阈值才开仓
-  vwap_open_threshold_percentile: open_basis_p20
-  # VWAP平仓基差阈值使用的分位字段名
-  # 可选值: close_basis_p10 / close_basis_p20 / close_basis_p30 / close_basis_p40
-  # 含义: 升序第 X 分位，基差 <= 阈值才平仓（价差已收敛）
-  vwap_close_threshold_percentile: close_basis_p20
-  # 平仓检查间隔(秒)
-  close_check_interval_sec: 5
-  # 止盈倍数 - 总盈亏bps(基差收敛+已收资金费) >= 24h资金费率bps * 此倍数 + 手续费bps 时止盈
-  take_profit_days_multiplier: 15
-  # 最大资金费支付次数 - 超过此次数强制平仓
-  max_funding_payments: 30
-  # 峰值回落开仓策略 - 基差超阈值后监控峰值，回落确认后开仓
-  peak_pullback_pct: 0.10          # 从峰值回落百分比(10%)确认开仓
-  peak_monitor_timeout_sec: 60     # 监控超时(秒)，超时后直接开仓
-  # 谷底反弹止盈策略 - 止盈条件满足后监控基差谷底，反弹确认后平仓
-  valley_rebound_pct: 0.10         # 从谷底反弹百分比(10%)确认平仓(基于收敛范围)
-  valley_monitor_timeout_sec: 60   # 监控超时(秒)，超时后直接平仓
-  # 平仓失败冷却期(秒) - 同一标的平仓被拒后 N 秒内不重试，避免日志爆炸和重复订单
-  close_cooldown_sec: 60
+
+  # ─── 开仓策略 ───
+  open:
+    amount_usdt: 100                        # 单笔开仓金额（USDT）
+    check_interval_sec: 5                   # 开仓检查间隔（秒）
+    cooldown_sec: 15                        # 同标的开仓冷却（秒）
+    max_positions_per_asset: 3              # 同标的最大持仓数
+    vwap_basis_threshold_bps: 20            # 全局回退VWAP基差阈值（bps）
+    orderbook_coverage_threshold: 0.8       # 盘口覆盖阈值（<= 此值显示绿色）
+    risk_relief_bps: -5                     # 风险缓释（bps）
+
+  # ─── 开仓过滤 ───
+  filter:
+    # 资金费率阈值百分位（对应 mi_gate_future_funding_rate_threshold 表字段名）
+    funding_rate_threshold_percentile: percentile_30
+    # 现货24h成交额低于此值不开仓
+    min_spot_volume_24h_usdt: 100000
+    # 期货24h成交额低于此值不开仓
+    min_future_volume_24h_usdt: 50000
+
+  # ─── 峰值回落策略（开仓确认） ───
+  peak_pullback:
+    pullback_pct: 0.10                      # 从峰值回落百分比(10%)确认开仓
+    monitor_timeout_sec: 300                # 监控超时（秒），超时后直接开仓
+    timeout_cooldown_sec: 300               # 超时开仓后冷却期（秒）
+
+  # ─── 平仓策略 ───
+  close:
+    check_interval_sec: 5                   # 平仓检查间隔（秒）
+    cooldown_sec: 60                        # 平仓失败冷却（秒）
+    take_profit_days_multiplier: 15         # 止盈倍数（总盈亏bps >= 24h费率bps * 此值 + 手续费bps）
+    max_funding_payments: 30                # 最大资金费支付次数，超过强制平仓
+
+  # ─── 谷底反弹策略（平仓确认） ───
+  valley_rebound:
+    rebound_pct: 0.10                       # 从谷底反弹百分比(10%)确认平仓
+    monitor_timeout_sec: 60                 # 监控超时（秒），超时后直接平仓
+
+  # ─── VWAP基差阈值 ───
+  vwap:
+    snapshot_interval_sec: 10               # 快照采样间隔（秒）
+    snapshot_retention_days: 60             # 快照保留天数
+    threshold_lookback_days: 7              # 阈值回溯天数（用于每日统计分析）
+    # 可选值: open_basis_p10 / open_basis_p20 / open_basis_p30 / open_basis_p40
+    open_threshold_percentile: open_basis_p20
+    # 可选值: close_basis_p10 / close_basis_p20 / close_basis_p30 / close_basis_p40
+    close_threshold_percentile: close_basis_p20
+
+  # ─── 持仓管理 ───
+  position:
+    funding_update_sec: 3600                # 资金费更新间隔（秒）
+    push_interval_sec: 5                    # 实时数据推送间隔（秒）
+
+# 保证金风控配置（逐仓模式）
+margin:
+  # 杠杆倍数（用于计算初始保证金和爆仓价）
+  leverage: 2
+  # 默认维持保证金率（当合约表无数据时的回退值）
+  default_maintenance_rate: 0.005
+  # 距爆仓预警阈值(%)：低于此值时禁止该标的新开仓 + 前端告警
+  warning_pct: 15
+  # 距爆仓平仓阈值(%)：低于此值时触发两端同时平仓
+  close_threshold_pct: 10
+
+# 资金管理配置
+capital:
+  # Binance 初始入金 (USDT)
+  binance_initial: 100000
+  # Gate 初始入金 (USDT)
+  gate_initial: 100000

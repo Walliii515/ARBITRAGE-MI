@@ -85,6 +85,18 @@ def calc_vwap_basis_bps(spot_vwap, future_vwap) -> Optional[float]:
     return (future_vwap - spot_vwap) / spot_vwap * 10000
 
 
+def calc_open_fee_bps(spot_open_fee: float, future_open_fee: float) -> float:
+    """开仓手续费 BPS（负数）"""
+    return round(-(spot_open_fee + future_open_fee) * 10000, 2)
+
+
+def calc_full_fee_bps(spot_open_fee: float, spot_close_fee: float,
+                      future_open_fee: float, future_close_fee: float) -> float:
+    """全部手续费 BPS（开+平，负数）"""
+    return round(-(spot_open_fee + spot_close_fee +
+                   future_open_fee + future_close_fee) * 10000, 2)
+
+
 def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                           threshold_meta: Dict[str, float], cfg: EnrichConfig) -> None:
     """
@@ -98,7 +110,7 @@ def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
     - funding_rate_24h: 24h 资金费率
     - funding_threshold: 资金费率阈值
     """
-    open_fee_bps = -(cfg.spot_open_fee + cfg.future_open_fee) * 10000
+    open_fee_bps = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
 
     for row in rows:
         base_asset = row.get('base_asset', '')
@@ -148,8 +160,8 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
     - 每档 USDT 值（现货 + 期货）
     - vwap_threshold_bps
     """
-    open_fee_bps = -(cfg.spot_open_fee + cfg.future_open_fee) * 10000
-    close_fee_bps = -(cfg.spot_close_fee + cfg.future_close_fee) * 10000
+    open_fee_bps = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
+    close_fee_bps = round(-(cfg.spot_close_fee + cfg.future_close_fee) * 10000, 2)
 
     for row in rows:
         base_asset = row.get('base_asset', '')

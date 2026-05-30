@@ -349,7 +349,7 @@ def main():
     parser = argparse.ArgumentParser(description='VWAP基差分位阈值计算')
     parser.add_argument(
         '--lookback-days', type=int,
-        default=config.get_int('trade.vwap_threshold_lookback_days', 7),
+        default=config.get_int('trade.vwap.threshold_lookback_days', 7),
         help='回溯天数 (默认从配置读取，fallback=7)'
     )
     parser.add_argument(

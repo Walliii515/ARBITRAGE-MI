@@ -17,7 +17,7 @@ from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
 from calc.executor_client import ExecutorClient
-from calc.orderbook_enricher import calc_vwap_basis_bps
+from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps
 
 logger = get_logger(__name__)
 
@@ -38,23 +38,31 @@ class ClosingExecutor:
         executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
         self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
 
-        self.take_profit_multiplier = config.get_float('trade.take_profit_days_multiplier', 6.0)
-        self.max_funding_payments = config.get_int('trade.max_funding_payments', 30)
+        self.take_profit_multiplier = config.get_float('trade.close.take_profit_days_multiplier', 6.0)
+        self.max_funding_payments = config.get_int('trade.close.max_funding_payments', 30)
 
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
         self.fee_spot_close = config.get_float('trade.fee.spot_close', 0.00075)
         self.fee_future_open = config.get_float('trade.fee.future_open', 0.00075)
         self.fee_future_close = config.get_float('trade.fee.future_close', 0.00075)
+        # 全部手续费 BPS（正数，用于止盈阈值累加）
+        self.fee_full_bps = -calc_full_fee_bps(
+            self.fee_spot_open, self.fee_spot_close,
+            self.fee_future_open, self.fee_future_close
+        )
 
         # 谷底反弹止盈策略
-        self.valley_rebound_pct = config.get_float('trade.valley_rebound_pct', 0.10)
-        self.valley_monitor_timeout_sec = config.get_int('trade.valley_monitor_timeout_sec', 60)
+        self.valley_rebound_pct = config.get_float('trade.valley_rebound.rebound_pct', 0.10)
+        self.valley_monitor_timeout_sec = config.get_int('trade.valley_rebound.monitor_timeout_sec', 60)
         self._valley_state: Dict[str, Dict] = {}  # base_asset -> {valley_bps, start_time, open_spread_bps}
 
         # 平仓失败冷却机制
-        self.close_cooldown_sec = config.get_int('trade.close_cooldown_sec', 60)
+        self.close_cooldown_sec = config.get_int('trade.close.cooldown_sec', 60)
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
+
+        # 保证金风控配置
+        self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
 
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
@@ -100,7 +108,20 @@ class ClosingExecutor:
             close_reason = None
             close_reason_detail = None
 
-            if self._check_funding_count(pos):
+            # 优先级 0：保证金爆仓风控（最高优先级，距爆仓距离低于阈值时立即平仓）
+            if self._check_margin_liquidation(pos):
+                liq_distance = pos.get('liq_distance_pct')
+                liq_price = pos.get('liq_price')
+                close_reason = 'margin_close'
+                close_reason_detail = (
+                    f"保证金风控|距爆仓{liq_distance:.2f}%"
+                    f"(<{self.margin_close_threshold_pct}%)"
+                    f"|爆仓价{liq_price:.4f}"
+                    f"|当前{pos.get('current_future_price', 0):.4f}"
+                )
+                # 紧急平仓，清除谷底状态
+                self._valley_state.pop(ba, None)
+            elif self._check_funding_count(pos):
                 close_reason = 'funding_count'
                 count = int(pos.get('funding_payments_count') or 0)
                 close_reason_detail = (
@@ -165,6 +186,17 @@ class ClosingExecutor:
     # 条件检查
     # ──────────────────────────────────────────────────────────────────
 
+    def _check_margin_liquidation(self, pos: Dict) -> bool:
+        """
+        保证金爆仓风控（优先级 0）：
+        当仓位的距爆仓距离低于平仓阈值时触发两端同时平仓。
+        距爆仓距离 <= 0 表示已“模拟爆仓”，同样触发平仓。
+        """
+        liq_distance = pos.get('liq_distance_pct')
+        if liq_distance is None:
+            return False
+        return liq_distance < self.margin_close_threshold_pct
+
     def _check_funding_count(self, pos: Dict) -> bool:
         """检查资金费次数是否达到上限"""
         count = int(pos.get('funding_payments_count') or 0)
@@ -195,8 +227,7 @@ class ClosingExecutor:
         # funding_rate_24h 是24小时总费率（如 0.0003 = 0.03%/天），转为 bps
         funding_rate_bps = funding_rate_24h_val * 10000
         # 止盈阈值 = N天资金费等价收益 + 全部开平仓手续费成本(bps)
-        fee_cost_bps = (self.fee_spot_open + self.fee_spot_close +
-                        self.fee_future_open + self.fee_future_close) * 10000
+        fee_cost_bps = self.fee_full_bps
         threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
         return total_pnl_bps >= threshold
 
@@ -322,8 +353,7 @@ class ClosingExecutor:
 
         funding_rate_24h_val = float(pos.get('funding_rate_24h') or 0)
         funding_rate_bps = funding_rate_24h_val * 10000
-        fee_cost_bps = (self.fee_spot_open + self.fee_spot_close +
-                        self.fee_future_open + self.fee_future_close) * 10000
+        fee_cost_bps = self.fee_full_bps
         threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
 
         detail = (
@@ -418,7 +448,7 @@ class ClosingExecutor:
         ba = pos.get('base_asset', '')
         spot_symbol = pos.get('spot_symbol') or f"{ba}USDT"
         future_contract = pos.get('future_contract', '')
-        target_amount = config.get_float('trade.open_amount_usdt', 500)
+        target_amount = config.get_float('trade.open.amount_usdt', 500)
 
         spot_order = {
             'order_uuid': order_uuid,

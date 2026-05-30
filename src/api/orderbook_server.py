@@ -40,6 +40,7 @@ from calc.trading_executor import TradingExecutor
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+from calc.capital_tracker import CapitalConfig, calculate_account_summary
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.service_lifecycle import ServiceLifecycleManager, SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 
@@ -80,18 +81,18 @@ BROADCAST_THROTTLE_SEC = config.get_float('orderbook.broadcast_throttle_sec', 1.
 SNAPSHOT_BATCH_SIZE = config.get_int('orderbook.snapshot_batch_size', 40)
 SNAPSHOT_BATCH_WORKERS = config.get_int('orderbook.snapshot_batch_workers', 40)
 # 每次开仓金额（USDT），作为新列推送给前端
-OPEN_AMOUNT_USDT = config.get_float('trade.open_amount_usdt', 5000.0)
+OPEN_AMOUNT_USDT = config.get_float('trade.open.amount_usdt', 5000.0)
 # 资金费率阈值百分位字段名（对应 mi_gate_future_funding_rate_threshold 表的列名）
-FUNDING_THRESHOLD_PERCENTILE = config.get_str('trade.funding_rate_threshold_percentile', 'percentile_30')
+FUNDING_THRESHOLD_PERCENTILE = config.get_str('trade.filter.funding_rate_threshold_percentile', 'percentile_30')
 # 盘口覆盖阈值
-ORDERBOOK_COVERAGE_THRESHOLD = config.get_float('trade.orderbook_coverage_threshold', 0.8)
+ORDERBOOK_COVERAGE_THRESHOLD = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)
 # 风险缓释（bps）
-RISK_RELIEF_BPS = config.get_float('trade.risk_relief_bps', 10)
+RISK_RELIEF_BPS = config.get_float('trade.open.risk_relief_bps', 10)
 # 开仓边际基差阈值（bps）
-OPEN_VWAP_BASIS_THRESHOLD_BPS = config.get_float('trade.open_vwap_basis_threshold_bps', -60)
+OPEN_VWAP_BASIS_THRESHOLD_BPS = config.get_float('trade.open.vwap_basis_threshold_bps', -60)
 # 24小时成交量过滤阈值（USDT）
-MIN_SPOT_VOLUME_24H_USDT = config.get_float('trade.min_spot_volume_24h_usdt', 0)
-MIN_FUTURE_VOLUME_24H_USDT = config.get_float('trade.min_future_volume_24h_usdt', 0)
+MIN_SPOT_VOLUME_24H_USDT = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
+MIN_FUTURE_VOLUME_24H_USDT = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
 # 费率配置（bps 计算用）
 SPOT_OPEN_FEE = config.get_float('trade.fee.spot_open', 0.00075)
 SPOT_CLOSE_FEE = config.get_float('trade.fee.spot_close', 0.00075)
@@ -107,7 +108,7 @@ _enrich_cfg = EnrichConfig(
     spot_close_fee=SPOT_CLOSE_FEE,
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
-    close_threshold_col=config.get_str('trade.vwap_close_threshold_percentile', 'close_basis_p20'),
+    close_threshold_col=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20'),
 )
 
 # 盈亏计算配置实例（持仓实时推送用）
@@ -118,6 +119,19 @@ _pnl_cfg = PnlConfig(
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
     risk_relief_bps=RISK_RELIEF_BPS,
+    margin_leverage=config.get_float('margin.leverage', 2.0),
+    margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
+)
+
+# 资金跟踪配置实例
+_capital_cfg = CapitalConfig(
+    leverage=config.get_float('margin.leverage', 2.0),
+    binance_initial=config.get_float('capital.binance_initial', 100000.0),
+    gate_initial=config.get_float('capital.gate_initial', 100000.0),
+    fee_spot_open=SPOT_OPEN_FEE,
+    fee_spot_close=SPOT_CLOSE_FEE,
+    fee_future_open=FUTURE_OPEN_FEE,
+    fee_future_close=FUTURE_CLOSE_FEE,
 )
 
 # 服务生命周期管理器（在 lifespan 中初始化）
@@ -195,7 +209,7 @@ def fetch_vwap_threshold_meta() -> Dict[str, float]:
 
     根据配置项 trade.vwap_open_threshold_percentile 动态选择对应的 pX 列。
     """
-    col = config.get_str('trade.vwap_open_threshold_percentile', 'open_basis_p20')
+    col = config.get_str('trade.vwap.open_threshold_percentile', 'open_basis_p20')
     # 防注入校验
     valid_cols = ('open_basis_p10', 'open_basis_p20', 'open_basis_p30', 'open_basis_p40')
     if col not in valid_cols:
@@ -511,7 +525,8 @@ async def retry_snapshot(body: dict):
         raise HTTPException(status_code=400, detail='base_asset 不能为空')
     if not svc:
         raise HTTPException(status_code=400, detail='服务未初始化')
-    ok, message = svc.retry_contract(base_asset)
+    loop = asyncio.get_event_loop()
+    ok, message = await loop.run_in_executor(None, svc.retry_contract, base_asset)
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {'ok': True, 'message': message}
@@ -537,10 +552,17 @@ async def retry_all_failed():
     if not failed_assets:
         return {'ok': True, 'message': '所有连接正常，无需重试', 'results': []}
 
-    results = []
-    for asset in failed_assets:
-        ok, msg = svc.retry_contract(asset)
-        results.append({'base_asset': asset, 'ok': ok, 'message': msg})
+    # 在线程池中执行同步阻塞的重试操作，避免卡住 event loop
+    loop = asyncio.get_event_loop()
+
+    def _do_retry_all():
+        results = []
+        for asset in failed_assets:
+            ok, msg = svc.retry_contract(asset)
+            results.append({'base_asset': asset, 'ok': ok, 'message': msg})
+        return results
+
+    results = await loop.run_in_executor(None, _do_retry_all)
 
     success_count = sum(1 for r in results if r['ok'])
     return {
@@ -609,7 +631,7 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
 
 async def _open_position_loop():
     """定时检查开仓条件"""
-    interval = config.get_int('trade.open_check_interval_sec', 5)
+    interval = config.get_int('trade.open.check_interval_sec', 5)
 
     while True:
         try:
@@ -637,6 +659,28 @@ async def _open_position_loop():
                         _contract_meta, _spot_meta, _threshold_meta,
                         _vwap_threshold_meta, _close_vwap_threshold_meta
                     )
+
+                # 更新保证金风控状态（用于禁止接近爆仓标的开仓）
+                try:
+                    _margin_tracker = PositionTracker(_contract_meta)
+                    _margin_positions = _margin_tracker.get_holding_positions()
+                    if _margin_positions:
+                        # 构建 close_vwaps 用于计算 liq_distance
+                        _margin_close_vwaps: Dict[str, Dict] = {}
+                        for _mr in merged_rows:
+                            _mba = _mr.get('base_asset', '')
+                            _spot_cv = _mr.get('spot_close_vwap')
+                            _future_cv = _mr.get('future_close_vwap')
+                            if _mba and _spot_cv is not None and _future_cv is not None:
+                                _margin_close_vwaps[_mba] = {
+                                    'spot_close_vwap': float(_spot_cv),
+                                    'future_close_vwap': float(_future_cv),
+                                }
+                        calculate_realtime_pnl(_margin_positions, _margin_close_vwaps, _contract_meta, _pnl_cfg)
+                        _trading_executor.update_holding_margin_status(_margin_positions)
+                except Exception as _me:
+                    logger.debug(f"保证金状态更新失败(不影响开仓): {_me}")
+
                 results = _trading_executor.check_and_open(merged_rows)
 
                 # 推送开仓结果(如有成功)
@@ -661,7 +705,7 @@ async def _position_funding_loop():
     """定时更新资金费收益（启动后立即执行一次，之后每小时检查）
     结算完成后通过 WS 推送 funding_history_update 事件，前端按需更新。
     """
-    interval = config.get_int('trade.position_funding_update_sec', 3600)
+    interval = config.get_int('trade.position.funding_update_sec', 3600)
 
     # 启动后等待服务就绪再执行第一次
     await asyncio.sleep(10)
@@ -686,7 +730,7 @@ async def _position_funding_loop():
 
 async def _close_position_loop():
     """定时检查平仓条件，触发平仓执行"""
-    interval = config.get_int('trade.close_check_interval_sec', 5)
+    interval = config.get_int('trade.close.check_interval_sec', 5)
 
     while True:
         try:
@@ -760,7 +804,7 @@ async def _position_realtime_push():
     """定时推送持仓实时数据（含已平仓，使用平仓 VWAP 作为实时价格）
     注意：funding_history 不在此推送（低频数据），仅通过 REST 初始加载 + 结算后事件推送。
     """
-    interval = config.get_float('trade.position_push_interval_sec', 5.0)
+    interval = config.get_float('trade.position.push_interval_sec', 5.0)
 
     while True:
         try:
@@ -790,13 +834,17 @@ async def _position_realtime_push():
                             'future_close_vwap': float(future_cv),
                         }
 
-            # 计算实时盈亡（已平仓持仓用DB存储的价格，不依赖 close_vwaps）
+            # 计算实时盈亏（已平仓持仓用DB存储的价格，不依赖 close_vwaps）
             calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
-
+            
+            # 计算资金汇总
+            account_summary = calculate_account_summary(positions, _capital_cfg)
+            
             # 推送（不含 funding_history，保持消息精简）
             payload = {
                 'type': 'position_update',
                 'positions': positions,
+                'account_summary': account_summary,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             await broadcast_queue.put(payload)
@@ -807,7 +855,7 @@ async def _position_realtime_push():
 
 async def _vwap_snapshot_loop():
     """定时采样VWAP基差数据落库，用于历史分位统计"""
-    interval = config.get_int('trade.vwap_snapshot_interval_sec', 10)
+    interval = config.get_int('trade.vwap.snapshot_interval_sec', 10)
 
     while True:
         try:

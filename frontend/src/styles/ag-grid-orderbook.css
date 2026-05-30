@@ -19,8 +19,13 @@
 }
 
 .orderbook-grid .ag-cell {
-  border-right: none !important;
+  border-right: none;
   line-height: 32px;
+}
+
+/* 保留单元格聚焦时的右侧边框（选中状态蓝色边框） */
+.orderbook-grid .ag-cell-focus {
+  border-right: 1px solid var(--ag-range-selection-border-color, #2196f3) !important;
 }
 
 .orderbook-grid .ag-row {

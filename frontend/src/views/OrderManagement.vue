@@ -97,7 +97,15 @@ let gridApi: GridApi<DisplayRow> | null = null
 const loading = ref(false)
 const statusFilter = ref<string>('')
 const channelFilter = ref<string>('')
+const orderSideFilter = ref<string>('')
+const baseAssetFilter = ref<string>('')
 const timeRange = ref<[string, string] | null>(null)
+
+/** 从当前数据中提取唯一标的资产列表，供下拉框选择 */
+const assetOptions = computed(() => {
+  const assets = new Set(rowData.value.map(r => r.base_asset).filter(Boolean) as string[])
+  return Array.from(assets).sort()
+})
 
 /** 分组展开状态：position_id -> isExpanded */
 const expandedGroups = ref<Set<number>>(new Set())
@@ -470,7 +478,7 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     valueFormatter: priceFormatter,
     cellRenderer: (params: any) => {
       if (params.data?.isGroupHeader) {
-        return formatSummaryVwap((params.data as DisplayRow).orders)
+        return ''
       }
       return priceFormatter(params)
     },
@@ -515,7 +523,7 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     valueFormatter: percentFormatter,
     cellRenderer: (params: any) => {
       if (params.data?.isGroupHeader) {
-        return formatSummaryCoverage((params.data as DisplayRow).orders)
+        return ''
       }
       // 开仓行显示 open_coverage，平仓行显示 coverage_ratio
       const val = params.data?.order_side === 'close'
@@ -613,20 +621,53 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     },
   },
   {
-    headerName: '开平仓/拒单原因',
+    headerName: '开平仓原因',
     field: 'reject_reason',
-    width: 300,
-    tooltipField: 'reject_reason',
+    colId: 'trade_reason',
+    width: 200,
     tooltipComponent: LongTextTooltip,
     tooltipValueGetter: (params: any) => {
-      if (params.data?.isGroupHeader) return null
+      if (params.data?.isGroupHeader) {
+        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status !== 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
+        return reasons.length ? reasons.join(' | ') : null
+      }
+      if (params.data?.market_type !== 'spot') return null
+      if (params.data?.status === 'rejected') return null
+      return params.data?.reject_reason || null
+    },
+    cellRenderer: (params: any) => {
+      if (params.data?.isGroupHeader) {
+        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status !== 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
+        return reasons.length ? reasons.join(' | ') : ''
+      }
+      if (params.data?.market_type !== 'spot') return ''
+      if (params.data?.status === 'rejected') return ''
+      return params.data?.reject_reason ?? ''
+    },
+  },
+  {
+    headerName: '拒单原因',
+    field: 'reject_reason',
+    colId: 'reject_reason',
+    width: 200,
+    tooltipComponent: LongTextTooltip,
+    tooltipValueGetter: (params: any) => {
+      if (params.data?.isGroupHeader) {
+        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status === 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
+        return reasons.length ? reasons.join(' | ') : null
+      }
+      if (params.data?.market_type !== 'spot') return null
+      if (params.data?.status !== 'rejected') return null
       return params.data?.reject_reason ?? null
     },
     cellRenderer: (params: any) => {
       if (params.data?.isGroupHeader) {
-        return ''
+        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status === 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
+        return reasons.length ? reasons.join(' | ') : ''
       }
-      return params.value ?? ''
+      if (params.data?.market_type !== 'spot') return ''
+      if (params.data?.status !== 'rejected') return ''
+      return params.data?.reject_reason ?? ''
     },
   },
 ])
@@ -801,6 +842,12 @@ async function fetchOrders() {
     if (channelFilter.value) {
       params.set('channel', channelFilter.value)
     }
+    if (orderSideFilter.value) {
+      params.set('order_side', orderSideFilter.value)
+    }
+    if (baseAssetFilter.value) {
+      params.set('base_asset', baseAssetFilter.value.trim())
+    }
     if (timeRange.value && timeRange.value[0]) {
       params.set('start_time', timeRange.value[0])
     }
@@ -900,6 +947,12 @@ const channelOptions = [
   { label: '实盘', value: 'Live' },
 ]
 
+const orderSideOptions = [
+  { label: '全部', value: '' },
+  { label: '开仓', value: 'open' },
+  { label: '平仓', value: 'close' },
+]
+
 /* ───── 生命周期 ───── */
 onMounted(() => {
   // 注册全局函数供 cellRenderer 使用
@@ -935,16 +988,47 @@ onMounted(() => {
           </el-radio-button>
         </el-radio-group>
 
-        <span class="filter-label" style="margin-left: 24px;">时间范围：</span>
+        <span class="filter-label" style="margin-left: 24px;">方向过滤：</span>
+        <el-radio-group v-model="orderSideFilter" size="small" @change="fetchOrders">
+          <el-radio-button
+            v-for="opt in orderSideOptions"
+            :key="opt.value"
+            :value="opt.value"
+          >
+            {{ opt.label }}
+          </el-radio-button>
+        </el-radio-group>
+      </div>
+
+      <div class="filter-row" style="margin-top: 10px;">
+        <span class="filter-label">标的：</span>
+        <el-select
+          v-model="baseAssetFilter"
+          placeholder="标的资产"
+          size="small"
+          filterable
+          clearable
+          style="width: 150px;"
+          @change="fetchOrders"
+        >
+          <el-option
+            v-for="asset in assetOptions"
+            :key="asset"
+            :label="asset"
+            :value="asset"
+          />
+        </el-select>
+
+        <span class="filter-label" style="margin-left: 24px;">时间：</span>
         <el-date-picker
           v-model="timeRange"
           type="datetimerange"
-          range-separator="至"
-          start-placeholder="开始时间"
-          end-placeholder="结束时间"
+          range-separator="-"
+          start-placeholder="开始"
+          end-placeholder="结束"
           size="small"
           value-format="YYYY-MM-DDTHH:mm:ss"
-          style="width: 360px;"
+          style="width: 280px;"
           @change="fetchOrders"
         />
 
@@ -1033,7 +1117,13 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.filter-row :deep(.el-radio-group) {
+  flex-wrap: nowrap;
+  flex-shrink: 0;
 }
 
 .filter-label {

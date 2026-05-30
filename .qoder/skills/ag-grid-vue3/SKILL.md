@@ -596,10 +596,11 @@ import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
 <ag-grid-vue :tooltipShowDelay="300" ... />
 ```
 
-⚠️ 如果使用了 `cellRenderer`，还需配合 `tooltipValueGetter` 确保 tooltip 获取正确的值：
+⚠️ 如果使用了 `cellRenderer`，必须用 `tooltipValueGetter` 确保 tooltip 获取正确的值（**不要**同时设置 `tooltipField`）：
 ```typescript
 {
   field: 'reject_reason',
+  // ⚠️ 不要加 tooltipField，会覆盖 tooltipValueGetter
   tooltipComponent: LongTextTooltip,
   tooltipValueGetter: (params) => params.data?.reject_reason ?? null,
   cellRenderer: (params) => params.value ?? '',
@@ -669,14 +670,29 @@ function toggleColumnVisibility(colId: string, visible: boolean) {
 
 **原因**：`tooltipField` 依赖原始字段值，而 `cellRenderer` 可能改变了渲染内容，两者不联动。
 
-**解决**：同时配置 `tooltipValueGetter`：
+**解决**：使用 `tooltipValueGetter`（**不要**同时设置 `tooltipField`，否则 `tooltipField` 优先级更高，会覆盖 `tooltipValueGetter` 的返回值，导致汇总行等自定义行 tooltip 失效）：
 ```typescript
 {
   field: 'reject_reason',
-  tooltipField: 'reject_reason',
+  // ⚠️ 不要加 tooltipField，它会覆盖 tooltipValueGetter
   tooltipValueGetter: (params) => params.data?.reject_reason ?? null,
   tooltipComponent: LongTextTooltip,
   cellRenderer: (params) => params.value ?? '',
+}
+```
+
+### Q7: 选中单元格的蓝色焦点边框只有 3 面（缺右侧）
+
+**原因**：自定义 CSS 中 `.ag-cell { border-right: none !important }` 把竖分隔线去掉了，但 `!important` 同时覆盖了 AG Grid 的选中焦点边框样式。
+
+**解决**：去掉 `!important`，然后为聚焦态单独恢复右边框：
+```css
+.orderbook-grid .ag-cell {
+  border-right: none;  /* 不加 !important */
+}
+
+.orderbook-grid .ag-cell-focus {
+  border-right: 1px solid var(--ag-range-selection-border-color, #2196f3) !important;
 }
 ```
 

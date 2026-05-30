@@ -5,7 +5,8 @@ import type { ColDef, GridApi, GridReadyEvent } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
-import { get } from '../utils/request'
+import { get, post } from '../utils/request'
+import { showSuccess, showError } from '../utils/message'
 
 /* ───── 类型 ───── */
 interface SignalRow {
@@ -43,6 +44,74 @@ const loading = ref(false)
 const filterStatus = ref<string>('')
 const filterDays = ref<number>(3)
 const filterAsset = ref<string>('')
+
+/** 列状态持久化 */
+const PAGE_KEY = 'trade_signals'
+
+/** 列选择面板 */
+interface ColumnVisibility {
+  colId: string
+  headerName: string
+  visible: boolean
+}
+const columnVisibilities = ref<ColumnVisibility[]>([])
+
+function refreshColumnVisibilities() {
+  if (!gridApi.value) return
+  const states = gridApi.value.getColumnState()
+  columnVisibilities.value = columnDefs.value
+    .filter((col) => col.field)
+    .map((col) => {
+      const state = states.find((s) => s.colId === (col.field ?? col.colId))
+      return {
+        colId: (col.field ?? col.colId) as string,
+        headerName: col.headerName ?? (col.field ?? ''),
+        visible: state?.hide !== true,
+      }
+    })
+}
+
+function toggleColumnVisibility(colId: string, visible: boolean) {
+  if (!gridApi.value) return
+  gridApi.value.setColumnsVisible([colId], visible)
+  const col = columnVisibilities.value.find((c) => c.colId === colId)
+  if (col) col.visible = visible
+}
+
+async function saveColumnState() {
+  if (!gridApi.value) return
+  const columnState = gridApi.value.getColumnState()
+  try {
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
+    const data = await res.json()
+    if (data?.success) {
+      showSuccess('列配置已保存')
+    } else {
+      showError(data?.message || '保存列配置失败')
+    }
+  } catch (e) {
+    showError('保存列配置失败')
+  }
+}
+
+async function loadColumnState() {
+  if (!gridApi.value) return
+  try {
+    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const data = await res.json()
+    if (data?.columnState && Array.isArray(data.columnState)) {
+      gridApi.value.applyColumnState({ state: data.columnState, applyOrder: true })
+    }
+  } catch (e) {
+    console.warn('Failed to load column config from server:', e)
+  }
+}
+
+/** 从当前数据中提取唯一标的资产列表，供下拉快速选择 */
+const assetOptions = computed(() => {
+  const assets = new Set(rowData.value.map(r => r.base_asset))
+  return Array.from(assets).sort()
+})
 
 /* ───── 列配置 ───── */
 const statusMap: Record<string, { label: string; color: string }> = {
@@ -142,6 +211,7 @@ async function fetchSignals() {
 function onGridReady(event: GridReadyEvent) {
   gridApi.value = event.api
   setupGridCopy(event.api)
+  loadColumnState()
 }
 
 /* ───── 快捷过滤 ───── */
@@ -231,18 +301,43 @@ onMounted(() => {
       </div>
 
       <div class="filter-group">
-        <el-input
+        <el-select
           v-model="filterAsset"
-          placeholder="搜索标的"
+          placeholder="标的资产"
           size="small"
+          filterable
           clearable
-          style="width: 140px"
-          @keyup.enter="onAssetSearch"
-          @clear="onAssetSearch"
-        />
+          style="width: 150px"
+          @change="fetchSignals"
+        >
+          <el-option
+            v-for="asset in assetOptions"
+            :key="asset"
+            :label="asset"
+            :value="asset"
+          />
+        </el-select>
       </div>
 
       <el-button size="small" :loading="loading" @click="fetchSignals">刷新</el-button>
+
+      <div class="filter-group" style="margin-left: auto">
+        <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
+          <template #reference>
+            <el-button size="small">列选择</el-button>
+          </template>
+          <div class="column-picker">
+            <div v-for="col in columnVisibilities" :key="col.colId" class="column-picker-item">
+              <el-checkbox
+                :model-value="col.visible"
+                @change="(val: boolean | string | number) => toggleColumnVisibility(col.colId, !!val)"
+              />
+              <span class="column-picker-label">{{ col.headerName }}</span>
+            </div>
+          </div>
+        </el-popover>
+        <el-button size="small" @click="saveColumnState">保存列配置</el-button>
+      </div>
     </div>
 
     <!-- AG Grid 表格 -->
@@ -323,5 +418,33 @@ onMounted(() => {
 .grid-container {
   flex: 1;
   min-height: 0;
+}
+
+/* 列选择面板 */
+.column-picker {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 4px 8px;
+  margin-right: 4px;
+}
+
+.column-picker-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 4px;
+  gap: 8px;
+}
+
+.column-picker-item :deep(.el-checkbox) {
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+.column-picker-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

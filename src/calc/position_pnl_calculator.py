@@ -5,9 +5,9 @@
 计算持仓实时盈亏（浮动盈亏、已实现盈亏、总盈亏），与推送逻辑解耦。
 """
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
-from calc.orderbook_enricher import calc_vwap_basis_bps
+from calc.orderbook_enricher import calc_vwap_basis_bps, calc_open_fee_bps, calc_full_fee_bps
 
 
 @dataclass
@@ -19,6 +19,28 @@ class PnlConfig:
     future_open_fee: float
     future_close_fee: float
     risk_relief_bps: float
+    margin_leverage: float = 2.0
+    margin_default_mmr: float = 0.005
+
+
+def _calc_funding_bps(funding_total_pnl, open_amount_usdt: float) -> Tuple[float, float]:
+    """计算资金费收益金额及BPS"""
+    funding_pnl = float(funding_total_pnl or 0)
+    funding_pnl_bps = (
+        round(funding_pnl / open_amount_usdt * 10000, 2)
+        if open_amount_usdt else 0.0
+    )
+    return funding_pnl, funding_pnl_bps
+
+
+def _calc_total_pnl(floating_pnl_bps, realized_pnl_bps: float,
+                    funding_pnl_bps: float, fee_bps: float,
+                    floating_pnl: float, realized_pnl: float,
+                    funding_pnl: float, fee_cost: float) -> Tuple[float, float]:
+    """总盈亏 = 浮动 + 已实现 + 资金费 + 手续费（BPS和金额）"""
+    total_bps = round((floating_pnl_bps or 0) + realized_pnl_bps + funding_pnl_bps + fee_bps, 2)
+    total_amt = round(floating_pnl + realized_pnl + funding_pnl + fee_cost, 4)
+    return total_bps, total_amt
 
 
 def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
@@ -29,21 +51,29 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
     Args:
         positions: PositionTracker.get_holding_positions() 返回的持仓列表
         close_vwaps: base_asset -> {'spot_close_vwap': float, 'future_close_vwap': float}
-        contract_meta: base_asset -> {funding_rate_24h, funding_next_apply, ...}
+        contract_meta: base_asset -> {funding_rate_24h, funding_next_apply, maintenance_rate, ...}
         cfg: 盈亏计算配置
 
     Returns:
         注入了 PnL 字段的持仓列表（同一引用）
     """
-    fee_bps = round(-(cfg.spot_open_fee + cfg.spot_close_fee +
-                      cfg.future_open_fee + cfg.future_close_fee) * 10000, 2)
+    fee_bps_full = calc_full_fee_bps(cfg.spot_open_fee, cfg.spot_close_fee,
+                                      cfg.future_open_fee, cfg.future_close_fee)
+    fee_bps_open = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
+
+    # 保证金风控配置（通过 PnlConfig 注入）
+    margin_leverage = cfg.margin_leverage
+    margin_default_mmr = cfg.margin_default_mmr
 
     for pos in positions:
         ba = pos.get('base_asset', '')
         vwap_data = close_vwaps.get(ba)
 
-        # 注入费率 (bps)
-        pos['fee_bps'] = fee_bps
+        # 注入费率 (bps) - 根据状态区分：持仓中只显示开仓费，已平仓显示全部费
+        if pos.get('status') == 'closed':
+            pos['fee_bps'] = fee_bps_full
+        else:
+            pos['fee_bps'] = fee_bps_open
 
         # 注入风险缓释 (bps)
         pos['risk_relief_bps'] = cfg.risk_relief_bps
@@ -57,7 +87,7 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             else str(fna) if fna else None
         )
 
-        # ── 已平仓分支：浮动盈产归零，用实际平仓VWAP锁定已实现盈产 ──
+        # ── 已平仓分支：浮动盈亏归零，用实际平仓VWAP锁定已实现盈亏 ──
         if pos.get('status') == 'closed':
             pos['floating_pnl_total'] = 0
             pos['floating_pnl_bps'] = 0
@@ -72,27 +102,30 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
                 float(pos['close_spread_bps']) if pos.get('close_spread_bps') else None
             )
 
-            # 资金费收益 (bps)
-            funding_pnl = float(pos.get('funding_total_pnl') or 0)
-            funding_pnl_bps = (
-                round(funding_pnl / cfg.open_amount_usdt * 10000, 2)
-                if cfg.open_amount_usdt else 0.0
+            # 资金费收益
+            funding_pnl, funding_pnl_bps = _calc_funding_bps(
+                pos.get('funding_total_pnl'), cfg.open_amount_usdt
             )
             pos['funding_pnl_bps'] = funding_pnl_bps
 
-            # 费率金额 (USDT)
-            fee_cost_usdt = round(fee_bps / 10000 * cfg.open_amount_usdt, 4)
+            # 手续费金额 - 已平仓用全部手续费(30bps)
+            fee_cost_usdt = round(fee_bps_full / 10000 * cfg.open_amount_usdt, 4)
+            pos['fee_cost'] = fee_cost_usdt
 
-            # 已实现盈产 (bps) = (开仓基差 - 平仓基差) + 费率bps + 资金费bps
+            # 已实现盈亏 = 纯价差利润（开仓基差 - 平仓基差）
             open_spread = float(pos.get('open_spread_bps') or 0)
             close_spread = float(pos.get('close_spread_bps') or 0)
-            spread_pnl_bps = open_spread - close_spread  # 正数=盈利
-            pos['realized_pnl_bps'] = round(spread_pnl_bps + fee_bps + funding_pnl_bps, 2)
+            spread_pnl_bps = open_spread - close_spread
+            pos['realized_pnl_bps'] = round(spread_pnl_bps, 2)
             pos['realized_pnl'] = round(
-                pos['realized_pnl_bps'] / 10000 * cfg.open_amount_usdt, 4
+                spread_pnl_bps / 10000 * cfg.open_amount_usdt, 4
             )
-            pos['total_pnl_bps'] = pos['realized_pnl_bps']
-            pos['total_pnl'] = pos['realized_pnl']
+
+            # 总盈亏
+            pos['total_pnl_bps'], pos['total_pnl'] = _calc_total_pnl(
+                0, spread_pnl_bps, funding_pnl_bps, fee_bps_full,
+                0, pos['realized_pnl'], funding_pnl, fee_cost_usdt
+            )
             continue
 
         if vwap_data:
@@ -120,29 +153,35 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             floating_future = (future_open_price - current_future) * future_qty
             pos['floating_pnl_total'] = round(floating_spot + floating_future, 4)
 
-            # 资金费收益 (bps)
-            funding_pnl = float(pos.get('funding_total_pnl') or 0)
-            funding_pnl_bps = round(
-                funding_pnl / cfg.open_amount_usdt * 10000, 2
-            ) if cfg.open_amount_usdt else 0.0
+            # 资金费收益
+            funding_pnl, funding_pnl_bps = _calc_funding_bps(
+                pos.get('funding_total_pnl'), cfg.open_amount_usdt
+            )
             pos['funding_pnl_bps'] = funding_pnl_bps
 
-            # 费率金额 (USDT)
-            fee_cost_usdt = round(fee_bps / 10000 * cfg.open_amount_usdt, 4)
+            # 手续费金额 - 持仓中只计开仓手续费(15bps)
+            fee_cost_usdt = round(fee_bps_open / 10000 * cfg.open_amount_usdt, 4)
+            pos['fee_cost'] = fee_cost_usdt
 
-            # 已实现盈亏 (bps) = 费率bps + 资金费收益bps
-            pos['realized_pnl_bps'] = round(fee_bps + funding_pnl_bps, 2)
-            # 已实现盈亏 (金额) = 费率金额 + 资金费收益
-            pos['realized_pnl'] = round(fee_cost_usdt + funding_pnl, 4)
+            # 已实现盈亏 = 0（持仓中尚无价差利润）
+            pos['realized_pnl_bps'] = 0
+            pos['realized_pnl'] = 0
 
-            # 总盈亏 (bps) = 浮动盈亏bps + 费率bps + 资金费收益bps
-            pos['total_pnl_bps'] = round(
-                (pos['floating_pnl_bps'] or 0) + fee_bps + funding_pnl_bps, 2
+            # 总盈亏
+            pos['total_pnl_bps'], pos['total_pnl'] = _calc_total_pnl(
+                pos['floating_pnl_bps'], 0, funding_pnl_bps, fee_bps_open,
+                pos['floating_pnl_total'], 0, funding_pnl, fee_cost_usdt
             )
-            # 总盈亏 (金额) = 浮动盈亏 + 资金费收益 + 费率金额
-            pos['total_pnl'] = round(
-                pos['floating_pnl_total'] + funding_pnl + fee_cost_usdt, 4
-            )
+
+            # ── 保证金风控指标注入（逐仓模式空头爆仓价 + 距爆仓距离）──
+            maintenance_rate = c_meta.get('maintenance_rate') or margin_default_mmr
+            liq_price = future_open_price * (1 + 1 / margin_leverage - maintenance_rate)
+            pos['liq_price'] = round(liq_price, 6)
+            if current_future > 0:
+                liq_distance_pct = (liq_price - current_future) / current_future * 100
+                pos['liq_distance_pct'] = round(liq_distance_pct, 2)
+            else:
+                pos['liq_distance_pct'] = None
         else:
             pos['current_spot_price'] = None
             pos['current_future_price'] = None
@@ -150,9 +189,12 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['floating_pnl_total'] = None
             pos['floating_pnl_bps'] = None
             pos['funding_pnl_bps'] = None
+            pos['fee_cost'] = None
             pos['realized_pnl_bps'] = None
             pos['realized_pnl'] = None
             pos['total_pnl_bps'] = None
             pos['total_pnl'] = None
+            pos['liq_price'] = None
+            pos['liq_distance_pct'] = None
 
     return positions

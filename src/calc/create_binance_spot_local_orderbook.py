@@ -1,7 +1,7 @@
 # coding: utf-8
 """
 Binance 现货本地订单簿管理器
-使用 Partial Book Depth Streams（@depth5@1000ms）维护5档盘口
+使用 Partial Book Depth Streams（@depth5@100ms）维护5档盘口
 每条 WS 消息就是完整的5档快照，无需 REST 铺底和增量同步
 """
 import json
@@ -22,7 +22,7 @@ from common.logger import get_logger, log_print
 logger = get_logger(__name__)
 
 # 固定参数
-SPEED = '1000ms'
+SPEED = '100ms'
 LEVEL = 5
 
 

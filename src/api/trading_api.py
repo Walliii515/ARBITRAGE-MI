@@ -47,6 +47,7 @@ def _serialize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 async def get_orders(
     status: Optional[str] = Query(None, description="订单状态过滤"),
     channel: Optional[str] = Query(None, description="渠道过滤"),
+    order_side: Optional[str] = Query(None, description="订单方向过滤(open/close)"),
     position_id: Optional[int] = Query(None, description="持仓ID过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
     start_time: Optional[str] = Query(None, description="开始时间"),
@@ -62,6 +63,9 @@ async def get_orders(
     if channel:
         sql += " AND channel = %s"
         params.append(channel)
+    if order_side:
+        sql += " AND order_side = %s"
+        params.append(order_side)
     if position_id is not None:
         sql += " AND position_id = %s"
         params.append(position_id)
@@ -309,7 +313,7 @@ async def trigger_threshold_calculate():
 
     _threshold_calc_running = True
     try:
-        lookback_days = config.get_int('trade.vwap_threshold_lookback_days', 7)
+        lookback_days = config.get_int('trade.vwap.threshold_lookback_days', 7)
         # 在线程池中执行，避免阻塞事件循环
         loop = asyncio.get_event_loop()
         from calc.calculate_vwap_basis_threshold import run_analysis

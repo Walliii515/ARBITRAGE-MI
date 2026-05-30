@@ -172,9 +172,13 @@ class PositionTracker:
                 total_pnl = round(single_pnl * payments_to_credit, 4)
                 current_count = int(pos.get('funding_payments_count') or 0)
                 
-                # 确定下次结算时间：使用交易所的 funding_next_apply
-                exchange_next = pos.get('funding_next_apply')
-                next_time = exchange_next if exchange_next and exchange_next > now else now + timedelta(hours=8)
+                # 确定下次结算时间：基于当前 next_funding_time 正向推进，避免依赖可能过期的交易所元数据
+                if next_funding:
+                    next_time = next_funding + timedelta(seconds=FUNDING_INTERVAL_SEC * payments_to_credit)
+                else:
+                    # 历史遗留数据（next_funding 为 None），使用交易所下次结算时间或当前+8h
+                    exchange_next = pos.get('funding_next_apply')
+                    next_time = exchange_next if exchange_next and exchange_next > now else now + timedelta(hours=8)
                 
                 # 累加资金费到持仓
                 update_sql = """

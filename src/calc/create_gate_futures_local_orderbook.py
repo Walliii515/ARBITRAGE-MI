@@ -2,7 +2,7 @@
 """
 Gate.io 永续合约本地订单簿管理器
 合并 REST 快照和 WebSocket 增量更新
-统一使用 frequency=1000ms, level=5 维护5档盘口
+统一使用 frequency=100ms, level=5 维护5档盘口
 """
 import json
 import math
@@ -25,7 +25,7 @@ from common.logger import get_logger, log_print
 logger = get_logger(__name__)
 
 # 固定参数
-FREQUENCY = '1000ms'
+FREQUENCY = '100ms'
 LEVEL = 5
 
 

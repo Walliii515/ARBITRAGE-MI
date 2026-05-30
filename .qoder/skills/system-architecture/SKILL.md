@@ -302,3 +302,25 @@ Gate WS ─────┘           │
 | `trade.funding_rate_threshold_percentile` | 资金费率阈值 | `percentile_30` |
 | `trade.meta_refresh_interval_min` | ETL 刷新间隔 | `15` |
 | `trade.open_cooldown_sec` | 开仓冷却期 | `3600` |
+
+---
+
+## 9. 不可调整约束（红线）
+
+> 以下配置与参数经实盘验证，**禁止以性能优化为由进行修改**。
+
+### 9.1 交易所 WebSocket 订阅频率
+
+| 交易所 | 模块 | 常量 | 值 | 约束原因 |
+|---------|------|------|-----|----------|
+| Gate Futures | `create_gate_futures_local_orderbook.py` | `FREQUENCY` | `'100ms'` | 实盘开仓依赖低延迟盘口，1000ms 延迟会导致滑点过大 |
+| Binance Spot | `create_binance_spot_local_orderbook.py` | `SPEED` | `'100ms'` | 同上，VWAP 基差计算需要实时性 |
+
+**禁止操作**：
+- ✗ 将频率降为 `1000ms` 以降低 CPU
+- ✗ 在任何“性能优化”场景中修改此参数
+
+**合法的性能优化方向**（不触碰频率）：
+- ✓ 广播节流（`broadcast_throttle_sec`）
+- ✓ 计算结果缓存（merge + hedge_metrics 缓存）
+- ✓ 定时轮询替代逐消息回调

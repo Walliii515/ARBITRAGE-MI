@@ -109,14 +109,14 @@ def insert_contracts(contracts):
     INSERT INTO mi_gate_future_contracts (
         name, base_asset, type, quanto_multiplier, order_price_round, order_size_min, order_size_max,
         enable_decimal, leverage_min, leverage_max, maker_fee_rate, 
-        taker_fee_rate, funding_rate, funding_rate_24h, funding_interval,
+        taker_fee_rate, maintenance_rate, funding_rate, funding_rate_24h, funding_interval,
         funding_next_apply, status, funding_rate_limit, 
         volume_24h_settle,
         updated_at
     ) VALUES (
         %(name)s, %(base_asset)s, %(type)s, %(quanto_multiplier)s, %(order_price_round)s, %(order_size_min)s, %(order_size_max)s,
         %(enable_decimal)s, %(leverage_min)s, %(leverage_max)s, %(maker_fee_rate)s,
-        %(taker_fee_rate)s, %(funding_rate)s, %(funding_rate_24h)s, %(funding_interval)s,
+        %(taker_fee_rate)s, %(maintenance_rate)s, %(funding_rate)s, %(funding_rate_24h)s, %(funding_interval)s,
         %(funding_next_apply)s, %(status)s, %(funding_rate_limit)s,
         %(volume_24h_settle)s,
         %(updated_at)s
@@ -143,6 +143,7 @@ def insert_contracts(contracts):
                     'leverage_max': int(contract.get('leverage_max', 0)),
                     'maker_fee_rate': float(contract.get('maker_fee_rate', 0)),
                     'taker_fee_rate': float(contract.get('taker_fee_rate', 0)),
+                    'maintenance_rate': float(contract.get('maintenance_rate', 0)) if contract.get('maintenance_rate') else None,
                     'funding_rate': float(contract.get('funding_rate', 0)),
                     'funding_rate_24h': calculate_24h_funding_rate_value(
                         contract.get('funding_rate'), 

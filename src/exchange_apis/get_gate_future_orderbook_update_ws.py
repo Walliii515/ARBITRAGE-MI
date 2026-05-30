@@ -111,7 +111,7 @@ class GateFuturesOrderBookWS:
         
         Args:
             contract: 合约标识，如 'BTC_USDT'
-            frequency: 推送频率，'20ms' 或 '100ms'（注意：20ms只支持level=20）
+            frequency: 推送频率，'20ms'、'100ms' 或 '1000ms'（注意：20ms只支持level=20）
             level: 深度档位数量，支持: 100, 50, 20 (注意：10已被Gate.io移除)
         """
         # 检查是否已经订阅过
@@ -120,9 +120,9 @@ class GateFuturesOrderBookWS:
                 log_print(f" {contract} 已经订阅过，跳过重复订阅")
                 return
                 
-        # 验证参数
-        if frequency not in ['20ms', '100ms']:
-            logger.warning(f"⚠ 警告: frequency={frequency} 可能不被支持，建议使用 '20ms' 或 '100ms'")
+        # 验证参数（Gate.io 支持 20ms/100ms/1000ms）
+        if frequency not in ['20ms', '100ms', '1000ms']:
+            logger.warning(f"⚠ 警告: frequency={frequency} 可能不被支持，建议使用 '20ms'、'100ms' 或 '1000ms'")
                 
         if frequency == '20ms' and level != 20:
             logger.warning(f"⚠ 警告: 20ms频率只支持level=20，当前level={level}")

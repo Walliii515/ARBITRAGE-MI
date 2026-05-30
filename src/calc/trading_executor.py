@@ -4,7 +4,7 @@
 - 成交引擎通过 ExecutorClient (HTTP) 调用独立的执行器服务（虚拟/实盘），实现虚实分离
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 from common.database import db_manager
@@ -13,7 +13,7 @@ from common.logger import get_logger
 
 logger = get_logger(__name__)
 from common.tools import format_binance_order_params, format_gate_order_params
-from calc.orderbook_enricher import calc_vwap_basis_bps
+from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps, calc_open_fee_bps
 from calc.executor_client import ExecutorClient
 
 
@@ -43,29 +43,63 @@ class TradingExecutor:
         self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
         
         # 从配置读取阈值
-        self.coverage_threshold = config.get_float('trade.orderbook_coverage_threshold', 0.8)
-        self.basis_threshold_bps = config.get_float('trade.open_vwap_basis_threshold_bps', -60)
-        self.cooldown_sec = config.get_int('trade.open_cooldown_sec', 3600)
-        self.funding_threshold_key = config.get('trade.funding_rate_threshold_percentile', 'percentile_30')
+        self.coverage_threshold = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)
+        self.basis_threshold_bps = config.get_float('trade.open.vwap_basis_threshold_bps', -60)
+        self.cooldown_sec = config.get_int('trade.open.cooldown_sec', 3600)
+        self.funding_threshold_key = config.get('trade.filter.funding_rate_threshold_percentile', 'percentile_30')
 
         # 手续费率（用于盈利性守卫计算）
-        self.fee_cost_bps = (config.get_float('trade.fee.spot_open', 0.00075) +
-                            config.get_float('trade.fee.spot_close', 0.00075) +
-                            config.get_float('trade.fee.future_open', 0.00075) +
-                            config.get_float('trade.fee.future_close', 0.00075)) * 10000
+        self.fee_cost_bps = -calc_full_fee_bps(
+            config.get_float('trade.fee.spot_open', 0.00075),
+            config.get_float('trade.fee.spot_close', 0.00075),
+            config.get_float('trade.fee.future_open', 0.00075),
+            config.get_float('trade.fee.future_close', 0.00075)
+        )
 
         # 盈利性守卫使用的平仓基差分位字段名
-        self.close_threshold_col = config.get_str('trade.vwap_close_threshold_percentile', 'close_basis_p20')
+        self.close_threshold_col = config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20')
 
         # 24小时成交量过滤阈值（USDT）
-        self.min_spot_volume = config.get_float('trade.min_spot_volume_24h_usdt', 0)
-        self.min_future_volume = config.get_float('trade.min_future_volume_24h_usdt', 0)
+        self.min_spot_volume = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
+        self.min_future_volume = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
 
         # 峰值回落开仓策略
-        self.peak_pullback_pct = config.get_float('trade.peak_pullback_pct', 0.10)
-        self.peak_monitor_timeout_sec = config.get_int('trade.peak_monitor_timeout_sec', 60)
+        self.peak_pullback_pct = config.get_float('trade.peak_pullback.pullback_pct', 0.10)
+        self.peak_monitor_timeout_sec = config.get_int('trade.peak_pullback.monitor_timeout_sec', 60)
+        self.peak_timeout_cooldown_sec = config.get_int('trade.peak_pullback.timeout_cooldown_sec', 300)
         self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, signal_id}
+        self._timeout_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 超时冷却截止时间
+
+        # 保证金风控：距爆仓距离低于此值时禁止开仓
+        self.margin_warning_pct = config.get_float('margin.warning_pct', 8.0)
+        # 持仓距爆仓距离缓存: base_asset -> liq_distance_pct
+        self._holding_liq_distance: Dict[str, float] = {}
+        self._holding_count: Dict[str, int] = {}  # base_asset -> 持仓中仓位数量
+        self.max_positions_per_asset = config.get_int('trade.open.max_positions_per_asset', 1)
     
+    def update_holding_margin_status(self, positions: List[Dict]):
+        """
+        更新持仓的保证金状态缓存（由调用方在每个开仓检查周期前调用）
+
+        Args:
+            positions: 已由 calculate_realtime_pnl 富化的持仓列表（含 liq_distance_pct）
+        """
+        self._holding_liq_distance.clear()
+        self._holding_count.clear()
+        for pos in positions:
+            if pos.get('status') != 'holding':
+                continue
+            ba = pos.get('base_asset', '')
+            if not ba:
+                continue
+            # 统计同标的持仓数量
+            self._holding_count[ba] = self._holding_count.get(ba, 0) + 1
+            liq_dist = pos.get('liq_distance_pct')
+            if liq_dist is not None:
+                # 同一标的多个仓位时，取最小距爆仓距离（最危险的）
+                if ba not in self._holding_liq_distance or liq_dist < self._holding_liq_distance[ba]:
+                    self._holding_liq_distance[ba] = liq_dist
+
     def check_and_open(self, orderbook_rows: List[Dict]) -> List[Dict]:
         """
         检查所有合约并执行开仓
@@ -109,6 +143,10 @@ class TradingExecutor:
                 if not self._pass_cooldown_check(base_asset):
                     continue
                 
+                # 2.5 超时开仓冷却检查（防止连续超时重复开仓）
+                if not self._pass_timeout_cooldown(base_asset):
+                    continue
+                
                 # 3. 峰值回落确认
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
                 if not self._pass_peak_check(base_asset, open_vwap_basis):
@@ -147,6 +185,14 @@ class TradingExecutor:
                 # 开仓后清除峰值状态
                 self._peak_state.pop(base_asset, None)
                 
+                # 超时触发的开仓，设置较长冷却期
+                if trigger_type == 'timeout':
+                    self._timeout_cooldown_until[base_asset] = datetime.now() + timedelta(seconds=self.peak_timeout_cooldown_sec)
+                    logger.info(
+                        f"超时开仓冷却启动 | {base_asset} | "
+                        f"冷却{self.peak_timeout_cooldown_sec}s"
+                    )
+                
                 results.append({
                     'base_asset': base_asset,
                     'success': exec_result['success'],
@@ -176,11 +222,23 @@ class TradingExecutor:
     def _pass_risk_check(self, row: Dict) -> bool:
         """
         风控规则检查:
+        0. 保证金风控: 该标的现有持仓距爆仓距离 < warning_pct 时禁止开仓
         1. 资金费率 >= 阈值
         2. 开仓盘口覆盖 <= 阈值
         3. 开仓边际基差 >= 阈值
         4. 盈利性守卫: 开仓基差 > 平仓基差阈值 + 手续费(确保价差有收敛空间)
         """
+        base_asset = row.get('base_asset', '')
+
+        # 同标的持仓数上限检查：防止同一波收敛行情中连续开仓
+        if self._holding_count.get(base_asset, 0) >= self.max_positions_per_asset:
+            return False
+
+        # 保证金风控检查：该标的现有持仓已接近爆仓时禁止加仓
+        if base_asset in self._holding_liq_distance:
+            if self._holding_liq_distance[base_asset] < self.margin_warning_pct:
+                return False
+
         # 资金费率检查
         funding_rate = row.get('funding_rate_24h')
         contract = row.get('contract', '')
@@ -360,6 +418,12 @@ class TradingExecutor:
         """识别风控失败的具体原因（用于信号日志）"""
         base_asset = row.get('base_asset', '')
 
+        # 保证金风控检查
+        if base_asset in self._holding_liq_distance:
+            liq_dist = self._holding_liq_distance[base_asset]
+            if liq_dist < self.margin_warning_pct:
+                return f"保证金风控(距爆仓{liq_dist:.1f}%<{self.margin_warning_pct:.1f}%)"
+
         # 资金费率检查
         funding_rate = row.get('funding_rate_24h')
         contract = row.get('contract', '')
@@ -453,6 +517,17 @@ class TradingExecutor:
 
         return '|'.join(parts)
 
+    def _pass_timeout_cooldown(self, base_asset: str) -> bool:
+        """检查超时开仓冷却期（防止连续超时重复开仓）"""
+        cooldown_until = self._timeout_cooldown_until.get(base_asset)
+        if cooldown_until is None:
+            return True  # 无超时冷却
+        if datetime.now() >= cooldown_until:
+            # 冷却已过期，清除
+            self._timeout_cooldown_until.pop(base_asset, None)
+            return True
+        return False
+
     def _pass_cooldown_check(self, base_asset: str) -> bool:
         """检查冷却期(从订单表查询最近一次成功开仓)"""
         sql = """
@@ -482,7 +557,7 @@ class TradingExecutor:
         contract = row['contract']
         
         target_qty = row['spot_qty']  # 已对齐的对冲数量
-        open_amount_usdt = config.get_float('trade.open_amount_usdt', 500)
+        open_amount_usdt = config.get_float('trade.open.amount_usdt', 500)
         target_amount = row.get('open_amount_usdt', open_amount_usdt)
         
         # 获取精度配置
@@ -553,9 +628,11 @@ class TradingExecutor:
                 actual_basis_bps = order_group.get('open_vwap_basis_bps')
             order_group['open_vwap_basis_bps'] = actual_basis_bps
             # 重算开仓边际基差
-            open_fee_bps = -(config.get_float('trade.fee.spot_open', 0.00075)
-                             + config.get_float('trade.fee.future_open', 0.00075)) * 10000
-            risk_relief_bps = config.get_float('trade.risk_relief_bps', 10)
+            open_fee_bps = calc_open_fee_bps(
+                config.get_float('trade.fee.spot_open', 0.00075),
+                config.get_float('trade.fee.future_open', 0.00075)
+            )
+            risk_relief_bps = config.get_float('trade.open.risk_relief_bps', 10)
             if actual_basis_bps is not None:
                 order_group['open_marginal_basis_bps'] = round(actual_basis_bps + open_fee_bps + risk_relief_bps, 2)
         

@@ -18,8 +18,17 @@ import FundingHistoryTooltip from '../ag-grid/FundingHistoryTooltip.vue'
 import { get, post } from '../utils/request'
 import { getToken } from '../utils/auth'
 
-/** 开仓金额，与后端 config.yaml trade.open_amount_usdt 保持一致，用于前端兜底计算 funding_pnl_bps */
-const OPEN_AMOUNT_USDT = 500
+/** 开仓金额，与后端 config.yaml trade.open.amount_usdt 保持一致，用于前端兜底计算 funding_pnl_bps */
+const OPEN_AMOUNT_USDT = 100
+
+/** 兜底补充 funding_pnl_bps（后端未注入时由前端根据金额反算） */
+function ensureFundingBps(rows: PositionRow[]) {
+  for (const row of rows) {
+    if (row.funding_pnl_bps == null && row.funding_total_pnl != null) {
+      row.funding_pnl_bps = Math.round(row.funding_total_pnl / OPEN_AMOUNT_USDT * 10000 * 100) / 100
+    }
+  }
+}
 
 /* ───── 类型 ───── */
 interface PositionRow {
@@ -53,12 +62,46 @@ interface PositionRow {
   realized_pnl: number | null
   total_pnl_bps: number | null
   total_pnl: number | null
+  fee_cost: number | null
+  liq_price: number | null
+  liq_distance_pct: number | null
 }
 
 interface WsPositionMessage {
   type: string
   positions?: PositionRow[]
   data?: PositionRow[]
+  account_summary?: AccountSummary
+}
+
+interface AccountExchange {
+  initial: number
+  capital_used?: number
+  margin_used?: number
+  floating_value: number
+  realized_pnl: number
+  fees: number
+  available: number
+  net_value: number
+}
+
+interface AccountTotal {
+  initial: number
+  used: number
+  floating_pnl: number
+  realized_pnl: number
+  funding_pnl: number
+  fee_cost: number
+  total_pnl: number
+  fees: number
+  available: number
+  net_value: number
+}
+
+interface AccountSummary {
+  binance: AccountExchange
+  gate: AccountExchange
+  total: AccountTotal
 }
 
 /* ───── 状态 ───── */
@@ -68,8 +111,10 @@ const positionMap = new Map<number, PositionRow>()
 let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)
 const statusFilter = ref<string>('')
+const baseAssetFilter = ref<string>('')
 const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
 const wsLatencyMs = ref<number | null>(null)
+const accountSummary = ref<AccountSummary | null>(null)
 
 /** 列状态持久化（数据库版） */
 const PAGE_KEY = 'position_monitor'
@@ -128,6 +173,10 @@ function connectWs() {
       }
       if (msg.type === 'position_update' && (msg.positions || msg.data)) {
         applyPositionUpdates(msg.positions || msg.data!)
+        // 提取资金汇总
+        if ((msg as any).account_summary) {
+          accountSummary.value = (msg as any).account_summary
+        }
       }
       // 资金费结算后的一次性历史更新事件
       if (msg.type === 'funding_history_update' && (msg as any).funding_histories) {
@@ -159,12 +208,7 @@ function scheduleReconnect() {
 }
 
 function applyPositionUpdates(updates: PositionRow[]) {
-  // WS 推送的数据也可能缺少 funding_pnl_bps（WS断连时后端未计算），兜底计算
-  for (const row of updates) {
-    if (row.funding_pnl_bps == null && row.funding_total_pnl != null) {
-      row.funding_pnl_bps = Math.round(row.funding_total_pnl / OPEN_AMOUNT_USDT * 10000 * 100) / 100
-    }
-  }
+  ensureFundingBps(updates)
   if (!gridApi) {
     for (const row of updates) {
       positionMap.set(row.id, row)
@@ -504,6 +548,17 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellStyle: pnlCellStyle,
   },
   {
+    headerName: '手续费',
+    field: 'fee_cost',
+    width: 100,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: pnlFormatter,
+    cellStyle: pnlCellStyle,
+  },
+  {
     headerName: '总盈亏(bps)',
     field: 'total_pnl_bps',
     width: 120,
@@ -533,6 +588,36 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
     valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '爆仓价',
+    field: 'liq_price',
+    width: 110,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: priceFormatter,
+  },
+  {
+    headerName: '距爆仓(%)',
+    field: 'liq_distance_pct',
+    width: 110,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (params: ValueFormatterParams) => {
+      if (params.value == null) return ''
+      return Number(params.value).toFixed(2) + '%'
+    },
+    cellStyle: (params: any) => {
+      const value = params.value as number | null
+      if (value == null) return { color: '#909399' }
+      if (value > 8) return { color: '#67c23a' }       // > warning_pct: 绿色(安全)
+      if (value > 5) return { color: '#e6a23c' }       // warning ~ close: 橙色(警告)
+      return { color: '#f56c6c' }                       // < close_threshold: 红色(危险)
+    },
   },
   {
     headerName: '开仓原因',
@@ -565,6 +650,9 @@ const defaultColDef: ColDef = {
   enableValue: false,
 }
 
+/** 默认排序：开仓时间降序 */
+const initialSortModel = [{ colId: 'opened_at', sort: 'desc' as const }]
+
 const localeText = {
   generalMenuTab: '常规',
   filterMenuTab: '筛选',
@@ -582,18 +670,37 @@ const getRowId = (params: GetRowIdParams<PositionRow>) =>
 
 /* ───── 外部过滤 ───── */
 function isExternalFilterPresent(): boolean {
-  return statusFilter.value !== ''
+  return statusFilter.value !== '' || baseAssetFilter.value !== ''
 }
 
 function doesExternalFilterPass(params: any): boolean {
-  if (!statusFilter.value) return true
   const data = params.data as PositionRow
-  return data?.status === statusFilter.value
+  if (statusFilter.value && data?.status !== statusFilter.value) return false
+  if (baseAssetFilter.value && data?.base_asset !== baseAssetFilter.value) return false
+  return true
 }
+
+/* ───── 过滤后的数据（用于汇总行） ───── */
+/** 从当前数据中提取唯一标的资产列表，供下拉框选择 */
+const assetOptions = computed(() => {
+  const assets = new Set(rowData.value.map(r => r.base_asset).filter(Boolean) as string[])
+  return Array.from(assets).sort()
+})
+
+const filteredRows = computed(() => {
+  let rows = rowData.value
+  if (statusFilter.value) {
+    rows = rows.filter(r => r.status === statusFilter.value)
+  }
+  if (baseAssetFilter.value) {
+    rows = rows.filter(r => r.base_asset === baseAssetFilter.value)
+  }
+  return rows
+})
 
 /* ───── 汇总统计 ───── */
 const summaryStats = computed(() => {
-  const all = rowData.value
+  const all = filteredRows.value
   const holdingCount = all.filter((r) => r.status === 'holding').length
   const closedCount = all.filter((r) => r.status === 'closed').length
   const totalCount = all.length
@@ -609,6 +716,10 @@ const summaryStats = computed(() => {
     (sum, r) => sum + (r.funding_total_pnl ?? 0),
     0,
   )
+  const totalFees = all.reduce(
+    (sum, r) => sum + (r.fee_cost ?? 0),
+    0,
+  )
   const totalPnl = all.reduce(
     (sum, r) => sum + (r.total_pnl ?? 0),
     0,
@@ -620,6 +731,7 @@ const summaryStats = computed(() => {
     totalFloatingPnl,
     totalRealizedPnl,
     totalFundingPnl,
+    totalFees,
     totalPnl,
   }
 })
@@ -629,9 +741,14 @@ function formatPnl(value: number): string {
   return prefix + value.toFixed(2)
 }
 
+function formatAmount(value: number | undefined | null): string {
+  if (value == null || !Number.isFinite(value)) return '—'
+  return value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
 /* ───── pinned 汇总行 ───── */
 const pinnedBottomRowData = computed<PositionRow[]>(() => {
-  const rows = rowData.value
+  const rows = filteredRows.value
   if (rows.length === 0) return []
 
   const sumField = (field: keyof PositionRow): number =>
@@ -657,6 +774,7 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     floating_pnl_bps: null,
     floating_pnl_total: sumField('floating_pnl_total'),
     fee_bps: null,
+    fee_cost: sumField('fee_cost'),
     risk_relief_bps: null,
     funding_pnl_bps: null,
     funding_rate_24h: null,
@@ -668,6 +786,8 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     realized_pnl: sumField('realized_pnl'),
     total_pnl_bps: null,
     total_pnl: sumField('total_pnl'),
+    liq_price: null,
+    liq_distance_pct: null,
   }]
 })
 async function fetchPositions() {
@@ -680,12 +800,7 @@ async function fetchPositions() {
     }
     const data = await res.json()
     const rows: PositionRow[] = Array.isArray(data) ? data : (data.positions ?? [])
-    // REST 返回的原始数据可能缺少 funding_pnl_bps（非DB字段），在此兜底计算
-    for (const row of rows) {
-      if (row.funding_pnl_bps == null && row.funding_total_pnl != null) {
-        row.funding_pnl_bps = Math.round(row.funding_total_pnl / OPEN_AMOUNT_USDT * 10000 * 100) / 100
-      }
-    }
+    ensureFundingBps(rows)
     positionMap.clear()
     for (const row of rows) {
       positionMap.set(row.id, row)
@@ -844,8 +959,65 @@ onUnmounted(() => {
       </div>
       <div class="summary-group">
         <span class="summary-item">
+          <span class="summary-label">手续费</span>
+          <span class="summary-value" :class="summaryStats.totalFees >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalFees) }}</span>
+        </span>
+      </div>
+      <div class="summary-group">
+        <span class="summary-item">
           <span class="summary-label">总盈亏</span>
           <span class="summary-value" :class="summaryStats.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalPnl) }}</span>
+        </span>
+      </div>
+    </div>
+
+    <!-- 资金汇总栏 -->
+    <div v-if="accountSummary" class="capital-bar">
+      <div class="capital-section">
+        <span class="capital-title">Binance</span>
+        <span class="capital-item">
+          <span class="capital-label">资金占用</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.binance.capital_used) }}</span>
+        </span>
+        <span class="capital-item">
+          <span class="capital-label">可用</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.binance.available) }}</span>
+        </span>
+        <span class="capital-item">
+          <span class="capital-label">净值</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.binance.net_value) }}</span>
+        </span>
+      </div>
+      <div class="capital-divider"></div>
+      <div class="capital-section">
+        <span class="capital-title">Gate</span>
+        <span class="capital-item">
+          <span class="capital-label">保证金占用</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.gate.margin_used) }}</span>
+        </span>
+        <span class="capital-item">
+          <span class="capital-label">可用</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.gate.available) }}</span>
+        </span>
+        <span class="capital-item">
+          <span class="capital-label">净值</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.gate.net_value) }}</span>
+        </span>
+      </div>
+      <div class="capital-divider"></div>
+      <div class="capital-section">
+        <span class="capital-title">合计</span>
+        <span class="capital-item">
+          <span class="capital-label">总占用</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.total.used) }}</span>
+        </span>
+        <span class="capital-item">
+          <span class="capital-label">总可用</span>
+          <span class="capital-value">{{ formatAmount(accountSummary.total.available) }}</span>
+        </span>
+        <span class="capital-item">
+          <span class="capital-label">总净值</span>
+          <span class="capital-value" :class="accountSummary.total.net_value >= accountSummary.total.initial ? 'pnl-positive' : 'pnl-negative'">{{ formatAmount(accountSummary.total.net_value) }}</span>
         </span>
       </div>
     </div>
@@ -862,6 +1034,23 @@ onUnmounted(() => {
             {{ opt.label }}
           </el-radio-button>
         </el-radio-group>
+
+        <el-select
+          v-model="baseAssetFilter"
+          placeholder="标的资产"
+          size="small"
+          filterable
+          clearable
+          style="width: 150px; margin-left: 12px;"
+          @change="triggerFilterChanged"
+        >
+          <el-option
+            v-for="asset in assetOptions"
+            :key="asset"
+            :label="asset"
+            :value="asset"
+          />
+        </el-select>
 
         <el-button
           size="small"
@@ -927,6 +1116,7 @@ onUnmounted(() => {
         :rowData="rowData"
         :pinnedBottomRowData="pinnedBottomRowData"
         :defaultColDef="defaultColDef"
+        :initialState="{ sort: { sortModel: initialSortModel } }"
         :getRowId="getRowId"
         :header-height="32"
         :row-height="32"
@@ -1064,5 +1254,72 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
+}
+
+/* ───── 资金汇总栏 ───── */
+.capital-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  padding: 8px 18px;
+  flex-wrap: wrap;
+}
+
+.capital-section {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+}
+
+.capital-section:first-child {
+  padding-left: 0;
+}
+
+.capital-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--app-text);
+  margin-right: 4px;
+}
+
+.capital-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.capital-label {
+  font-size: 11px;
+  color: var(--app-text-muted);
+}
+
+.capital-value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.capital-value.pnl-positive {
+  color: #f56c6c;
+}
+
+.capital-value.pnl-negative {
+  color: #67c23a;
+}
+
+.capital-value.fee-value {
+  color: #e6a23c;
+}
+
+.capital-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--app-border);
+  margin: 0 4px;
 }
 </style>

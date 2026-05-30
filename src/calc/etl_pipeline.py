@@ -154,7 +154,7 @@ def _run_cleanup_vwap_snapshots():
     操作：DELETE 超过保留天数的历史快照记录
     保留天数：config trade.vwap_snapshot_retention_days（默认 14 天）
     """
-    retention_days = config.get_int('trade.vwap_snapshot_retention_days', 14)
+    retention_days = config.get_int('trade.vwap.snapshot_retention_days', 14)
     try:
         with db_manager.get_connection() as conn:
             cursor = conn.cursor()
@@ -186,7 +186,7 @@ def _run_daily_vwap_analysis():
     """
     from calc.calculate_vwap_basis_threshold import run_analysis
 
-    lookback_days = config.get_int('trade.vwap_threshold_lookback_days', 7)
+    lookback_days = config.get_int('trade.vwap.threshold_lookback_days', 7)
 
     logger.info(f'开始每日VWAP基差分位阈值计算 (lookback={lookback_days})')
     try:

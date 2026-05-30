@@ -19,7 +19,7 @@ def fetch_contract_meta() -> Dict[str, Dict]:
         base_asset -> {quanto_multiplier, order_price_round, order_size_min,
                        enable_decimal, funding_rate_24h, volume_24h_settle, funding_next_apply}
     """
-    sql = "SELECT base_asset, quanto_multiplier, order_price_round, order_size_min, enable_decimal, funding_rate_24h, volume_24h_settle, funding_next_apply FROM mi_gate_future_contracts"
+    sql = "SELECT base_asset, quanto_multiplier, order_price_round, order_size_min, enable_decimal, funding_rate_24h, volume_24h_settle, funding_next_apply, maintenance_rate FROM mi_gate_future_contracts"
     result = {}
     try:
         with db_manager.get_cursor() as cursor:
@@ -34,6 +34,7 @@ def fetch_contract_meta() -> Dict[str, Dict]:
                     'funding_rate_24h': float(row['funding_rate_24h']) if row.get('funding_rate_24h') is not None else None,
                     'volume_24h_settle': float(row['volume_24h_settle']) if row.get('volume_24h_settle') is not None else None,
                     'funding_next_apply': row.get('funding_next_apply'),
+                    'maintenance_rate': float(row['maintenance_rate']) if row.get('maintenance_rate') is not None else None,
                 }
     except Exception as e:
         logger.error(f'加载合约元数据失败: {e}', exc_info=True)
