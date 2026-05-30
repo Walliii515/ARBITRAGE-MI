@@ -355,7 +355,7 @@ class ServiceLifecycleManager:
             if not snapshot:
                 with self._conn_lock:
                     self._connection_status[ba]['gate_snapshot'] = CONN_FAILED
-                    self._connection_status[ba]['gate_snapshot_error'] = 'REST快照返回空（合约可能已下架）'
+                    self._connection_status[ba]['gate_snapshot_error'] = 'REST快照返回空（瞬时错误，可重试）'
                 return False, f'{contract} 快照返回空'
 
             # 写入本地订单簿
@@ -569,8 +569,8 @@ class ServiceLifecycleManager:
                     if ba in self._connection_status:
                         self._connection_status[ba]['gate_snapshot'] = CONN_FAILED
                         self._connection_status[ba]['gate_snapshot_error'] = error_msg
-                    # 超时/网络错误可重试，合约不存在/已下架不重试
-                    if '超时' in error_msg or 'timeout' in error_msg.lower() or '网络' in error_msg or 'Connection' in error_msg:
+                    # 超时/网络错误/快照返回空可重试，合约不存在/已下架不重试
+                    if '超时' in error_msg or 'timeout' in error_msg.lower() or '网络' in error_msg or 'Connection' in error_msg or '快照返回空' in error_msg:
                         retryable_failures.append(contract)
     
             log_print(f"\u2713 批次 {batch_no} 完成")

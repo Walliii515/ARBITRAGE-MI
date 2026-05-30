@@ -11,7 +11,7 @@ import type {
 } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
-import { showError } from '../utils/message'
+import { showError, showSuccess } from '../utils/message'
 import { get, post } from '../utils/request'
 
 /* ───── 类型 ───── */
@@ -224,6 +224,7 @@ const defaultColDef: ColDef = {
 
 /* ───── 数据加载 ───── */
 const retrying = ref<Set<string>>(new Set())
+const retryingAll = ref(false)
 
 async function retrySnapshot(baseAsset: string) {
   if (retrying.value.has(baseAsset)) return
@@ -241,6 +242,26 @@ async function retrySnapshot(baseAsset: string) {
     // request.ts 已处理
   } finally {
     retrying.value.delete(baseAsset)
+  }
+}
+
+async function retryAllFailed() {
+  if (retryingAll.value) return
+  retryingAll.value = true
+  try {
+    const res = await post('/api/service/retry-all-failed', {})
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: '一键重连失败' }))
+      showError(err.detail || '一键重连失败')
+    } else {
+      const data = await res.json()
+      showSuccess(data.message || '重连完成')
+      await fetchData()
+    }
+  } catch (e: any) {
+    // request.ts 已处理
+  } finally {
+    retryingAll.value = false
   }
 }
 
@@ -329,6 +350,16 @@ onUnmounted(() => {
         </el-radio-group>
         <el-button size="small" @click="fetchData" :loading="loading" style="margin-left: 12px">
           刷新
+        </el-button>
+        <el-button
+          size="small"
+          type="warning"
+          @click="retryAllFailed"
+          :loading="retryingAll"
+          :disabled="serviceState !== 'running'"
+          style="margin-left: 8px"
+        >
+          一键重连
         </el-button>
       </div>
     </div>

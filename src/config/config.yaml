@@ -13,6 +13,8 @@ orderbook:
   settle: usdt
   # 最大订阅合约数（从 mi_base_asset 加载的上限）
   max_contracts: 999
+  # 进程启动后自动启动 WS 服务（设为 true 则崩溃重启后自动恢复连接）
+  auto_start: true
 
   # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
   broadcast_throttle_sec: 1.0
@@ -61,7 +63,7 @@ trade:
   # VWAP基差快照采样间隔(秒)
   vwap_snapshot_interval_sec: 10
   # VWAP基差快照保留天数
-  vwap_snapshot_retention_days: 14
+  vwap_snapshot_retention_days: 60
   # VWAP基差阈值回溯天数(用于每日统计分析)
   vwap_threshold_lookback_days: 7
   # VWAP开仓基差阈值使用的分位字段名

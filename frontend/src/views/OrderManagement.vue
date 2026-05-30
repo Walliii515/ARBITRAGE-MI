@@ -333,7 +333,8 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     cellRenderer: (params: any) => {
       if (params.data?.isGroupHeader) {
         const group = params.data as DisplayRow
-        return `<strong class="group-asset">${group.base_asset}</strong>`
+        const count = group.orders?.length ?? 0
+        return `<strong class="group-asset">${group.base_asset} (${count})</strong>`
       }
       return params.value ?? ''
     },
@@ -612,21 +613,19 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     },
   },
   {
-    headerName: '开仓/平仓原因',
+    headerName: '开平仓/拒单原因',
     field: 'reject_reason',
     width: 300,
     tooltipField: 'reject_reason',
     tooltipComponent: LongTextTooltip,
     tooltipValueGetter: (params: any) => {
       if (params.data?.isGroupHeader) return null
-      if (params.data?.market_type !== 'spot') return null
       return params.data?.reject_reason ?? null
     },
     cellRenderer: (params: any) => {
       if (params.data?.isGroupHeader) {
         return ''
       }
-      if (params.data?.market_type !== 'spot') return ''
       return params.value ?? ''
     },
   },

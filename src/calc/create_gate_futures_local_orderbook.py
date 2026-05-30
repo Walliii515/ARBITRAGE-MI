@@ -350,8 +350,8 @@ class OrderBookManager:
                             f" (id={snapshot.get('id')})"
                         )
                     else:
-                        failed_details.append((contract, 'REST快照返回空（合约可能已下架）'))
-                        log_print(f"  ✗ {contract} 初始快照获取失败")
+                        failed_details.append((contract, 'REST快照返回空（瞬时错误，可重试）'))
+                        log_print(f"  ✗ {contract} 初始快照返回空（瞬时错误）")
                 except Exception as e:
                     error_msg = str(e)
                     if 'CONTRACT_NOT_FOUND' in error_msg or '404' in error_msg:

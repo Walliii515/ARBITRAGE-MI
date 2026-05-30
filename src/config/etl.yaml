@@ -86,7 +86,7 @@ tasks:
   cleanup_vwap_snapshots:
     enabled: true
     schedule: daily
-    daily_hour: 0  # 每天凌晨 0 点
+    daily_hour: 1  # 凌晨1点执行清理，与阈值计算错开避免争抢资源
     daily_minute: 0
 
   # VWAP 基差分位阈值 - 每日批量统计
@@ -100,5 +100,5 @@ tasks:
   daily_vwap_threshold:
     enabled: true
     schedule: daily
-    daily_hour: 0  # 每天凌晨 0 点
-    daily_minute: 0
+    daily_hour: 0  # 凌晨0点执行阈值计算
+    daily_minute: 5  # 延迟5分钟，避免与其他凌晨0点任务撞车

@@ -55,26 +55,47 @@ def calculate_percentile(sorted_values: list, percentile: int) -> float:
     return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
 
 
-def fetch_snapshot_data(lookback_days: int) -> list:
+def fetch_distinct_assets(start_time: str) -> list:
     """
-    从快照表读取指定天数内的有效数据
+    获取快照表中指定时间范围内所有有效标的列表
 
     Args:
-        lookback_days: 回溯天数
+        start_time: 起始时间字符串
 
     Returns:
-        快照行列表
+        base_asset 列表
     """
-    start_time = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
-
     sql = """
-        SELECT base_asset, open_vwap_basis_bps, close_vwap_basis_bps, open_coverage
+        SELECT DISTINCT base_asset
         FROM mi_vwap_basis_snapshot
         WHERE snapshot_time >= %s
           AND open_vwap_basis_bps IS NOT NULL
     """
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, (start_time,))
+        return [row['base_asset'] for row in cursor.fetchall()]
+
+
+def fetch_asset_snapshot_data(base_asset: str, start_time: str) -> list:
+    """
+    读取单个标的指定时间范围内的快照数据
+
+    Args:
+        base_asset: 标的资产
+        start_time: 起始时间字符串
+
+    Returns:
+        该标的的快照行列表
+    """
+    sql = """
+        SELECT open_vwap_basis_bps, close_vwap_basis_bps, open_coverage
+        FROM mi_vwap_basis_snapshot
+        WHERE base_asset = %s
+          AND snapshot_time >= %s
+          AND open_vwap_basis_bps IS NOT NULL
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, (base_asset, start_time))
         return cursor.fetchall()
 
 
@@ -154,10 +175,13 @@ def compute_close_statistics(values: list) -> dict:
 
 def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
     """
-    执行分析并写入阈值表
+    执行分析并写入阈值表（逐标的流式处理，避免全表加载）
 
     纯统计计算，写入所有分位值（open_basis_p10~p40 + close_basis_p10~p40）。
     使用哪个分位作为阈值由应用层根据配置决定。
+
+    改进：不再一次性读取全部快照数据到内存，而是逐标的查询计算，
+    峰值内存从 ~2000万行 降至 单标的 ~6万行。
 
     Args:
         lookback_days: 回溯天数
@@ -168,98 +192,18 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
         f"覆盖率过滤<={coverage_filter}"
     )
 
-    # 1. 读取原始数据
-    rows = fetch_snapshot_data(lookback_days)
-    if not rows:
+    start_time = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
+
+    # 1. 获取有效标的列表（轻量查询）
+    all_assets = fetch_distinct_assets(start_time)
+    if not all_assets:
         logger.warning("无有效快照数据，跳过分析")
         return
 
-    logger.info(f"读取到 {len(rows)} 条原始快照数据")
+    logger.info(f"发现 {len(all_assets)} 个有效标的，开始逐标的计算...")
 
-    # 2. 按 base_asset 分组，过滤无效样本
-    open_grouped = {}   # base_asset -> [open_basis_bps...]
-    close_grouped = {}  # base_asset -> [close_basis_bps...]
-    filtered_count = 0
-
-    for row in rows:
-        base_asset = row['base_asset']
-        coverage = float(row['open_coverage']) if row.get('open_coverage') is not None else 0.0
-
-        # 过滤盘口覆盖 > coverage_filter 的样本（流动性不足时VWAP不可靠）
-        if coverage > coverage_filter:
-            filtered_count += 1
-            continue
-
-        # 开仓基差
-        open_bps = row.get('open_vwap_basis_bps')
-        if open_bps is not None:
-            if base_asset not in open_grouped:
-                open_grouped[base_asset] = []
-            open_grouped[base_asset].append(float(open_bps))
-
-        # 平仓基差
-        close_bps = row.get('close_vwap_basis_bps')
-        if close_bps is not None:
-            if base_asset not in close_grouped:
-                close_grouped[base_asset] = []
-            close_grouped[base_asset].append(float(close_bps))
-
-    logger.info(
-        f"开仓有效标的 {len(open_grouped)} 个, 平仓有效标的 {len(close_grouped)} 个, "
-        f"过滤掉 {filtered_count} 条覆盖率过高样本"
-    )
-
-    # 3. 计算统计指标
-    calc_date = date.today()
-    results = []
-
-    # 取所有出现过的标的的并集
-    all_assets = set(open_grouped.keys()) | set(close_grouped.keys())
-
-    for base_asset in all_assets:
-        open_values = open_grouped.get(base_asset, [])
-        close_values = close_grouped.get(base_asset, [])
-
-        if len(open_values) < 10 and len(close_values) < 10:
-            logger.warning(f"  {base_asset}: 样本量不足(open={len(open_values)}, close={len(close_values)})，跳过")
-            continue
-
-        result = {
-            'base_asset': base_asset,
-            'calc_date': calc_date,
-        }
-
-        # 开仓统计
-        if len(open_values) >= 10:
-            open_stats = compute_open_statistics(open_values)
-            result.update(open_stats)
-        else:
-            result['open_sample_count'] = len(open_values)
-
-        # 平仓统计
-        if len(close_values) >= 10:
-            close_stats = compute_close_statistics(close_values)
-            result.update(close_stats)
-        else:
-            result['close_sample_count'] = len(close_values)
-
-        results.append(result)
-
-        logger.info(
-            f"  {base_asset}: open_n={result.get('open_sample_count', 0)}, "
-            f"open_p20={result.get('open_basis_p20', '-')}, "
-            f"open_p30={result.get('open_basis_p30', '-')}, "
-            f"close_n={result.get('close_sample_count', 0)}, "
-            f"close_p20={result.get('close_basis_p20', '-')}, "
-            f"close_p30={result.get('close_basis_p30', '-')}"
-        )
-
-    if not results:
-        logger.warning("无有效统计结果")
-        return
-
-    # 4. 写入阈值表（UPSERT）
-    sql = """
+    # UPSERT SQL
+    upsert_sql = """
         INSERT INTO mi_vwap_basis_threshold (
             base_asset, calc_date,
             open_sample_count, open_basis_max, open_basis_min, open_basis_mean, open_basis_std,
@@ -296,41 +240,107 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
             updated_at = NOW()
     """
 
-    # 补齐可能缺失的 key（样本不足时部分字段为 None）
     all_keys = [
         'open_sample_count', 'open_basis_max', 'open_basis_min', 'open_basis_mean', 'open_basis_std',
         'open_basis_p10', 'open_basis_p20', 'open_basis_p30', 'open_basis_p40',
         'close_sample_count', 'close_basis_max', 'close_basis_min', 'close_basis_mean', 'close_basis_std',
         'close_basis_p10', 'close_basis_p20', 'close_basis_p30', 'close_basis_p40',
     ]
-    for result in results:
-        for key in all_keys:
-            result.setdefault(key, None)
 
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        for result in results:
-            cursor.execute(sql, result)
-        conn.commit()
+    # 2. 逐标的查询 + 计算 + 写入
+    calc_date = date.today()
+    results = []  # 仅用于最终汇总日志
+    success_count = 0
+    skip_count = 0
 
-    logger.info(f"✓ 已写入 {len(results)} 个标的的VWAP基差阈值 (日期={calc_date})")
+    for idx, base_asset in enumerate(all_assets, 1):
+        try:
+            # 查询单标的数据（峰值内存 ~6万行）
+            rows = fetch_asset_snapshot_data(base_asset, start_time)
+            if not rows:
+                skip_count += 1
+                continue
 
-    # 5. 输出汇总
-    logger.info("=" * 90)
-    logger.info(f"分析完成 | 日期={calc_date} | 回溯={lookback_days}天")
-    logger.info(f"{'标的':<10} {'开仓N':<7} {'open_p20':<10} {'open_p30':<10} {'平仓N':<7} {'close_p20':<10} {'close_p30':<10}")
-    logger.info("-" * 90)
-    for r in sorted(results, key=lambda x: x.get('open_basis_p20') or 0, reverse=True):
-        logger.info(
-            f"{r['base_asset']:<10} "
-            f"{r.get('open_sample_count', 0) or 0:<7} "
-            f"{str(r.get('open_basis_p20', '-')):<10} "
-            f"{str(r.get('open_basis_p30', '-')):<10} "
-            f"{r.get('close_sample_count', 0) or 0:<7} "
-            f"{str(r.get('close_basis_p20', '-')):<10} "
-            f"{str(r.get('close_basis_p30', '-')):<10}"
-        )
-    logger.info("=" * 90)
+            # 按覆盖率过滤 + 分组
+            open_values = []
+            close_values = []
+            for row in rows:
+                coverage = float(row['open_coverage']) if row.get('open_coverage') is not None else 0.0
+                if coverage > coverage_filter:
+                    continue
+                open_bps = row.get('open_vwap_basis_bps')
+                if open_bps is not None:
+                    open_values.append(float(open_bps))
+                close_bps = row.get('close_vwap_basis_bps')
+                if close_bps is not None:
+                    close_values.append(float(close_bps))
+
+            # 释放原始行数据
+            del rows
+
+            if len(open_values) < 10 and len(close_values) < 10:
+                skip_count += 1
+                continue
+
+            result = {
+                'base_asset': base_asset,
+                'calc_date': calc_date,
+            }
+
+            # 开仓统计
+            if len(open_values) >= 10:
+                result.update(compute_open_statistics(open_values))
+            else:
+                result['open_sample_count'] = len(open_values)
+
+            # 平仓统计
+            if len(close_values) >= 10:
+                result.update(compute_close_statistics(close_values))
+            else:
+                result['close_sample_count'] = len(close_values)
+
+            # 补齐缺失 key
+            for key in all_keys:
+                result.setdefault(key, None)
+
+            # 立即写入（单标的 UPSERT）
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(upsert_sql, result)
+                conn.commit()
+
+            success_count += 1
+            results.append(result)
+
+            # 每 50 个标的输出进度
+            if idx % 50 == 0:
+                logger.info(f"  进度: {idx}/{len(all_assets)} 标的已处理")
+
+        except Exception as e:
+            logger.error(f"  {base_asset} 计算失败: {e}")
+            continue
+
+    logger.info(f"✓ 已写入 {success_count} 个标的的VWAP基差阈值，跳过 {skip_count} 个 (日期={calc_date})")
+
+    # 3. 输出汇总（只输出 top 20 避免日志刻刷）
+    if results:
+        logger.info("=" * 90)
+        logger.info(f"分析完成 | 日期={calc_date} | 回溯={lookback_days}天 | 成功={success_count} 跳过={skip_count}")
+        logger.info(f"{'\u6807\u7684':<10} {'\u5f00\u4ed3N':<7} {'open_p20':<10} {'open_p30':<10} {'\u5e73\u4ed3N':<7} {'close_p20':<10} {'close_p30':<10}")
+        logger.info("-" * 90)
+        for r in sorted(results, key=lambda x: x.get('open_basis_p20') or 0, reverse=True)[:20]:
+            logger.info(
+                f"{r['base_asset']:<10} "
+                f"{r.get('open_sample_count', 0) or 0:<7} "
+                f"{str(r.get('open_basis_p20', '-')):<10} "
+                f"{str(r.get('open_basis_p30', '-')):<10} "
+                f"{r.get('close_sample_count', 0) or 0:<7} "
+                f"{str(r.get('close_basis_p20', '-')):<10} "
+                f"{str(r.get('close_basis_p30', '-')):<10}"
+            )
+        if len(results) > 20:
+            logger.info(f"  ... 省略 {len(results) - 20} 个标的")
+        logger.info("=" * 90)
 
 
 def main():

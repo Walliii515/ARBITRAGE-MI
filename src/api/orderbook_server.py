@@ -372,6 +372,7 @@ async def lifespan(app: FastAPI):
     global svc, event_loop, broadcast_queue
 
     event_loop = asyncio.get_running_loop()
+    event_loop.set_exception_handler(_asyncio_exception_handler)
     broadcast_queue = asyncio.Queue()
     worker_task = asyncio.create_task(broadcast_worker())
 
@@ -433,6 +434,12 @@ async def lifespan(app: FastAPI):
     # svc.register_broadcast(schedule_broadcast)
     svc.set_runtime(event_loop, broadcast_queue, build_payload, schedule_broadcast)
     asyncio.create_task(_orderbook_broadcast_loop())
+
+    # 自动启动 WS 服务（进程崩溃重启后自动恢复连接）
+    auto_start = config.get('orderbook.auto_start', False)
+    if auto_start:
+        log_print('ℹ 配置 auto_start=true，自动启动 WS 服务...')
+        svc.start()
 
     yield
 
@@ -506,6 +513,39 @@ async def retry_snapshot(body: dict):
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {'ok': True, 'message': message}
+
+
+@app.post('/api/service/retry-all-failed', dependencies=[Depends(verify_token_dependency)])
+async def retry_all_failed():
+    """一键重连：对所有快照失败或无实时数据的标的批量重试"""
+    if not svc:
+        raise HTTPException(status_code=400, detail='服务未初始化')
+    if svc.state != SERVICE_RUNNING:
+        raise HTTPException(status_code=400, detail='服务未运行，无法重试')
+
+    # 找出所有异常标的
+    connections = svc.get_connection_status()
+    failed_assets = [
+        c['base_asset'] for c in connections
+        if c['gate_snapshot_status'] == 'failed'
+        or (not c['gate_receiving_data'] and c['gate_snapshot_status'] != 'pending')
+        or not c['binance_receiving_data']
+    ]
+
+    if not failed_assets:
+        return {'ok': True, 'message': '所有连接正常，无需重试', 'results': []}
+
+    results = []
+    for asset in failed_assets:
+        ok, msg = svc.retry_contract(asset)
+        results.append({'base_asset': asset, 'ok': ok, 'message': msg})
+
+    success_count = sum(1 for r in results if r['ok'])
+    return {
+        'ok': True,
+        'message': f'已重试 {len(failed_assets)} 个标的，成功 {success_count} 个',
+        'results': results,
+    }
 
 
 @app.get('/api/orderbook/snapshot', dependencies=[Depends(verify_token_dependency)])
@@ -786,6 +826,38 @@ async def _vwap_snapshot_loop():
 
         except Exception as e:
             logger.error(f"VWAP快照落库失败: {e}")
+
+
+# ───── 崩溃日志：全局异常钩子 ─────
+
+def _global_exception_handler(exc_type, exc_value, exc_tb):
+    """捕获未处理的同步异常，记录到日志文件"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical('未捕获的异常导致进程即将退出', exc_info=(exc_type, exc_value, exc_tb))
+
+sys.excepthook = _global_exception_handler
+
+
+def _threading_exception_handler(args):
+    """捕获子线程中未处理的异常"""
+    logger.critical(
+        f'线程 [{args.thread.name}] 未捕获异常: {args.exc_type.__name__}: {args.exc_value}',
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+threading.excepthook = _threading_exception_handler
+
+
+def _asyncio_exception_handler(loop, context):
+    """捕获 asyncio 事件循环中未处理的异常"""
+    exception = context.get('exception')
+    message = context.get('message', '未知 asyncio 异常')
+    if exception:
+        logger.critical(f'asyncio 未处理异常: {message}', exc_info=exception)
+    else:
+        logger.critical(f'asyncio 未处理异常: {message}')
 
 
 def main():
