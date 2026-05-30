@@ -57,13 +57,13 @@ function toggleMenu() {
           <el-icon><Monitor /></el-icon>
           <template #title>订单簿监控</template>
         </el-menu-item>
-        <el-menu-item index="/orders">
-          <el-icon><List /></el-icon>
-          <template #title>订单管理</template>
-        </el-menu-item>
         <el-menu-item index="/signals">
           <el-icon><Stopwatch /></el-icon>
           <template #title>交易信号</template>
+        </el-menu-item>
+        <el-menu-item index="/orders">
+          <el-icon><List /></el-icon>
+          <template #title>订单管理</template>
         </el-menu-item>
         <el-menu-item index="/positions">
           <el-icon><TrendCharts /></el-icon>
