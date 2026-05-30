@@ -30,7 +30,7 @@ trade:
     url: http://localhost:8081    # 成交引擎服务地址
     timeout_sec: 5                # HTTP 请求超时（秒）
   # 每次开仓金额（计价币种 USDT），用于前端展示及后续下单/风控
-  open_amount_usdt: 200
+  open_amount_usdt: 100
     # 盘口覆盖阈值（开仓盘口覆盖 <= 此值时显示绿色）
   orderbook_coverage_threshold: 0.8
   # 风险缓释（bps），用于开仓边际基差计算

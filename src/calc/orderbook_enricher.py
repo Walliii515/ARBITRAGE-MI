@@ -64,6 +64,7 @@ class EnrichConfig:
     spot_close_fee: float
     future_open_fee: float
     future_close_fee: float
+    close_threshold_col: str = 'close_basis_p20'
 
 
 def calc_vwap_basis_bps(spot_vwap, future_vwap) -> Optional[float]:
@@ -135,7 +136,8 @@ def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
 def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                            spot_meta: Dict[str, Dict], threshold_meta: Dict[str, float],
                            vwap_threshold_meta: Dict[str, float],
-                           cfg: EnrichConfig, meta_update_time: str) -> None:
+                           cfg: EnrichConfig, meta_update_time: str,
+                           close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None) -> None:
     """
     为 WS 快照推送富化完整字段（就地修改 rows）
 
@@ -247,3 +249,10 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
 
         # --- 按标的 VWAP 基差阈值 ---
         row['vwap_threshold_bps'] = vwap_threshold_meta.get(base_asset)
+
+        # --- 盈利性守卫: 平仓基差阈值 ---
+        if close_vwap_threshold_meta and base_asset in close_vwap_threshold_meta:
+            close_data = close_vwap_threshold_meta[base_asset]
+            row['close_vwap_threshold_bps'] = close_data.get(cfg.close_threshold_col)
+        else:
+            row['close_vwap_threshold_bps'] = None

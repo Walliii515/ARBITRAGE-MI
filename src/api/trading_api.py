@@ -413,3 +413,56 @@ async def save_column_config(page_key: str, payload: Dict[str, Any]):
             return {'success': False, 'message': f'保存失败: {str(e)}'}
         finally:
             cursor.close()
+
+
+# ──────────────────────────────────────────────────────────────────
+# 交易信号日志
+# ──────────────────────────────────────────────────────────────────
+
+@router.get('/signals')
+async def get_signals(
+    status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected"),
+    base_asset: Optional[str] = Query(None, description="标的资产过滤"),
+    days: int = Query(3, ge=1, le=30, description="最近N天"),
+):
+    """查询历史交易信号"""
+    sql = "SELECT * FROM mi_trade_signal WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+    params: List = [days]
+
+    if status:
+        sql += " AND status = %s"
+        params.append(status)
+    if base_asset:
+        sql += " AND base_asset LIKE %s"
+        params.append(f"%{base_asset}%")
+
+    sql += " ORDER BY signal_time DESC LIMIT 2000"
+
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+
+    data = _serialize_rows(rows)
+
+    # 计算汇总统计
+    total = len(data)
+    opened_count = sum(1 for r in data if r.get('status') == 'opened')
+    rejected_count = sum(1 for r in data if r.get('status') == 'rejected')
+    conditions_lost_count = sum(1 for r in data if r.get('status') == 'conditions_lost')
+    monitoring_count = sum(1 for r in data if r.get('status') == 'monitoring')
+
+    resolved = [r for r in data if r.get('duration_sec') is not None]
+    avg_duration = round(sum(r['duration_sec'] for r in resolved) / len(resolved), 1) if resolved else 0
+
+    return {
+        'signals': data,
+        'summary': {
+            'total': total,
+            'opened': opened_count,
+            'rejected': rejected_count,
+            'conditions_lost': conditions_lost_count,
+            'monitoring': monitoring_count,
+            'conversion_rate': round(opened_count / total * 100, 1) if total > 0 else 0,
+            'avg_duration_sec': avg_duration,
+        }
+    }

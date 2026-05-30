@@ -64,7 +64,7 @@ class TradingExecutor:
         # 峰值回落开仓策略
         self.peak_pullback_pct = config.get_float('trade.peak_pullback_pct', 0.10)
         self.peak_monitor_timeout_sec = config.get_int('trade.peak_monitor_timeout_sec', 60)
-        self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time}
+        self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, signal_id}
     
     def check_and_open(self, orderbook_rows: List[Dict]) -> List[Dict]:
         """
@@ -87,12 +87,19 @@ class TradingExecutor:
                 # 0. 数据完整性检查：缺少有效盘口数据时跳过
                 if row.get('spot_qty') is None or row.get('open_vwap_basis_bps') is None:
                     # 数据不完整时清除峰值状态，避免数据恢复后误触发超时开仓
+                    self._resolve_signal(base_asset, 'conditions_lost', '数据不完整(盘口中断)')
                     self._peak_state.pop(base_asset, None)
                     continue
                 
                 # 1. 风控检查
                 if not self._pass_risk_check(row):
                     # 风控不通过，清除该标的峰值监控状态（基差已跌回阈值下）
+                    exit_reason = self._get_risk_fail_reason(row)
+                    current_basis = row.get('open_vwap_basis_bps')
+                    self._resolve_signal(
+                        base_asset, 'conditions_lost', exit_reason,
+                        exit_basis_bps=float(current_basis) if current_basis is not None else None
+                    )
                     self._peak_state.pop(base_asset, None)
                     continue
                 
@@ -120,7 +127,24 @@ class TradingExecutor:
                 # 7. 持久化订单
                 self._save_orders(order_group, exec_result)
                 
-                # 开仓成功后清除峰值状态
+                # 8. 更新信号状态
+                peak_state = self._peak_state.get(base_asset, {})
+                trigger_type = peak_state.get('trigger')
+                if exec_result['success']:
+                    self._resolve_signal(
+                        base_asset, 'opened', None,
+                        exit_basis_bps=open_vwap_basis,
+                        trigger_type=trigger_type,
+                        order_uuid=order_group['order_uuid']
+                    )
+                else:
+                    self._resolve_signal(
+                        base_asset, 'rejected', exec_result.get('message'),
+                        exit_basis_bps=open_vwap_basis,
+                        trigger_type=trigger_type
+                    )
+                
+                # 开仓后清除峰值状态
                 self._peak_state.pop(base_asset, None)
                 
                 results.append({
@@ -221,10 +245,12 @@ class TradingExecutor:
         
         if state is None:
             # 首次进入监控，记录峰值和开始时间
+            signal_id = self._create_signal(base_asset, current_basis_bps)
             self._peak_state[base_asset] = {
                 'peak_bps': current_basis_bps,
                 'start_time': now,
                 'trigger': None,  # 用于记录触发方式
+                'signal_id': signal_id,
             }
             logger.info(
                 f"峰值监控开始 | {base_asset} | "
@@ -259,7 +285,122 @@ class TradingExecutor:
             return True
         
         return False
-    
+
+    # ──────────────────────────────────────────────────────────────────
+    # 信号日志记录
+    # ──────────────────────────────────────────────────────────────────
+
+    def _create_signal(self, base_asset: str, entry_basis_bps: float) -> Optional[int]:
+        """创建信号记录（进入峰值监控时）"""
+        try:
+            sql = """
+                INSERT INTO mi_trade_signal (base_asset, signal_time, status, entry_basis_bps, peak_basis_bps)
+                VALUES (%(base_asset)s, %(signal_time)s, 'monitoring', %(entry_basis_bps)s, %(peak_basis_bps)s)
+            """
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, {
+                    'base_asset': base_asset,
+                    'signal_time': datetime.now(),
+                    'entry_basis_bps': round(entry_basis_bps, 2),
+                    'peak_basis_bps': round(entry_basis_bps, 2),
+                })
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"信号记录创建失败 {base_asset}: {e}")
+            return None
+
+    def _resolve_signal(
+        self, base_asset: str, status: str, exit_reason: Optional[str],
+        exit_basis_bps: Optional[float] = None,
+        trigger_type: Optional[str] = None,
+        order_uuid: Optional[str] = None,
+    ):
+        """结束信号记录（状态转为终态）"""
+        state = self._peak_state.get(base_asset)
+        if not state:
+            return  # 无峰值状态，说明没有活跃信号
+
+        signal_id = state.get('signal_id')
+        if not signal_id:
+            return
+
+        now = datetime.now()
+        duration_sec = int((now - state['start_time']).total_seconds())
+        peak_bps = state.get('peak_bps')
+
+        try:
+            sql = """
+                UPDATE mi_trade_signal SET
+                    status = %(status)s,
+                    resolved_time = %(resolved_time)s,
+                    peak_basis_bps = %(peak_basis_bps)s,
+                    exit_basis_bps = %(exit_basis_bps)s,
+                    exit_reason = %(exit_reason)s,
+                    duration_sec = %(duration_sec)s,
+                    trigger_type = %(trigger_type)s,
+                    order_uuid = %(order_uuid)s
+                WHERE id = %(id)s
+            """
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, {
+                    'status': status,
+                    'resolved_time': now,
+                    'peak_basis_bps': round(peak_bps, 2) if peak_bps is not None else None,
+                    'exit_basis_bps': round(exit_basis_bps, 2) if exit_basis_bps is not None else None,
+                    'exit_reason': exit_reason[:200] if exit_reason else None,
+                    'duration_sec': duration_sec,
+                    'trigger_type': trigger_type,
+                    'order_uuid': order_uuid,
+                    'id': signal_id,
+                })
+        except Exception as e:
+            logger.error(f"信号记录更新失败 {base_asset}: {e}")
+
+    def _get_risk_fail_reason(self, row: Dict) -> str:
+        """识别风控失败的具体原因（用于信号日志）"""
+        base_asset = row.get('base_asset', '')
+
+        # 资金费率检查
+        funding_rate = row.get('funding_rate_24h')
+        contract = row.get('contract', '')
+        threshold = self.threshold_meta.get(contract)
+        if funding_rate is not None and threshold is not None:
+            if float(funding_rate) < float(threshold):
+                return f"资金费率不达标({float(funding_rate)*100:.4f}%<{float(threshold)*100:.4f}%)"
+
+        # 盘口覆盖检查
+        open_coverage = row.get('open_coverage')
+        if open_coverage is not None and float(open_coverage) > self.coverage_threshold:
+            return f"盘口覆盖超限({float(open_coverage):.2f}>{self.coverage_threshold})"
+
+        # 基差不达标
+        open_vwap_basis = row.get('open_vwap_basis_bps')
+        if open_vwap_basis is not None:
+            thr = self.vwap_threshold_meta.get(base_asset, self.basis_threshold_bps)
+            if float(open_vwap_basis) < thr:
+                return f"基差跌回阈值下({float(open_vwap_basis):.1f}<{thr:.1f}bps)"
+
+        # 盈利性守卫
+        if open_vwap_basis is not None and base_asset in self.close_vwap_threshold_meta:
+            close_data = self.close_vwap_threshold_meta[base_asset]
+            close_thr = close_data.get(self.close_threshold_col)
+            if close_thr is not None:
+                if float(open_vwap_basis) <= float(close_thr) + self.fee_cost_bps:
+                    return f"盈利性守卫({float(open_vwap_basis):.1f}<={float(close_thr):.1f}+{self.fee_cost_bps:.0f})"
+
+        # 成交量不足
+        if self.min_future_volume > 0 and base_asset in self.contract_meta:
+            vol = self.contract_meta[base_asset].get('volume_24h_settle')
+            if vol is not None and vol < self.min_future_volume:
+                return f"期货成交量不足({vol:.0f}<{self.min_future_volume:.0f})"
+
+        if self.min_spot_volume > 0 and base_asset in self.spot_meta:
+            vol = self.spot_meta[base_asset].get('quote_volume')
+            if vol is not None and vol < self.min_spot_volume:
+                return f"现货成交量不足({vol:.0f}<{self.min_spot_volume:.0f})"
+
+        return '风控条件变化'
+
     def _build_open_reason(self, row: Dict, base_asset: str, open_vwap_basis: float) -> str:
         """
         构建开仓原因字符串，记录关键决策参数，便于复盘。

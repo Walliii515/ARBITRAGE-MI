@@ -107,6 +107,7 @@ _enrich_cfg = EnrichConfig(
     spot_close_fee=SPOT_CLOSE_FEE,
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
+    close_threshold_col=config.get_str('trade.vwap_close_threshold_percentile', 'close_basis_p20'),
 )
 
 # 盈亏计算配置实例（持仓实时推送用）
@@ -259,7 +260,8 @@ def build_payload() -> dict:
     # 每秒重建一次，这里的就地修改不影响其他消费者
     enrich_snapshot_fields(
         rows, _contract_meta, _spot_meta, _threshold_meta,
-        _vwap_threshold_meta, _enrich_cfg, _meta_update_time
+        _vwap_threshold_meta, _enrich_cfg, _meta_update_time,
+        _close_vwap_threshold_meta
     )
 
     return {

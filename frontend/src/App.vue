@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection } from '@element-plus/icons-vue'
+import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { removeToken } from './utils/auth'
 import { ElMessage } from 'element-plus'
@@ -60,6 +60,10 @@ function toggleMenu() {
         <el-menu-item index="/orders">
           <el-icon><List /></el-icon>
           <template #title>订单管理</template>
+        </el-menu-item>
+        <el-menu-item index="/signals">
+          <el-icon><Stopwatch /></el-icon>
+          <template #title>交易信号</template>
         </el-menu-item>
         <el-menu-item index="/positions">
           <el-icon><TrendCharts /></el-icon>

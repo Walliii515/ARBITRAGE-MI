@@ -170,6 +170,8 @@ const openVwapBasisThresholdBps = ref<number>(0)
 const filterByMarginalBasis = ref<boolean>(true)
 /** 成交量过滤开关（默认开启） */
 const filterByVolume = ref<boolean>(true)
+/** 盈利性守卫过滤开关（默认开启） */
+const filterByProfitability = ref<boolean>(true)
 /** 现货24h成交量阈值（USDT） */
 const minSpotVolume24h = ref<number>(5000000)
 /** 期货24h成交量阈值（USDT） */
@@ -308,6 +310,32 @@ function volumeFilterFunc(params: any): boolean {
   return true
 }
 
+/** AG Grid 外部过滤函数：盈利性守卫过滤 */
+function profitabilityGuardFilterFunc(params: any): boolean {
+  if (!filterByProfitability.value) {
+    return true // 不过滤，显示所有
+  }
+  
+  const data = params.data as OrderBookRow
+  if (!data) return true
+  
+  const openVwapBasis = data.open_vwap_basis_bps as number | null | undefined
+  const closeThreshold = data.close_vwap_threshold_bps as number | null | undefined
+  
+  // 没有平仓阈值数据时不过滤（新标的可能无历史数据）
+  if (closeThreshold == null || openVwapBasis == null) {
+    return true
+  }
+  
+  // 盈利性守卫: 开仓基差 > 平仓基差阈值 + 全程手续费
+  // fee_cost_bps = -(open_fee_bps + close_fee_bps)
+  const openFeeBps = data.open_fee_bps ?? 0
+  const closeFeeBps = data.close_fee_bps ?? 0
+  const feeCostBps = -(openFeeBps + closeFeeBps)
+  
+  return openVwapBasis > closeThreshold + feeCostBps
+}
+
 /** 标的资产过滤函数 */
 function assetFilterFunc(params: any): boolean {
   if (!assetFilterKeyword.value) return true
@@ -320,7 +348,7 @@ function assetFilterFunc(params: any): boolean {
 
 /** 组合过滤函数 */
 function combinedFilterFunc(params: any): boolean {
-  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && volumeFilterFunc(params) && assetFilterFunc(params)
+  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && volumeFilterFunc(params) && profitabilityGuardFilterFunc(params) && assetFilterFunc(params)
 }
 
 /** WebSocket 实例提升到模块级，避免 HMR 时断开 */
@@ -1186,6 +1214,12 @@ watch(filterByVolume, () => {
   }
 })
 
+watch(filterByProfitability, () => {
+  if (gridApi) {
+    gridApi.onFilterChanged()
+  }
+})
+
 onMounted(() => {
   // HMR 时复用已有的 WebSocket 连接，不重新创建
   if (!wsInitialized || socket?.readyState === WebSocket.CLOSED) {
@@ -1404,6 +1438,14 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
                 inline-prompt
                 active-text="成交量过滤"
                 inactive-text="成交量过滤"
+                style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
+              />
+              <el-switch
+                v-model="filterByProfitability"
+                class="filter-switch"
+                inline-prompt
+                active-text="盈利性守卫"
+                inactive-text="盈利性守卫"
                 style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
               />
             </div>

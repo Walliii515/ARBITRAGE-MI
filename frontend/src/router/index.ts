@@ -20,6 +20,11 @@ const router = createRouter({
       component: () => import('../views/OrderManagement.vue'),
     },
     {
+      path: '/signals',
+      name: 'signals',
+      component: () => import('../views/TradeSignals.vue'),
+    },
+    {
       path: '/positions',
       name: 'positions',
       component: () => import('../views/PositionMonitor.vue'),

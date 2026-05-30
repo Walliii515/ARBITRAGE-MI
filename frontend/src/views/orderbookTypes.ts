@@ -62,6 +62,8 @@ export interface OrderBookRow {
   risk_relief_bps?: number | null
   /** 按标的VWAP基差阈值(bps)，后端按标的下发 */
   vwap_threshold_bps?: number | null
+  /** 盈利性守卫: 平仓基差阈值(bps)，后端按标的下发 */
+  close_vwap_threshold_bps?: number | null
   [key: string]: string | number | boolean | null | undefined
 }
 
