@@ -54,8 +54,8 @@ trade:
   funding_rate_threshold_percentile: percentile_30
   # 开仓检查间隔(秒)
   open_check_interval_sec: 5
-  # 开仓冷却期(秒) - 同一合约10秒内不重复开仓
-  open_cooldown_sec: 10
+  # 开仓冷却期(秒) - 同一合约15秒内不重复开仓
+  open_cooldown_sec: 15
   # 持仓资金费更新间隔(秒) - 1小时
   position_funding_update_sec: 3600
   # 持仓实时数据推送间隔(秒)
