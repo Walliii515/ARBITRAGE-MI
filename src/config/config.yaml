@@ -77,7 +77,7 @@ trade:
   # 平仓检查间隔(秒)
   close_check_interval_sec: 5
   # 止盈倍数 - 总盈亏bps(基差收敛+已收资金费) >= 24h资金费率bps * 此倍数 + 手续费bps 时止盈
-  take_profit_days_multiplier: 10
+  take_profit_days_multiplier: 15
   # 最大资金费支付次数 - 超过此次数强制平仓
   max_funding_payments: 30
   # 峰值回落开仓策略 - 基差超阈值后监控峰值，回落确认后开仓

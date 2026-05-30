@@ -58,20 +58,33 @@ export function useGridCopy() {
     return String(rawValue)
   }
 
-  /* ── 复制到剪贴板 ── */
+  /* ── 复制到剪贴板（兼容 HTTP 非安全上下文） ── */
   function copyToClipboard(text: string) {
     if (!text) return
-    navigator.clipboard.writeText(text).catch(() => {
-      // fallback
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
+
+    // Clipboard API 仅在安全上下文（HTTPS / localhost）下可用
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
+    } else {
+      fallbackCopy(text)
+    }
+  }
+
+  function fallbackCopy(text: string) {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.left = '-9999px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    try {
       document.execCommand('copy')
-      document.body.removeChild(ta)
-    })
+    } catch (_) {
+      // 静默失败
+    }
+    document.body.removeChild(ta)
   }
 
   /* ── Cmd+C / Ctrl+C 键盘监听 ── */
