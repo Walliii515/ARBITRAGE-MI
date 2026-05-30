@@ -52,6 +52,10 @@ class ClosingExecutor:
         self.valley_monitor_timeout_sec = config.get_int('trade.valley_monitor_timeout_sec', 60)
         self._valley_state: Dict[str, Dict] = {}  # base_asset -> {valley_bps, start_time, open_spread_bps}
 
+        # 平仓失败冷却机制
+        self.close_cooldown_sec = config.get_int('trade.close_cooldown_sec', 60)
+        self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
+
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
     # ──────────────────────────────────────────────────────────────────
@@ -86,6 +90,11 @@ class ClosingExecutor:
 
             if current_spread_bps is None:
                 continue  # 无盘口数据，跳过
+
+            # ── 冷却期检查：平仓失败后 N 秒内不重试 ──
+            cooldown_until = self._close_cooldown.get(ba)
+            if cooldown_until and (datetime.now() - cooldown_until).total_seconds() < self.close_cooldown_sec:
+                continue
 
             # ── 按优先级检查平仓条件 ──
             close_reason = None
@@ -129,16 +138,22 @@ class ClosingExecutor:
                 result = self._execute_close(pos, close_reason, close_reason_detail, orderbook_row)
                 results.append(result)
                 if result.get('success'):
-                    # 平仓成功，清除谷底监控状态
+                    # 平仓成功，清除谷底监控状态和冷却记录
                     self._valley_state.pop(ba, None)
+                    self._close_cooldown.pop(ba, None)
                     logger.info(
                         f"平仓成功 | {ba} | reason={close_reason} | "
                         f"spread_bps={current_spread_bps:.2f}"
                     )
                 else:
+                    # 平仓失败，进入冷却期
+                    self._close_cooldown[ba] = datetime.now()
+                    # 超时触发的谷底状态也需清除，避免下次继续超时重试
+                    self._valley_state.pop(ba, None)
                     logger.warning(
                         f"平仓失败 | {ba} | reason={close_reason} | "
-                        f"msg={result.get('message')}"
+                        f"msg={result.get('message')} | "
+                        f"冷却{self.close_cooldown_sec}s"
                     )
             except Exception as e:
                 logger.error(f"平仓执行异常 {ba}: {e}", exc_info=True)
@@ -496,10 +511,10 @@ class ClosingExecutor:
             order['risk_relief_bps'] = None
             order['open_marginal_basis_bps'] = None
             order['funding_rate_24h'] = pos.get('funding_rate_24h')
-            # 将平仓详细原因写入 reject_reason 字段，供前端复盘查看
-            order['reject_reason'] = close_reason_detail
 
             if exec_result.get('success'):
+                # 成功时写入平仓触发原因，供前端复盘查看
+                order['reject_reason'] = close_reason_detail
                 exec_data = exec_result[market_key] or {}
                 order['status'] = 'executed'
                 order['exec_price'] = exec_data.get('exec_price')
@@ -508,6 +523,9 @@ class ClosingExecutor:
                 order['coverage_ratio'] = exec_data.get('coverage_ratio')
                 order['executed_at'] = datetime.now()
             else:
+                # 失败时写入拒单原因：触发原因 + 执行器拒绝消息
+                reject_msg = exec_result.get('message', '')
+                order['reject_reason'] = f"{close_reason_detail} | 拒单: {reject_msg}"
                 order['status'] = 'rejected'
                 order['exec_price'] = None
                 order['exec_qty'] = None

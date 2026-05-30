@@ -36,6 +36,9 @@ class VirtualExecutor:
         """
         执行虚拟成交
 
+        风控前置逻辑：先同时校验两边深度，两边都满足才执行，
+        避免单边成交导致套利对不一致。
+
         Args:
             order_group: 订单组，包含 spot_order 和 future_order
             orderbook_row: 当前盘口数据行（合并后的订单簿，含5档深度）
@@ -51,20 +54,28 @@ class VirtualExecutor:
         result = {'success': False, 'spot_order': None, 'future_order': None, 'message': ''}
 
         try:
-            # 1. 现货成交计算
+            # ── 风控前置：同时校验两边深度 ──
             spot_result = self._calc_vwap(order_group['spot_order'], orderbook_row, 'spot')
+            future_result = self._calc_vwap(order_group['future_order'], orderbook_row, 'future')
+
+            # 两边都必须通过才执行，否则拒绝并报告失败侧
+            if not spot_result['success'] and not future_result['success']:
+                spot_reason = spot_result.get('reason', '未知')
+                future_reason = future_result.get('reason', '未知')
+                result['message'] = f"双边拒单: 现货({spot_reason}), 期货({future_reason})"
+                return result
+
             if not spot_result['success']:
                 result['message'] = f"现货拒单: {spot_result['reason']}"
                 return result
-            result['spot_order'] = spot_result
 
-            # 2. 期货成交计算
-            future_result = self._calc_vwap(order_group['future_order'], orderbook_row, 'future')
             if not future_result['success']:
                 result['message'] = f"期货拒单: {future_result['reason']}"
                 return result
-            result['future_order'] = future_result
 
+            # ── 两边深度均充足，确认成交 ──
+            result['spot_order'] = spot_result
+            result['future_order'] = future_result
             result['success'] = True
             result['message'] = '成交成功'
         except Exception as e:
