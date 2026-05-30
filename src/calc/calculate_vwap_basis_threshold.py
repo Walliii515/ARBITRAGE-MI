@@ -326,7 +326,9 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
     if results:
         logger.info("=" * 90)
         logger.info(f"分析完成 | 日期={calc_date} | 回溯={lookback_days}天 | 成功={success_count} 跳过={skip_count}")
-        logger.info(f"{'\u6807\u7684':<10} {'\u5f00\u4ed3N':<7} {'open_p20':<10} {'open_p30':<10} {'\u5e73\u4ed3N':<7} {'close_p20':<10} {'close_p30':<10}")
+        header = "{:<10} {:<7} {:<10} {:<10} {:<7} {:<10} {:<10}".format(
+            '标的', '开仓N', 'open_p20', 'open_p30', '平仓N', 'close_p20', 'close_p30')
+        logger.info(header)
         logger.info("-" * 90)
         for r in sorted(results, key=lambda x: x.get('open_basis_p20') or 0, reverse=True)[:20]:
             logger.info(
