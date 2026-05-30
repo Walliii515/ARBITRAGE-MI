@@ -30,7 +30,7 @@ trade:
     url: http://localhost:8081    # 成交引擎服务地址
     timeout_sec: 5                # HTTP 请求超时（秒）
   # 每次开仓金额（计价币种 USDT），用于前端展示及后续下单/风控
-  open_amount_usdt: 500
+  open_amount_usdt: 200
     # 盘口覆盖阈值（开仓盘口覆盖 <= 此值时显示绿色）
   orderbook_coverage_threshold: 0.8
   # 风险缓释（bps），用于开仓边际基差计算
@@ -54,8 +54,8 @@ trade:
   funding_rate_threshold_percentile: percentile_30
   # 开仓检查间隔(秒)
   open_check_interval_sec: 5
-  # 开仓冷却期(秒) - 同一合约1小时内不重复开仓
-  open_cooldown_sec: 3600
+  # 开仓冷却期(秒) - 同一合约10秒内不重复开仓
+  open_cooldown_sec: 10
   # 持仓资金费更新间隔(秒) - 1小时
   position_funding_update_sec: 3600
   # 持仓实时数据推送间隔(秒)
