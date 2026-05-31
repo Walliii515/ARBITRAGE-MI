@@ -26,8 +26,8 @@ orderbook:
 trade:
   # ─── 成交引擎 ───
   executor:
-    # url: http://localhost:8081    # 虚拟盘地址
-    url: http://localhost:8082    # 实盘地址
+    url: http://localhost:8081    # 虚拟盘地址
+    # url: http://localhost:8082    # 实盘地址
     timeout_sec: 15                # HTTP 请求超时（秒）
 
   # ─── 手续费率 ───
@@ -115,6 +115,6 @@ capital:
 # API Key/Secret 从 .env 环境变量读取，此处仅配置 URL 和超时
 real_executor:
   # 环境: testnet / mainnet（模拟盘/实盘，也可通过 EXCHANGE_ENV 环境变量覆盖）
-  env: mainnet
+  env: testnet
   # HTTP 请求超时（秒）
   timeout_sec: 10

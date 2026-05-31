@@ -39,10 +39,12 @@ trade:
 
   # ─── 开仓策略 ───
   open:
-    amount_usdt: 5                        # 单笔开仓金额（USDT）
+    amount_usdt: 10                        # 单笔开仓金额（USDT）
     check_interval_sec: 5                   # 开仓检查间隔（秒）
     cooldown_sec: 15                        # 同标的开仓冷却（秒）
+    reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
     max_positions_per_asset: 3              # 同标的最大持仓数
+    # max_positions_per_asset: 1              # 同标的最大持仓数
     vwap_basis_threshold_bps: 20            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.8       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
@@ -67,7 +69,9 @@ trade:
     check_interval_sec: 5                   # 平仓检查间隔（秒）
     cooldown_sec: 60                        # 平仓失败冷却（秒）
     take_profit_days_multiplier: 15         # 止盈倍数（总盈亏bps >= 24h费率bps * 此值 + 手续费bps）
+    # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= 24h费率bps * 此值 + 手续费bps）
     max_funding_payments: 30                # 最大资金费支付次数，超过强制平仓
+    # max_funding_payments: 2                # 最大资金费支付次数，超过强制平仓
 
   # ─── 谷底反弹策略（平仓确认） ───
   valley_rebound:
@@ -103,14 +107,14 @@ margin:
 # 资金管理配置
 capital:
   # Binance 初始入金 (USDT)
-  binance_initial: 100
+  binance_initial: 500
   # Gate 初始入金 (USDT)
-  gate_initial: 100
+  gate_initial: 250
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置 URL 和超时
 real_executor:
-  # 环境: testnet / mainnet（也可通过 EXCHANGE_ENV 环境变量覆盖）
-  env: testnet
+  # 环境: testnet / mainnet（模拟盘/实盘，也可通过 EXCHANGE_ENV 环境变量覆盖）
+  env: mainnet
   # HTTP 请求超时（秒）
   timeout_sec: 10
