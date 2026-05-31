@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { removeToken } from './utils/auth'
 import { ElMessage } from 'element-plus'
-import { post } from './utils/request'
+import { post, get } from './utils/request'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,6 +13,50 @@ const isCollapsed = ref(false)
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
+
+// ───── 成交引擎模式标识 ─────
+type TradingMode = 'virtual' | 'testnet' | 'mainnet' | 'unknown'
+const tradingMode = ref<TradingMode>('unknown')
+
+const tradingModeLabel = computed(() => {
+  switch (tradingMode.value) {
+    case 'mainnet': return '实盘'
+    case 'testnet': return '模拟盘'
+    case 'virtual': return '虚拟盘'
+    default: return ''
+  }
+})
+
+const tradingModeColor = computed(() => {
+  switch (tradingMode.value) {
+    case 'mainnet': return '#f56c6c'   // 红色
+    case 'testnet': return '#e6a23c'   // 橙色
+    case 'virtual': return '#909399'   // 灰色
+    default: return 'transparent'
+  }
+})
+
+async function fetchTradingMode() {
+  try {
+    const resp = await get('/api/service/exchange-connectivity')
+    if (resp.ok) {
+      const data = await resp.json()
+      if (!data.is_real) {
+        tradingMode.value = 'virtual'
+      } else {
+        tradingMode.value = data.detail?.env === 'mainnet' ? 'mainnet' : 'testnet'
+      }
+    }
+  } catch {
+    // 服务未启动时静默失败
+  }
+}
+
+onMounted(() => {
+  if (!isLoginPage.value) {
+    fetchTradingMode()
+  }
+})
 
 async function handleLogout() {
   try {
@@ -40,8 +84,14 @@ function toggleMenu() {
   <el-container v-else class="app-container">
     <el-aside :width="isCollapsed ? '64px' : '200px'" class="app-aside">
       <div class="logo">
-        <span v-if="!isCollapsed">Arbitrage-Mi</span>
-        <span v-else>Ai</span>
+        <div class="logo-title">
+          <span v-if="!isCollapsed">Arbitrage-Mi</span>
+          <span v-else>Ai</span>
+        </div>
+        <div v-if="tradingMode !== 'unknown'" class="trading-mode-badge" :style="{ backgroundColor: tradingModeColor }">
+          <span v-if="!isCollapsed">{{ tradingModeLabel }}</span>
+          <span v-else>{{ tradingModeLabel[0] }}</span>
+        </div>
       </div>
       
       <el-menu
@@ -128,8 +178,10 @@ function toggleMenu() {
 
 .logo {
   height: 60px;
-  line-height: 60px;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   color: var(--app-text);
   font-size: 15px;
   font-weight: 600;
@@ -137,6 +189,21 @@ function toggleMenu() {
   border-bottom: 1px solid var(--app-border);
   overflow: hidden;
   white-space: nowrap;
+  padding: 0 12px;
+}
+
+.logo-title {
+  flex-shrink: 0;
+}
+
+.trading-mode-badge {
+  font-size: 10px;
+  font-weight: 500;
+  color: #fff;
+  padding: 2px 6px;
+  border-radius: 3px;
+  line-height: 1.2;
+  letter-spacing: 0;
 }
 
 .collapse-btn {

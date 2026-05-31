@@ -112,9 +112,16 @@ let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)
 const statusFilter = ref<string>('')
 const baseAssetFilter = ref<string>('')
+const filterDays = ref<number>(90) // 默认90天
 const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
 const wsLatencyMs = ref<number | null>(null)
 const accountSummary = ref<AccountSummary | null>(null)
+
+// 分页配置
+const paginationPageSize = ref<number>(100)
+const paginationPageSizeOptions = [100, 500, 1000, 5000]
+const paginationCurrentPage = ref<number>(1)
+const paginationTotal = ref<number>(0)
 
 /** 列状态持久化（数据库版） */
 const PAGE_KEY = 'position_monitor'
@@ -793,24 +800,72 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
 async function fetchPositions() {
   loading.value = true
   try {
-    const res = await get('/api/trading/positions')
+    const params = new URLSearchParams()
+    params.set('days', String(filterDays.value))
+    params.set('page', String(paginationCurrentPage.value))
+    params.set('page_size', String(paginationPageSize.value))
+    if (statusFilter.value) {
+      params.set('status', statusFilter.value)
+    }
+    if (baseAssetFilter.value) {
+      params.set('base_asset', baseAssetFilter.value.trim())
+    }
+    const query = params.toString()
+    const url = `/api/trading/positions${query ? '?' + query : ''}`
+    const res = await get(url)
     if (!res.ok) {
       showError('获取持仓数据失败')
       return
     }
     const data = await res.json()
-    const rows: PositionRow[] = Array.isArray(data) ? data : (data.positions ?? [])
+    const rows: PositionRow[] = data.positions || []
     ensureFundingBps(rows)
     positionMap.clear()
     for (const row of rows) {
       positionMap.set(row.id, row)
     }
     rowData.value = rows
+    
+    // 更新分页信息
+    if (data.pagination) {
+      paginationTotal.value = data.pagination.total || 0
+    }
   } catch {
     showError('请求持仓数据失败')
   } finally {
     loading.value = false
   }
+}
+
+/** 页码变化 */
+function onPageChange(page: number) {
+  paginationCurrentPage.value = page
+  fetchPositions()
+}
+
+/** 每页条数变化 */
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1 // 切换每页条数时回到第一页
+  fetchPositions()
+}
+
+/** 计算总页数 */
+const totalPages = computed(() => {
+  return Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
+})
+
+/** 快捷状态过滤 */
+function setStatusFilter(status: string) {
+  statusFilter.value = status
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchPositions()
+}
+
+/** 快捷时间过滤 */
+function setDaysFilter(days: number) {
+  filterDays.value = days
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchPositions()
 }
 
 /* ───── 状态过滤选项 ───── */
@@ -1024,25 +1079,30 @@ onUnmounted(() => {
 
     <el-card shadow="never" class="status-card">
       <div class="filter-row">
-        <span class="filter-label">状态过滤：</span>
-        <el-radio-group v-model="statusFilter" size="small" @change="triggerFilterChanged">
-          <el-radio-button
-            v-for="opt in statusOptions"
-            :key="opt.value"
-            :value="opt.value"
-          >
-            {{ opt.label }}
-          </el-radio-button>
-        </el-radio-group>
+        <span class="filter-label">状态：</span>
+        <el-button-group size="small">
+          <el-button :type="statusFilter === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部</el-button>
+          <el-button :type="statusFilter === 'holding' ? 'primary' : 'default'" @click="setStatusFilter('holding')">持仓中</el-button>
+          <el-button :type="statusFilter === 'closed' ? 'primary' : 'default'" @click="setStatusFilter('closed')">已平仓</el-button>
+        </el-button-group>
 
+        <span class="filter-label" style="margin-left: 24px;">时间：</span>
+        <el-button-group size="small">
+          <el-button :type="filterDays === 7 ? 'primary' : 'default'" @click="setDaysFilter(7)">7天</el-button>
+          <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDaysFilter(30)">30天</el-button>
+          <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDaysFilter(90)">90天</el-button>
+          <el-button :type="filterDays === 365 ? 'primary' : 'default'" @click="setDaysFilter(365)">1年</el-button>
+        </el-button-group>
+
+        <span class="filter-label" style="margin-left: 24px;">标的：</span>
         <el-select
           v-model="baseAssetFilter"
           placeholder="标的资产"
           size="small"
           filterable
           clearable
-          style="width: 150px; margin-left: 12px;"
-          @change="triggerFilterChanged"
+          style="width: 150px;"
+          @change="fetchPositions"
         >
           <el-option
             v-for="asset in assetOptions"
@@ -1055,7 +1115,7 @@ onUnmounted(() => {
         <el-button
           size="small"
           type="primary"
-          style="margin-left: 16px;"
+          style="margin-left: auto;"
           :loading="loading"
           @click="fetchPositions"
         >
@@ -1127,6 +1187,51 @@ onUnmounted(() => {
       />
       </div>
     </el-card>
+
+    <!-- 底部分页控件 -->
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="onPageChange"
+          controls-position="right"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1321,5 +1426,26 @@ onUnmounted(() => {
   height: 20px;
   background: var(--app-border);
   margin: 0 4px;
+}
+
+/* 底部分页控件 */
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

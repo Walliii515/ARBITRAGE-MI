@@ -12,7 +12,6 @@ from common.config import config
 from common.logger import get_logger
 
 logger = get_logger(__name__)
-from common.tools import format_binance_order_params, format_gate_order_params
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps, calc_open_fee_bps
 from calc.executor_client import ExecutorClient
 
@@ -76,6 +75,13 @@ class TradingExecutor:
         self._holding_liq_distance: Dict[str, float] = {}
         self._holding_count: Dict[str, int] = {}  # base_asset -> 持仓中仓位数量
         self.max_positions_per_asset = config.get_int('trade.open.max_positions_per_asset', 1)
+
+        # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
+        self.reject_cooldown_sec = config.get_int('trade.open.reject_cooldown_sec', 300)
+        self._reject_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 冷却截止时间
+
+        # 开仓金额（用于 min_notional 前置校验）
+        self.open_amount_usdt = config.get_float('trade.open.amount_usdt', 5)
     
     def update_holding_margin_status(self, positions: List[Dict]):
         """
@@ -147,6 +153,10 @@ class TradingExecutor:
                 if not self._pass_timeout_cooldown(base_asset):
                     continue
                 
+                # 2.6 拒单冷却检查（被交易所拒单后暂停该标的开仓）
+                if not self._pass_reject_cooldown(base_asset):
+                    continue
+                
                 # 3. 峰值回落确认
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
                 if not self._pass_peak_check(base_asset, open_vwap_basis):
@@ -180,6 +190,12 @@ class TradingExecutor:
                         base_asset, 'rejected', exec_result.get('message'),
                         exit_basis_bps=open_vwap_basis,
                         trigger_type=trigger_type
+                    )
+                    # 被交易所拒单后启动冷却，避免重复提交失败订单
+                    self._reject_cooldown_until[base_asset] = datetime.now() + timedelta(seconds=self.reject_cooldown_sec)
+                    logger.info(
+                        f"开仓拒单冷却启动 | {base_asset} | "
+                        f"冷却{self.reject_cooldown_sec}s | 原因: {exec_result.get('message', '')[:80]}"
                     )
                 
                 # 开仓后清除峰值状态
@@ -237,6 +253,12 @@ class TradingExecutor:
         # 保证金风控检查：该标的现有持仓已接近爆仓时禁止加仓
         if base_asset in self._holding_liq_distance:
             if self._holding_liq_distance[base_asset] < self.margin_warning_pct:
+                return False
+
+        # 最小名义价值检查：开仓金额低于交易所最低要求时直接过滤
+        if base_asset in self.spot_meta:
+            min_notional = self.spot_meta[base_asset].get('min_notional')
+            if min_notional is not None and self.open_amount_usdt < min_notional:
                 return False
 
         # 资金费率检查
@@ -424,6 +446,11 @@ class TradingExecutor:
             if liq_dist < self.margin_warning_pct:
                 return f"保证金风控(距爆仓{liq_dist:.1f}%<{self.margin_warning_pct:.1f}%)"
 
+        # 最小名义价值检查
+        if base_asset in self.spot_meta:
+            min_notional = self.spot_meta[base_asset].get('min_notional')
+            if min_notional is not None and self.open_amount_usdt < min_notional:
+                return f"开仓金额低于最小名义值({self.open_amount_usdt}<{min_notional}USDT)"
         # 资金费率检查
         funding_rate = row.get('funding_rate_24h')
         contract = row.get('contract', '')
@@ -528,6 +555,17 @@ class TradingExecutor:
             return True
         return False
 
+    def _pass_reject_cooldown(self, base_asset: str) -> bool:
+        """检查开仓拒单冷却期（被交易所拒单后暂停该标的开仓）"""
+        cooldown_until = self._reject_cooldown_until.get(base_asset)
+        if cooldown_until is None:
+            return True  # 无拒单冷却
+        if datetime.now() >= cooldown_until:
+            # 冷却已过期，清除
+            self._reject_cooldown_until.pop(base_asset, None)
+            return True
+        return False
+
     def _pass_cooldown_check(self, base_asset: str) -> bool:
         """检查冷却期(从订单表查询最近一次成功开仓)"""
         sql = """
@@ -557,11 +595,9 @@ class TradingExecutor:
         contract = row['contract']
         
         target_qty = row['spot_qty']  # 已对齐的对冲数量
-        open_amount_usdt = config.get_float('trade.open.amount_usdt', 500)
-        target_amount = row.get('open_amount_usdt', open_amount_usdt)
+        target_amount = row.get('open_amount_usdt', self.open_amount_usdt)
         
         # 获取精度配置
-        qty_precision_spot = self._get_spot_qty_precision(base_asset)
         quanto_multiplier = self._get_quanto_multiplier(base_asset)
         
         # 现货订单
@@ -576,7 +612,6 @@ class TradingExecutor:
             'status': 'pending',
             'target_qty': target_qty,
             'target_amount': target_amount,
-            'exchange_params': format_binance_order_params(base_asset, target_qty, qty_precision_spot, order_uuid)
         }
         
         # 期货订单
@@ -591,7 +626,6 @@ class TradingExecutor:
             'status': 'pending',
             'target_qty': target_qty,
             'target_amount': target_amount,
-            'exchange_params': format_gate_order_params(contract, target_qty, quanto_multiplier, order_uuid)
         }
         
         return {
@@ -688,9 +722,6 @@ class TradingExecutor:
                 order['exec_amount'] = None
                 order['coverage_ratio'] = None
                 order['executed_at'] = None
-            
-            # 移除非DB字段
-            order.pop('exchange_params', None)
             
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, order)

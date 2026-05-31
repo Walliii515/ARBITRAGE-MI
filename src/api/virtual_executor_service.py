@@ -6,7 +6,7 @@
 TradingExecutor 通过 ExecutorClient 调用本服务完成成交计算。
 
 启动方式：
-    cd src && python -m uvicorn api.executor_service:app --port 8081
+    cd src && python3 api/virtual_executor_service.py
 
 切换实盘时，只需启动实盘执行器服务并修改 config.yaml 中的 trade.executor.url，
 本服务不会对实盘产生任何影响。

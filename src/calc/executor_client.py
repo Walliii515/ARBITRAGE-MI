@@ -75,6 +75,49 @@ class ExecutorClient:
             logger.error(error_msg, exc_info=True)
             return self._error_result(error_msg)
 
+    def check_connectivity(self) -> Dict:
+        """
+        检查成交引擎交易所连通性
+
+        调用 GET /api/connectivity，返回格式：
+        {
+            'all_ok': bool,
+            'env': 'testnet'/'mainnet',
+            'binance': {'ok': bool, ...},
+            'gate': {'ok': bool, ...}
+        }
+
+        如果引擎不支持该接口（如虚拟成交引擎），返回 {'all_ok': True, 'virtual': True}
+        """
+        url = f'{self.base_url}/api/connectivity'
+        try:
+            resp = requests.get(url, timeout=self.timeout)
+            if resp.status_code == 404:
+                # 虚拟成交引擎没有此接口，视为不需要检查
+                return {'all_ok': True, 'virtual': True}
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.ConnectionError:
+            return {'all_ok': False, 'error': f'成交引擎服务不可达({self.base_url})'}
+        except requests.exceptions.Timeout:
+            return {'all_ok': False, 'error': f'连通性检查超时({self.timeout}s)'}
+        except Exception as e:
+            return {'all_ok': False, 'error': str(e)}
+
+    def check_health(self) -> Dict:
+        """
+        检查成交引擎健康状态
+
+        返回 /api/health 响应，可通过 'engine' 字段判断是 virtual 还是 real。
+        """
+        url = f'{self.base_url}/api/health'
+        try:
+            resp = requests.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
     @staticmethod
     def _error_result(message: str) -> Dict:
         """构造错误返回（与 VirtualExecutor.execute 返回格式一致）"""
@@ -87,13 +130,12 @@ class ExecutorClient:
 
     @staticmethod
     def _sanitize_order_group(order_group: Dict) -> Dict:
-        """清理订单组中不可序列化的字段（如 exchange_params 包含复杂对象）"""
+        """清理订单组中不可 JSON 序列化的字段"""
         cleaned = {}
         for key, value in order_group.items():
-            if key in ('spot_order', 'future_order'):
-                # 子订单：移除 exchange_params（仅用于真实下单）
-                order_copy = {k: v for k, v in value.items() if k != 'exchange_params'}
-                cleaned[key] = order_copy
+            if key in ('spot_order', 'future_order') and isinstance(value, dict):
+                # 子订单：复制一份避免修改原始对象
+                cleaned[key] = dict(value)
             else:
                 cleaned[key] = value
         return cleaned

@@ -50,12 +50,40 @@ async def get_orders(
     order_side: Optional[str] = Query(None, description="订单方向过滤(open/close)"),
     position_id: Optional[int] = Query(None, description="持仓ID过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
-    start_time: Optional[str] = Query(None, description="开始时间"),
-    end_time: Optional[str] = Query(None, description="结束时间")
+    days: int = Query(1, ge=1, le=90, description="最近N天（开仓时间）"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
-    """查询订单列表"""
-    sql = "SELECT * FROM mi_trade_order WHERE 1=1"
-    params = []
+    """查询订单列表（支持分页）"""
+    # 查询总数
+    count_sql = "SELECT COUNT(*) as total FROM mi_trade_order WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+    count_params = [days]
+    
+    if status:
+        count_sql += " AND status = %s"
+        count_params.append(status)
+    if channel:
+        count_sql += " AND channel = %s"
+        count_params.append(channel)
+    if order_side:
+        count_sql += " AND order_side = %s"
+        count_params.append(order_side)
+    if position_id is not None:
+        count_sql += " AND position_id = %s"
+        count_params.append(position_id)
+    if base_asset:
+        count_sql += " AND base_asset = %s"
+        count_params.append(base_asset)
+    
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(count_sql, count_params)
+        total_row = cursor.fetchone()
+        total = total_row['total'] if total_row else 0
+    
+    # 查询分页数据
+    offset = (page - 1) * page_size
+    sql = "SELECT * FROM mi_trade_order WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+    params = [days]
     
     if status:
         sql += " AND status = %s"
@@ -72,19 +100,23 @@ async def get_orders(
     if base_asset:
         sql += " AND base_asset = %s"
         params.append(base_asset)
-    if start_time:
-        sql += " AND created_at >= %s"
-        params.append(start_time)
-    if end_time:
-        sql += " AND created_at <= %s"
-        params.append(end_time)
     
-    sql += " ORDER BY created_at DESC LIMIT 1000"
+    sql += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+    params.extend([page_size, offset])
     
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, params)
         rows = cursor.fetchall()
-        return _serialize_rows(rows)
+    
+    return {
+        'orders': _serialize_rows(rows),
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total': total,
+            'total_pages': (total + page_size - 1) // page_size,
+        }
+    }
 
 
 @router.get('/orders/grouped')
@@ -144,12 +176,33 @@ async def get_orders_grouped():
 @router.get('/positions')
 async def get_positions(
     status: Optional[str] = Query(None, description="持仓状态过滤"),
-    base_asset: Optional[str] = Query(None, description="标的资产过滤")
+    base_asset: Optional[str] = Query(None, description="标的资产过滤"),
+    days: int = Query(90, ge=1, le=365, description="最近N天（开仓时间）"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
-    """查询持仓列表（含资金费结算历史）"""
+    """查询持仓列表（含资金费结算历史，支持分页）"""
     try:
-        sql = "SELECT * FROM mi_trade_position WHERE 1=1"
-        params = []
+        # 查询总数
+        count_sql = "SELECT COUNT(*) as total FROM mi_trade_position WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+        count_params = [days]
+        
+        if status:
+            count_sql += " AND status = %s"
+            count_params.append(status)
+        if base_asset:
+            count_sql += " AND base_asset = %s"
+            count_params.append(base_asset)
+        
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(count_sql, count_params)
+            total_row = cursor.fetchone()
+            total = total_row['total'] if total_row else 0
+        
+        # 查询分页数据
+        offset = (page - 1) * page_size
+        sql = "SELECT * FROM mi_trade_position WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+        params = [days]
         
         if status:
             sql += " AND status = %s"
@@ -158,14 +211,23 @@ async def get_positions(
             sql += " AND base_asset = %s"
             params.append(base_asset)
         
-        sql += " ORDER BY opened_at DESC"
+        sql += " ORDER BY opened_at DESC LIMIT %s OFFSET %s"
+        params.extend([page_size, offset])
         
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, params)
             rows = cursor.fetchall()
         
         if not rows:
-            return []
+            return {
+                'positions': [],
+                'pagination': {
+                    'page': page,
+                    'page_size': page_size,
+                    'total': 0,
+                    'total_pages': 0,
+                }
+            }
         
         # 获取资金费结算历史（仅查询当前返回的持仓 ID）
         position_ids = [r['id'] for r in rows]
@@ -201,7 +263,15 @@ async def get_positions(
         for row in serialized:
             row['funding_history'] = histories.get(row.get('id'), [])
         
-        return serialized
+        return {
+            'positions': serialized,
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+                'total_pages': (total + page_size - 1) // page_size,
+            }
+        }
     except Exception as e:
         logger.error(f'查询持仓失败: {e}', exc_info=True)
         raise
@@ -428,8 +498,28 @@ async def get_signals(
     status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
     days: int = Query(3, ge=1, le=30, description="最近N天"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
-    """查询历史交易信号"""
+    """查询历史交易信号（支持分页）"""
+    # 查询总数
+    count_sql = "SELECT COUNT(*) as total FROM mi_trade_signal WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+    count_params: List = [days]
+
+    if status:
+        count_sql += " AND status = %s"
+        count_params.append(status)
+    if base_asset:
+        count_sql += " AND base_asset LIKE %s"
+        count_params.append(f"%{base_asset}%")
+
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(count_sql, count_params)
+        total_row = cursor.fetchone()
+        total = total_row['total'] if total_row else 0
+
+    # 查询分页数据
+    offset = (page - 1) * page_size
     sql = "SELECT * FROM mi_trade_signal WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"
     params: List = [days]
 
@@ -440,7 +530,8 @@ async def get_signals(
         sql += " AND base_asset LIKE %s"
         params.append(f"%{base_asset}%")
 
-    sql += " ORDER BY signal_time DESC LIMIT 2000"
+    sql += " ORDER BY signal_time DESC LIMIT %s OFFSET %s"
+    params.extend([page_size, offset])
 
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, params)
@@ -448,25 +539,54 @@ async def get_signals(
 
     data = _serialize_rows(rows)
 
-    # 计算汇总统计
-    total = len(data)
-    opened_count = sum(1 for r in data if r.get('status') == 'opened')
-    rejected_count = sum(1 for r in data if r.get('status') == 'rejected')
-    conditions_lost_count = sum(1 for r in data if r.get('status') == 'conditions_lost')
-    monitoring_count = sum(1 for r in data if r.get('status') == 'monitoring')
+    # 计算汇总统计（基于全量数据，需要单独查询）
+    summary_sql = """
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'opened' THEN 1 ELSE 0 END) as opened,
+            SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+            SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END) as conditions_lost,
+            SUM(CASE WHEN status = 'monitoring' THEN 1 ELSE 0 END) as monitoring,
+            MAX(signal_time) as latest_signal_time
+        FROM mi_trade_signal 
+        WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)
+    """
+    summary_params: List = [days]
 
-    resolved = [r for r in data if r.get('duration_sec') is not None]
-    avg_duration = round(sum(r['duration_sec'] for r in resolved) / len(resolved), 1) if resolved else 0
+    if status:
+        summary_sql += " AND status = %s"
+        summary_params.append(status)
+    if base_asset:
+        summary_sql += " AND base_asset LIKE %s"
+        summary_params.append(f"%{base_asset}%")
+
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(summary_sql, summary_params)
+        summary_row = cursor.fetchone()
+
+    summary_data = _serialize_row(summary_row) if summary_row else {}
+    total_count = summary_data.get('total', 0)
+    opened_count = summary_data.get('opened', 0)
+    rejected_count = summary_data.get('rejected', 0)
+    conditions_lost_count = summary_data.get('conditions_lost', 0)
+    monitoring_count = summary_data.get('monitoring', 0)
+    latest_signal_time = summary_data.get('latest_signal_time')
 
     return {
         'signals': data,
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total': total_count,
+            'total_pages': (total_count + page_size - 1) // page_size,
+        },
         'summary': {
-            'total': total,
+            'total': total_count,
             'opened': opened_count,
             'rejected': rejected_count,
             'conditions_lost': conditions_lost_count,
             'monitoring': monitoring_count,
-            'conversion_rate': round(opened_count / total * 100, 1) if total > 0 else 0,
-            'avg_duration_sec': avg_duration,
+            'conversion_rate': round(opened_count / total_count * 100, 1) if total_count > 0 else 0,
+            'latest_signal_time': latest_signal_time,
         }
     }

@@ -1,8 +1,13 @@
 source /Users/jeffrey/Documents/MyProject/Arbitrage-Mi/.venv/bin/activate
 
 后端： 
+    -   模拟盘启动
+python src/api/virtual_executor_service.py
+    -   实盘启动
+python src/api/real_executor_service.py
 python src/api/orderbook_server.py
-python src/api/executor_service.py
+
+
 前端：
 cd frontend
 npm run dev
@@ -58,7 +63,7 @@ src
     ｜—— vwap_snapshot_recorder.py 定时采样 VWAP 基差数据并批量落库，用于后续历史分位统计，表mi_vwap_basis_snapshot
 
 ｜—— api
-    ｜—— executor_service.py   成交引擎 HTTP 服务（虚拟成交）
+    ｜—— virtual_executor_service.py   成交引擎 HTTP 服务（虚拟成交）
     ｜—— orderbook_server.py   将后端构建的实时盘口通过ws推送给vue前端
     ｜—— trading_api.py   交易API路由模块，订单查询，持仓查询，持仓汇总统计
 ｜—— config
@@ -73,3 +78,16 @@ src
 
 
 
+实盘切换：
+config.yaml
+  # ─── 成交引擎 ───
+  executor:
+    # url: http://localhost:8081    # 虚拟盘地址
+    url: http://localhost:8082    # 实盘地址
+
+  # 环境: testnet / mainnet（交易所模拟盘/加一所实盘）
+  env: mainnet
+
+启动服务：
+    real_executor_service.py 交易所实盘/虚拟盘成交引擎
+    virtual_executor_service.py 虚拟成交引擎

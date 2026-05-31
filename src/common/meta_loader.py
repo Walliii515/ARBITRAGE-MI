@@ -1,7 +1,7 @@
 """
 元数据加载模块
 
-从数据库加载合约元数据和现货元数据，供 orderbook_server 和 executor_service 等多个服务共用。
+从数据库加载合约元数据和现货元数据，供 orderbook_server 和 virtual/real_executor_service 等多个服务共用。
 """
 from typing import Dict
 
@@ -48,7 +48,7 @@ def fetch_spot_meta() -> Dict[str, Dict]:
     Returns:
         base_asset -> {step_size, tick_size, min_qty, quote_volume}
     """
-    sql = "SELECT base_asset, step_size, tick_size, min_qty, quote_volume FROM mi_binance_spot_info"
+    sql = "SELECT base_asset, step_size, tick_size, min_qty, min_notional, quote_volume FROM mi_binance_spot_info"
     result = {}
     try:
         with db_manager.get_cursor() as cursor:
@@ -59,6 +59,7 @@ def fetch_spot_meta() -> Dict[str, Dict]:
                     'step_size': float(row['step_size']),
                     'tick_size': float(row['tick_size']),
                     'min_qty': float(row['min_qty']),
+                    'min_notional': float(row['min_notional']) if row.get('min_notional') is not None else None,
                     'quote_volume': float(row['quote_volume']) if row.get('quote_volume') is not None else None,
                 }
     except Exception as e:

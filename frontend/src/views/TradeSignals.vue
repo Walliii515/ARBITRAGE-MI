@@ -32,19 +32,25 @@ interface Summary {
   conditions_lost: number
   monitoring: number
   conversion_rate: number
-  avg_duration_sec: number
+  latest_signal_time: string | null
 }
 
 /* ───── 状态 ───── */
 const gridApi = shallowRef<GridApi | null>(null)
 const rowData = ref<SignalRow[]>([])
-const summary = ref<Summary>({ total: 0, opened: 0, rejected: 0, conditions_lost: 0, monitoring: 0, conversion_rate: 0, avg_duration_sec: 0 })
+const summary = ref<Summary>({ total: 0, opened: 0, rejected: 0, conditions_lost: 0, monitoring: 0, conversion_rate: 0, latest_signal_time: null })
 const loading = ref(false)
 
 // 筛选条件
 const filterStatus = ref<string>('')
-const filterDays = ref<number>(3)
+const filterDays = ref<number>(1) // 默认今日
 const filterAsset = ref<string>('')
+
+// 分页配置
+const paginationPageSize = ref<number>(100)
+const paginationPageSizeOptions = [100, 500, 1000, 5000]
+const paginationCurrentPage = ref<number>(1)
+const paginationTotal = ref<number>(0)
 
 /** 列状态持久化 */
 const PAGE_KEY = 'trade_signals'
@@ -194,6 +200,8 @@ async function fetchSignals() {
   try {
     const params = new URLSearchParams()
     params.set('days', String(filterDays.value))
+    params.set('page', String(paginationCurrentPage.value))
+    params.set('page_size', String(paginationPageSize.value))
     if (filterStatus.value) params.set('status', filterStatus.value)
     if (filterAsset.value.trim()) params.set('base_asset', filterAsset.value.trim())
 
@@ -202,6 +210,11 @@ async function fetchSignals() {
     const json = await res.json()
     rowData.value = json.signals || []
     summary.value = json.summary || summary.value
+    
+    // 更新分页信息
+    if (json.pagination) {
+      paginationTotal.value = json.pagination.total || 0
+    }
   } catch (e: any) {
     console.error('加载信号失败:', e)
   } finally {
@@ -215,18 +228,33 @@ function onGridReady(event: GridReadyEvent) {
   loadColumnState()
 }
 
+/** 页码变化 */
+function onPageChange(page: number) {
+  paginationCurrentPage.value = page
+  fetchSignals()
+}
+
+/** 每页条数变化 */
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1 // 切换每页条数时回到第一页
+  fetchSignals()
+}
+
 /* ───── 快捷过滤 ───── */
 function setStatusFilter(status: string) {
   filterStatus.value = status
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
   fetchSignals()
 }
 
 function setDaysFilter(days: number) {
   filterDays.value = days
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
   fetchSignals()
 }
 
 function onAssetSearch() {
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
   fetchSignals()
 }
 
@@ -235,9 +263,33 @@ const { gridContainerRef, setupGridCopy } = useGridCopy()
 
 /* ───── 格式化 ───── */
 function formatDuration(sec: number): string {
+  if (!sec || sec === 0) return '0s'
   if (sec < 60) return `${sec}s`
-  return `${Math.floor(sec / 60)}m ${sec % 60}s`
+  const minutes = Math.floor(sec / 60)
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  const seconds = sec % 60
+  if (hours > 0) {
+    return `${hours}h ${remainingMinutes}m ${seconds}s`
+  }
+  return `${remainingMinutes}m ${seconds}s`
 }
+
+/** 格式化时间 */
+function formatTime(timeStr: string | null): string {
+  if (!timeStr) return '无'
+  // 如果是完整的时间格式，提取时间部分
+  if (timeStr.includes(' ')) {
+    const parts = timeStr.split(' ')
+    return parts[1] || timeStr
+  }
+  return timeStr
+}
+
+/** 计算总页数 */
+const totalPages = computed(() => {
+  return Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
+})
 
 /* ───── WebSocket 自动刷新 ───── */
 let ws: WebSocket | null = null
@@ -292,35 +344,49 @@ onUnmounted(() => {
 
 <template>
   <div class="signals-page">
-    <!-- 顶部统计卡片 -->
-    <div class="summary-cards">
-      <div class="card">
-        <div class="card-value">{{ summary.total }}</div>
-        <div class="card-label">总信号</div>
+    <!-- 顶部统计栏 -->
+    <div class="summary-bar">
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">总信号</span>
+          <span class="summary-value">{{ summary.total }}</span>
+        </span>
       </div>
-      <div class="card card-success">
-        <div class="card-value">{{ summary.opened }}</div>
-        <div class="card-label">已开仓</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">已开仓</span>
+          <span class="summary-value summary-success">{{ summary.opened }}</span>
+        </span>
       </div>
-      <div class="card card-danger">
-        <div class="card-value">{{ summary.rejected }}</div>
-        <div class="card-label">被拒</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">被拒</span>
+          <span class="summary-value summary-danger">{{ summary.rejected }}</span>
+        </span>
       </div>
-      <div class="card card-info">
-        <div class="card-value">{{ summary.conditions_lost }}</div>
-        <div class="card-label">条件消失</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">条件消失</span>
+          <span class="summary-value summary-info">{{ summary.conditions_lost }}</span>
+        </span>
       </div>
-      <div class="card card-primary">
-        <div class="card-value">{{ summary.monitoring }}</div>
-        <div class="card-label">监控中</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">监控中</span>
+          <span class="summary-value summary-primary">{{ summary.monitoring }}</span>
+        </span>
       </div>
-      <div class="card">
-        <div class="card-value">{{ summary.conversion_rate }}%</div>
-        <div class="card-label">转化率</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">转化率</span>
+          <span class="summary-value">{{ summary.conversion_rate }}%</span>
+        </span>
       </div>
-      <div class="card">
-        <div class="card-value">{{ formatDuration(summary.avg_duration_sec) }}</div>
-        <div class="card-label">平均时长</div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">最近更新</span>
+          <span class="summary-value">{{ formatTime(summary.latest_signal_time) }}</span>
+        </span>
       </div>
     </div>
 
@@ -400,6 +466,51 @@ onUnmounted(() => {
         style="width: 100%; height: 100%"
       />
     </div>
+
+    <!-- 底部分页控件 -->
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="onPageChange"
+          controls-position="right"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -412,37 +523,57 @@ onUnmounted(() => {
   gap: 12px;
 }
 
-.summary-cards {
+/* ───── 汇总栏 ───── */
+.summary-bar {
   display: flex;
-  gap: 12px;
+  align-items: center;
+  gap: 24px;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  padding: 10px 18px;
   flex-wrap: wrap;
 }
 
-.card {
-  background: var(--app-card, #1e1e2e);
-  border: 1px solid var(--app-border, #2d2d3d);
-  border-radius: 8px;
-  padding: 12px 18px;
-  min-width: 100px;
-  text-align: center;
+.summary-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
-.card-value {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--el-text-color-primary, #e0e0e0);
+.summary-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
 }
 
-.card-label {
+.summary-label {
   font-size: 12px;
-  color: var(--el-text-color-secondary, #909399);
-  margin-top: 4px;
+  color: var(--app-text-muted);
 }
 
-.card-success .card-value { color: #67c23a; }
-.card-danger .card-value { color: #f56c6c; }
-.card-info .card-value { color: #909399; }
-.card-primary .card-value { color: #409eff; }
+.summary-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.summary-value.summary-success {
+  color: #67c23a;
+}
+
+.summary-value.summary-danger {
+  color: #f56c6c;
+}
+
+.summary-value.summary-info {
+  color: #909399;
+}
+
+.summary-value.summary-primary {
+  color: #409eff;
+}
 
 .filter-bar {
   display: flex;
@@ -493,5 +624,26 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 底部分页控件 */
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

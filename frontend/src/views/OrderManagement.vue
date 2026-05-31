@@ -52,7 +52,7 @@ interface OrderGroup {
   orders: OrderRow[]
   total_amount: number
   executed_amount: number
-  status: 'all_executed' | 'partial' | 'pending'
+  status: 'all_executed' | 'partial' | 'pending' | 'rejected'
 }
 
 interface DisplayRow {
@@ -64,7 +64,7 @@ interface DisplayRow {
   orders?: OrderRow[]
   total_amount?: number
   executed_amount?: number
-  groupStatus?: 'all_executed' | 'partial' | 'pending'
+  groupStatus?: 'all_executed' | 'partial' | 'pending' | 'rejected'
   isExpanded?: boolean
   // 明细行字段（继承 OrderRow）
   id?: number
@@ -100,7 +100,13 @@ const statusFilter = ref<string>('')
 const channelFilter = ref<string>('')
 const orderSideFilter = ref<string>('')
 const baseAssetFilter = ref<string>('')
-const timeRange = ref<[string, string] | null>(null)
+const filterDays = ref<number>(1) // 默认今日
+
+// 分页配置
+const paginationPageSize = ref<number>(500)
+const paginationPageSizeOptions = [500, 1000, 2000, 5000]
+const paginationCurrentPage = ref<number>(1)
+const paginationTotal = ref<number>(0)
 
 /** 从当前数据中提取唯一标的资产列表，供下拉框选择 */
 const assetOptions = computed(() => {
@@ -407,6 +413,7 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
           all_executed: '#67c23a',
           partial: '#e6a23c',
           pending: '#909399',
+          rejected: '#f56c6c',
         }
         const color = statusMap[params.data.groupStatus ?? 'pending'] ?? '#909399'
         return { color }
@@ -419,6 +426,7 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
           all_executed: '全部成交',
           partial: '部分成交',
           pending: '待执行',
+          rejected: '被拒',
         }
         return statusMap[params.data.groupStatus ?? 'pending'] ?? '待执行'
       }
@@ -742,8 +750,11 @@ const displayRows = computed<DisplayRow[]>(() => {
   // 计算分组状态
   for (const group of groups.values()) {
     const executedCount = group.orders.filter(o => o.status === 'executed').length
+    const rejectedCount = group.orders.filter(o => o.status === 'rejected').length
     if (executedCount === group.orders.length) {
       group.status = 'all_executed'
+    } else if (rejectedCount > 0) {
+      group.status = 'rejected'
     } else if (executedCount > 0) {
       group.status = 'partial'
     } else {
@@ -833,10 +844,41 @@ function toggleAllGroups(expand: boolean) {
     expandedGroups.value = new Set()
   }
 }
+
+/** 快捷时间过滤 */
+function setDaysFilter(days: number) {
+  filterDays.value = days
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchOrders()
+}
+
+/** 快捷状态过滤 */
+function setStatusFilter(status: string) {
+  statusFilter.value = status
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchOrders()
+}
+
+/** 快捷渠道过滤 */
+function setChannelFilter(channel: string) {
+  channelFilter.value = channel
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchOrders()
+}
+
+/** 快捷方向过滤 */
+function setOrderSideFilter(side: string) {
+  orderSideFilter.value = side
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchOrders()
+}
 async function fetchOrders() {
   loading.value = true
   try {
     const params = new URLSearchParams()
+    params.set('days', String(filterDays.value))
+    params.set('page', String(paginationCurrentPage.value))
+    params.set('page_size', String(paginationPageSize.value))
     if (statusFilter.value) {
       params.set('status', statusFilter.value)
     }
@@ -849,12 +891,6 @@ async function fetchOrders() {
     if (baseAssetFilter.value) {
       params.set('base_asset', baseAssetFilter.value.trim())
     }
-    if (timeRange.value && timeRange.value[0]) {
-      params.set('start_time', timeRange.value[0])
-    }
-    if (timeRange.value && timeRange.value[1]) {
-      params.set('end_time', timeRange.value[1])
-    }
     const query = params.toString()
     const url = `/api/trading/orders${query ? '?' + query : ''}`
     const res = await get(url)
@@ -863,13 +899,35 @@ async function fetchOrders() {
       return
     }
     const data = await res.json()
-    rowData.value = Array.isArray(data) ? data : (data.orders ?? [])
+    rowData.value = data.orders || []
+    
+    // 更新分页信息
+    if (data.pagination) {
+      paginationTotal.value = data.pagination.total || 0
+    }
   } catch {
     showError('请求订单数据失败')
   } finally {
     loading.value = false
   }
 }
+
+/** 页码变化 */
+function onPageChange(page: number) {
+  paginationCurrentPage.value = page
+  fetchOrders()
+}
+
+/** 每页条数变化 */
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1 // 切换每页条数时回到第一页
+  fetchOrders()
+}
+
+/** 计算总页数 */
+const totalPages = computed(() => {
+  return Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
+})
 
 /* ───── 列选择面板 ───── */
 function refreshColumnVisibilities() {
@@ -1013,42 +1071,41 @@ onUnmounted(() => {
   <div class="monitor-page">
     <el-card shadow="never" class="status-card">
       <div class="filter-row">
-        <span class="filter-label">状态过滤：</span>
-        <el-radio-group v-model="statusFilter" size="small" @change="fetchOrders">
-          <el-radio-button
-            v-for="opt in statusOptions"
-            :key="opt.value"
-            :value="opt.value"
-          >
-            {{ opt.label }}
-          </el-radio-button>
-        </el-radio-group>
+        <span class="filter-label">状态：</span>
+        <el-button-group size="small">
+          <el-button :type="statusFilter === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部</el-button>
+          <el-button :type="statusFilter === 'executed' ? 'primary' : 'default'" @click="setStatusFilter('executed')">已成交</el-button>
+          <el-button :type="statusFilter === 'pending' ? 'primary' : 'default'" @click="setStatusFilter('pending')">待执行</el-button>
+          <el-button :type="statusFilter === 'rejected' ? 'primary' : 'default'" @click="setStatusFilter('rejected')">被拒</el-button>
+          <el-button :type="statusFilter === 'failed' ? 'primary' : 'default'" @click="setStatusFilter('failed')">失败</el-button>
+        </el-button-group>
 
-        <span class="filter-label" style="margin-left: 24px;">渠道过滤：</span>
-        <el-radio-group v-model="channelFilter" size="small" @change="fetchOrders">
-          <el-radio-button
-            v-for="opt in channelOptions"
-            :key="opt.value"
-            :value="opt.value"
-          >
-            {{ opt.label }}
-          </el-radio-button>
-        </el-radio-group>
+        <span class="filter-label" style="margin-left: 24px;">渠道：</span>
+        <el-button-group size="small">
+          <el-button :type="channelFilter === '' ? 'primary' : 'default'" @click="setChannelFilter('')">全部</el-button>
+          <el-button :type="channelFilter === 'Mock' ? 'primary' : 'default'" @click="setChannelFilter('Mock')">Mock</el-button>
+          <el-button :type="channelFilter === 'SimTrade' ? 'primary' : 'default'" @click="setChannelFilter('SimTrade')">SimTrade</el-button>
+          <el-button :type="channelFilter === 'Live' ? 'primary' : 'default'" @click="setChannelFilter('Live')">Live</el-button>
+        </el-button-group>
 
-        <span class="filter-label" style="margin-left: 24px;">方向过滤：</span>
-        <el-radio-group v-model="orderSideFilter" size="small" @change="fetchOrders">
-          <el-radio-button
-            v-for="opt in orderSideOptions"
-            :key="opt.value"
-            :value="opt.value"
-          >
-            {{ opt.label }}
-          </el-radio-button>
-        </el-radio-group>
+        <span class="filter-label" style="margin-left: 24px;">方向：</span>
+        <el-button-group size="small">
+          <el-button :type="orderSideFilter === '' ? 'primary' : 'default'" @click="setOrderSideFilter('')">全部</el-button>
+          <el-button :type="orderSideFilter === 'open' ? 'primary' : 'default'" @click="setOrderSideFilter('open')">开仓</el-button>
+          <el-button :type="orderSideFilter === 'close' ? 'primary' : 'default'" @click="setOrderSideFilter('close')">平仓</el-button>
+        </el-button-group>
       </div>
 
       <div class="filter-row" style="margin-top: 10px;">
-        <span class="filter-label">标的：</span>
+        <span class="filter-label">时间：</span>
+        <el-button-group size="small">
+          <el-button :type="filterDays === 1 ? 'primary' : 'default'" @click="setDaysFilter(1)">今日</el-button>
+          <el-button :type="filterDays === 3 ? 'primary' : 'default'" @click="setDaysFilter(3)">3天</el-button>
+          <el-button :type="filterDays === 7 ? 'primary' : 'default'" @click="setDaysFilter(7)">7天</el-button>
+          <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDaysFilter(30)">30天</el-button>
+        </el-button-group>
+
+        <span class="filter-label" style="margin-left: 24px;">标的：</span>
         <el-select
           v-model="baseAssetFilter"
           placeholder="标的资产"
@@ -1066,23 +1123,10 @@ onUnmounted(() => {
           />
         </el-select>
 
-        <span class="filter-label" style="margin-left: 24px;">时间：</span>
-        <el-date-picker
-          v-model="timeRange"
-          type="datetimerange"
-          range-separator="-"
-          start-placeholder="开始"
-          end-placeholder="结束"
-          size="small"
-          value-format="YYYY-MM-DDTHH:mm:ss"
-          style="width: 280px;"
-          @change="fetchOrders"
-        />
-
         <el-button
           size="small"
           type="primary"
-          style="margin-left: 16px;"
+          style="margin-left: auto;"
           :loading="loading"
           @click="fetchOrders"
         >
@@ -1146,6 +1190,51 @@ onUnmounted(() => {
       />
       </div>
     </el-card>
+
+    <!-- 底部分页控件 -->
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="onPageChange"
+          controls-position="right"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1269,5 +1358,26 @@ onUnmounted(() => {
 /* 汇总行背景色 */
 :deep(.ag-row[data-row-index]) {
   background: transparent;
+}
+
+/* 底部分页控件 */
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

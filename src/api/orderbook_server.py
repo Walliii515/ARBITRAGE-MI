@@ -155,6 +155,13 @@ _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p
 _trading_executor: Optional['TradingExecutor'] = None
 _closing_executor: Optional['ClosingExecutor'] = None
 
+# ───── 交易链路连通性熔断 ─────
+# 仅实盘模式下启用：Binance + Gate 任一不通即禁止交易
+_exchange_connectivity_ok: bool = True       # 默认 True（虚拟模式不受影响）
+_is_real_executor: bool = False              # 是否接入真实成交引擎
+_connectivity_detail: Dict = {}              # 最近一次连通性检查详情
+_connectivity_check_interval: int = 30       # 连通性检查间隔（秒）
+
 # 合并+对冲指标缓存（避免多个后台循环重复计算）
 _cached_merged_rows: List[Dict] = []
 _cached_merged_ts: float = 0.0
@@ -450,6 +457,7 @@ async def lifespan(app: FastAPI):
     # svc.register_broadcast(schedule_broadcast)
     svc.set_runtime(event_loop, broadcast_queue, build_payload, schedule_broadcast)
     asyncio.create_task(_orderbook_broadcast_loop())
+    asyncio.create_task(_connectivity_check_loop())
 
     # 自动启动 WS 服务（进程崩溃重启后自动恢复连接）
     auto_start = config.get('orderbook.auto_start', False)
@@ -514,6 +522,25 @@ async def service_connections():
         'binance_ws_connected': svc._binance_ws_connected(),
         'gate_ws_latency_ms': svc._calc_gate_data_age_ms(),
         'binance_ws_latency_ms': svc._calc_binance_data_age_ms(),
+    }
+
+
+@app.get('/api/service/exchange-connectivity')
+async def exchange_connectivity():
+    """获取交易链路连通性状态（无需认证，用于前端监控展示）
+
+    返回：
+    - is_real: 是否为实盘模式
+    - all_ok: 双边交易所是否均连通
+    - detail: 最近一次检查详情
+    - trading_allowed: 是否允许交易（虚拟模式始终 True）
+    """
+    return {
+        'is_real': _is_real_executor,
+        'all_ok': _exchange_connectivity_ok,
+        'trading_allowed': (not _is_real_executor) or _exchange_connectivity_ok,
+        'detail': _connectivity_detail,
+        'check_interval_sec': _connectivity_check_interval,
     }
 
 
@@ -640,6 +667,10 @@ async def _open_position_loop():
             if not svc or svc.state != SERVICE_RUNNING:
                 continue
 
+            # 交易链路熔断：实盘模式下，任一交易所不通则禁止开仓
+            if _is_real_executor and not _exchange_connectivity_ok:
+                continue
+
             # WS 已断连时跳过，避免用陈旧缓存数据触发开仓
             if not svc._gate_ws_connected() or not svc._binance_ws_connected():
                 continue
@@ -756,6 +787,10 @@ async def _close_position_loop():
             await asyncio.sleep(interval)
 
             if not svc or svc.state != SERVICE_RUNNING:
+                continue
+
+            # 交易链路熔断：实盘模式下，任一交易所不通则禁止平仓
+            if _is_real_executor and not _exchange_connectivity_ok:
                 continue
 
             # WS 已断连时跳过，避免用陈旧缓存数据触发平仓
@@ -901,6 +936,96 @@ async def _vwap_snapshot_loop():
 
         except Exception as e:
             logger.error(f"VWAP快照落库失败: {e}")
+
+
+async def _connectivity_check_loop():
+    """定时检查交易所 API 链路连通性（仅实盘模式生效）
+
+    逻辑：
+    1. 启动时等待 10s 让成交引擎服务就绪
+    2. 通过 ExecutorClient.check_health() 判断是否为 real 引擎
+    3. 如果是 real 引擎，定期调用 check_connectivity() 检查 Binance + Gate
+    4. 任一不通则设 _exchange_connectivity_ok = False，阻断开仓/平仓
+    5. 恢复后自动解除熔断
+    """
+    global _exchange_connectivity_ok, _is_real_executor, _connectivity_detail
+
+    from calc.executor_client import ExecutorClient
+
+    executor_url = config.get_str('trade.executor.url', 'http://localhost:8081')
+    executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
+    client = ExecutorClient(executor_url, timeout=executor_timeout)
+
+    # 启动等待：让成交引擎服务先启动
+    await asyncio.sleep(10)
+
+    # 探测是否为真实成交引擎
+    health = client.check_health()
+    engine_type = health.get('engine', 'virtual')
+    _is_real_executor = (engine_type == 'real')
+
+    if not _is_real_executor:
+        logger.info(f'成交引擎类型: {engine_type}，跳过交易链路连通性检查')
+        return  # 虚拟模式不需要检查
+
+    env_name = health.get('env', 'unknown')
+    logger.info(f'检测到真实成交引擎 (env={env_name})，启动交易链路连通性定时检查 (间隔 {_connectivity_check_interval}s)')
+
+    # 启动时立即执行一次检查
+    result = client.check_connectivity()
+    _connectivity_detail = result
+    _exchange_connectivity_ok = result.get('all_ok', False)
+
+    if _exchange_connectivity_ok:
+        log_print(f'✅ 交易链路连通性检查通过 (env={env_name})')
+    else:
+        binance_ok = result.get('binance', {}).get('ok', False)
+        gate_ok = result.get('gate', {}).get('ok', False)
+        log_print(
+            f'❌ 交易链路连通性检查失败! '
+            f'Binance={"✅" if binance_ok else "❌"} Gate={"✅" if gate_ok else "❌"} '
+            f'— 开仓/平仓已熔断'
+        )
+
+    # 定时循环检查
+    while True:
+        await asyncio.sleep(_connectivity_check_interval)
+        try:
+            result = client.check_connectivity()
+            _connectivity_detail = result
+            was_ok = _exchange_connectivity_ok
+            _exchange_connectivity_ok = result.get('all_ok', False)
+
+            # 状态变更时打印日志
+            if was_ok and not _exchange_connectivity_ok:
+                binance_ok = result.get('binance', {}).get('ok', False)
+                gate_ok = result.get('gate', {}).get('ok', False)
+                logger.warning(
+                    f'交易链路断开! Binance={"✅" if binance_ok else "❌"} '
+                    f'Gate={"✅" if gate_ok else "❌"} — 开仓/平仓已熔断'
+                )
+                # 通过 WS 通知前端
+                if broadcast_queue:
+                    await broadcast_queue.put({
+                        'type': 'connectivity_alert',
+                        'all_ok': False,
+                        'binance_ok': binance_ok,
+                        'gate_ok': gate_ok,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    })
+            elif not was_ok and _exchange_connectivity_ok:
+                logger.info('交易链路已恢复! 开仓/平仓熔断解除')
+                if broadcast_queue:
+                    await broadcast_queue.put({
+                        'type': 'connectivity_alert',
+                        'all_ok': True,
+                        'binance_ok': True,
+                        'gate_ok': True,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    })
+        except Exception as e:
+            logger.error(f'交易链路连通性检查异常: {e}')
+            _exchange_connectivity_ok = False
 
 
 # ───── 崩溃日志：全局异常钩子 ─────
