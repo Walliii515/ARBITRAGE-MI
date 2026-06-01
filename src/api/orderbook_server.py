@@ -82,8 +82,10 @@ SNAPSHOT_BATCH_SIZE = config.get_int('orderbook.snapshot_batch_size', 40)
 SNAPSHOT_BATCH_WORKERS = config.get_int('orderbook.snapshot_batch_workers', 40)
 # 每次开仓金额（USDT），作为新列推送给前端
 OPEN_AMOUNT_USDT = config.get_float('trade.open.amount_usdt', 5000.0)
-# 资金费率阈值百分位字段名（对应 mi_gate_future_funding_rate_threshold 表的列名）
+# 资金费率阈值百分位字段名（对应 mi_gate_future_funding_rate_threshold 表的列名，保留给前端展示）
 FUNDING_THRESHOLD_PERCENTILE = config.get_str('trade.filter.funding_rate_threshold_percentile', 'percentile_30')
+# 资金费率下限(bps)，开仓过滤用
+MIN_FUNDING_RATE_BPS = config.get_float('trade.open.min_funding_rate_bps', -6.0)
 # 盘口覆盖阈值
 ORDERBOOK_COVERAGE_THRESHOLD = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)
 # 风险缓释（bps）
@@ -150,6 +152,7 @@ _spot_meta: Dict[str, Dict] = {}
 _threshold_meta: Dict[str, float] = {}
 _vwap_threshold_meta: Dict[str, float] = {}  # base_asset -> threshold_bps
 _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p10..p40}
+_funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费率(止盈用)
 
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
@@ -193,41 +196,52 @@ def _get_merged_rows() -> List[Dict]:
 
 
 
-def fetch_threshold_meta() -> Dict[str, float]:
-    """从 mi_gate_future_funding_rate_threshold 表加载阈值百分位字段，按 contract 索引"""
-    sql = f"SELECT contract, {FUNDING_THRESHOLD_PERCENTILE} FROM mi_gate_future_funding_rate_threshold"
+def fetch_threshold_meta() -> tuple:
+    """从 mi_gate_future_funding_rate_threshold 表一次性加载：
+    1. 前端过滤用阈值（按 contract 索引）
+    2. 止盈用 percentile_40（按 base_asset 索引）
+
+    Returns:
+        (threshold_meta, funding_rate_p40_meta)
+        - threshold_meta: Dict[contract, float] — 前端展示/过滤用
+        - funding_rate_p40_meta: Dict[base_asset, float] — 止盈阈值计算用
+    """
+    sql = f"SELECT contract, {FUNDING_THRESHOLD_PERCENTILE}, percentile_40 FROM mi_gate_future_funding_rate_threshold"
     try:
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
             rows = cursor.fetchall()
-            result = {}
+            threshold_result = {}
+            p40_result = {}
             for row in rows:
                 contract = row['contract']
-                result[contract] = float(row[FUNDING_THRESHOLD_PERCENTILE]) if row[FUNDING_THRESHOLD_PERCENTILE] is not None else None
-            logger.info(f'已加载阈值元数据 {len(result)} 条')
-            return result
+                # 前端过滤用（按 contract 索引）
+                val = row[FUNDING_THRESHOLD_PERCENTILE]
+                threshold_result[contract] = float(val) if val is not None else None
+                # 止盈用 percentile_40（按 base_asset 索引）
+                p40_val = row['percentile_40']
+                if p40_val is not None:
+                    base_asset = contract.replace('_USDT', '').replace('_usdt', '')
+                    p40_result[base_asset] = float(p40_val)
+            logger.info(f'已加载费率阈值元数据 {len(threshold_result)} 条（含p40 {len(p40_result)} 条）')
+            return threshold_result, p40_result
     except Exception as e:
-        logger.error(f'加载阈值元数据失败: {e}')
-        return {}
+        logger.error(f'加载费率阈值元数据失败: {e}')
+        return {}, {}
 
 
-def fetch_vwap_threshold_meta() -> Dict[str, float]:
-    """从 mi_vwap_basis_threshold 加载最新一天的按标的VWAP基差阈值（开仓）
+def fetch_vwap_threshold_meta() -> Dict[str, Dict[str, float]]:
+    """从 mi_vwap_basis_threshold 加载最新一天的按标的VWAP开仓基差阈值（p10 + p20）
 
-    根据配置项 trade.vwap_open_threshold_percentile 动态选择对应的 pX 列。
+    返回: base_asset -> {'p10': float, 'p20': float}
+    - p10: 直接开仓阈值（降序前10%，更高基差）
+    - p20: 回落确认阈值（降序前20%，中高基差）
     """
-    col = config.get_str('trade.vwap.open_threshold_percentile', 'open_basis_p20')
-    # 防注入校验
-    valid_cols = ('open_basis_p10', 'open_basis_p20', 'open_basis_p30', 'open_basis_p40')
-    if col not in valid_cols:
-        logger.warning(f'vwap_open_threshold_percentile 配置值无效: {col}，回退为 open_basis_p20')
-        col = 'open_basis_p20'
-
-    sql = f"""
-        SELECT base_asset, {col} AS threshold_bps
+    sql = """
+        SELECT base_asset, open_basis_p10, open_basis_p20
         FROM mi_vwap_basis_threshold
         WHERE calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)
-          AND {col} IS NOT NULL
+          AND (open_basis_p10 IS NOT NULL OR open_basis_p20 IS NOT NULL)
     """
     try:
         with db_manager.get_cursor() as cursor:
@@ -235,8 +249,14 @@ def fetch_vwap_threshold_meta() -> Dict[str, float]:
             rows = cursor.fetchall()
             result = {}
             for row in rows:
-                result[row['base_asset']] = float(row['threshold_bps'])
-            logger.info(f'已加载VWAP开仓基差阈值 {len(result)} 条 (col={col})')
+                entry = {}
+                if row.get('open_basis_p10') is not None:
+                    entry['p10'] = float(row['open_basis_p10'])
+                if row.get('open_basis_p20') is not None:
+                    entry['p20'] = float(row['open_basis_p20'])
+                if entry:
+                    result[row['base_asset']] = entry
+            logger.info(f'已加载VWAP开仓基差阈值 {len(result)} 条 (p10+p20)')
             return result
     except Exception as e:
         logger.error(f'加载VWAP开仓基差阈值失败: {e}')
@@ -249,7 +269,7 @@ def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
     返回格式: base_asset -> {close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40}
     """
     sql = """
-        SELECT base_asset, close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40
+        SELECT base_asset, open_basis_p20, close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40
         FROM mi_vwap_basis_threshold
         WHERE calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)
     """
@@ -261,6 +281,7 @@ def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
             for row in rows:
                 ba = row['base_asset']
                 result[ba] = {
+                    'open_basis_p20': float(row['open_basis_p20']) if row.get('open_basis_p20') is not None else None,
                     'close_basis_p10': float(row['close_basis_p10']) if row.get('close_basis_p10') is not None else None,
                     'close_basis_p20': float(row['close_basis_p20']) if row.get('close_basis_p20') is not None else None,
                     'close_basis_p30': float(row['close_basis_p30']) if row.get('close_basis_p30') is not None else None,
@@ -290,6 +311,7 @@ def build_payload() -> dict:
         'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'open_amount_usdt': OPEN_AMOUNT_USDT,
         'funding_threshold_percentile': FUNDING_THRESHOLD_PERCENTILE,
+        'min_funding_rate_bps': MIN_FUNDING_RATE_BPS,
         'orderbook_coverage_threshold': ORDERBOOK_COVERAGE_THRESHOLD,
         'risk_relief_bps': RISK_RELIEF_BPS,
         'open_vwap_basis_threshold_bps': OPEN_VWAP_BASIS_THRESHOLD_BPS,
@@ -399,14 +421,14 @@ async def lifespan(app: FastAPI):
     broadcast_queue = asyncio.Queue()
     worker_task = asyncio.create_task(broadcast_worker())
 
-    global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _meta_update_time
+    global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _funding_rate_p40_meta, _meta_update_time
     _contract_meta = fetch_contract_meta()
     _spot_meta = fetch_spot_meta()
-    _threshold_meta = fetch_threshold_meta()
+    _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_print(f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条')
+    log_print(f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条，费率p40 {len(_funding_rate_p40_meta)} 条')
 
     async def _refresh_meta_cache_loop():
         """定时刷新内存缓存（ETL由各任务的IntervalScheduler独立执行）"""
@@ -424,14 +446,14 @@ async def lifespan(app: FastAPI):
             try:
                 logger.info(f'开始定时刷新内存缓存 (间隔: {min_interval} 分钟)...')
                 # 刷新内存缓存
-                global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _meta_update_time
+                global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _funding_rate_p40_meta, _meta_update_time
                 _contract_meta = fetch_contract_meta()
                 _spot_meta = fetch_spot_meta()
-                _threshold_meta = fetch_threshold_meta()
+                _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
                 _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
                 _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                logger.info(f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, 阈値 {len(_threshold_meta)} 条, VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条')
+                logger.info(f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, 阈値 {len(_threshold_meta)} 条, VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, 费率p40 {len(_funding_rate_p40_meta)} 条')
                 # 重置执行器单例，下次循环用新元数据重建
                 global _trading_executor, _closing_executor
                 _trading_executor = None
@@ -815,7 +837,7 @@ async def _position_funding_loop():
 
 async def _close_position_loop():
     """定时检查平仓条件，触发平仓执行"""
-    interval = config.get_int('trade.close.check_interval_sec', 5)
+    interval = config.get_float('trade.close.check_interval_sec', 0.5)
 
     while True:
         try:
@@ -870,7 +892,7 @@ async def _close_position_loop():
             global _closing_executor
             if _closing_executor is None:
                 from calc.closing_executor import ClosingExecutor
-                _closing_executor = ClosingExecutor(_contract_meta, _spot_meta)
+                _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
             results = _closing_executor.check_and_close(
                 positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
             )

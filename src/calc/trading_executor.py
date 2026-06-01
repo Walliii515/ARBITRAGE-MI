@@ -20,20 +20,19 @@ from exchange_apis.get_gate_future_contracts import get_single_contract_funding_
 class TradingExecutor:
     """交易执行器(开仓判断 + 订单生成 + 持久化，通过 ExecutorClient 调用成交引擎服务)"""
     
-    def __init__(self, contract_meta: Dict, spot_meta: Dict, threshold_meta: Dict,
+    def __init__(self, contract_meta: Dict, spot_meta: Dict, threshold_meta: Dict = None,
                  vwap_threshold_meta: Optional[Dict[str, float]] = None,
                  close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None):
         """
         Args:
             contract_meta: base_asset -> {quanto_multiplier, order_size_min, price_decimal, size_decimal, ...}
             spot_meta: base_asset -> {step_size, min_qty, ...}
-            threshold_meta: contract -> percentile threshold value
+            threshold_meta: 已废弃，保留参数兼容调用方
             vwap_threshold_meta: base_asset -> threshold_bps (按标的VWAP基差阈值)
             close_vwap_threshold_meta: base_asset -> {close_basis_p10..p40} (平仓基差阈值，用于盈利性守卫)
         """
         self.contract_meta = contract_meta
         self.spot_meta = spot_meta
-        self.threshold_meta = threshold_meta
         self.vwap_threshold_meta = vwap_threshold_meta or {}
         self.close_vwap_threshold_meta = close_vwap_threshold_meta or {}
         
@@ -46,7 +45,7 @@ class TradingExecutor:
         self.coverage_threshold = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)
         self.basis_threshold_bps = config.get_float('trade.open.vwap_basis_threshold_bps', -60)
         self.cooldown_sec = config.get_int('trade.open.cooldown_sec', 3600)
-        self.funding_threshold_key = config.get('trade.filter.funding_rate_threshold_percentile', 'percentile_30')
+        self.min_funding_rate_bps = config.get_float('trade.open.min_funding_rate_bps', -6.0)
 
         # 手续费率（用于盈利性守卫计算）
         self.fee_cost_bps = -calc_full_fee_bps(
@@ -159,10 +158,19 @@ class TradingExecutor:
                 if not self._pass_reject_cooldown(base_asset):
                     continue
                 
-                # 3. 峰值回落确认
+                # 3. 判断开仓通道
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
-                if not self._pass_peak_check(base_asset, open_vwap_basis, row):
-                    continue
+                direct_open = self._is_direct_open(base_asset, open_vwap_basis)
+
+                if direct_open:
+                    # 通道B: 基差>=p10，实时费率校验后直接开仓
+                    contract = row.get('contract', '')
+                    if not self._verify_realtime_funding_rate(base_asset, contract):
+                        continue
+                else:
+                    # 通道A: 基差>=p20，走峰值回落确认
+                    if not self._pass_peak_check(base_asset, open_vwap_basis, row):
+                        continue
                 
                 # 3.5 peak确认后，刷新最新盘口数据（消除决策到执行间的数据陈旧）
                 if refresh_fn:
@@ -252,7 +260,7 @@ class TradingExecutor:
         """
         风控规则检查:
         0. 保证金风控: 该标的现有持仓距爆仓距离 < warning_pct 时禁止开仓
-        1. 资金费率 >= 阈值
+        1. 资金费率 >= 下限(min_funding_rate_bps)
         2. 开仓盘口覆盖 <= 阈值
         3. 开仓边际基差 >= 阈值
         4. 盈利性守卫: 开仓基差 > 平仓基差阈值 + 手续费(确保价差有收敛空间)
@@ -274,12 +282,10 @@ class TradingExecutor:
             if min_notional is not None and self.open_amount_usdt < min_notional:
                 return False
 
-        # 资金费率检查
+        # 资金费率下限检查：24h费率(bps) >= min_funding_rate_bps
         funding_rate = row.get('funding_rate_24h')
-        contract = row.get('contract', '')
-        threshold = self.threshold_meta.get(contract)
-        if funding_rate is not None and threshold is not None:
-            if float(funding_rate) < float(threshold):
+        if funding_rate is not None:
+            if float(funding_rate) * 10000 < self.min_funding_rate_bps:
                 return False
         
         # 盘口覆盖检查
@@ -290,12 +296,13 @@ class TradingExecutor:
         
         # 边际基差检查（支持按标的VWAP基差阈值）
         # 统一口径：均与纯基差（open_vwap_basis_bps）对比，不含手续费和风险缓释
+        # 双通道最低门槛：使用 p20 作为入场最低要求
         base_asset = row.get('base_asset', '')
         open_vwap_basis = row.get('open_vwap_basis_bps')
         if open_vwap_basis is not None:
             if base_asset in self.vwap_threshold_meta:
-                # 按标的阈值：基差必须 >= 阈值才允许开仓
-                if float(open_vwap_basis) < self.vwap_threshold_meta[base_asset]:
+                p20 = self.vwap_threshold_meta[base_asset].get('p20')
+                if p20 is not None and float(open_vwap_basis) < p20:
                     return False
             else:
                 # 全局回退阈值
@@ -325,9 +332,17 @@ class TradingExecutor:
         
         return True
     
+    def _is_direct_open(self, base_asset: str, current_basis_bps: float) -> bool:
+        """判断是否走直接开仓通道（基差 >= p10，跳过峰值回落确认）"""
+        if base_asset in self.vwap_threshold_meta:
+            p10 = self.vwap_threshold_meta[base_asset].get('p10')
+            if p10 is not None:
+                return current_basis_bps >= p10
+        return False  # 无p10数据时回退到回落确认通道
+
     def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
         """
-        开仓前实时校验资金费率：从 Gate API 获取最新费率，确认仍为正且达标。
+        开仓前实时校验资金费率：从 Gate API 获取最新费率，确认仍达到下限。
         若 API 调用失败（网络问题等），回退为放行（不阻塞开仓）。
         """
         try:
@@ -337,20 +352,12 @@ class TradingExecutor:
                 logger.debug(f"实时费率校验跳过(获取失败) | {base_asset}")
                 return True
             
-            # 校验费率 >= 0（基本条件：费率为正）
-            if realtime_rate_24h < 0:
+            # 校验费率 >= 下限(min_funding_rate_bps)
+            rate_bps = realtime_rate_24h * 10000
+            if rate_bps < self.min_funding_rate_bps:
                 logger.info(
                     f"实时费率校验拦截 | {base_asset} | "
-                    f"实时费率={realtime_rate_24h*100:.4f}%(已翻负)"
-                )
-                return False
-            
-            # 校验费率是否达到阈值
-            threshold = self.threshold_meta.get(contract)
-            if threshold is not None and realtime_rate_24h < float(threshold):
-                logger.info(
-                    f"实时费率校验拦截 | {base_asset} | "
-                    f"实时费率={realtime_rate_24h*100:.4f}% < 阈值{float(threshold)*100:.4f}%"
+                    f"实时费率={rate_bps:.2f}bps < 下限{self.min_funding_rate_bps:.1f}bps"
                 )
                 return False
             
@@ -505,13 +512,12 @@ class TradingExecutor:
             min_notional = self.spot_meta[base_asset].get('min_notional')
             if min_notional is not None and self.open_amount_usdt < min_notional:
                 return f"开仓金额低于最小名义值({self.open_amount_usdt}<{min_notional}USDT)"
-        # 资金费率检查
+        # 资金费率下限检查
         funding_rate = row.get('funding_rate_24h')
-        contract = row.get('contract', '')
-        threshold = self.threshold_meta.get(contract)
-        if funding_rate is not None and threshold is not None:
-            if float(funding_rate) < float(threshold):
-                return f"资金费率不达标({float(funding_rate)*100:.4f}%<{float(threshold)*100:.4f}%)"
+        if funding_rate is not None:
+            rate_bps = float(funding_rate) * 10000
+            if rate_bps < self.min_funding_rate_bps:
+                return f"资金费率不达标({rate_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)"
 
         # 盘口覆盖检查
         open_coverage = row.get('open_coverage')
@@ -521,9 +527,10 @@ class TradingExecutor:
         # 基差不达标
         open_vwap_basis = row.get('open_vwap_basis_bps')
         if open_vwap_basis is not None:
-            thr = self.vwap_threshold_meta.get(base_asset, self.basis_threshold_bps)
-            if float(open_vwap_basis) < thr:
-                return f"基差跌回阈值下({float(open_vwap_basis):.1f}<{thr:.1f}bps)"
+            threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+            p20 = threshold_data.get('p20', self.basis_threshold_bps)
+            if float(open_vwap_basis) < p20:
+                return f"基差跌回阈值下({float(open_vwap_basis):.1f}<p20={p20:.1f}bps)"
 
         # 盈利性守卫
         if open_vwap_basis is not None and base_asset in self.close_vwap_threshold_meta:
@@ -553,9 +560,15 @@ class TradingExecutor:
         """
         parts = []
 
-        # 1. VWAP基差 vs 阈值
-        threshold_bps = self.vwap_threshold_meta.get(base_asset, self.basis_threshold_bps)
-        parts.append(f"基差{open_vwap_basis:.1f}bps(阈值{threshold_bps:.1f})")
+        # 1. VWAP基差 vs 阈值 + 通道标记
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        p10 = threshold_data.get('p10')
+        p20 = threshold_data.get('p20', self.basis_threshold_bps)
+        direct = p10 is not None and open_vwap_basis >= p10
+        if direct:
+            parts.append(f"基差{open_vwap_basis:.1f}bps(直开p10={p10:.1f})")
+        else:
+            parts.append(f"基差{open_vwap_basis:.1f}bps(阈值p20={p20:.1f})")
 
         # 2. 24h资金费率
         funding_rate = row.get('funding_rate_24h')

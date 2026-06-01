@@ -7,7 +7,7 @@
 平仓触发条件（按优先级）：
   1. 资金费次数 >= max_funding_payments
   2. 止盈: 总盈亏bps(基差收敛 + 已收资金费) >= 24h资金费率bps * multiplier + 手续费bps
-  3. 资金费率为负: 根据距下次结算时间选用不同 close_basis_pX 阈值，不足15分钟无条件平仓
+  3. 累计资金费超阈值: 费率为负时，累计支出bps >= max(open_p20 - close_p20, 15) × 0.5
 """
 import uuid
 from datetime import datetime
@@ -25,14 +25,16 @@ logger = get_logger(__name__)
 class ClosingExecutor:
     """平仓执行器（条件判断 + 订单生成 + 持久化，通过 ExecutorClient 调用成交引擎服务）"""
 
-    def __init__(self, contract_meta: Dict, spot_meta: Dict):
+    def __init__(self, contract_meta: Dict, spot_meta: Dict, funding_rate_p40_meta: Dict = None):
         """
         Args:
             contract_meta: base_asset -> {quanto_multiplier, ...}
             spot_meta:     base_asset -> {step_size, min_qty, ...}
+            funding_rate_p40_meta: base_asset -> percentile_40资金费率（用于止盈阈值计算）
         """
         self.contract_meta = contract_meta
         self.spot_meta = spot_meta
+        self.funding_rate_p40_meta = funding_rate_p40_meta or {}
 
         executor_url = config.get_executor_url()
         executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
@@ -60,6 +62,10 @@ class ClosingExecutor:
         # 平仓失败冷却机制
         self.close_cooldown_sec = config.get_int('trade.close.cooldown_sec', 60)
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
+
+        # 累计资金费支出阈值配置
+        self.funding_cost_tolerance_ratio = config.get_float('trade.close.funding_cost_tolerance_ratio', 0.5)
+        self.funding_cost_min_threshold_bps = config.get_float('trade.close.funding_cost_min_threshold_bps', 15.0)
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
@@ -140,11 +146,9 @@ class ClosingExecutor:
                 # 止盈不再满足，清除谷底监控状态
                 self._valley_state.pop(ba, None)
                 threshold_data = close_vwap_threshold_meta.get(ba, {})
-                if self._check_negative_funding(pos, current_spread_bps, threshold_data):
-                    close_reason = 'negative_funding'
-                    close_reason_detail = self._build_negative_funding_detail(
-                        pos, current_spread_bps, threshold_data
-                    )
+                if self._check_funding_cost_exceeded(pos, threshold_data):
+                    close_reason = 'funding_cost_exceeded'
+                    close_reason_detail = self._build_funding_cost_detail(pos, threshold_data)
 
             if not close_reason:
                 continue
@@ -204,17 +208,18 @@ class ClosingExecutor:
 
     def _check_take_profit(self, pos: Dict, current_spread_bps: float) -> bool:
         """
-        止盈条件（仅资金费率为正时适用）：
-            总盈亏bps(基差收敛 + 已收资金费) >= 24h资金费率(bps) * take_profit_days_multiplier + 手续费成本(bps)
+        止盈条件：
+            总盈亏bps(基差收敛 + 已收资金费) >= percentile_40费率(bps) * multiplier + 手续费(bps)
 
-        take_profit_days_multiplier 作用于24h资金费率，N=10 表示止盈目标为10天的资金费收入。
+        使用历史 percentile_40 资金费率（约为中位数正费率）作为基准，
+        避免当前费率为负时止盈失效。
         """
-        funding_rate_24h = pos.get('funding_rate_24h')
-        if funding_rate_24h is None:
-            return False
-        funding_rate_24h_val = float(funding_rate_24h)
-        if funding_rate_24h_val <= 0:
-            return False  # 费率为负时不适用止盈条件
+        ba = pos.get('base_asset', '')
+
+        # 从历史分位获取基准费率
+        funding_rate_p40 = self.funding_rate_p40_meta.get(ba)
+        if funding_rate_p40 is None or funding_rate_p40 <= 0:
+            return False  # 无历史数据或历史中位数也为负，不触发止盈
 
         open_spread_bps = float(pos.get('open_spread_bps') or 0)
         # 基差收敛利润 = 开仓基差 - 当前基差（收敛则为正）
@@ -224,62 +229,38 @@ class ClosingExecutor:
         # 总盈亏 = 基差收敛 + 已收资金费
         total_pnl_bps = spread_profit_bps + funding_earned_bps
 
-        # funding_rate_24h 是24小时总费率（如 0.0003 = 0.03%/天），转为 bps
-        funding_rate_bps = funding_rate_24h_val * 10000
-        # 止盈阈值 = N天资金费等价收益 + 全部开平仓手续费成本(bps)
+        # percentile_40 是24小时费率原始值（如 0.0003），转为 bps
+        funding_rate_bps = funding_rate_p40 * 10000
+        # 止盈阈值 = N天资金费等价收益 + 全部开平仓手续费(bps)
         fee_cost_bps = self.fee_full_bps
         threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
         return total_pnl_bps >= threshold
 
-    def _check_negative_funding(
-        self, pos: Dict, current_spread_bps: float, threshold_data: Dict
-    ) -> bool:
+    def _check_funding_cost_exceeded(self, pos: Dict, threshold_data: Dict) -> bool:
         """
-        资金费率为负时的平仓条件：
-        - 资金费率 >= 0 则不触发
-        - 仅在距下次资金支付 <= 2 小时时才生效（远离结算时费率波动大，不值得为短暂翻负平仓）
-        - 根据距下次资金支付剩余时间选用不同阈值列
-        - 不足 15 分钟无条件平仓
+        累计资金费支出超阈值：
+        - 前置：当前费率为负
+        - 阈值 = max(open_basis_p20 - close_basis_p20, min_threshold_bps) * tolerance_ratio
+        - 当 abs(funding_pnl_bps) >= 阈值时触发
         """
         funding_rate_24h = pos.get('funding_rate_24h')
         if funding_rate_24h is None or float(funding_rate_24h) >= 0:
             return False
 
-        # 解析下次资金支付时间
-        funding_next_str = pos.get('funding_next_apply')
-        if not funding_next_str:
+        funding_pnl_bps = float(pos.get('funding_pnl_bps') or 0)
+        if funding_pnl_bps >= 0:
+            return False  # 净收入，无需平仓
+
+        open_p20 = threshold_data.get('open_basis_p20')
+        close_p20 = threshold_data.get('close_basis_p20')
+        if open_p20 is None or close_p20 is None:
             return False
 
-        try:
-            if isinstance(funding_next_str, datetime):
-                next_time = funding_next_str
-            else:
-                next_time = datetime.strptime(str(funding_next_str)[:19], '%Y-%m-%d %H:%M:%S')
-        except (ValueError, TypeError):
-            logger.warning(f"无法解析 funding_next_apply: {funding_next_str}")
-            return False
+        convergence_space = float(open_p20) - float(close_p20)
+        effective_space = max(convergence_space, self.funding_cost_min_threshold_bps)
+        threshold = effective_space * self.funding_cost_tolerance_ratio
 
-        minutes_to_next = (next_time - datetime.now()).total_seconds() / 60
-
-        # 距结算超过 2 小时：不触发负费率平仓（费率波动大，可能很快翻正）
-        if minutes_to_next > 120:
-            return False
-
-        # 不足 15 分钟，无条件平仓
-        if minutes_to_next <= 15:
-            return True
-
-        # 根据剩余时间选择对应分位阈值（15min ~ 2h）
-        if minutes_to_next > 60:      # 1~2 小时
-            col = 'close_basis_p20'
-        else:                           # 15 分钟 ~ 1 小时
-            col = 'close_basis_p40'
-
-        threshold = threshold_data.get(col)
-        if threshold is None:
-            return False
-
-        return current_spread_bps <= float(threshold)
+        return abs(funding_pnl_bps) >= threshold
 
     def _pass_valley_check(self, base_asset: str, current_spread_bps: float, pos: Dict) -> bool:
         """
@@ -352,8 +333,8 @@ class ClosingExecutor:
         funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
         total_pnl_bps = spread_profit_bps + funding_earned_bps
 
-        funding_rate_24h_val = float(pos.get('funding_rate_24h') or 0)
-        funding_rate_bps = funding_rate_24h_val * 10000
+        funding_rate_p40 = self.funding_rate_p40_meta.get(ba, 0)
+        funding_rate_bps = funding_rate_p40 * 10000
         fee_cost_bps = self.fee_full_bps
         threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
 
@@ -361,7 +342,7 @@ class ClosingExecutor:
             f"止盈|总盈亏{total_pnl_bps:.1f}bps"
             f"(收敛{spread_profit_bps:.1f}+资金费{funding_earned_bps:.1f})"
             f">={threshold:.1f}bps"
-            f"({funding_rate_bps:.1f}×{self.take_profit_multiplier:.0f}+{fee_cost_bps:.0f}费)"
+            f"(p40={funding_rate_bps:.1f}×{self.take_profit_multiplier:.0f}+{fee_cost_bps:.0f}费)"
         )
 
         # 附加谷底反弹信息
@@ -377,45 +358,19 @@ class ClosingExecutor:
 
         return detail
 
-    def _build_negative_funding_detail(
-        self, pos: Dict, current_spread_bps: float, threshold_data: Dict
-    ) -> str:
-        """构建资金费率为负平仓的详细原因字符串"""
-        funding_rate_24h = float(pos.get('funding_rate_24h') or 0)
-        rate_pct = funding_rate_24h * 100
-
-        funding_next_str = pos.get('funding_next_apply')
-        minutes_to_next = None
-        if funding_next_str:
-            try:
-                if isinstance(funding_next_str, datetime):
-                    next_time = funding_next_str
-                else:
-                    next_time = datetime.strptime(str(funding_next_str)[:19], '%Y-%m-%d %H:%M:%S')
-                minutes_to_next = (next_time - datetime.now()).total_seconds() / 60
-            except (ValueError, TypeError):
-                pass
-
-        if minutes_to_next is not None and minutes_to_next <= 15:
-            return (
-                f"费率为负|费率{rate_pct:.4f}%"
-                f"|剩余{minutes_to_next:.0f}min(<15min无条件平仓)"
-            )
-
-        # 确定使用了哪个分位阈值（15min ~ 2h 窗口）
-        col = 'close_basis_p40'
-        if minutes_to_next is not None:
-            if minutes_to_next > 60:
-                col = 'close_basis_p20'
-
-        threshold_val = threshold_data.get(col)
-        thr_str = f"{float(threshold_val):.1f}" if threshold_val is not None else '?'
-        min_str = f"{minutes_to_next:.0f}" if minutes_to_next is not None else '?'
+    def _build_funding_cost_detail(self, pos: Dict, threshold_data: Dict) -> str:
+        """构建累计资金费超阈值平仓的详细原因"""
+        funding_pnl_bps = float(pos.get('funding_pnl_bps') or 0)
+        open_p20 = float(threshold_data.get('open_basis_p20') or 0)
+        close_p20 = float(threshold_data.get('close_basis_p20') or 0)
+        convergence_space = open_p20 - close_p20
+        effective_space = max(convergence_space, self.funding_cost_min_threshold_bps)
+        threshold = effective_space * self.funding_cost_tolerance_ratio
 
         return (
-            f"费率为负|费率{rate_pct:.4f}%"
-            f"|剩余{min_str}min"
-            f"|基差{current_spread_bps:.1f}<={thr_str}({col})"
+            f"资金费超限|累计{funding_pnl_bps:.1f}bps"
+            f"|阈值-{threshold:.1f}bps"
+            f"(收敛空间{effective_space:.1f}×{self.funding_cost_tolerance_ratio})"
         )
 
     # ──────────────────────────────────────────────────────────────────

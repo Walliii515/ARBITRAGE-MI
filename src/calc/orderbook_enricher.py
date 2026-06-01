@@ -147,7 +147,7 @@ def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
 
 def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                            spot_meta: Dict[str, Dict], threshold_meta: Dict[str, float],
-                           vwap_threshold_meta: Dict[str, float],
+                           vwap_threshold_meta: Dict[str, Dict],
                            cfg: EnrichConfig, meta_update_time: str,
                            close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None) -> None:
     """
@@ -259,8 +259,9 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         row['spot_usdt_bid_total'] = round(spot_bid_total, 2)
         row['spot_usdt_ask_total'] = round(spot_ask_total, 2)
 
-        # --- 按标的 VWAP 基差阈值 ---
-        row['vwap_threshold_bps'] = vwap_threshold_meta.get(base_asset)
+        # --- 按标的 VWAP 基差阈值（前端展示用 p20） ---
+        threshold_entry = vwap_threshold_meta.get(base_asset)
+        row['vwap_threshold_bps'] = threshold_entry.get('p20') if threshold_entry else None
 
         # --- 盈利性守卫: 平仓基差阈值 ---
         if close_vwap_threshold_meta and base_asset in close_vwap_threshold_meta:

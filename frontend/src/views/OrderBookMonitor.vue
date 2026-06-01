@@ -34,6 +34,7 @@ interface WsMessage {
   binance_ws?: ProgressInfo
   binance_data?: ProgressInfo
   funding_threshold_percentile?: string
+  min_funding_rate_bps?: number
   orderbook_coverage_threshold?: number
   risk_relief_bps?: number
   open_vwap_basis_threshold_bps?: number
@@ -154,8 +155,8 @@ const gateSnapshotProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 
 const gateWsProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
 const binanceDataProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
 const serviceBusy = ref(false)
-/** 资金费率阈值百分位字段名，从后端动态获取 */
-const fundingThresholdPercentile = ref<string>('percentile_30')
+/** 资金费率下限(bps)，从后端动态获取 */
+const minFundingRateBps = ref<number>(-6)
 /** 资金费率过滤开关（默认开启） */
 const filterByFundingRate = ref<boolean>(true)
 /** 盘口覆盖阈值，从后端动态获取 */
@@ -232,15 +233,14 @@ function fundingRateFilterFunc(params: any): boolean {
   if (!data) return true
   
   const fundingRate = data.funding_rate_24h
-  const percentileField = fundingThresholdPercentile.value as keyof OrderBookRow
-  const threshold = data[percentileField] as number | null | undefined
   
-  // 如果任一值为空，不排除（保持显示）
-  if (fundingRate == null || threshold == null) {
+  // 如果值为空，不排除（保持显示）
+  if (fundingRate == null) {
     return true
   }
   
-  return fundingRate >= threshold
+  // 资金费率(bps) >= 下限
+  return fundingRate * 10000 >= minFundingRateBps.value
 }
 
 /** AG Grid 外部过滤函数：盘口覆盖过滤 */
@@ -436,10 +436,8 @@ function fmtDepthPercent(v: number | null | undefined): string {
   return (v * 100).toFixed(1) + '%'
 }
 
-/** 动态生成列定义，根据配置的资金费率阈值百分位字段 */
+/** 动态生成列定义 */
 const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
-  const percentileField = fundingThresholdPercentile.value
-  
   return [
     { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90, sort: 'asc' },
     {
@@ -484,22 +482,12 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
         const value = params.value as number | null
         if (value == null) return { color: '#909399' }
         
-        const row = params.data
-        if (!row) return { color: '#909399' }
-        
-        const thresholdField = fundingThresholdPercentile.value as keyof OrderBookRow
-        const threshold = row[thresholdField] as number | null | undefined
-        
-        // >= 阈值：绿色
-        if (threshold != null && value >= threshold) {
+        // >= 下限(bps)：绿色
+        if (value * 10000 >= minFundingRateBps.value) {
           return { color: '#67c23a' }
         }
-        // < 0：红色
-        if (value < 0) {
-          return { color: '#f56c6c' }
-        }
-        // 其他：灰色
-        return { color: '#909399' }
+        // < 下限：红色
+        return { color: '#f56c6c' }
       },
     },
     {
@@ -519,16 +507,13 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       },
     },
     {
-      headerName: '费率阈值',
-      field: percentileField as string,
+      headerName: '费率下限(bps)',
       width: 110,
       type: 'numericColumn',
       cellClass: 'ag-right-aligned-cell',
       headerClass: 'ag-right-aligned-header',
-      valueFormatter: (p) => {
-        if (p.value == null) return '—'
-        return (Number(p.value) * 100).toFixed(4) + '%'
-      },
+      valueGetter: () => minFundingRateBps.value,
+      valueFormatter: (p) => p.value != null ? p.value.toFixed(1) : '—',
     },
   {
     headerName: '数据更新时间',
@@ -1060,9 +1045,9 @@ function connectWs() {
       // 更新交易所 WS 延迟
       if (msg.gate_ws_latency_ms !== undefined) gateWsLatencyMs.value = msg.gate_ws_latency_ms
       if (msg.binance_ws_latency_ms !== undefined) binanceWsLatencyMs.value = msg.binance_ws_latency_ms
-      // 更新资金费率阈值百分位配置
-      if (msg.funding_threshold_percentile) {
-        fundingThresholdPercentile.value = msg.funding_threshold_percentile
+      // 更新资金费率下限配置
+      if (msg.min_funding_rate_bps != null) {
+        minFundingRateBps.value = msg.min_funding_rate_bps
       }
       // 更新盘口覆盖阈值配置
       if (msg.orderbook_coverage_threshold != null) {
