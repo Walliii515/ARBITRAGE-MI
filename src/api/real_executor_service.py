@@ -14,7 +14,7 @@ TradingExecutor 通过 ExecutorClient 调用本服务完成真实下单。
     GET  /api/health   — 健康检查
     GET  /api/connectivity — 测试交易所连通性（新增）
 
-切换方式：修改 config.yaml 中 trade.executor.url 为 http://localhost:8082
+切换方式：修改 config.yaml 中 trade.mode 为 testnet/live（会自动使用 8082 端口的实盘服务）
 """
 import argparse
 import os
@@ -53,11 +53,11 @@ def _build_exchange_config() -> ExchangeConfig:
     """
     根据配置构建交易所配置
 
-    从 config.yaml 的 real_executor.env 读取环境（mainnet/testnet）
-    - env=testnet → 使用 Testnet URL + Testnet Key
-    - env=mainnet → 使用 Mainnet URL + Mainnet Key
+    环境由统一参数 trade.mode 派生（也可通过 TRADE_MODE 环境变量覆盖）：
+      - trade.mode = live    → 使用 Mainnet URL + Mainnet Key
+      - 其余（virtual/testnet） → 使用 Testnet URL + Testnet Key
     """
-    env = config.get_str('real_executor.env', default='testnet').lower()
+    env = config.get_real_executor_env()
 
     if env == 'mainnet':
         return ExchangeConfig(

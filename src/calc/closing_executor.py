@@ -34,7 +34,7 @@ class ClosingExecutor:
         self.contract_meta = contract_meta
         self.spot_meta = spot_meta
 
-        executor_url = config.get('trade.executor.url', 'http://localhost:8081')
+        executor_url = config.get_executor_url()
         executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
         self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
 

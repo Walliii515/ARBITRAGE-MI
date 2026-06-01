@@ -24,10 +24,15 @@ orderbook:
   snapshot_batch_workers: 40
 
 trade:
+  # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
+  # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
+  mode: live
+
   # ─── 成交引擎 ───
   executor:
-    # url: http://localhost:8081    # 虚拟盘地址
-    url: http://localhost:8082    # 实盘地址
+    # url: 默认由 trade.mode 派生（virtual→08081，testnet/live→08082）
+    # 如需自定义主机/端口可取消下行注释覆盖：
+    # url: http://localhost:8082
     timeout_sec: 15                # HTTP 请求超时（秒）
 
   # ─── 手续费率 ───
@@ -112,9 +117,8 @@ capital:
   gate_initial: 250
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
-# API Key/Secret 从 .env 环境变量读取，此处仅配置 URL 和超时
+# API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数
+# 注：交易所环境（mainnet/testnet）由顶层 trade.mode 统一控制，不再在此重复配置
 real_executor:
-  # 环境: testnet / mainnet（模拟盘/实盘，也可通过 EXCHANGE_ENV 环境变量覆盖）
-  env: mainnet
   # HTTP 请求超时（秒）
   timeout_sec: 10

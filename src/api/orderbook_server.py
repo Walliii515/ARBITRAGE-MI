@@ -987,7 +987,7 @@ async def _connectivity_check_loop():
 
     from calc.executor_client import ExecutorClient
 
-    executor_url = config.get_str('trade.executor.url', 'http://localhost:8081')
+    executor_url = config.get_executor_url()
     executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
     client = ExecutorClient(executor_url, timeout=executor_timeout)
 

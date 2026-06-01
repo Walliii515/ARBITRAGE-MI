@@ -76,6 +76,42 @@ class Config:
         value = self.get(key, default, env=env)
         return '' if value is None else str(value)
 
+    # ─── 运行模式统一入口（virtual / testnet / live） ───
+    # 主参数：trade.mode，则其他参数（成交引擎 URL、交易所环境）由它派生。
+    # 环境变量 TRADE_MODE 可临时覆盖；EXCHANGE_ENV 仅作为老变量向后兼容。
+    _VALID_TRADE_MODES = ('virtual', 'testnet', 'live')
+
+    def get_trade_mode(self) -> str:
+        """获取交易运行模式：virtual（虚拟盘） / testnet（模拟盘） / live（实盘）。
+
+        优先级：环境变量 TRADE_MODE > config.yaml 的 trade.mode > 默认 virtual。
+        对未知枚举值返回 virtual（安全默认，避免误上实盘）。
+        兼容老别名 'mainnet' → 视为 'live'。
+        """
+        mode = self.get_str('trade.mode', default='virtual', env='TRADE_MODE').lower()
+        if mode == 'mainnet':
+            mode = 'live'  # 向后兼容旧配置
+        return mode if mode in self._VALID_TRADE_MODES else 'virtual'
+
+    def get_executor_url(self) -> str:
+        """成交引擎 HTTP 地址。
+
+        - virtual 模式 → virtual_executor_service（默认 8081）
+        - testnet/live 模式 → real_executor_service（默认 8082）
+        - 如需自定义主机/端口，可在 config.yaml 显式设置 trade.executor.url 覆盖。
+        """
+        explicit = self.get_str('trade.executor.url', default='').strip()
+        if explicit:
+            return explicit
+        return 'http://localhost:8081' if self.get_trade_mode() == 'virtual' else 'http://localhost:8082'
+
+    def get_real_executor_env(self) -> str:
+        """真实成交引擎使用的交易所环境：mainnet 或 testnet（交易所术语）。
+
+        由 trade.mode 派生：live → mainnet，其余（virtual/testnet）→ testnet。
+        """
+        return 'mainnet' if self.get_trade_mode() == 'live' else 'testnet'
+
 
 # 全局单例
 config = Config()
