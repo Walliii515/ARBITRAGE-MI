@@ -324,3 +324,35 @@ Gate WS ─────┘           │
 - ✓ 广播节流（`broadcast_throttle_sec`）
 - ✓ 计算结果缓存（merge + hedge_metrics 缓存）
 - ✓ 定时轮询替代逐消息回调
+
+### 9.2 开仓热路径零 IO 约束
+
+> `_open_position_loop`（0.5s 间隔）是系统最关键的延迟敏感路径，**必须保持纯内存操作 + 下单**。
+
+**热路径允许的操作**：
+- ✓ 读取内存 OrderBook（`gate_manager.to_records()` / `spot_manager.to_records()`）
+- ✓ 纯计算（merge、hedge_metrics、enrich_trading_fields）
+- ✓ 读取内存风控状态（`_holding_liq_distance`、`_peak_state`）
+- ✓ 调用 ExecutorClient 下单（唯一允许的网络 IO）
+- ✓ 下单成功后持久化订单（非阻塞关键路径，已在执行结果返回后）
+
+**热路径禁止的操作**：
+- ✗ 数据库查询（如 `get_holding_positions()`、`get_all_positions()`）
+- ✗ REST API 调用（如实时获取费率、余额查询）
+- ✗ 文件 IO、日志落盘（`logger.info` 允许，但不可做同步文件写入阻塞）
+- ✗ 任何 `time.sleep()` 或同步阻塞等待
+
+**分频架构**：将不同实时性需求的逻辑拆分为独立循环
+
+| 循环 | 频率 | 操作类型 | 数据来源 |
+|------|------|----------|----------|
+| `_open_position_loop` | 0.5s | **纯内存 + 下单** | 无缓存直读 OrderBook |
+| `_margin_status_loop` | 5s | DB 查询 + PnL 计算 | 带缓存合并数据 |
+| `_close_position_loop` | 5s | DB 查询 + 平仓判断 | 带缓存合并数据 |
+| `_position_realtime_push` | 5s | DB 查询 + 前端推送 | 带缓存合并数据 |
+| `_orderbook_broadcast_loop` | 1s | 序列化 + 前端推送 | 带缓存合并数据 |
+
+**设计原则**：
+1. 凡不影响开仓决策实时性的逻辑（保证金状态、持仓推送、前端广播），**必须独立为低频循环**
+2. 开仓热路径的风控状态（如距爆仓距离）由低频循环预计算并写入内存，热路径仅**读取**
+3. 新增开仓前置检查时，若涉及 IO 操作，应在进入峰值监控时（首次触发）执行一次，而非每次循环执行

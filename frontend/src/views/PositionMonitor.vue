@@ -214,10 +214,30 @@ function scheduleReconnect() {
   }, 3000)
 }
 
+/** 判断 WS 行是否匹配当前过滤条件，未通过的行不进入 grid，避免 WS 持续推送把已过滤的行带回页面 */
+function matchesActiveFilter(row: PositionRow): boolean {
+  if (statusFilter.value && row.status !== statusFilter.value) return false
+  if (baseAssetFilter.value && row.base_asset !== baseAssetFilter.value) return false
+  return true
+}
+
 function applyPositionUpdates(updates: PositionRow[]) {
   ensureFundingBps(updates)
+  // WS 推送不携带 funding_history（后端为压缩消息体不下发），需保留 REST 初始加载/funding_history_update 已注入的字段，避免被覆盖
+  for (const row of updates) {
+    if (row.funding_history === undefined) {
+      const existing = positionMap.get(row.id)
+      if (existing && existing.funding_history != null) {
+        row.funding_history = existing.funding_history
+      }
+    }
+  }
+
+  // 仅保留通过当前过滤条件的行（防止 WS 把已被过滤的状态/标的带回 grid）
+  const filtered = updates.filter(matchesActiveFilter)
+
   if (!gridApi) {
-    for (const row of updates) {
+    for (const row of filtered) {
       positionMap.set(row.id, row)
     }
     rowData.value = Array.from(positionMap.values())
@@ -226,9 +246,19 @@ function applyPositionUpdates(updates: PositionRow[]) {
 
   const add: PositionRow[] = []
   const update: PositionRow[] = []
+  const remove: PositionRow[] = []
 
   for (const row of updates) {
     const old = positionMap.get(row.id)
+    const passes = matchesActiveFilter(row)
+    if (!passes) {
+      // 已不匹配过滤条件：从 grid 中移除（例如某行从 holding → closed，而当前选了 holding）
+      if (old) {
+        remove.push(old)
+        positionMap.delete(row.id)
+      }
+      continue
+    }
     if (!old) {
       add.push(row)
     } else {
@@ -237,8 +267,8 @@ function applyPositionUpdates(updates: PositionRow[]) {
     positionMap.set(row.id, row)
   }
 
-  if (add.length > 0 || update.length > 0) {
-    gridApi.applyTransaction({ add, update })
+  if (add.length > 0 || update.length > 0 || remove.length > 0) {
+    gridApi.applyTransaction({ add, update, remove })
     // 同步更新 rowData，触发 pinnedBottomRowData 重新计算
     rowData.value = Array.from(positionMap.values())
   }
@@ -858,6 +888,8 @@ const totalPages = computed(() => {
 function setStatusFilter(status: string) {
   statusFilter.value = status
   paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  // 通知 AG Grid 外部过滤器状态已变更（否则 WS 后续推送的行不会被重新评估）
+  gridApi?.onFilterChanged()
   fetchPositions()
 }
 
@@ -865,6 +897,13 @@ function setStatusFilter(status: string) {
 function setDaysFilter(days: number) {
   filterDays.value = days
   paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchPositions()
+}
+
+/** 标的资产过滤变更：同样需要通知 grid 外部过滤器状态变更 */
+function onBaseAssetFilterChange() {
+  paginationCurrentPage.value = 1
+  gridApi?.onFilterChanged()
   fetchPositions()
 }
 
@@ -1102,7 +1141,7 @@ onUnmounted(() => {
           filterable
           clearable
           style="width: 150px;"
-          @change="fetchPositions"
+          @change="onBaseAssetFilterChange"
         >
           <el-option
             v-for="asset in assetOptions"

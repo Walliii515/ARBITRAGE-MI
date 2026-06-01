@@ -34,14 +34,14 @@ trade:
   fee:
     spot_open: 0.00075
     spot_close: 0.00075
-    future_open: 0.00075
-    future_close: 0.00075
+    future_open: 0.0005
+    future_close: 0.0005
 
   # ─── 开仓策略 ───
   open:
     amount_usdt: 10                        # 单笔开仓金额（USDT）
-    check_interval_sec: 5                   # 开仓检查间隔（秒）
-    cooldown_sec: 15                        # 同标的开仓冷却（秒）
+    check_interval_sec: 0.5                 # 开仓检查间隔（秒）
+    cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
     max_positions_per_asset: 3              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
@@ -60,8 +60,8 @@ trade:
 
   # ─── 峰值回落策略（开仓确认） ───
   peak_pullback:
-    pullback_pct: 0.10                      # 从峰值回落百分比(10%)确认开仓
-    monitor_timeout_sec: 300                # 监控超时（秒），超时后直接开仓
+    pullback_pct: 0.03                    # 从峰值回落百分比(3%)确认开仓
+    monitor_timeout_sec: 30                 # 监控超时（秒），超时后直接开仓
     timeout_cooldown_sec: 300               # 超时开仓后冷却期（秒）
 
   # ─── 平仓策略 ───

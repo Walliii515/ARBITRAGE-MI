@@ -14,6 +14,7 @@ from common.logger import get_logger
 logger = get_logger(__name__)
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps, calc_open_fee_bps
 from calc.executor_client import ExecutorClient
+from exchange_apis.get_gate_future_contracts import get_single_contract_funding_rate
 
 
 class TradingExecutor:
@@ -106,12 +107,13 @@ class TradingExecutor:
                 if ba not in self._holding_liq_distance or liq_dist < self._holding_liq_distance[ba]:
                     self._holding_liq_distance[ba] = liq_dist
 
-    def check_and_open(self, orderbook_rows: List[Dict]) -> List[Dict]:
+    def check_and_open(self, orderbook_rows: List[Dict], refresh_fn=None) -> List[Dict]:
         """
         检查所有合约并执行开仓
         
         Args:
             orderbook_rows: 合并后的订单簿行(已计算对冲指标)
+            refresh_fn: 可选回调，peak确认后调用获取最新盘口数据（减少决策到执行间的数据陈旧）
         
         Returns:
             开仓结果列表
@@ -159,8 +161,19 @@ class TradingExecutor:
                 
                 # 3. 峰值回落确认
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
-                if not self._pass_peak_check(base_asset, open_vwap_basis):
+                if not self._pass_peak_check(base_asset, open_vwap_basis, row):
                     continue
+                
+                # 3.5 peak确认后，刷新最新盘口数据（消除决策到执行间的数据陈旧）
+                if refresh_fn:
+                    try:
+                        fresh_rows = refresh_fn()
+                        fresh_row = next((r for r in fresh_rows if r.get('base_asset') == base_asset), None)
+                        if fresh_row and fresh_row.get('open_vwap_basis_bps') is not None:
+                            row = fresh_row
+                            open_vwap_basis = float(fresh_row['open_vwap_basis_bps'])
+                    except Exception as e:
+                        logger.debug(f"刷新盘口失败(使用原数据): {e}")
                 
                 # 4. 构建开仓原因（用于复盘）
                 open_reason = self._build_open_reason(row, base_asset, open_vwap_basis)
@@ -312,10 +325,45 @@ class TradingExecutor:
         
         return True
     
-    def _pass_peak_check(self, base_asset: str, current_basis_bps: float) -> bool:
+    def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
+        """
+        开仓前实时校验资金费率：从 Gate API 获取最新费率，确认仍为正且达标。
+        若 API 调用失败（网络问题等），回退为放行（不阻塞开仓）。
+        """
+        try:
+            realtime_rate_24h = get_single_contract_funding_rate(contract)
+            if realtime_rate_24h is None:
+                # API 调用失败，回退为放行（不因网络问题阻止开仓）
+                logger.debug(f"实时费率校验跳过(获取失败) | {base_asset}")
+                return True
+            
+            # 校验费率 >= 0（基本条件：费率为正）
+            if realtime_rate_24h < 0:
+                logger.info(
+                    f"实时费率校验拦截 | {base_asset} | "
+                    f"实时费率={realtime_rate_24h*100:.4f}%(已翻负)"
+                )
+                return False
+            
+            # 校验费率是否达到阈值
+            threshold = self.threshold_meta.get(contract)
+            if threshold is not None and realtime_rate_24h < float(threshold):
+                logger.info(
+                    f"实时费率校验拦截 | {base_asset} | "
+                    f"实时费率={realtime_rate_24h*100:.4f}% < 阈值{float(threshold)*100:.4f}%"
+                )
+                return False
+            
+            return True
+        except Exception as e:
+            # 任何异常均回退为放行
+            logger.debug(f"实时费率校验异常(回退放行) | {base_asset}: {e}")
+            return True
+
+    def _pass_peak_check(self, base_asset: str, current_basis_bps: float, row: Dict = None) -> bool:
         """
         峰值回落确认逻辑:
-        - 首次超阈值: 记录峰值和开始时间, 返回 False(等待)
+        - 首次超阈值: 实时校验资金费率 + 记录峰值和开始时间, 返回 False(等待)
         - 后续更高: 更新峰值, 返回 False(继续等待)
         - 从峰值回落 X%: 返回 True(确认开仓)
         - 超时: 返回 True(直接开仓)
@@ -324,7 +372,13 @@ class TradingExecutor:
         state = self._peak_state.get(base_asset)
         
         if state is None:
-            # 首次进入监控，记录峰值和开始时间
+            # 首次进入监控前，实时校验资金费率（仅在此时调用一次API，不影响后续开仓速度）
+            if row:
+                contract = row.get('contract', '')
+                if not self._verify_realtime_funding_rate(base_asset, contract):
+                    return False
+            
+            # 实时费率确认OK，开始峰值监控
             signal_id = self._create_signal(base_asset, current_basis_bps)
             self._peak_state[base_asset] = {
                 'peak_bps': current_basis_bps,

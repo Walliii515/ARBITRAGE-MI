@@ -37,7 +37,7 @@ tasks:
   update_gate_contracts:
     enabled: true
     schedule: interval
-    interval_minutes: 15  # 每 15 分钟执行一次
+    interval_minutes: 5  # 每 5 分钟执行一次（资金费率对开仓/平仓决策影响大，需及时更新）
     run_on_startup: true  # 服务启动时立即执行一次
 
   # Binance 现货交易对信息更新

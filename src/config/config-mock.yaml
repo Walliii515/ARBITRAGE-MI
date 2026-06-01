@@ -34,8 +34,8 @@ trade:
   fee:
     spot_open: 0.00075
     spot_close: 0.00075
-    future_open: 0.00075
-    future_close: 0.00075
+    future_open: 0.0005
+    future_close: 0.0005
 
   # ─── 开仓策略 ───
   open:

@@ -441,6 +441,7 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_refresh_meta_cache_loop())
     asyncio.create_task(_open_position_loop())
+    asyncio.create_task(_margin_status_loop())
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
     asyncio.create_task(_position_realtime_push())
@@ -656,9 +657,19 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
         ws_clients.discard(websocket)
 
 
+def _get_fresh_trading_rows() -> List[Dict]:
+    """无缓存获取最新盘口+富化数据（用于开仓决策链路，确保数据最新鲜）"""
+    future_rows = svc.gate_manager.to_records() if svc and svc.gate_manager else []
+    spot_rows = svc.spot_manager.to_records() if svc and svc.spot_manager else []
+    rows = merge_orderbook_records(future_rows, spot_rows)
+    rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
+    enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg)
+    return rows
+
+
 async def _open_position_loop():
     """定时检查开仓条件"""
-    interval = config.get_int('trade.open.check_interval_sec', 5)
+    interval = config.get_float('trade.open.check_interval_sec', 5)
 
     while True:
         try:
@@ -676,13 +687,11 @@ async def _open_position_loop():
                 continue
 
             if svc.gate_manager and svc.spot_manager:
-                merged_rows = _get_merged_rows()
+                # 开仓链路绕过合并缓存，直接获取最新盘口（减少数据陈旧）
+                merged_rows = _get_fresh_trading_rows()
 
                 if not merged_rows:
                     continue
-
-                # 补充资金费率和阈值数据（使用公共富化模块）
-                enrich_trading_fields(merged_rows, _contract_meta, _threshold_meta, _enrich_cfg)
 
                 global _trading_executor
                 if _trading_executor is None:
@@ -691,28 +700,7 @@ async def _open_position_loop():
                         _vwap_threshold_meta, _close_vwap_threshold_meta
                     )
 
-                # 更新保证金风控状态（用于禁止接近爆仓标的开仓）
-                try:
-                    _margin_tracker = PositionTracker(_contract_meta)
-                    _margin_positions = _margin_tracker.get_holding_positions()
-                    if _margin_positions:
-                        # 构建 close_vwaps 用于计算 liq_distance
-                        _margin_close_vwaps: Dict[str, Dict] = {}
-                        for _mr in merged_rows:
-                            _mba = _mr.get('base_asset', '')
-                            _spot_cv = _mr.get('spot_close_vwap')
-                            _future_cv = _mr.get('future_close_vwap')
-                            if _mba and _spot_cv is not None and _future_cv is not None:
-                                _margin_close_vwaps[_mba] = {
-                                    'spot_close_vwap': float(_spot_cv),
-                                    'future_close_vwap': float(_future_cv),
-                                }
-                        calculate_realtime_pnl(_margin_positions, _margin_close_vwaps, _contract_meta, _pnl_cfg)
-                        _trading_executor.update_holding_margin_status(_margin_positions)
-                except Exception as _me:
-                    logger.debug(f"保证金状态更新失败(不影响开仓): {_me}")
-
-                results = _trading_executor.check_and_open(merged_rows)
+                results = _trading_executor.check_and_open(merged_rows, refresh_fn=_get_fresh_trading_rows)
 
                 # 推送信号变化通知（有任何结果即表示信号表有新增/状态变化）
                 if results and broadcast_queue:
@@ -749,6 +737,53 @@ async def _open_position_loop():
 
         except Exception as e:
             logger.error(f"开仓检查失败: {e}")
+
+
+async def _margin_status_loop():
+    """低频更新保证金风控状态（独立于开仓热路径，避免DB查询拖慢高频开仓检查）
+
+    保证金状态变化缓慢（需价格大幅波动），5秒更新一次即可满足风控需求。
+    """
+    interval = 5  # 秒
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+
+            if not svc or svc.state != SERVICE_RUNNING:
+                continue
+
+            global _trading_executor
+            if _trading_executor is None:
+                continue
+
+            if not (svc.gate_manager and svc.spot_manager):
+                continue
+
+            _margin_tracker = PositionTracker(_contract_meta)
+            _margin_positions = _margin_tracker.get_holding_positions()
+            if not _margin_positions:
+                # 无持仓时清空状态
+                _trading_executor.update_holding_margin_status([])
+                continue
+
+            # 使用带缓存的合并数据即可（保证金计算不需最新鲜数据）
+            merged_rows = _get_merged_rows()
+            _margin_close_vwaps: Dict[str, Dict] = {}
+            for _mr in merged_rows:
+                _mba = _mr.get('base_asset', '')
+                _spot_cv = _mr.get('spot_close_vwap')
+                _future_cv = _mr.get('future_close_vwap')
+                if _mba and _spot_cv is not None and _future_cv is not None:
+                    _margin_close_vwaps[_mba] = {
+                        'spot_close_vwap': float(_spot_cv),
+                        'future_close_vwap': float(_future_cv),
+                    }
+            calculate_realtime_pnl(_margin_positions, _margin_close_vwaps, _contract_meta, _pnl_cfg)
+            _trading_executor.update_holding_margin_status(_margin_positions)
+
+        except Exception as e:
+            logger.debug(f"保证金状态更新失败(不影响开仓): {e}")
 
 
 async def _position_funding_loop():

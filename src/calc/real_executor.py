@@ -15,6 +15,7 @@ import time
 import hashlib
 import hmac
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Optional
 from urllib.parse import urlencode
@@ -79,9 +80,9 @@ class RealExecutor:
         执行真实成交
 
         流程：
-        1. 先下 Binance 现货单
-        2. 现货成功后下 Gate 期货单
-        3. 任一失败则整体标记失败（已成交侧需人工处理）
+        1. 并发下 Binance 现货单 和 Gate 期货单（降低基差滑点）
+        2. 两边都成功则整体成功
+        3. 一边失败则标记单边成交风险（需人工处理）
 
         Args:
             order_group: 订单组，包含 spot_order 和 future_order
@@ -102,44 +103,56 @@ class RealExecutor:
             spot_order = order_group.get('spot_order', {})
             future_order = order_group.get('future_order', {})
 
-            # ── Step 1: 下 Binance 现货单 ──
-            spot_result = self._place_binance_spot_order(spot_order)
-            if not spot_result['success']:
-                result['message'] = f"现货拒单: {spot_result['reason']}"
-                return result
+            # ── 并发下单：同时向 Binance 和 Gate 发送市价单 ──
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                spot_future = pool.submit(self._place_binance_spot_order, spot_order)
+                gate_future = pool.submit(self._place_gate_futures_order, future_order)
 
-            # ── Step 2: 下 Gate 期货单（用现货实际成交量计算合约张数，确保对冲匹配） ──
-            # BUY 使用 quoteOrderQty 模式，实际买到的数量由 Binance 决定
-            # 期货张数必须基于实际成交量，而非预估量
-            if spot_order.get('trade_direction') == 'buy':
-                future_order['target_qty'] = spot_result['exec_qty']
-            future_result = self._place_gate_futures_order(future_order)
-            if not future_result['success']:
-                # 现货已成交但期货失败 — 严重情况，需告警
+                spot_result = spot_future.result()
+                future_result = gate_future.result()
+
+            # ── 判定结果 ──
+            if spot_result['success'] and future_result['success']:
+                # 两边都成功
+                result['spot_order'] = spot_result
+                result['future_order'] = future_result
+                result['success'] = True
+                result['message'] = '成交成功'
+                logger.info(
+                    f"真实成交成功(并发) | {spot_order.get('base_asset')} | "
+                    f"spot: price={spot_result['exec_price']}, qty={spot_result['exec_qty']} | "
+                    f"future: price={future_result['exec_price']}, qty={future_result['exec_qty']}"
+                )
+            elif spot_result['success'] and not future_result['success']:
+                # 现货成功但期货失败 — 严重情况
+                result['spot_order'] = spot_result
                 result['message'] = (
                     f"期货拒单(现货已成交,需人工处理): {future_result['reason']} | "
                     f"spot_exec: price={spot_result.get('exec_price')}, "
                     f"qty={spot_result.get('exec_qty')}"
                 )
-                # 仍然返回现货结果，便于上层记录
-                result['spot_order'] = spot_result
                 logger.critical(
                     f"⚠️ 单边成交风险 | {spot_order.get('base_asset')} | "
                     f"现货已成交但期货失败: {future_result['reason']}"
                 )
-                return result
-
-            # ── 两边都成功 ──
-            result['spot_order'] = spot_result
-            result['future_order'] = future_result
-            result['success'] = True
-            result['message'] = '成交成功'
-
-            logger.info(
-                f"真实成交成功 | {spot_order.get('base_asset')} | "
-                f"spot: price={spot_result['exec_price']}, qty={spot_result['exec_qty']} | "
-                f"future: price={future_result['exec_price']}, qty={future_result['exec_qty']}"
-            )
+            elif not spot_result['success'] and future_result['success']:
+                # 期货成功但现货失败 — 严重情况
+                result['future_order'] = future_result
+                result['message'] = (
+                    f"现货拒单(期货已成交,需人工处理): {spot_result['reason']} | "
+                    f"future_exec: price={future_result.get('exec_price')}, "
+                    f"qty={future_result.get('exec_qty')}"
+                )
+                logger.critical(
+                    f"⚠️ 单边成交风险 | {spot_order.get('base_asset')} | "
+                    f"期货已成交但现货失败: {spot_result['reason']}"
+                )
+            else:
+                # 两边都失败
+                result['message'] = (
+                    f"双边拒单: 现货({spot_result['reason']}), "
+                    f"期货({future_result['reason']})"
+                )
 
         except Exception as e:
             result['message'] = f"系统异常: {str(e)}"

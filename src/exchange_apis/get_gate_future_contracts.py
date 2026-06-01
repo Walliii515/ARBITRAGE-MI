@@ -105,6 +105,44 @@ def get_futures_contracts():
         return None
 
 
+def get_single_contract_funding_rate(contract_name: str) -> float | None:
+    """
+    实时获取单个合约的当前资金费率（用于开仓前的最终校验）
+    
+    Args:
+        contract_name: 合约名称，如 'BTC_USDT'
+    
+    Returns:
+        24h 资金费率（float），失败时返回 None
+    """
+    url = f'/futures/usdt/contracts/{contract_name}'
+    query_string = ''
+    body = ''
+    
+    signature, timestamp = generate_signature('GET', prefix + url, query_string, body, API_SECRET)
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'KEY': API_KEY,
+        'SIGN': signature,
+        'Timestamp': timestamp,
+    }
+    
+    try:
+        response = requests.get(host + prefix + url, headers=headers, timeout=3)
+        response.raise_for_status()
+        contract = response.json()
+        funding_rate = contract.get('funding_rate')
+        funding_interval = contract.get('funding_interval')
+        if funding_rate and funding_interval:
+            rate_24h = float(funding_rate) * (86400 / int(funding_interval))
+            return rate_24h
+        return None
+    except Exception as e:
+        logger.warning(f"实时获取资金费率失败 {contract_name}: {e}")
+        return None
+
+
 if __name__ == '__main__':
     log_print("正在获取 Gate.io 永续合约列表...")
     get_futures_contracts()

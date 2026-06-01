@@ -237,6 +237,7 @@ class ClosingExecutor:
         """
         资金费率为负时的平仓条件：
         - 资金费率 >= 0 则不触发
+        - 仅在距下次资金支付 <= 2 小时时才生效（远离结算时费率波动大，不值得为短暂翻负平仓）
         - 根据距下次资金支付剩余时间选用不同阈值列
         - 不足 15 分钟无条件平仓
         """
@@ -260,17 +261,17 @@ class ClosingExecutor:
 
         minutes_to_next = (next_time - datetime.now()).total_seconds() / 60
 
+        # 距结算超过 2 小时：不触发负费率平仓（费率波动大，可能很快翻正）
+        if minutes_to_next > 120:
+            return False
+
         # 不足 15 分钟，无条件平仓
         if minutes_to_next <= 15:
             return True
 
-        # 根据剩余时间选择对应分位阈值
-        if minutes_to_next > 180:       # 超过 3 小时
-            col = 'close_basis_p10'
-        elif minutes_to_next > 120:     # 2~3 小时
+        # 根据剩余时间选择对应分位阈值（15min ~ 2h）
+        if minutes_to_next > 60:      # 1~2 小时
             col = 'close_basis_p20'
-        elif minutes_to_next > 60:      # 1~2 小时
-            col = 'close_basis_p30'
         else:                           # 15 分钟 ~ 1 小时
             col = 'close_basis_p40'
 
@@ -401,15 +402,11 @@ class ClosingExecutor:
                 f"|剩余{minutes_to_next:.0f}min(<15min无条件平仓)"
             )
 
-        # 确定使用了哪个分位阈值
+        # 确定使用了哪个分位阈值（15min ~ 2h 窗口）
         col = 'close_basis_p40'
         if minutes_to_next is not None:
-            if minutes_to_next > 180:
-                col = 'close_basis_p10'
-            elif minutes_to_next > 120:
+            if minutes_to_next > 60:
                 col = 'close_basis_p20'
-            elif minutes_to_next > 60:
-                col = 'close_basis_p30'
 
         threshold_val = threshold_data.get(col)
         thr_str = f"{float(threshold_val):.1f}" if threshold_val is not None else '?'
