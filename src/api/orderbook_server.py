@@ -643,6 +643,73 @@ async def service_stop():
     return {'ok': True, 'message': message}
 
 
+@app.post('/api/trading/positions/{position_id}/manual-close', dependencies=[Depends(verify_token_dependency)])
+async def manual_close_position(position_id: int):
+    """手动一键平仓：跳过条件检查，直接对指定持仓执行平仓"""
+    # 1. 查询持仓记录
+    def _query_position():
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM mi_trade_position WHERE id = %s AND status = 'holding'",
+                (position_id,)
+            )
+            return cursor.fetchone()
+
+    pos = await asyncio.to_thread(_query_position)
+    if not pos:
+        raise HTTPException(status_code=404, detail=f'持仓 {position_id} 不存在或已平仓')
+
+    ba = pos.get('base_asset', '')
+
+    # 2. 检查盘口数据可用性
+    if not svc or svc.state != SERVICE_RUNNING:
+        raise HTTPException(status_code=503, detail='服务未运行，无法执行平仓')
+
+    if not svc._gate_ws_connected() or not svc._binance_ws_connected():
+        raise HTTPException(status_code=503, detail='WebSocket 未连接，无法获取实时盘口数据')
+
+    # 3. 获取该标的的最新盘口数据
+    merged_rows = _get_merged_rows()
+    orderbook_row = None
+    for row in merged_rows:
+        if row.get('base_asset') == ba:
+            orderbook_row = row
+            break
+
+    if not orderbook_row:
+        raise HTTPException(status_code=503, detail=f'标的 {ba} 无盘口数据，无法执行平仓')
+
+    # 4. 复用 ClosingExecutor 执行平仓
+    global _closing_executor
+    if _closing_executor is None:
+        from calc.closing_executor import ClosingExecutor
+        _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
+
+    result = await asyncio.to_thread(_closing_executor.manual_close, pos, orderbook_row)
+
+    # 5. 平仓成功后推送 WebSocket 通知
+    if result.get('success') and event_loop and broadcast_queue:
+        close_payload = {
+            'type': 'close_position_result',
+            'results': [result],
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        await broadcast_queue.put(close_payload)
+        order_payload = {
+            'type': 'order_update',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        await broadcast_queue.put(order_payload)
+
+    # 6. 返回结果
+    return {
+        'success': result.get('success', False),
+        'message': result.get('message', ''),
+        'order_uuid': result.get('order_uuid'),
+        'base_asset': ba,
+    }
+
+
 @app.websocket('/ws/orderbook')
 async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
     # 验证 token

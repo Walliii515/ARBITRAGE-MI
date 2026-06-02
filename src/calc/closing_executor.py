@@ -374,6 +374,25 @@ class ClosingExecutor:
         )
 
     # ──────────────────────────────────────────────────────────────────
+    # 手动平仓（外部调用入口）
+    # ──────────────────────────────────────────────────────────────────
+
+    def manual_close(self, pos: Dict, orderbook_row: Dict) -> Dict:
+        """手动一键平仓（跳过条件检查，直接执行）
+
+        Args:
+            pos: 持仓记录（需包含 id, base_asset, spot_symbol, future_contract,
+                 spot_open_qty, future_open_qty 等字段）
+            orderbook_row: 该标的的合并订单簿行数据（传给成交引擎）
+
+        Returns:
+            {base_asset, success, order_uuid, close_reason, message}
+        """
+        close_reason = 'manual'
+        close_reason_detail = '手动一键平仓'
+        return self._execute_close(pos, close_reason, close_reason_detail, orderbook_row)
+
+    # ──────────────────────────────────────────────────────────────────
     # 订单构建与执行
     # ──────────────────────────────────────────────────────────────────
 

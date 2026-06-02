@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, onUnmounted, computed, nextTick } from 'vue'
+import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -9,7 +9,7 @@ import type {
   ValueFormatterParams,
   ColumnState,
 } from 'ag-grid-community'
-import { ElPopover } from 'element-plus'
+import { ElPopover, ElMessageBox } from 'element-plus'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
@@ -65,7 +65,7 @@ interface DisplayRow {
   total_amount?: number
   executed_amount?: number
   groupStatus?: 'all_executed' | 'partial' | 'pending' | 'rejected'
-  isExpanded?: boolean
+  isExpanded?: boolean  // deprecated, kept for interface compat
   // 明细行字段（继承 OrderRow）
   id?: number
   created_at?: string | null
@@ -114,8 +114,10 @@ const assetOptions = computed(() => {
   return Array.from(assets).sort()
 })
 
-/** 分组展开状态：position_id -> isExpanded */
-const expandedGroups = ref<Set<number>>(new Set())
+/** 订单详情弹窗 */
+const detailDialogVisible = ref(false)
+const detailOrders = ref<OrderRow[]>([])
+const detailPositionId = ref<number | null>(null)
 
 /** 列状态持久化（数据库版） */
 const PAGE_KEY = 'order_management'
@@ -301,31 +303,6 @@ const orderSideFormatter = (params: ValueFormatterParams) => {
 
 /* ───── 列定义 ───── */
 const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
-  {
-    headerName: '',
-    field: 'isGroupHeader',
-    width: 50,
-    pinned: 'left',
-    lockPosition: true,
-    lockPinned: true,
-    suppressMovable: true,
-    sortable: false,
-    filter: false,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        const icon = group.isExpanded ? '−' : '+'
-        return `
-          <div class="expand-btn-cell">
-            <button class="expand-btn" onclick="window.toggleGroupExpansion(${group.position_id})">
-              ${icon}
-            </button>
-          </div>
-        `
-      }
-      return ''
-    },
-  },
   {
     headerName: '下单时间',
     field: 'created_at',
@@ -679,6 +656,32 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
       return params.data?.reject_reason ?? ''
     },
   },
+  {
+    headerName: '操作',
+    colId: 'action',
+    width: 160,
+    pinned: 'right',
+    lockPosition: true,
+    lockPinned: true,
+    suppressMovable: true,
+    sortable: false,
+    filter: false,
+    cellRenderer: (params: any) => {
+      if (!params.data?.isGroupHeader) return ''
+      const group = params.data as DisplayRow
+      const hasClose = group.orders?.some((o: any) => o.order_side === 'close')
+      const openOrders = group.orders?.filter((o: any) => o.order_side === 'open') ?? []
+      const allOpenExecuted = openOrders.length > 0 && openOrders.every((o: any) => o.status === 'executed')
+      // 详情按钮始终显示，一键平仓仅开仓成功且未平仓时显示
+      let html = `<span class="action-btns">`
+      html += `<button class="detail-btn" onclick="window.openDetailDialog(${group.position_id})">详情</button>`
+      if (!hasClose && allOpenExecuted) {
+        html += `<button class="manual-close-btn" onclick="window.handleManualClose(${group.position_id})">平仓</button>`
+      }
+      html += `</span>`
+      return html
+    },
+  },
 ])
 
 const defaultColDef: ColDef = {
@@ -713,9 +716,7 @@ const getRowId = (params: GetRowIdParams<DisplayRow>) => {
 /* ───── 分组数据转换 ───── */
 /**
  * 将扁平订单转换为分组展示数据
- * 1. 按 position_id 分组
- * 2. 每组生成汇总行
- * 3. 展开的组追加明细行
+ * 每个 position_id 对应一条主记录行（不再支持展开明细）
  */
 const displayRows = computed<DisplayRow[]>(() => {
   const groups = new Map<number, OrderGroup>()
@@ -723,7 +724,7 @@ const displayRows = computed<DisplayRow[]>(() => {
   // 按 position_id 分组
   for (const order of rowData.value) {
     const pid = order.position_id
-    if (pid == null) continue // 无 position_id 的订单暂不分组
+    if (pid == null) continue
     
     if (!groups.has(pid)) {
       groups.set(pid, {
@@ -762,87 +763,36 @@ const displayRows = computed<DisplayRow[]>(() => {
     }
   }
   
-  // 生成展示行
-  const rows: DisplayRow[] = []
-  
-  // 按 position_id 降序排列（最新在前）
+  // 生成展示行（每个 position 一行，按 position_id 降序）
   const sortedGroups = Array.from(groups.values()).sort((a, b) => 
     (b.position_id ?? 0) - (a.position_id ?? 0)
   )
   
-  for (const group of sortedGroups) {
-    const isExpanded = expandedGroups.value.has(group.position_id ?? 0)
-    
-    // 汇总行
-    rows.push({
-      isGroupHeader: true,
-      position_id: group.position_id,
-      base_asset: group.base_asset,
-      order_uuid: group.order_uuid,
-      orders: group.orders,
-      total_amount: group.total_amount,
-      executed_amount: group.executed_amount,
-      groupStatus: group.status,
-      isExpanded,
-      // 风控指标：同一组订单共享，仅在汇总行展示
-      open_vwap_basis_bps: group.orders[0]?.open_vwap_basis_bps ?? null,
-      risk_relief_bps: group.orders[0]?.risk_relief_bps ?? null,
-      open_marginal_basis_bps: group.orders[0]?.open_marginal_basis_bps ?? null,
-      funding_rate_24h: group.orders[0]?.funding_rate_24h ?? null,
-    })
-    
-    // 明细行（展开时）
-    if (isExpanded) {
-      const closeBasis = computeCloseBasisBps(group.orders)
-      for (const order of group.orders) {
-        const row: DisplayRow = {
-          isGroupHeader: false,
-          ...order,
-        }
-        // 为平仓 spot 行附加计算的平仓基差
-        if (order.order_side === 'close' && order.market_type === 'spot') {
-          row._close_basis_bps = closeBasis
-        }
-        rows.push(row)
-      }
-    }
-  }
-  
-  return rows
+  return sortedGroups.map(group => ({
+    isGroupHeader: true,
+    position_id: group.position_id,
+    base_asset: group.base_asset,
+    order_uuid: group.order_uuid,
+    orders: group.orders,
+    total_amount: group.total_amount,
+    executed_amount: group.executed_amount,
+    groupStatus: group.status,
+    // 风控指标
+    open_vwap_basis_bps: group.orders[0]?.open_vwap_basis_bps ?? null,
+    risk_relief_bps: group.orders[0]?.risk_relief_bps ?? null,
+    open_marginal_basis_bps: group.orders[0]?.open_marginal_basis_bps ?? null,
+    funding_rate_24h: group.orders[0]?.funding_rate_24h ?? null,
+  }))
 })
 
-/** 切换分组展开状态 */
-function toggleGroupExpansion(positionId: number | null) {
+/** 打开订单详情弹窗 */
+function openDetailDialog(positionId: number | null) {
   if (positionId == null) return
-  const newSet = new Set(expandedGroups.value)
-  if (newSet.has(positionId)) {
-    newSet.delete(positionId)
-  } else {
-    newSet.add(positionId)
-  }
-  expandedGroups.value = newSet
-  
-  // 强制 AG Grid 刷新受影响的行
-  if (gridApi) {
-    nextTick(() => {
-      gridApi?.redrawRows()
-    })
-  }
-}
-
-/** 全展开/全收起 */
-function toggleAllGroups(expand: boolean) {
-  if (expand) {
-    const allIds = new Set<number>()
-    for (const order of rowData.value) {
-      if (order.position_id != null) {
-        allIds.add(order.position_id)
-      }
-    }
-    expandedGroups.value = allIds
-  } else {
-    expandedGroups.value = new Set()
-  }
+  const row = displayRows.value.find(r => r.position_id === positionId)
+  if (!row?.orders?.length) return
+  detailPositionId.value = positionId
+  detailOrders.value = row.orders
+  detailDialogVisible.value = true
 }
 
 /** 快捷时间过滤 */
@@ -990,6 +940,14 @@ function onGridReady(params: GridReadyEvent<DisplayRow>) {
   setupGridCopy(params.api)
 }
 
+/** 双击行打开详情弹窗 */
+function onRowDoubleClicked(params: any) {
+  const positionId = params.data?.position_id
+  if (positionId != null) {
+    openDetailDialog(positionId)
+  }
+}
+
 /* ───── 状态标签快捷选项 ───── */
 const statusOptions = [
   { label: '全部', value: '' },
@@ -1048,10 +1006,48 @@ function connectWs() {
   }
 }
 
+/* ───── 一键平仓 ───── */
+const closingPositionId = ref<number | null>(null)
+
+async function handleManualClose(positionId: number) {
+  try {
+    await ElMessageBox.confirm(
+      `确认对持仓 #${positionId} 执行一键平仓？\n系统将同时发送现货卖单和期货买单。`,
+      '一键平仓确认',
+      {
+        confirmButtonText: '确认平仓',
+        cancelButtonText: '取消',
+        type: 'warning',
+      }
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  closingPositionId.value = positionId
+  try {
+    const res = await post(`/api/trading/positions/${positionId}/manual-close`)
+    const data = await res.json()
+    if (data.success) {
+      showSuccess(`平仓成功: ${data.base_asset}`)
+    } else {
+      showError(`平仓失败: ${data.message || '未知错误'}`)
+    }
+  } catch (e: any) {
+    // 处理 HTTP 错误状态码
+    if (e?.message && !e.message.includes('未授权') && !e.message.includes('权限不足')) {
+      showError(`平仓请求失败: ${e.message}`)
+    }
+  } finally {
+    closingPositionId.value = null
+  }
+}
+
 /* ───── 生命周期 ───── */
 onMounted(() => {
   // 注册全局函数供 cellRenderer 使用
-  ;(window as any).toggleGroupExpansion = toggleGroupExpansion
+  ;(window as any).handleManualClose = handleManualClose
+  ;(window as any).openDetailDialog = openDetailDialog
   
   fetchOrders()
   connectWs()
@@ -1140,12 +1136,6 @@ onUnmounted(() => {
         <div class="grid-header">
           <span>订单管理</span>
           <div class="header-actions">
-            <el-button size="small" @click="toggleAllGroups(true)">
-              全展开
-            </el-button>
-            <el-button size="small" @click="toggleAllGroups(false)">
-              全收起
-            </el-button>
             <el-popover
               placement="bottom-end"
               :width="260"
@@ -1187,6 +1177,7 @@ onUnmounted(() => {
         :row-height="32"
         :tooltipShowDelay="300"
         @grid-ready="onGridReady"
+        @row-double-clicked="onRowDoubleClicked"
       />
       </div>
     </el-card>
@@ -1235,6 +1226,39 @@ onUnmounted(() => {
         />
       </div>
     </div>
+
+    <!-- 订单详情弹窗 -->
+    <el-dialog
+      v-model="detailDialogVisible"
+      :title="`订单详情 - 持仓 #${detailPositionId}`"
+      width="900px"
+      destroy-on-close
+    >
+      <el-table :data="detailOrders" border stripe size="small" style="width: 100%">
+        <el-table-column prop="order_side" label="方向" width="70" :formatter="(row: OrderRow) => row.order_side === 'open' ? '开仓' : '平仓'">
+          <template #default="{ row }">
+            <span :style="{ color: row.order_side === 'close' ? '#e6a23c' : '#67c23a' }">
+              {{ row.order_side === 'open' ? '开仓' : '平仓' }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="market_type" label="市场" width="70" />
+        <el-table-column prop="trade_direction" label="交易方向" width="70" />
+        <el-table-column prop="status" label="状态" width="80">
+          <template #default="{ row }">
+            <span :style="{ color: row.status === 'executed' ? '#67c23a' : row.status === 'rejected' || row.status === 'failed' ? '#f56c6c' : '#e6a23c' }">
+              {{ { pending: '待执行', executed: '已成交', rejected: '已拒单', failed: '失败' }[row.status as string] || row.status }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="target_amount" label="目标金额" width="100" align="right" :formatter="(row: OrderRow) => formatAmount(row.target_amount)" />
+        <el-table-column prop="exec_price" label="成交价" width="110" align="right" :formatter="(row: OrderRow) => formatDecimal(row.exec_price, 6)" />
+        <el-table-column prop="exec_qty" label="成交数量" width="100" align="right" :formatter="(row: OrderRow) => formatDecimal(row.exec_qty, 4)" />
+        <el-table-column prop="exec_amount" label="成交金额" width="100" align="right" :formatter="(row: OrderRow) => formatAmount(row.exec_amount)" />
+        <el-table-column prop="reject_reason" label="原因" min-width="140" show-overflow-tooltip />
+        <el-table-column prop="created_at" label="时间" width="160" :formatter="(row: OrderRow) => formatTime(row.created_at)" />
+      </el-table>
+    </el-dialog>
   </div>
 </template>
 
@@ -1316,43 +1340,56 @@ onUnmounted(() => {
 }
 
 /* 分组汇总行样式 */
-:deep(.expand-btn-cell) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-}
-
-:deep(.expand-btn) {
-  width: 20px;
-  height: 20px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 3px;
-  background: var(--el-bg-color);
-  color: var(--el-text-color-primary);
-  font-size: 14px;
-  font-weight: bold;
-  line-height: 1;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-:deep(.expand-btn:hover) {
-  border-color: var(--el-color-primary);
-  color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
-}
-
-
 :deep(.group-asset) {
   color: var(--el-color-primary);
 }
 
 :deep(.group-executed) {
   color: var(--el-color-success);
+}
+
+/* 操作列按钮组 */
+:deep(.action-btns) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+:deep(.detail-btn) {
+  padding: 2px 10px;
+  font-size: 12px;
+  border: 1px solid var(--el-color-primary);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--el-color-primary);
+  cursor: pointer;
+  transition: all 0.2s;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+:deep(.detail-btn:hover) {
+  background: var(--el-color-primary);
+  color: #fff;
+}
+
+/* 一键平仓按钮 */
+:deep(.manual-close-btn) {
+  padding: 2px 10px;
+  font-size: 12px;
+  border: 1px solid #f56c6c;
+  border-radius: 3px;
+  background: transparent;
+  color: #f56c6c;
+  cursor: pointer;
+  transition: all 0.2s;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+:deep(.manual-close-btn:hover) {
+  background: #f56c6c;
+  color: #fff;
 }
 
 /* 汇总行背景色 */
