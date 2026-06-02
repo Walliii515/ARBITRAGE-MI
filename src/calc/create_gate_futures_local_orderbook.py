@@ -57,6 +57,10 @@ class LocalOrderBook:
         
         self._first_update_applied = False  # 第一条增量是否已应用
         self.last_update_time = 0.0  # 本地时间
+        # WS 增量更新次数累计（每成功 apply_update +1，快照重建时清零）
+        # 用于 sustain/旁路风控检测“盘口呆滞”：快照重建后临时取到的购卖五档可能为异常价格，
+        # 无后续增量补上时不应被认为是“新鲜”数据。
+        self.update_count: int = 0
         self.lock = threading.Lock()
         
     def update_from_snapshot(self, snapshot_data: Dict):
@@ -103,6 +107,8 @@ class LocalOrderBook:
             self.bids = OrderedDict(sorted(self.bids.items(), reverse=True))
             self.last_update_time = time.time()
             self._first_update_applied = False  # 重置，等待新的第一条增量
+            # 快照重建【清零 update_count】，避免呆滞检测误判
+            self.update_count = 0
             
     def apply_update(self, update_data: Dict) -> bool:
         """
@@ -173,7 +179,9 @@ class LocalOrderBook:
             self.id = u
             self.update_time = update_data.get('t', self.update_time)
             self.last_update_time = time.time()
-            
+            # 增量成功应用，计数 +1（供 sustain / 旁路风控检测盘口是否呆滞）
+            self.update_count += 1
+
             return True
             
     def to_dict_row(self) -> Dict:
@@ -184,6 +192,7 @@ class LocalOrderBook:
                 'contract': self.contract,
                 'update_id': self.id,
                 'update_time': self.update_time,
+                'update_count': self.update_count,
             }
             
             # 买单（前5档）

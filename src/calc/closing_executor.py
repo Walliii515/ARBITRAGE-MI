@@ -75,6 +75,8 @@ class ClosingExecutor:
 
         # 最终风控旁路：盘口最大允许陈旧时间（秒）
         self._max_orderbook_stale_sec = config.get_float('trade.close.max_orderbook_stale_sec', 5.0)
+        # 盘口健康度门禁：sustain/valley 窗口内 update_count 增量下限
+        self.min_update_count = max(0, config.get_int('trade.orderbook_health.min_update_count', 5))
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -90,6 +92,46 @@ class ClosingExecutor:
         self._gate_manager = gate_manager
         self._spot_manager = spot_manager
         logger.info('OrderBookManager 已注入 ClosingExecutor（平仓最终风控旁路就绪）')
+
+    def _get_orderbook_update_counts(self, contract: str, symbol: str) -> tuple:
+        """从 OrderBookManager 读取 gate / spot 盘口的 update_count。任一缺失时返回 None。"""
+        gate_count = None
+        spot_count = None
+        try:
+            if self._gate_manager is not None:
+                gob = self._gate_manager.get_orderbook(contract)
+                if gob is not None:
+                    gate_count = int(getattr(gob, 'update_count', 0) or 0)
+            if self._spot_manager is not None:
+                sob = self._spot_manager.get_orderbook(symbol)
+                if sob is not None:
+                    spot_count = int(getattr(sob, 'update_count', 0) or 0)
+        except Exception as e:
+            logger.debug(f'读取 update_count 异常(忽略): {e}')
+        return gate_count, spot_count
+
+    def _check_update_count_freshness(
+        self,
+        gate_uc_now,
+        spot_uc_now,
+        gate_uc_start,
+        spot_uc_start,
+    ) -> tuple:
+        """“更新次数闸”校验：gate 与 spot 任一侧增量 < min_update_count 即拒。依赖状态缺失退化为放行。"""
+        if self.min_update_count <= 0:
+            return True, ''
+        if gate_uc_now is None or spot_uc_now is None:
+            return True, ''
+        if gate_uc_start is None or spot_uc_start is None:
+            return True, ''
+        gate_delta = gate_uc_now - gate_uc_start
+        spot_delta = spot_uc_now - spot_uc_start
+        if gate_delta < self.min_update_count or spot_delta < self.min_update_count:
+            return False, (
+                f'盘口呆滞(gate增量={gate_delta}, spot增量={spot_delta}, '
+                f'需≥{self.min_update_count})'
+            )
+        return True, ''
 
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
@@ -360,6 +402,18 @@ class ClosingExecutor:
                     f'max={self._max_orderbook_stale_sec}s)'
                 )
 
+            # ── 2.5 更新次数闸：拦截“盘口冻住 / 快照刚重建”呆滞场景 ──
+            valley_state = self._valley_state.get(base_asset)
+            if valley_state:
+                gate_uc_now = int(getattr(gate_ob, 'update_count', 0) or 0)
+                spot_uc_now = int(getattr(spot_ob, 'update_count', 0) or 0)
+                uc_passed, uc_reason = self._check_update_count_freshness(
+                    gate_uc_now, spot_uc_now,
+                    valley_state.get('gate_uc_start'), valley_state.get('spot_uc_start'),
+                )
+                if not uc_passed:
+                    return False, None, None, uc_reason
+
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
             from calc.merge_cross_exchange_orderbook import merge_orderbook_records
             from calc.calculate_hedge_metrics import calculate_hedge_metrics
@@ -424,17 +478,23 @@ class ClosingExecutor:
         state = self._valley_state.get(base_asset)
 
         if state is None:
-            # 首次进入监控，记录谷底和开始时间
+            # 首次进入监控，记录谷底、开始时间 及 update_count 起点
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
+            contract = pos.get('future_contract', '')
+            symbol = pos.get('spot_symbol') or f"{base_asset}USDT"
+            gate_uc_start, spot_uc_start = self._get_orderbook_update_counts(contract, symbol)
             self._valley_state[base_asset] = {
                 'valley_bps': current_spread_bps,
                 'start_time': now,
                 'open_spread_bps': open_spread_bps,
                 'trigger': None,
+                'gate_uc_start': gate_uc_start,
+                'spot_uc_start': spot_uc_start,
             }
             logger.info(
                 f"止盈谷底监控开始 | {base_asset} | "
-                f"spread={current_spread_bps:.2f}bps"
+                f"spread={current_spread_bps:.2f}bps | "
+                f"uc_start(gate={gate_uc_start}, spot={spot_uc_start})"
             )
             return False
 

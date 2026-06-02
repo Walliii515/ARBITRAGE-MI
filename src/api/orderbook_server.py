@@ -910,7 +910,8 @@ async def _open_position_loop():
                         peak_pullback_pct=config.get_float('trade.peak_pullback.pullback_pct', 0.10),
                         peak_monitor_timeout_sec=config.get_int('trade.peak_pullback.monitor_timeout_sec', 60),
                         peak_timeout_cooldown_sec=config.get_int('trade.peak_pullback.timeout_cooldown_sec', 300),
-                        p10_sustain_sec=config.get_float('trade.direct_open.sustain_sec', 3.0),
+                        sustain_sec=config.get_float('trade.peak_pullback.sustain_sec', 5.0),
+                        min_update_count=config.get_int('trade.orderbook_health.min_update_count', 5),
                         margin_warning_pct=config.get_float('margin.warning_pct', 8.0),
                         risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
                     )

@@ -49,13 +49,15 @@ class TradingExecutorConfig:
     min_spot_volume_24h_usdt: float = 0
     min_future_volume_24h_usdt: float = 0
 
-    # ─── 峰值回落策略 ───
+    # ─── 峰值回落 + sustain 确认（开仓唯一通道） ───
     peak_pullback_pct: float = 0.10
     peak_monitor_timeout_sec: int = 60
     peak_timeout_cooldown_sec: int = 300
+    sustain_sec: float = 5.0                # 峰值监控最低持续秒数（与 update_count 闸共同过滤脉冲/呆滞）
 
-    # ─── p10持续确认 ───
-    p10_sustain_sec: float = 3.0
+    # ─── 盘口健康度门禁（更新次数闸） ───
+    # 回落判定窗口内 update_count 增量 < min_update_count 视为呆滞拒开
+    min_update_count: int = 5
 
     # ─── 保证金风控 ───
     margin_warning_pct: float = 8.0
@@ -109,20 +111,18 @@ class TradingExecutor:
         self.min_spot_volume = cfg.min_spot_volume_24h_usdt
         self.min_future_volume = cfg.min_future_volume_24h_usdt
 
-        # 峰值回落开仓策略
+        # 峰值回落 + sustain 开仓策略（单通道）
         self.peak_pullback_pct = cfg.peak_pullback_pct
         self.peak_monitor_timeout_sec = cfg.peak_monitor_timeout_sec
         self.peak_timeout_cooldown_sec = cfg.peak_timeout_cooldown_sec
-        self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, signal_id}
+        self.sustain_sec = cfg.sustain_sec
+        self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, trigger, signal_id, gate_uc_start, spot_uc_start}
         self._timeout_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 超时冷却截止时间
-
-        # p10持续确认：基差连续 >= p10 持续 N 秒才触发直开，过滤高频脉冲
-        self.p10_sustain_sec = cfg.p10_sustain_sec
-        self._p10_sustain_state: Dict[str, Dict] = {}  # base_asset -> {start_time, min_basis}
-        # 临时槽位：p10持续确认通过后的信息（供 _build_open_reason 取用，单次开仓后清空）
-        self._p10_sustain_confirmed: Dict[str, Dict] = {}  # base_asset -> {sustained_sec, min_basis}
-        # 临时槽位：直开通道实时费率校验通过时记录的实时费率(bps)
+        # 临时槽位：实时费率校验通过时记录的实时费率(bps)，供 _build_open_reason 取用
         self._last_realtime_rate_bps: Dict[str, float] = {}
+
+        # 盘口健康度门禁：回落确认窗口内 update_count 增量下限
+        self.min_update_count = max(0, int(cfg.min_update_count))
 
         # 保证金风控：距爆仓距离低于此值时禁止开仓
         self.margin_warning_pct = cfg.margin_warning_pct
@@ -134,6 +134,11 @@ class TradingExecutor:
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
         self.reject_cooldown_sec = cfg.reject_cooldown_sec
         self._reject_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 冷却截止时间
+
+        # 开仓冷却缓存：base_asset -> 上次成功开仓时间（DB 真理源 + 内存维护）
+        # 仅本类 _save_orders 成功路径会写入，无外部入口，故可纯内存维护，避免每标的查 SQL
+        self._last_open_time: Dict[str, datetime] = {}
+        self._cooldown_loaded: bool = False  # 启动后首轮从 DB 一次性 load
 
         # 开仓金额（用于 min_notional 前置校验）
         self.open_amount_usdt = cfg.open_amount_usdt
@@ -224,6 +229,10 @@ class TradingExecutor:
         # 避免依赖 5s 间隔的 margin_loop 导致计数滞后被高频检查穿透。
         self._refresh_holding_count_from_db()
 
+        # 启动后首次进入：一次性从 DB 加载所有标的的最近一次成功开仓时间，
+        # 之后冷却检查全走内存（无外部插入订单的前提下，单一写入路径在 check_and_open 自身）。
+        self._load_open_cooldown_from_db()
+
         for row in orderbook_rows:
             try:
                 base_asset = row.get('base_asset', '')
@@ -234,7 +243,7 @@ class TradingExecutor:
                     self._resolve_signal(base_asset, 'conditions_lost', '数据不完整(盘口中断)')
                     self._peak_state.pop(base_asset, None)
                     continue
-                
+                                
                 # 1. 风控检查
                 if not self._pass_risk_check(row):
                     # 风控不通过，清除该标的峰值监控状态（基差已跌回阈值下）
@@ -246,39 +255,26 @@ class TradingExecutor:
                     )
                     self._peak_state.pop(base_asset, None)
                     continue
-                
+                                
                 risk_passed_assets.add(base_asset)
-                
+                                
                 # 2. 冷却检查
                 if not self._pass_cooldown_check(base_asset):
                     continue
-                
+                                
                 # 2.5 超时开仓冷却检查（防止连续超时重复开仓）
                 if not self._pass_timeout_cooldown(base_asset):
                     continue
-                
-                # 2.6 拒单冷却检查（被交易所拒单后暂停该标的开仓）
+                                
+                # 2.6 拒单冷却检查（被交易所拒单后暂停该标开仓）
                 if not self._pass_reject_cooldown(base_asset):
                     continue
-                
-                # 3. 判断开仓通道
+                                
+                # 3. 峰值回落 + sustain 确认（单通道）
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
-                direct_open = self._is_direct_open(base_asset, open_vwap_basis)
-
-                if direct_open:
-                    # 通道B: 基差>=p10，持续确认后实时费率校验再开仓
-                    if not self._pass_p10_sustain_check(base_asset, open_vwap_basis):
-                        continue
-                    contract = row.get('contract', '')
-                    if not self._verify_realtime_funding_rate(base_asset, contract):
-                        continue
-                else:
-                    # 通道A: 基差>=p20，走峰值回落确认
-                    # 基差跌回p20区间时，清除p10持续状态（已不再满足p10）
-                    self._p10_sustain_state.pop(base_asset, None)
-                    if not self._pass_peak_check(base_asset, open_vwap_basis, row):
-                        continue
-                
+                if not self._pass_peak_check(base_asset, open_vwap_basis, row):
+                    continue
+                                
                 # 3.5 最终风控旁路：单标的最短链路重新校验（拦截信号过期场景）
                 contract = row.get('contract', '')
                 symbol = row.get('symbol', '')
@@ -342,16 +338,8 @@ class TradingExecutor:
                         f"冷却{self.reject_cooldown_sec}s | 原因: {exec_result.get('message', '')[:80]}"
                     )
                 
-                # 开仓后清除峰值状态
+                # 开仓后清除峰值状态（trigger 仅可能为 'pullback'，超时分支已在 _pass_peak_check 内放弃）
                 self._peak_state.pop(base_asset, None)
-                
-                # 超时触发的开仓，设置较长冷却期
-                if trigger_type == 'timeout':
-                    self._timeout_cooldown_until[base_asset] = datetime.now() + timedelta(seconds=self.peak_timeout_cooldown_sec)
-                    logger.info(
-                        f"超时开仓冷却启动 | {base_asset} | "
-                        f"冷却{self.peak_timeout_cooldown_sec}s"
-                    )
                 
                 results.append({
                     'base_asset': base_asset,
@@ -361,8 +349,9 @@ class TradingExecutor:
                 })
                 
                 if exec_result['success']:
-                    # 立即递增持仓计数，避免下一轮循环（0.5s后）在margin_loop刷新前绕过上限检查
+                    # 立即递增持仓计数 + 写入冷却时间，避免下一轮（0.5s后）穿透上限/冷却检查
                     self._holding_count[base_asset] = self._holding_count.get(base_asset, 0) + 1
+                    self._last_open_time[base_asset] = datetime.now()
                     logger.info(
                         f"开仓成功 | {base_asset} | "
                         f"spot_vwap={exec_result['spot_order']['exec_price']} | "
@@ -422,8 +411,7 @@ class TradingExecutor:
         
         # 边际基差检查（支持按标的VWAP基差阈值）
         # 统一口径：均与纯基差（open_vwap_basis_bps）对比，不含手续费和风险缓释
-        # 双通道最低门槛：使用 p20 作为入场最低要求
-        base_asset = row.get('base_asset', '')
+        # 入场最低门槛：使用 p20 作为入场最低要求
         open_vwap_basis = row.get('open_vwap_basis_bps')
         if open_vwap_basis is not None:
             if base_asset in self.vwap_threshold_meta:
@@ -458,62 +446,56 @@ class TradingExecutor:
         
         return True
     
-    def _is_direct_open(self, base_asset: str, current_basis_bps: float) -> bool:
-        """判断是否走直接开仓通道（基差 >= p10）"""
-        if base_asset in self.vwap_threshold_meta:
-            p10 = self.vwap_threshold_meta[base_asset].get('p10')
-            if p10 is not None:
-                return current_basis_bps >= p10
-        return False  # 无p10数据时回退到回落确认通道
-
-    def _pass_p10_sustain_check(self, base_asset: str, current_basis_bps: float) -> bool:
+    def _get_orderbook_update_counts(self, contract: str, symbol: str) -> tuple:
         """
-        p10持续确认：基差连续 >= p10 持续 N 秒才确认开仓。
-        过滤高频套利算法触发的瞬时基差脉冲。
+        从 OrderBookManager 读取当前 gate / spot 盘口的 update_count。
 
-        状态机:
-        - 首次触发p10: 记录开始时间，返回 False(等待)
-        - 后续仍 >= p10: 累计时间，达到 sustain_sec 返回 True(确认)
-        - 基差跌破p10: 外层逻辑会清除状态（direct_open=False 时 pop）
+        Returns:
+            (gate_count, spot_count)：任一 manager 未注入或盘口不存在时返回 None
         """
-        now = datetime.now()
-        state = self._p10_sustain_state.get(base_asset)
+        gate_count = None
+        spot_count = None
+        try:
+            if self._gate_manager is not None:
+                gate_ob = self._gate_manager.get_orderbook(contract)
+                if gate_ob is not None:
+                    gate_count = int(getattr(gate_ob, 'update_count', 0) or 0)
+            if self._spot_manager is not None:
+                spot_ob = self._spot_manager.get_orderbook(symbol)
+                if spot_ob is not None:
+                    spot_count = int(getattr(spot_ob, 'update_count', 0) or 0)
+        except Exception as e:
+            logger.debug(f'读取 update_count 异常(忽略)：{e}')
+        return gate_count, spot_count
 
-        if state is None:
-            # 首次触发 p10，开始计时
-            self._p10_sustain_state[base_asset] = {
-                'start_time': now,
-                'min_basis': current_basis_bps,
-            }
-            logger.info(
-                f"p10持续确认开始 | {base_asset} | "
-                f"basis={current_basis_bps:.2f}bps | 需持续{self.p10_sustain_sec}s"
+    def _check_update_count_freshness(
+        self,
+        gate_uc_now: Optional[int],
+        spot_uc_now: Optional[int],
+        gate_uc_start: Optional[int],
+        spot_uc_start: Optional[int],
+    ) -> tuple:
+        """
+        “更新次数闸”校验：sustain 窗口内 gate 与 spot 任一侧 update_count 增量均需 ≥ min_update_count。
+
+        返回:
+            (passed: bool, reason: str)
+        依赖状态缺失时退化为放行（忽略）。
+        """
+        if self.min_update_count <= 0:
+            return True, ''
+        if gate_uc_now is None or spot_uc_now is None:
+            return True, ''  # 未注入 manager 或盘口缺失，不阶步拦截
+        if gate_uc_start is None or spot_uc_start is None:
+            return True, ''  # 状态丢失时退化为放行（避免间歇误拒）
+        gate_delta = gate_uc_now - gate_uc_start
+        spot_delta = spot_uc_now - spot_uc_start
+        if gate_delta < self.min_update_count or spot_delta < self.min_update_count:
+            return False, (
+                f'盘口呆滞(gate增量={gate_delta}, spot增量={spot_delta}, '
+                f'需≥{self.min_update_count})'
             )
-            return False
-
-        # 更新期间最低基差（用于日志复盘）
-        if current_basis_bps < state['min_basis']:
-            state['min_basis'] = current_basis_bps
-
-        # 检查是否持续足够时间
-        elapsed = (now - state['start_time']).total_seconds()
-        if elapsed >= self.p10_sustain_sec:
-            # 持续确认通过，清除监控状态
-            min_basis = state['min_basis']
-            self._p10_sustain_state.pop(base_asset, None)
-            # 写入临时槽位，供 _build_open_reason 拼接到开仓原因
-            self._p10_sustain_confirmed[base_asset] = {
-                'sustained_sec': elapsed,
-                'min_basis': min_basis,
-            }
-            logger.info(
-                f"p10持续确认通过 | {base_asset} | "
-                f"sustained={elapsed:.1f}s | min_basis={min_basis:.1f}bps | "
-                f"current={current_basis_bps:.1f}bps"
-            )
-            return True
-
-        return False
+        return True, ''
 
     def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
         """
@@ -551,21 +533,10 @@ class TradingExecutor:
         设计目的：
         - 拦截"信号过期"场景（峰值监控期间基差已衰减到不值得开仓的水平）
         - 检测盘口数据陈旧性（低流动性标的WS更新稀疏）
+        - 复用 _peak_state 内记录的 update_count 起点，拦截“盘口冻住 + 快照重建”呆滞场景
         - 确保下单用的数据 = 校验用的数据（同一份最短链路读取）
 
-        最短链路：单标的盘口读取 → VWAP基差计算 → 阈值+盈利性守卫+覆盖率校验
-
-        Args:
-            base_asset: 标的资产 (e.g. 'BTC')
-            contract: Gate合约名 (e.g. 'BTC_USDT')
-            symbol: Binance交易对 (e.g. 'BTCUSDT')
-
-        Returns:
-            (passed, fresh_row, gate_basis_bps, reject_reason)
-            - passed: 是否通过最终风控
-            - fresh_row: 通过时返回合并后的最新盘口行（供后续下单使用）
-            - gate_basis_bps: 最终校验时的VWAP基差
-            - reject_reason: 未通过时的拒绝原因
+        最短链路：单标的盘口读取 → VWAP基差计算 → 阈值+盈利性守卫+覆盖率+update_count闸校验
         """
         # 未注入 manager 时退化为放行（兼容测试场景）
         if not self._gate_manager or not self._spot_manager:
@@ -592,6 +563,18 @@ class TradingExecutor:
                     f'盘口过期(gate_age={gate_age:.1f}s, spot_age={spot_age:.1f}s, '
                     f'max={self._max_orderbook_stale_sec}s)'
                 )
+
+            # ── 2.5 更新次数闸：拦截“盘口时间戳新 / 但期间未真正更新”的呆滞场景 ──
+            uc_state = self._peak_state.get(base_asset)
+            if uc_state:
+                gate_uc_now = int(getattr(gate_ob, 'update_count', 0) or 0)
+                spot_uc_now = int(getattr(spot_ob, 'update_count', 0) or 0)
+                uc_passed, uc_reason = self._check_update_count_freshness(
+                    gate_uc_now, spot_uc_now,
+                    uc_state.get('gate_uc_start'), uc_state.get('spot_uc_start'),
+                )
+                if not uc_passed:
+                    return False, None, None, uc_reason
 
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
             from calc.merge_cross_exchange_orderbook import merge_orderbook_records
@@ -655,63 +638,98 @@ class TradingExecutor:
 
     def _pass_peak_check(self, base_asset: str, current_basis_bps: float, row: Dict = None) -> bool:
         """
-        峰值回落确认逻辑:
-        - 首次超阈值: 实时校验资金费率 + 记录峰值和开始时间, 返回 False(等待)
+        峰值回落 + sustain 开仓确认（单通道）:
+        - 首次超阈值: 实时校验资金费率 + 记录峰值、开始时间及 update_count 起点, 返回 False(等待)
         - 后续更高: 更新峰值, 返回 False(继续等待)
-        - 从峰值回落 X%: 返回 True(确认开仓)
-        - 超时: 返回 True(直接开仓)
+        - 监控超时(elapsed ≥ monitor_timeout_sec): 基差长期不回落，放弃本轮 + resolve 信号为
+          'monitor_timeout' + 进入 timeout_cooldown_sec 冷却, 返回 False（不开劣质单）
+        - 从峰值回落 ≥ pullback_pct，且 elapsed ≥ sustain_sec，且 update_count 增量达标:
+          返回 True (trigger='pullback')；达不到 sustain / update_count 要求时仅返回 False 等待（不重置）。
         """
         now = datetime.now()
         state = self._peak_state.get(base_asset)
-        
+        row = row or {}
+        contract = row.get('contract', '')
+        symbol = row.get('symbol', '')
+
         if state is None:
-            # 首次进入监控前，实时校验资金费率（仅在此时调用一次API，不影响后续开仓速度）
-            if row:
-                contract = row.get('contract', '')
-                if not self._verify_realtime_funding_rate(base_asset, contract):
-                    return False
-            
-            # 实时费率确认OK，开始峰值监控
+            # 首次进入监控：实时费率校验 + 记录峰值/起点 update_count + 创建信号
+            if not self._verify_realtime_funding_rate(base_asset, contract):
+                return False
+
+            gate_uc_now, spot_uc_now = self._get_orderbook_update_counts(contract, symbol)
             signal_id = self._create_signal(base_asset, current_basis_bps)
             self._peak_state[base_asset] = {
                 'peak_bps': current_basis_bps,
                 'start_time': now,
-                'trigger': None,  # 用于记录触发方式
+                'trigger': None,
                 'signal_id': signal_id,
+                'gate_uc_start': gate_uc_now,
+                'spot_uc_start': spot_uc_now,
             }
             logger.info(
                 f"峰值监控开始 | {base_asset} | "
-                f"basis={current_basis_bps:.2f}bps"
+                f"basis={current_basis_bps:.2f}bps | 需持续{self.sustain_sec}s且回落{self.peak_pullback_pct*100:.0f}% | "
+                f"uc_start(gate={gate_uc_now}, spot={spot_uc_now})"
             )
             return False
-        
+
         # 更新峰值
         if current_basis_bps > state['peak_bps']:
             state['peak_bps'] = current_basis_bps
-        
-        # 检查超时
+
+        # 监控超时：基差长期不回落，放弃本轮 + 进入冷却（不开劣质单）
         elapsed_sec = (now - state['start_time']).total_seconds()
         if elapsed_sec >= self.peak_monitor_timeout_sec:
-            state['trigger'] = 'timeout'
-            logger.info(
-                f"峰值监控超时，直接开仓 | {base_asset} | "
-                f"peak={state['peak_bps']:.2f} | current={current_basis_bps:.2f} | "
-                f"elapsed={elapsed_sec:.0f}s"
+            peak_bps = state['peak_bps']
+            # resolve 必须在 pop 之前，_resolve_signal 内部依赖 _peak_state 取 signal_id
+            self._resolve_signal(
+                base_asset, 'monitor_timeout',
+                f'监控{elapsed_sec:.0f}s未回落(峰{peak_bps:.1f}bps)',
+                exit_basis_bps=current_basis_bps,
+                trigger_type='monitor_timeout',
             )
-            return True
-        
-        # 检查回落确认: 当前基差 <= 峰值 * (1 - pullback_pct)
+            self._peak_state.pop(base_asset, None)
+            self._timeout_cooldown_until[base_asset] = now + timedelta(seconds=self.peak_timeout_cooldown_sec)
+            logger.info(
+                f"峰值监控超时放弃 | {base_asset} | "
+                f"peak={peak_bps:.2f} | current={current_basis_bps:.2f} | "
+                f"elapsed={elapsed_sec:.0f}s | 冷却{self.peak_timeout_cooldown_sec}s 后重新监控"
+            )
+            return False
+
+        # 检查回落阈值：当前基差 ≤ 峰值 × (1 - pullback_pct)
         pullback_threshold = state['peak_bps'] * (1 - self.peak_pullback_pct)
-        if current_basis_bps <= pullback_threshold:
-            state['trigger'] = 'pullback'
+        if current_basis_bps > pullback_threshold:
+            return False  # 尚未回落到位
+
+        # 回落到位，其次检查持续时间
+        if elapsed_sec < self.sustain_sec:
+            return False  # 持续不足，继续等待
+
+        # 最后检查 update_count 增量闸（拦截“盘口冻住”呆滞场景）
+        gate_uc_now, spot_uc_now = self._get_orderbook_update_counts(contract, symbol)
+        uc_passed, uc_reason = self._check_update_count_freshness(
+            gate_uc_now, spot_uc_now,
+            state.get('gate_uc_start'), state.get('spot_uc_start'),
+        )
+        if not uc_passed:
+            # 呆滞：仅拦截本轮，不重置状态；WS 恢复后增量足则下轮达标
             logger.info(
-                f"峰值回落确认，执行开仓 | {base_asset} | "
-                f"peak={state['peak_bps']:.2f} | current={current_basis_bps:.2f} | "
-                f"pullback={self.peak_pullback_pct*100:.0f}%"
+                f"峰值回落拒绝(更新次数不足) | {base_asset} | "
+                f"sustained={elapsed_sec:.1f}s | {uc_reason}"
             )
-            return True
-        
-        return False
+            return False
+
+        state['trigger'] = 'pullback'
+        logger.info(
+            f"峰值回落确认，执行开仓 | {base_asset} | "
+            f"peak={state['peak_bps']:.2f} | current={current_basis_bps:.2f} | "
+            f"sustained={elapsed_sec:.1f}s | pullback={self.peak_pullback_pct*100:.0f}% | "
+            f"uc增量(gate={(gate_uc_now or 0)-(state.get('gate_uc_start') or 0)}, "
+            f"spot={(spot_uc_now or 0)-(state.get('spot_uc_start') or 0)})"
+        )
+        return True
 
     # ──────────────────────────────────────────────────────────────────
     # 信号日志记录
@@ -842,19 +860,14 @@ class TradingExecutor:
     def _build_open_reason(self, row: Dict, base_asset: str, open_vwap_basis: float) -> str:
         """
         构建开仓原因字符串，记录关键决策参数，便于复盘。
-        格式: "基差{bps}(阈值{thr})|费率{rate}|峰值{info}"
+        格式: "基差{bps}(阈值p20={thr})|费率{rate}|峰值{info}|守卫|量"
         """
         parts = []
 
-        # 1. VWAP基差 vs 阈值 + 通道标记
+        # 1. VWAP基差 vs p20 阈值
         threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-        p10 = threshold_data.get('p10')
         p20 = threshold_data.get('p20', self.basis_threshold_bps)
-        direct = p10 is not None and open_vwap_basis >= p10
-        if direct:
-            parts.append(f"基差{open_vwap_basis:.1f}bps(直开p10={p10:.1f})")
-        else:
-            parts.append(f"基差{open_vwap_basis:.1f}bps(阈值p20={p20:.1f})")
+        parts.append(f"基差{open_vwap_basis:.1f}bps(阈值p20={p20:.1f})")
 
         # 2. 24h资金费率
         funding_rate = row.get('funding_rate_24h')
@@ -862,42 +875,35 @@ class TradingExecutor:
             rate_pct = float(funding_rate) * 100
             parts.append(f"费率{rate_pct:.4f}%")
 
-        # 3. 通道判定细节
-        if direct:
-            # 通道B(直开)：p10持续确认 + 实时费率校验
-            confirmed = self._p10_sustain_confirmed.pop(base_asset, None)
-            if confirmed:
-                parts.append(
-                    f"p10持续{confirmed['sustained_sec']:.1f}s"
-                    f"(谷{confirmed['min_basis']:.1f}≥{p10:.1f})"
-                )
-            rt_rate = self._last_realtime_rate_bps.pop(base_asset, None)
-            if rt_rate is not None:
-                parts.append(
-                    f"实时费率✓({rt_rate:.2f}bps≥{self.min_funding_rate_bps:.1f})"
-                )
-        else:
-            # 通道A(回落)：峰值回落/超时信息
-            peak_state = self._peak_state.get(base_asset)
-            if peak_state:
-                peak_bps = peak_state.get('peak_bps', 0)
-                trigger = peak_state.get('trigger', 'unknown')
-                if trigger == 'pullback':
-                    parts.append(f"峰值回落(峰{peak_bps:.1f}→回落{self.peak_pullback_pct*100:.0f}%)")
-                elif trigger == 'timeout':
-                    elapsed = (datetime.now() - peak_state['start_time']).total_seconds()
-                    parts.append(f"峰值超时(峰{peak_bps:.1f},{elapsed:.0f}s)")
-                else:
-                    parts.append(f"峰值{peak_bps:.1f}")
+        # 3. 实时费率校验结果（峰值首次入场时调 API 一次）
+        rt_rate = self._last_realtime_rate_bps.pop(base_asset, None)
+        if rt_rate is not None:
+            parts.append(
+                f"实时费率✓({rt_rate:.2f}bps≥{self.min_funding_rate_bps:.1f})"
+            )
 
-        # 4. 盈利性守卫
+        # 4. 峰值回落 / 超时信息
+        peak_state = self._peak_state.get(base_asset)
+        if peak_state:
+            peak_bps = peak_state.get('peak_bps', 0)
+            trigger = peak_state.get('trigger', 'unknown')
+            elapsed = (datetime.now() - peak_state['start_time']).total_seconds()
+            if trigger == 'pullback':
+                parts.append(
+                    f"峰值回落(峰{peak_bps:.1f},持续{elapsed:.1f}s≥{self.sustain_sec}s,"
+                    f"回落{self.peak_pullback_pct*100:.0f}%)"
+                )
+            else:
+                parts.append(f"峰值{peak_bps:.1f}")
+
+        # 5. 盈利性守卫
         if base_asset in self.close_vwap_threshold_meta:
             close_data = self.close_vwap_threshold_meta[base_asset]
             close_thr = close_data.get(self.close_threshold_col)
             if close_thr is not None:
                 parts.append(f"守卫({open_vwap_basis:.1f}>{float(close_thr):.1f}+{self.fee_cost_bps:.0f}费)")
 
-        # 5. 24h成交量（现货/期货）
+        # 6. 24h成交量（现货/期货）
         vol_parts = []
         if base_asset in self.spot_meta:
             qv = self.spot_meta[base_asset].get('quote_volume')
@@ -934,27 +940,46 @@ class TradingExecutor:
             return True
         return False
 
-    def _pass_cooldown_check(self, base_asset: str) -> bool:
-        """检查冷却期(从订单表查询最近一次成功开仓)"""
-        sql = """
-            SELECT MAX(created_at) as last_open_time 
-            FROM mi_trade_order 
-            WHERE base_asset = %s 
-              AND market_type = 'spot' 
-              AND order_side = 'open' 
-              AND status = 'executed'
-              AND channel = %s
+    def _load_open_cooldown_from_db(self):
         """
-        with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, (base_asset, self.executor_client.channel))
-            row = cursor.fetchone()
-            
-            if not row or not row['last_open_time']:
-                return True  # 无开仓记录
-            
-            last_time = row['last_open_time']
-            elapsed = (datetime.now() - last_time).total_seconds()
-            return elapsed >= self.cooldown_sec
+        启动后首次进入开仓循环时，从 DB 一次性加载所有标的的最近一次成功开仓时间，
+        之后所有冷却判定走内存（_pass_cooldown_check）。
+
+        前提：本服务是 mi_trade_order(open) 的唯一写入入口（无手动开仓 / 外部脚本）。
+        失败时不置 loaded flag，下轮自动重试。
+        """
+        if self._cooldown_loaded:
+            return
+        try:
+            sql = """
+                SELECT base_asset, MAX(created_at) AS last_open_time
+                FROM mi_trade_order
+                WHERE market_type = 'spot'
+                  AND order_side = 'open'
+                  AND status = 'executed'
+                  AND channel = %s
+                GROUP BY base_asset
+            """
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, (self.executor_client.channel,))
+                rows = cursor.fetchall()
+            for r in rows:
+                ba = r.get('base_asset')
+                t = r.get('last_open_time')
+                if ba and t:
+                    self._last_open_time[ba] = t
+            self._cooldown_loaded = True
+            logger.info(f"开仓冷却缓存初始化 | {len(self._last_open_time)}个标的")
+        except Exception as e:
+            logger.error(f"开仓冷却缓存加载失败(下轮重试): {e}")
+
+    def _pass_cooldown_check(self, base_asset: str) -> bool:
+        """检查同标的开仓冷却（纯内存，由 _last_open_time 维护）"""
+        last_time = self._last_open_time.get(base_asset)
+        if last_time is None:
+            return True  # 无开仓记录
+        elapsed = (datetime.now() - last_time).total_seconds()
+        return elapsed >= self.cooldown_sec
     
     def _create_order_group(self, row: Dict) -> Dict:
         """生成订单组(现货+期货)"""

@@ -45,7 +45,7 @@ trade:
   # ─── 开仓策略 ───
   open:
     amount_usdt: 10                        # 单笔开仓金额（USDT）
-    check_interval_sec: 0.5                 # 开仓检查间隔（秒）
+    check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
     max_positions_per_asset: 3              # 同标的最大持仓数
@@ -64,19 +64,22 @@ trade:
     # 期货24h成交额低于此值不开仓
     min_future_volume_24h_usdt: 50000
 
-  # ─── p10直开持续确认 ───
-  direct_open:
-    sustain_sec: 5                          # 基差连续>=p10持续此秒数才触发直开，过滤高频脉冲
+  # ─── 盘口健康度门禁（sustain / 旁路风控共用） ───
+  # 作用：拦截呆滞盘口。峰值监控起点记录 update_count_start，校验时要求
+  # update_count 增量 >= min_update_count，不达标判为“盘口呆滞”拒开/拒平
+  orderbook_health:
+    min_update_count: 5                     # sustain 窗口内至少需 5 次 WS 更新
 
-  # ─── 峰值回落策略（开仓确认） ───
+  # ─── 峰值回落 + sustain 确认（开仓唯一通道） ───
   peak_pullback:
-    pullback_pct: 0.05                    # 从峰值回落百分比(5%)确认开仓
+    pullback_pct: 0.05                      # 从峰值回落百分比(5%)确认开仓
+    sustain_sec: 3                          # 峰值监控最低持续秒数（与 update_count 闸共同过滤脉冲／呆滞）
     monitor_timeout_sec: 30                 # 监控超时（秒），超时后直接开仓
     timeout_cooldown_sec: 120               # 超时开仓后冷却期（秒）
 
   # ─── 平仓策略 ───
   close:
-    check_interval_sec: 0.5                 # 平仓检查间隔（秒）
+    check_interval_sec: 0.2                 # 平仓检查间隔（秒）；与开仓对称
     cooldown_sec: 60                        # 平仓失败冷却（秒）
     take_profit_days_multiplier: 10         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
     # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
@@ -95,7 +98,7 @@ trade:
     snapshot_interval_sec: 10               # 快照采样间隔（秒）
     snapshot_retention_days: 60             # 快照保留天数
     threshold_lookback_days: 7              # 阈值回溯天数（用于每日统计分析）
-    # 开仓双通道: p10(直接开) + p20(回落确认)，由代码固定使用这两列
+    # 平仓基差阈值分位列（用于开仓盈利性守卫：开仓基差需明显高于未来可能的平仓基差）
     # 可选值: close_basis_p10 / close_basis_p20 / close_basis_p30 / close_basis_p40
     close_threshold_percentile: close_basis_p20
 

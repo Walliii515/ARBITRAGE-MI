@@ -49,6 +49,10 @@ class LocalOrderBook:
         self.bids: List[tuple] = []
         self.asks: List[tuple] = []
 
+        # WS 更新次数累计（每收到一帧 partial depth +1），用于呆滞盘口检测
+        # Binance Partial Depth Stream 每帧即完整 5 档快照，无 REST 重建场景，无需清零
+        self.update_count: int = 0
+
         self.lock = threading.Lock()
 
     def update_from_partial_depth(self, data: Dict):
@@ -73,6 +77,7 @@ class LocalOrderBook:
                 for a in data.get('asks', [])[:LEVEL]
             ]
             self.update_time = time.time()
+            self.update_count += 1
 
     def to_dict_row(self) -> Dict:
         """将当前订单簿转为一行字典，供 to_records() 序列化"""
@@ -82,6 +87,7 @@ class LocalOrderBook:
                 'symbol': self.symbol,
                 'update_id': self.last_update_id,
                 'update_time': self.update_time,
+                'update_count': self.update_count,
             }
 
             for i in range(LEVEL):
