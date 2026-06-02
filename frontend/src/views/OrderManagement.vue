@@ -64,10 +64,6 @@ interface PositionRow {
   future_close_amount: number | null
   close_spread_bps: number | null
   close_reason: string | null
-  funding_rate_sum_bps: number | null
-  funding_payments_count: number | null
-  funding_total_pnl: number | null
-  total_pnl: number | null
   // 子查询注入字段
   channel: string | null
   order_count: number | null
@@ -249,46 +245,7 @@ const columnDefs = computed((): ColDef[] => [
     headerClass: 'ag-right-aligned-header',
     valueFormatter: bpsFormatter,
   },
-  {
-    headerName: '资金费次数',
-    field: 'funding_payments_count',
-    width: 100,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-  },
-  {
-    headerName: '资金费PnL',
-    field: 'funding_total_pnl',
-    width: 110,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: (params: ValueFormatterParams) => {
-      if (params.value == null) return ''
-      return Number(params.value).toFixed(2)
-    },
-    cellStyle: (params: any) => {
-      if (params.value == null) return null
-      return { color: params.value > 0 ? '#67c23a' : params.value < 0 ? '#f56c6c' : '#909399' }
-    },
-  },
-  {
-    headerName: '总盈亏',
-    field: 'total_pnl',
-    width: 110,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: (params: ValueFormatterParams) => {
-      if (params.value == null) return ''
-      return Number(params.value).toFixed(2)
-    },
-    cellStyle: (params: any) => {
-      if (params.value == null) return null
-      return { color: params.value > 0 ? '#67c23a' : params.value < 0 ? '#f56c6c' : '#909399' }
-    },
-  },
+
   {
     headerName: '开仓原因',
     field: 'open_reason',

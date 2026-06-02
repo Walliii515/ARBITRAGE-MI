@@ -209,7 +209,8 @@ class PositionTracker:
                 # 确定下次结算时间：基于最后一笔结算时间 + 8h
                 next_time = settle_times[-1] + timedelta(seconds=FUNDING_INTERVAL_SEC)
                 
-                # 累加资金费到持仓
+                # 累加资金费到持仓 + 写入历史明细：合并到同一事务，确保原子性。
+                # 任一失败则两边都回滚，避免出现 funding_payments_count 与 history 行数不一致。
                 update_sql = """
                     UPDATE mi_trade_position SET
                         funding_rate_sum_bps = funding_rate_sum_bps + %(rate_bps)s,
@@ -219,23 +220,26 @@ class PositionTracker:
                     WHERE id = %(position_id)s
                 """
                 
-                with db_manager.get_cursor() as cursor:
-                    cursor.execute(update_sql, {
-                        'rate_bps': total_rate_bps,
-                        'credit_count': payments_to_credit,
-                        'funding_pnl': total_pnl,
-                        'next_funding_time': next_time,
-                        'position_id': pos['id']
-                    })
-                
-                # 写入结算历史明细（逐期写入真实费率和时间）
-                self._insert_funding_history(
-                    position_id=pos['id'],
-                    base_asset=pos['base_asset'],
-                    current_count=current_count,
-                    period_data=period_data,
-                    future_notional=future_notional,
-                )
+                with db_manager.get_connection() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(update_sql, {
+                            'rate_bps': total_rate_bps,
+                            'credit_count': payments_to_credit,
+                            'funding_pnl': total_pnl,
+                            'next_funding_time': next_time,
+                            'position_id': pos['id']
+                        })
+                        
+                        # 写入结算历史明细（逐期写入真实费率和时间）
+                        # 使用同一连接以保证与上面的 UPDATE 在同一事务
+                        self._insert_funding_history(
+                            cursor=cursor,
+                            position_id=pos['id'],
+                            base_asset=pos['base_asset'],
+                            current_count=current_count,
+                            period_data=period_data,
+                            future_notional=future_notional,
+                        )
                 
                 updated_count += 1
                 logger.info(
@@ -310,17 +314,22 @@ class PositionTracker:
         
         return results
     
-    def _insert_funding_history(self, position_id: int, base_asset: str,
+    def _insert_funding_history(self, cursor, position_id: int, base_asset: str,
                                 current_count: int, period_data: List[tuple],
                                 future_notional: float):
         """
         逐期写入资金费结算历史记录。
         
+        使用 INSERT IGNORE 防止 (position_id, payment_seq) 唯一约束冲突时
+        重复写入（依赖 migration 006 添加的 uk_position_seq）。调用方需
+        传入与 UPDATE position 同一事务的 cursor，保证两次写入原子。
+        
         Args:
+            cursor: 数据库 cursor（与 UPDATE mi_trade_position 共用同一事务）
             period_data: [(rate_24h, single_rate, single_pnl, settle_time), ...]
         """
         insert_sql = """
-            INSERT INTO mi_funding_fee_history
+            INSERT IGNORE INTO mi_funding_fee_history
                 (position_id, base_asset, payment_seq, funding_rate, funding_rate_24h,
                  funding_pnl, future_notional, settled_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -336,8 +345,7 @@ class PositionTracker:
             ))
         
         if rows:
-            with db_manager.get_cursor() as cursor:
-                cursor.executemany(insert_sql, rows)
+            cursor.executemany(insert_sql, rows)
     
     def get_holding_positions(self) -> List[Dict]:
         """获取所有持仓中记录"""
