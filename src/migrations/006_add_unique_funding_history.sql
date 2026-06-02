@@ -10,5 +10,5 @@
 --
 -- 注意：MySQL DROP INDEX 不支持 IF EXISTS，重复执行需先确认索引是否已存在。
 
-ALTER TABLE mi_funding_fee_history
+ALTER TABLE mi_trade_funding_fee_history
     ADD UNIQUE KEY uk_position_seq (position_id, payment_seq);

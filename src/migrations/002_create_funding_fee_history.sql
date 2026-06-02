@@ -1,7 +1,7 @@
 -- 资金费结算历史表
 -- 记录每次资金费结算的详细信息，支持前端展示"第几次、费率、金额"
 
-CREATE TABLE IF NOT EXISTS mi_funding_fee_history (
+CREATE TABLE IF NOT EXISTS mi_trade_funding_fee_history (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
     position_id BIGINT NOT NULL COMMENT '关联持仓ID (mi_trade_position.id)',
     base_asset VARCHAR(64) NOT NULL COMMENT '标的资产',

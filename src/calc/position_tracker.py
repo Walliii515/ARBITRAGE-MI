@@ -109,7 +109,7 @@ class PositionTracker:
         逻辑：
         1. 仅使用持仓自身的 next_funding_time 判断是否到期
         2. 支持追补：若 next_funding_time 为 NULL 或已过多个结算周期，一次性追补所有缺失的结算
-        3. 每次结算查历史费率表取当期真实费率，写入 mi_funding_fee_history 记录明细
+        3. 每次结算查历史费率表取当期真实费率，写入 mi_trade_funding_fee_history 记录明细
         4. settled_at 基于 next_funding_time 正向推算，确保时间戳与真实结算周期对齐
         """
         sql = """
@@ -329,7 +329,7 @@ class PositionTracker:
             period_data: [(rate_24h, single_rate, single_pnl, settle_time), ...]
         """
         insert_sql = """
-            INSERT IGNORE INTO mi_funding_fee_history
+            INSERT IGNORE INTO mi_trade_funding_fee_history
                 (position_id, base_asset, payment_seq, funding_rate, funding_rate_24h,
                  funding_pnl, future_notional, settled_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -377,7 +377,7 @@ class PositionTracker:
         sql = """
             SELECT position_id, payment_seq, funding_rate, funding_rate_24h,
                    funding_pnl, future_notional, settled_at
-            FROM mi_funding_fee_history
+            FROM mi_trade_funding_fee_history
             ORDER BY position_id, payment_seq
         """
         with db_manager.get_cursor() as cursor:

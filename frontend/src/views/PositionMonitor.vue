@@ -18,14 +18,19 @@ import FundingHistoryTooltip from '../ag-grid/FundingHistoryTooltip.vue'
 import { get, post } from '../utils/request'
 import { getToken } from '../utils/auth'
 
-/** 开仓金额，与后端 config.yaml trade.open.amount_usdt 保持一致，用于前端兜底计算 funding_pnl_bps */
-const OPEN_AMOUNT_USDT = 100
+/** 标准开仓金额（USDT）：从后端 REST/WS 推送动态读取，与后端 config.yaml trade.open.amount_usdt 保持一致，
+ *  避免前后端硬编码漂移导致 funding_pnl_bps 兑底计算偏差。
+ *  接收顺序：REST /api/trading/positions 响应 → WS position_update 推送。
+ *  兑底默认 10，仅防后端未推送时出现 NaN。
+ */
+const openAmountUsdt = ref<number>(10)
 
-/** 兜底补充 funding_pnl_bps（后端未注入时由前端根据金额反算） */
+/** 兑底补充 funding_pnl_bps（后端未注入时由前端根据金额反算） */
 function ensureFundingBps(rows: PositionRow[]) {
+  const base = openAmountUsdt.value || 10
   for (const row of rows) {
     if (row.funding_pnl_bps == null && row.funding_total_pnl != null) {
-      row.funding_pnl_bps = Math.round(row.funding_total_pnl / OPEN_AMOUNT_USDT * 10000 * 100) / 100
+      row.funding_pnl_bps = Math.round(row.funding_total_pnl / base * 10000 * 100) / 100
     }
   }
 }
@@ -179,6 +184,9 @@ function connectWs() {
         return
       }
       if (msg.type === 'position_update' && (msg.positions || msg.data)) {
+        // 同步标准开仓金额（后端 config.yaml trade.open.amount_usdt）后再走 ensureFundingBps
+        const oa = (msg as any).open_amount_usdt
+        if (typeof oa === 'number' && oa > 0) openAmountUsdt.value = oa
         applyPositionUpdates(msg.positions || msg.data!)
         // 提取资金汇总
         if ((msg as any).account_summary) {
@@ -848,6 +856,10 @@ async function fetchPositions() {
       return
     }
     const data = await res.json()
+    // 同步标准开仓金额（后端 config.yaml trade.open.amount_usdt）后再走 ensureFundingBps
+    if (typeof data.open_amount_usdt === 'number' && data.open_amount_usdt > 0) {
+      openAmountUsdt.value = data.open_amount_usdt
+    }
     const rows: PositionRow[] = data.positions || []
     ensureFundingBps(rows)
     positionMap.clear()

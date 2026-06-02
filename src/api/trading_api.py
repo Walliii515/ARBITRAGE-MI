@@ -247,7 +247,7 @@ async def get_positions(
         history_sql = f"""
             SELECT position_id, payment_seq, funding_rate, funding_rate_24h,
                    funding_pnl, future_notional, settled_at
-            FROM mi_funding_fee_history
+            FROM mi_trade_funding_fee_history
             WHERE position_id IN ({placeholders})
             ORDER BY position_id, payment_seq
         """
@@ -282,7 +282,9 @@ async def get_positions(
                 'page_size': page_size,
                 'total': total,
                 'total_pages': (total + page_size - 1) // page_size,
-            }
+            },
+            # 标准开仓金额，前端用于兑底计算 funding_pnl_bps、避免硬编码与后端配置漂移
+            'open_amount_usdt': config.get_float('trade.open.amount_usdt', 10.0),
         }
     except Exception as e:
         logger.error(f'查询持仓失败: {e}', exc_info=True)

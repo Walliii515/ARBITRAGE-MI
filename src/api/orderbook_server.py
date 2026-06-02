@@ -1029,6 +1029,8 @@ async def _position_realtime_push():
                 'type': 'position_update',
                 'positions': positions,
                 'account_summary': account_summary,
+                # 标准开仓金额：前端兑底计算 funding_pnl_bps 使用，避免与后端配置漂移
+                'open_amount_usdt': OPEN_AMOUNT_USDT,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             await broadcast_queue.put(payload)
