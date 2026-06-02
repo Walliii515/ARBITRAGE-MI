@@ -3,6 +3,7 @@
 - TradingExecutor: 开仓判断 + 订单生成 + 持久化
 - 成交引擎通过 ExecutorClient (HTTP) 调用独立的执行器服务（虚拟/实盘），实现虚实分离
 """
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -82,7 +83,25 @@ class TradingExecutor:
 
         # 开仓金额（用于 min_notional 前置校验）
         self.open_amount_usdt = config.get_float('trade.open.amount_usdt', 5)
+
+        # 最终风控旁路：盘口最大允许陈旧时间（秒）
+        self._max_orderbook_stale_sec = config.get_float('trade.open.max_orderbook_stale_sec', 5.0)
+        # OrderBookManager 引用（由外部注入）
+        self._gate_manager = None
+        self._spot_manager = None
     
+    def set_orderbook_managers(self, gate_manager, spot_manager):
+        """
+        注入 OrderBookManager 引用，供最终风控旁路直接读取单标的盘口。
+
+        Args:
+            gate_manager: Gate 期货 OrderBookManager 实例
+            spot_manager: Binance 现货 OrderBookManager 实例
+        """
+        self._gate_manager = gate_manager
+        self._spot_manager = spot_manager
+        logger.info('OrderBookManager 已注入 TradingExecutor（最终风控旁路就绪）')
+
     def update_holding_margin_status(self, positions: List[Dict]):
         """
         更新持仓的保证金状态缓存（由调用方在每个开仓检查周期前调用）
@@ -106,13 +125,12 @@ class TradingExecutor:
                 if ba not in self._holding_liq_distance or liq_dist < self._holding_liq_distance[ba]:
                     self._holding_liq_distance[ba] = liq_dist
 
-    def check_and_open(self, orderbook_rows: List[Dict], refresh_fn=None) -> List[Dict]:
+    def check_and_open(self, orderbook_rows: List[Dict]) -> List[Dict]:
         """
         检查所有合约并执行开仓
         
         Args:
             orderbook_rows: 合并后的订单簿行(已计算对冲指标)
-            refresh_fn: 可选回调，peak确认后调用获取最新盘口数据（减少决策到执行间的数据陈旧）
         
         Returns:
             开仓结果列表
@@ -172,16 +190,32 @@ class TradingExecutor:
                     if not self._pass_peak_check(base_asset, open_vwap_basis, row):
                         continue
                 
-                # 3.5 peak确认后，刷新最新盘口数据（消除决策到执行间的数据陈旧）
-                if refresh_fn:
-                    try:
-                        fresh_rows = refresh_fn()
-                        fresh_row = next((r for r in fresh_rows if r.get('base_asset') == base_asset), None)
-                        if fresh_row and fresh_row.get('open_vwap_basis_bps') is not None:
-                            row = fresh_row
-                            open_vwap_basis = float(fresh_row['open_vwap_basis_bps'])
-                    except Exception as e:
-                        logger.debug(f"刷新盘口失败(使用原数据): {e}")
+                # 3.5 最终风控旁路：单标的最短链路重新校验（拦截信号过期场景）
+                contract = row.get('contract', '')
+                symbol = row.get('symbol', '')
+                gate_passed, gate_row, gate_basis, gate_reason = self._pre_execution_gate(
+                    base_asset, contract, symbol
+                )
+                if not gate_passed:
+                    # 最终风控拦截，信号标记为 gate_rejected
+                    peak_state = self._peak_state.get(base_asset, {})
+                    self._resolve_signal(
+                        base_asset, 'gate_rejected', gate_reason,
+                        exit_basis_bps=gate_basis,
+                        trigger_type=peak_state.get('trigger')
+                    )
+                    self._peak_state.pop(base_asset, None)
+                    logger.info(
+                        f"最终风控旁路拦截 | {base_asset} | "
+                        f"gate_basis={gate_basis}bps | 原因: {gate_reason}"
+                    )
+                    continue
+
+                # 使用旁路返回的最新数据（单标的最短链路）
+                if gate_row is not None:
+                    row = gate_row
+                if gate_basis is not None:
+                    open_vwap_basis = gate_basis
                 
                 # 4. 构建开仓原因（用于复盘）
                 open_reason = self._build_open_reason(row, base_asset, open_vwap_basis)
@@ -366,6 +400,115 @@ class TradingExecutor:
             # 任何异常均回退为放行
             logger.debug(f"实时费率校验异常(回退放行) | {base_asset}: {e}")
             return True
+
+    def _pre_execution_gate(self, base_asset: str, contract: str, symbol: str) -> tuple:
+        """
+        最终风控旁路：下单前用单标的最短链路重新校验开仓条件。
+
+        设计目的：
+        - 拦截"信号过期"场景（峰值监控期间基差已衰减到不值得开仓的水平）
+        - 检测盘口数据陈旧性（低流动性标的WS更新稀疏）
+        - 确保下单用的数据 = 校验用的数据（同一份最短链路读取）
+
+        最短链路：单标的盘口读取 → VWAP基差计算 → 阈值+盈利性守卫+覆盖率校验
+
+        Args:
+            base_asset: 标的资产 (e.g. 'BTC')
+            contract: Gate合约名 (e.g. 'BTC_USDT')
+            symbol: Binance交易对 (e.g. 'BTCUSDT')
+
+        Returns:
+            (passed, fresh_row, gate_basis_bps, reject_reason)
+            - passed: 是否通过最终风控
+            - fresh_row: 通过时返回合并后的最新盘口行（供后续下单使用）
+            - gate_basis_bps: 最终校验时的VWAP基差
+            - reject_reason: 未通过时的拒绝原因
+        """
+        # 未注入 manager 时退化为放行（兼容测试场景）
+        if not self._gate_manager or not self._spot_manager:
+            return True, None, None, ''
+
+        try:
+            # ── 1. 单标的盘口读取（最短链路，不遍历其他标的）──
+            gate_ob = self._gate_manager.get_orderbook(contract)
+            spot_ob = self._spot_manager.get_orderbook(symbol)
+
+            if not gate_ob or not spot_ob:
+                return False, None, None, f'盘口不可用(gate={gate_ob is not None}, spot={spot_ob is not None})'
+
+            gate_row = gate_ob.to_dict_row()
+            spot_row = spot_ob.to_dict_row()
+
+            # ── 2. 盘口新鲜度检查 ──
+            now_ts = time.time()
+            gate_age = now_ts - (gate_row.get('update_time') or 0)
+            spot_age = now_ts - (spot_row.get('update_time') or 0)
+
+            if gate_age > self._max_orderbook_stale_sec or spot_age > self._max_orderbook_stale_sec:
+                return False, None, None, (
+                    f'盘口过期(gate_age={gate_age:.1f}s, spot_age={spot_age:.1f}s, '
+                    f'max={self._max_orderbook_stale_sec}s)'
+                )
+
+            # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
+            from calc.merge_cross_exchange_orderbook import merge_orderbook_records
+            from calc.calculate_hedge_metrics import calculate_hedge_metrics
+
+            merged = merge_orderbook_records([gate_row], [spot_row])
+            if not merged:
+                return False, None, None, '盘口合并失败'
+
+            merged = calculate_hedge_metrics(
+                merged, self.contract_meta, self.spot_meta, self.open_amount_usdt
+            )
+            row = merged[0]
+
+            # ── 4. 计算VWAP基差 ──
+            gate_basis_bps = calc_vwap_basis_bps(
+                row.get('spot_open_vwap'), row.get('future_open_vwap')
+            )
+            if gate_basis_bps is None:
+                return False, None, None, 'VWAP基差计算失败(盘口深度不足)'
+            gate_basis_bps = round(gate_basis_bps, 2)
+
+            # ── 5. 基差阈值校验 ──
+            if base_asset in self.vwap_threshold_meta:
+                p20 = self.vwap_threshold_meta[base_asset].get('p20')
+                if p20 is not None and gate_basis_bps < p20:
+                    return False, row, gate_basis_bps, (
+                        f'基差衰减({gate_basis_bps:.1f}bps < 阈值p20={p20:.1f})'
+                    )
+            else:
+                if gate_basis_bps < self.basis_threshold_bps:
+                    return False, row, gate_basis_bps, (
+                        f'基差衰减({gate_basis_bps:.1f}bps < 全局阈值{self.basis_threshold_bps})'
+                    )
+
+            # ── 6. 盈利性守卫 ──
+            if base_asset in self.close_vwap_threshold_meta:
+                close_data = self.close_vwap_threshold_meta[base_asset]
+                close_threshold = close_data.get(self.close_threshold_col)
+                if close_threshold is not None:
+                    if gate_basis_bps <= float(close_threshold) + self.fee_cost_bps:
+                        return False, row, gate_basis_bps, (
+                            f'盈利性守卫拦截(basis={gate_basis_bps:.1f} <= '
+                            f'close_thr={float(close_threshold):.1f}+fee={self.fee_cost_bps:.0f})'
+                        )
+
+            # ── 7. 盘口覆盖校验 ──
+            open_coverage = row.get('open_coverage')
+            if open_coverage is not None and float(open_coverage) > self.coverage_threshold:
+                return False, row, gate_basis_bps, (
+                    f'盘口覆盖超限({float(open_coverage):.2f} > {self.coverage_threshold})'
+                )
+
+            # ── 全部通过 ──
+            return True, row, gate_basis_bps, ''
+
+        except Exception as e:
+            # 异常时退化为放行（不因旁路故障阻塞正常开仓）
+            logger.warning(f"最终风控旁路异常(退化放行) | {base_asset}: {e}")
+            return True, None, None, ''
 
     def _pass_peak_check(self, base_asset: str, current_basis_bps: float, row: Dict = None) -> bool:
         """

@@ -158,6 +158,9 @@ _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费�
 _trading_executor: Optional['TradingExecutor'] = None
 _closing_executor: Optional['ClosingExecutor'] = None
 
+# ───── 开仓暂停开关 ─────
+_open_paused: bool = False                   # True 时暂停开仓循环，平仓不受影响
+
 # ───── 交易链路连通性熔断 ─────
 # 仅实盘模式下启用：Binance + Gate 任一不通即禁止交易
 _exchange_connectivity_ok: bool = True       # 默认 True（虚拟模式不受影响）
@@ -643,6 +646,30 @@ async def service_stop():
     return {'ok': True, 'message': message}
 
 
+@app.post('/api/trading/open/pause', dependencies=[Depends(verify_token_dependency)])
+async def pause_open():
+    """暂停开仓（平仓不受影响）"""
+    global _open_paused
+    _open_paused = True
+    logger.info('⏸ 开仓已暂停（手动操作）')
+    return {'ok': True, 'open_paused': True}
+
+
+@app.post('/api/trading/open/resume', dependencies=[Depends(verify_token_dependency)])
+async def resume_open():
+    """恢复开仓"""
+    global _open_paused
+    _open_paused = False
+    logger.info('▶ 开仓已恢复（手动操作）')
+    return {'ok': True, 'open_paused': False}
+
+
+@app.get('/api/trading/open/status')
+async def open_status():
+    """查询开仓暂停状态（无需认证）"""
+    return {'open_paused': _open_paused}
+
+
 @app.post('/api/trading/positions/{position_id}/manual-close', dependencies=[Depends(verify_token_dependency)])
 async def manual_close_position(position_id: int):
     """手动一键平仓：跳过条件检查，直接对指定持仓执行平仓"""
@@ -767,6 +794,10 @@ async def _open_position_loop():
             if not svc or svc.state != SERVICE_RUNNING:
                 continue
 
+            # 开仓暂停开关：手动暂停时跳过，平仓不受影响
+            if _open_paused:
+                continue
+
             # 交易链路熔断：实盘模式下，任一交易所不通则禁止开仓
             if _is_real_executor and not _exchange_connectivity_ok:
                 continue
@@ -788,8 +819,9 @@ async def _open_position_loop():
                         _contract_meta, _spot_meta, _threshold_meta,
                         _vwap_threshold_meta, _close_vwap_threshold_meta
                     )
+                    _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
 
-                results = _trading_executor.check_and_open(merged_rows, refresh_fn=_get_fresh_trading_rows)
+                results = _trading_executor.check_and_open(merged_rows)
 
                 # 推送信号变化通知（有任何结果即表示信号表有新增/状态变化）
                 if results and broadcast_queue:
