@@ -992,6 +992,7 @@ async def _close_position_loop():
             if _closing_executor is None:
                 from calc.closing_executor import ClosingExecutor
                 _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
+                _closing_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
             results = _closing_executor.check_and_close(
                 positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
             )

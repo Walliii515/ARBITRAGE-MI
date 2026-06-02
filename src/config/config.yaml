@@ -53,7 +53,7 @@ trade:
     vwap_basis_threshold_bps: 20            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
-    min_funding_rate_bps: -15                # 24h资金费率下限(bps)，低于此值不开仓
+    min_funding_rate_bps: 0                # 24h资金费率下限(bps)，低于此值不开仓
 
   # ─── 开仓过滤 ───
   filter:

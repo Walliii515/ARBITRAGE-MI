@@ -5,10 +5,13 @@
 - 成交引擎通过 ExecutorClient (HTTP) 调用独立的执行器服务（虚拟/实盘），实现虚实分离
 
 平仓触发条件（按优先级）：
+  0. 保证金爆仓风控（距爆仓距离 < 阈值）
   1. 资金费次数 >= max_funding_payments
   2. 止盈: 总盈亏bps(基差收敛 + 已收资金费) >= 24h资金费率bps * multiplier + 手续费bps
+     (止盈下单前有最终风控旁路，确认仍满足止盈)
   3. 累计资金费超阈值: 费率为负时，累计支出bps >= max(open_p20 - close_p20, 15) × 0.5
 """
+import time
 import uuid
 from datetime import datetime
 from typing import List, Dict
@@ -69,6 +72,24 @@ class ClosingExecutor:
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
+
+        # 最终风控旁路：盘口最大允许陈旧时间（秒）
+        self._max_orderbook_stale_sec = config.get_float('trade.close.max_orderbook_stale_sec', 5.0)
+        # OrderBookManager 引用（由外部注入）
+        self._gate_manager = None
+        self._spot_manager = None
+
+    def set_orderbook_managers(self, gate_manager, spot_manager):
+        """
+        注入 OrderBookManager 引用，供平仓最终风控旁路直接读取单标的盘口。
+
+        Args:
+            gate_manager: Gate 期货 OrderBookManager 实例
+            spot_manager: Binance 现货 OrderBookManager 实例
+        """
+        self._gate_manager = gate_manager
+        self._spot_manager = spot_manager
+        logger.info('OrderBookManager 已注入 ClosingExecutor（平仓最终风控旁路就绪）')
 
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
@@ -152,6 +173,25 @@ class ClosingExecutor:
 
             if not close_reason:
                 continue
+
+            # ── 最终风控旁路：仅对止盈平仓生效，确认下单前仍满足止盈 ──
+            if close_reason == 'take_profit':
+                contract = pos.get('future_contract', '')
+                symbol = pos.get('spot_symbol') or f"{ba}USDT"
+                gate_passed, gate_row, gate_basis, gate_reason = self._pre_execution_gate(
+                    ba, contract, symbol, pos
+                )
+                if not gate_passed:
+                    logger.info(
+                        f"平仓最终风控旁路拦截 | {ba} | reason={close_reason} | "
+                        f"gate_basis={gate_basis}bps | 原因: {gate_reason}"
+                    )
+                    # 旁路拦截后清除谷底状态，下一轮重新判断
+                    self._valley_state.pop(ba, None)
+                    continue
+                # 使用旁路返回的最新盘口行（确保下单数据 = 校验数据）
+                if gate_row is not None:
+                    orderbook_rows_by_asset[ba] = gate_row
 
             # ── 执行平仓 ──
             orderbook_row = orderbook_rows_by_asset.get(ba)
@@ -261,6 +301,109 @@ class ClosingExecutor:
         threshold = effective_space * self.funding_cost_tolerance_ratio
 
         return abs(funding_pnl_bps) >= threshold
+
+    def _pre_execution_gate(self, base_asset: str, contract: str, symbol: str, pos: Dict) -> tuple:
+        """
+        平仓最终风控旁路：下单前用单标的最短链路重新校验平仓条件。
+
+        设计目的：
+        - 拦截“信号过期”场景（谷底确认后基差已回弹至不利平仓的水平）
+        - 检测盘口数据陈旧性（低流动性标的WS更新稀疏）
+        - 确保下单用的数据 = 校验用的数据
+
+        校验逻辑：重新计算平仓VWAP基差，确认平仓仍然有利可图：
+        - 新基差未大幅回弹超过开仓基差（即仍有收敛空间）
+
+        Args:
+            base_asset: 标的资产 (e.g. 'BTC')
+            contract: Gate合约名 (e.g. 'BTC_USDT')
+            symbol: Binance交易对 (e.g. 'BTCUSDT')
+            pos: 当前持仓记录（含 open_spread_bps）
+
+        Returns:
+            (passed, fresh_row, gate_basis_bps, reject_reason)
+            - passed: 是否通过最终风控
+            - fresh_row: 通过时返回合并后的最新盘口行（供后续下单使用）
+            - gate_basis_bps: 最终校验时的平仓VWAP基差
+            - reject_reason: 未通过时的拒绝原因
+        """
+        # 未注入 manager 时退化为放行（兼容测试场景）
+        if not self._gate_manager or not self._spot_manager:
+            return True, None, None, ''
+
+        try:
+            # ── 1. 单标的盘口读取（最短链路）──
+            gate_ob = self._gate_manager.get_orderbook(contract)
+            spot_ob = self._spot_manager.get_orderbook(symbol)
+
+            if not gate_ob or not spot_ob:
+                return False, None, None, f'盘口不可用(gate={gate_ob is not None}, spot={spot_ob is not None})'
+
+            gate_row = gate_ob.to_dict_row()
+            spot_row = spot_ob.to_dict_row()
+
+            # ── 2. 盘口新鲜度检查 ──
+            now_ts = time.time()
+            gate_age = now_ts - (gate_row.get('update_time') or 0)
+            spot_age = now_ts - (spot_row.get('update_time') or 0)
+
+            if gate_age > self._max_orderbook_stale_sec or spot_age > self._max_orderbook_stale_sec:
+                return False, None, None, (
+                    f'盘口过期(gate_age={gate_age:.1f}s, spot_age={spot_age:.1f}s, '
+                    f'max={self._max_orderbook_stale_sec}s)'
+                )
+
+            # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
+            from calc.merge_cross_exchange_orderbook import merge_orderbook_records
+            from calc.calculate_hedge_metrics import calculate_hedge_metrics
+
+            open_amount_usdt = config.get_float('trade.open.amount_usdt', 5)
+            merged = merge_orderbook_records([gate_row], [spot_row])
+            if not merged:
+                return False, None, None, '盘口合并失败'
+
+            merged = calculate_hedge_metrics(
+                merged, self.contract_meta, self.spot_meta, open_amount_usdt
+            )
+            row = merged[0]
+
+            # ── 4. 计算平仓VWAP基差 ──
+            gate_basis_bps = calc_vwap_basis_bps(
+                row.get('spot_close_vwap'), row.get('future_close_vwap')
+            )
+            if gate_basis_bps is None:
+                return False, None, None, '平仓VWAP基差计算失败(盘口深度不足)'
+            gate_basis_bps = round(gate_basis_bps, 2)
+
+            # ── 5. 盈利性校验：确认平仓仍有利可图 ──
+            # 平仓基差应 < 开仓基差（即价差已收敛）
+            # 如果新基差 >= 开仓基差，说明收敛已完全逆转，平仓会亨损
+            open_spread_bps = float(pos.get('open_spread_bps') or 0)
+            if gate_basis_bps >= open_spread_bps:
+                return False, row, gate_basis_bps, (
+                    f'收敛逆转(平仓基差{gate_basis_bps:.1f}bps >= '
+                    f'开仓基差{open_spread_bps:.1f}bps, 无收敛利润)'
+                )
+
+            # ── 6. 基差回弹幅度检查：与触发时相比不应回弹过大 ──
+            # 如果新基差比开仓基差的收敛空间回弹超过 50%，说明收敛已大幅逆转
+            convergence_total = open_spread_bps - gate_basis_bps
+            original_convergence = open_spread_bps - float(pos.get('current_spread_bps') or gate_basis_bps)
+            if original_convergence > 0 and convergence_total > 0:
+                reversion_ratio = (gate_basis_bps - float(pos.get('current_spread_bps') or gate_basis_bps)) / original_convergence
+                if reversion_ratio > 0.5:
+                    return False, row, gate_basis_bps, (
+                        f'基差回弹过大(回弹{reversion_ratio:.0%}, '
+                        f'触发时{pos.get("current_spread_bps")}bps→当前{gate_basis_bps}bps)'
+                    )
+
+            # ── 全部通过 ──
+            return True, row, gate_basis_bps, ''
+
+        except Exception as e:
+            # 异常时退化为放行（不因旁路故障阻塞正常平仓）
+            logger.warning(f'平仓最终风控旁路异常(退化放行) | {base_asset}: {e}')
+            return True, None, None, ''
 
     def _pass_valley_check(self, base_asset: str, current_spread_bps: float, pos: Dict) -> bool:
         """
