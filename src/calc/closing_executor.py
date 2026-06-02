@@ -192,6 +192,13 @@ class ClosingExecutor:
                 # 使用旁路返回的最新盘口行（确保下单数据 = 校验数据）
                 if gate_row is not None:
                     orderbook_rows_by_asset[ba] = gate_row
+                # 补充旁路判定信息到原因详情（供复盘）
+                if gate_basis is not None:
+                    drift_bps = gate_basis - current_spread_bps
+                    close_reason_detail = (
+                        f"{close_reason_detail}"
+                        f"|旁路✓(gate={gate_basis:.1f}bps,偏移{drift_bps:+.1f})"
+                    )
 
             # ── 执行平仓 ──
             orderbook_row = orderbook_rows_by_asset.get(ba)
@@ -532,7 +539,24 @@ class ClosingExecutor:
             {base_asset, success, order_uuid, close_reason, message}
         """
         close_reason = 'manual'
-        close_reason_detail = '手动一键平仓'
+        # 构建详情：携带当前基差/开仓基差/资金费收益等关键判定数据，便于复盘
+        ba = pos.get('base_asset', '')
+        open_spread = pos.get('open_spread_bps')
+        current_spread = pos.get('current_spread_bps')
+        funding_pnl_bps = pos.get('funding_pnl_bps')
+        parts = ['手动一键平仓']
+        if open_spread is not None and current_spread is not None:
+            convergence = float(open_spread) - float(current_spread)
+            parts.append(
+                f"基差 {float(open_spread):.1f}→{float(current_spread):.1f}bps"
+                f"(收敛{convergence:+.1f})"
+            )
+        if funding_pnl_bps is not None:
+            parts.append(f"已收资金费{float(funding_pnl_bps):+.1f}bps")
+        liq_distance = pos.get('liq_distance_pct')
+        if liq_distance is not None:
+            parts.append(f"距爆仓{float(liq_distance):.2f}%")
+        close_reason_detail = '|'.join(parts)
         return self._execute_close(pos, close_reason, close_reason_detail, orderbook_row)
 
     # ──────────────────────────────────────────────────────────────────

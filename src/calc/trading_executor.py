@@ -119,6 +119,10 @@ class TradingExecutor:
         # p10持续确认：基差连续 >= p10 持续 N 秒才触发直开，过滤高频脉冲
         self.p10_sustain_sec = cfg.p10_sustain_sec
         self._p10_sustain_state: Dict[str, Dict] = {}  # base_asset -> {start_time, min_basis}
+        # 临时槽位：p10持续确认通过后的信息（供 _build_open_reason 取用，单次开仓后清空）
+        self._p10_sustain_confirmed: Dict[str, Dict] = {}  # base_asset -> {sustained_sec, min_basis}
+        # 临时槽位：直开通道实时费率校验通过时记录的实时费率(bps)
+        self._last_realtime_rate_bps: Dict[str, float] = {}
 
         # 保证金风控：距爆仓距离低于此值时禁止开仓
         self.margin_warning_pct = cfg.margin_warning_pct
@@ -494,9 +498,14 @@ class TradingExecutor:
         # 检查是否持续足够时间
         elapsed = (now - state['start_time']).total_seconds()
         if elapsed >= self.p10_sustain_sec:
-            # 持续确认通过，清除状态
+            # 持续确认通过，清除监控状态
             min_basis = state['min_basis']
             self._p10_sustain_state.pop(base_asset, None)
+            # 写入临时槽位，供 _build_open_reason 拼接到开仓原因
+            self._p10_sustain_confirmed[base_asset] = {
+                'sustained_sec': elapsed,
+                'min_basis': min_basis,
+            }
             logger.info(
                 f"p10持续确认通过 | {base_asset} | "
                 f"sustained={elapsed:.1f}s | min_basis={min_basis:.1f}bps | "
@@ -526,7 +535,9 @@ class TradingExecutor:
                     f"实时费率={rate_bps:.2f}bps < 下限{self.min_funding_rate_bps:.1f}bps"
                 )
                 return False
-            
+
+            # 校验通过：记录实时费率，供 _build_open_reason 拼接到开仓原因
+            self._last_realtime_rate_bps[base_asset] = rate_bps
             return True
         except Exception as e:
             # 任何异常均回退为放行
@@ -851,18 +862,33 @@ class TradingExecutor:
             rate_pct = float(funding_rate) * 100
             parts.append(f"费率{rate_pct:.4f}%")
 
-        # 3. 峰值回落信息
-        peak_state = self._peak_state.get(base_asset)
-        if peak_state:
-            peak_bps = peak_state.get('peak_bps', 0)
-            trigger = peak_state.get('trigger', 'unknown')
-            if trigger == 'pullback':
-                parts.append(f"峰值回落(峰{peak_bps:.1f}→回落{self.peak_pullback_pct*100:.0f}%)")
-            elif trigger == 'timeout':
-                elapsed = (datetime.now() - peak_state['start_time']).total_seconds()
-                parts.append(f"峰值超时(峰{peak_bps:.1f},{elapsed:.0f}s)")
-            else:
-                parts.append(f"峰值{peak_bps:.1f}")
+        # 3. 通道判定细节
+        if direct:
+            # 通道B(直开)：p10持续确认 + 实时费率校验
+            confirmed = self._p10_sustain_confirmed.pop(base_asset, None)
+            if confirmed:
+                parts.append(
+                    f"p10持续{confirmed['sustained_sec']:.1f}s"
+                    f"(谷{confirmed['min_basis']:.1f}≥{p10:.1f})"
+                )
+            rt_rate = self._last_realtime_rate_bps.pop(base_asset, None)
+            if rt_rate is not None:
+                parts.append(
+                    f"实时费率✓({rt_rate:.2f}bps≥{self.min_funding_rate_bps:.1f})"
+                )
+        else:
+            # 通道A(回落)：峰值回落/超时信息
+            peak_state = self._peak_state.get(base_asset)
+            if peak_state:
+                peak_bps = peak_state.get('peak_bps', 0)
+                trigger = peak_state.get('trigger', 'unknown')
+                if trigger == 'pullback':
+                    parts.append(f"峰值回落(峰{peak_bps:.1f}→回落{self.peak_pullback_pct*100:.0f}%)")
+                elif trigger == 'timeout':
+                    elapsed = (datetime.now() - peak_state['start_time']).total_seconds()
+                    parts.append(f"峰值超时(峰{peak_bps:.1f},{elapsed:.0f}s)")
+                else:
+                    parts.append(f"峰值{peak_bps:.1f}")
 
         # 4. 盈利性守卫
         if base_asset in self.close_vwap_threshold_meta:
