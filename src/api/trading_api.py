@@ -45,87 +45,69 @@ def _serialize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 @router.get('/orders')
 async def get_orders(
-    status: Optional[str] = Query(None, description="持仓状态过滤(executed/rejected/pending)"),
+    status: Optional[str] = Query(None, description="持仓状态(holding/closed)"),
     channel: Optional[str] = Query(None, description="渠道过滤"),
-    order_side: Optional[str] = Query(None, description="持仓方向过滤(open=仅开仓/close=已平仓)"),
+    order_side: Optional[str] = Query(None, description="方向过滤(open=持仓中/close=已平仓)"),
     position_id: Optional[int] = Query(None, description="持仓ID过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
-    days: int = Query(1, ge=1, le=90, description="最近N天（开仓时间）"),
+    days: int = Query(1, ge=1, le=90, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页持仓数"),
 ):
-    """查询订单列表（按持仓分页，过滤条件作用于持仓级别）"""
-    # ─── Step 1: 查询符合条件的 position_id ───
-    base_where = "created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) AND position_id IS NOT NULL"
-    base_params: list = [days]
+    """查询持仓列表（直接查 mi_trade_position，按持仓分页）"""
+    # ─── 构建 WHERE 条件 ───
+    where_clauses = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    params: list = [days]
+
+    # 方向过滤 → 映射为持仓状态
+    if order_side == 'open':
+        where_clauses.append("p.status = 'holding'")
+    elif order_side == 'close':
+        where_clauses.append("p.status = 'closed'")
+    elif status in ('holding', 'closed'):
+        where_clauses.append("p.status = %s")
+        params.append(status)
+    elif status == 'executed':
+        pass  # 所有持仓都是成功开仓的，不需额外过滤
+    elif status in ('pending', 'rejected', 'failed'):
+        # 这些状态不适用于持仓级别，返回空
+        return {'orders': [], 'pagination': {'page': page, 'page_size': page_size, 'total': 0, 'total_pages': 0}}
+
+    if base_asset:
+        where_clauses.append("p.base_asset = %s")
+        params.append(base_asset)
+
+    if position_id is not None:
+        where_clauses.append("p.id = %s")
+        params.append(position_id)
 
     if channel:
-        base_where += " AND channel = %s"
-        base_params.append(channel)
-    if base_asset:
-        base_where += " AND base_asset = %s"
-        base_params.append(base_asset)
-    if position_id is not None:
-        base_where += " AND position_id = %s"
-        base_params.append(position_id)
+        where_clauses.append("EXISTS (SELECT 1 FROM mi_trade_order o WHERE o.position_id = p.id AND o.channel = %s)")
+        params.append(channel)
 
-    # 以 position_id 分组，通过 HAVING 实现持仓级过滤
-    having_clauses: list = []
-    having_params: list = []
+    where_sql = " AND ".join(where_clauses)
 
-    if status:
-        if status == 'executed':
-            having_clauses.append("COUNT(*) = SUM(CASE WHEN status = 'executed' THEN 1 ELSE 0 END)")
-        elif status == 'rejected':
-            having_clauses.append("SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) > 0")
-        elif status == 'pending':
-            having_clauses.append("SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) > 0")
-        elif status == 'failed':
-            having_clauses.append("SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) > 0")
-
-    if order_side:
-        if order_side == 'open':
-            # 仅开仓：没有任何平仓订单
-            having_clauses.append("SUM(CASE WHEN order_side = 'close' THEN 1 ELSE 0 END) = 0")
-        elif order_side == 'close':
-            # 已平仓：存在平仓订单
-            having_clauses.append("SUM(CASE WHEN order_side = 'close' THEN 1 ELSE 0 END) > 0")
-
-    having_sql = ""
-    if having_clauses:
-        having_sql = " HAVING " + " AND ".join(having_clauses)
-
-    # ─── Step 2: 统计符合条件的持仓总数 ───
-    count_sql = f"SELECT COUNT(*) AS total FROM (SELECT position_id FROM mi_trade_order WHERE {base_where} GROUP BY position_id{having_sql}) AS t"
-    count_params = base_params + having_params
-
+    # ─── 统计持仓总数 ───
+    count_sql = f"SELECT COUNT(*) AS total FROM mi_trade_position p WHERE {where_sql}"
     with db_manager.get_cursor() as cursor:
-        cursor.execute(count_sql, count_params)
+        cursor.execute(count_sql, params)
         total_row = cursor.fetchone()
         total = total_row['total'] if total_row else 0
 
-    # ─── Step 3: 分页获取 position_id 列表 ───
+    # ─── 分页查询持仓 ───
     offset = (page - 1) * page_size
-    pid_sql = f"SELECT position_id FROM mi_trade_order WHERE {base_where} GROUP BY position_id{having_sql} ORDER BY MAX(id) DESC LIMIT %s OFFSET %s"
-    pid_params = base_params + having_params + [page_size, offset]
-
+    query_params = list(params) + [page_size, offset]
+    sql = f"""
+        SELECT p.*,
+               (SELECT o.channel FROM mi_trade_order o WHERE o.position_id = p.id LIMIT 1) AS channel,
+               (SELECT COUNT(*) FROM mi_trade_order o WHERE o.position_id = p.id) AS order_count
+        FROM mi_trade_position p
+        WHERE {where_sql}
+        ORDER BY p.id DESC
+        LIMIT %s OFFSET %s
+    """
     with db_manager.get_cursor() as cursor:
-        cursor.execute(pid_sql, pid_params)
-        pid_rows = cursor.fetchall()
-        pids = [r['position_id'] for r in pid_rows]
-
-    if not pids:
-        return {
-            'orders': [],
-            'pagination': {'page': page, 'page_size': page_size, 'total': total, 'total_pages': (total + page_size - 1) // page_size if total else 0}
-        }
-
-    # ─── Step 4: 获取这些持仓的全部订单 ───
-    placeholders = ','.join(['%s'] * len(pids))
-    order_sql = f"SELECT * FROM mi_trade_order WHERE position_id IN ({placeholders}) ORDER BY position_id DESC, id ASC"
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(order_sql, pids)
+        cursor.execute(sql, query_params)
         rows = cursor.fetchall()
 
     return {
@@ -137,6 +119,16 @@ async def get_orders(
             'total_pages': (total + page_size - 1) // page_size if total else 0,
         }
     }
+
+
+@router.get('/positions/{position_id}/orders')
+async def get_position_orders(position_id: int):
+    """获取指定持仓的全部订单明细（弹窗用）"""
+    sql = "SELECT * FROM mi_trade_order WHERE position_id = %s ORDER BY id ASC"
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, [position_id])
+        rows = cursor.fetchall()
+    return {'orders': _serialize_rows(rows)}
 
 
 @router.get('/orders/grouped')

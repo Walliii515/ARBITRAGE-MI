@@ -7,7 +7,6 @@ import type {
   GridApi,
   GridReadyEvent,
   ValueFormatterParams,
-  ColumnState,
 } from 'ag-grid-community'
 import { ElPopover, ElMessageBox } from 'element-plus'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -26,16 +25,15 @@ interface OrderRow {
   base_asset: string | null
   market_type: string | null
   trade_direction: string | null
-  order_side: string | null  // open/close
-  status: string | null  // pending/executed/rejected/failed
-  channel: string | null  // Mock/SimTrade/Live
+  order_side: string | null
+  status: string | null
+  channel: string | null
   target_qty: number | null
   target_amount: number | null
   exec_price: number | null
   exec_qty: number | null
   exec_amount: number | null
   coverage_ratio: number | null
-  // 开仓时刻风控指标
   open_coverage: number | null
   open_vwap_basis_bps: number | null
   risk_relief_bps: number | null
@@ -44,57 +42,41 @@ interface OrderRow {
   reject_reason: string | null
 }
 
-/* ───── 分组展示类型 ───── */
-interface OrderGroup {
-  position_id: number | null
-  base_asset: string
+/** 持仓行类型（来自 mi_trade_position 表） */
+interface PositionRow {
+  id: number
   order_uuid: string | null
-  orders: OrderRow[]
-  total_amount: number
-  executed_amount: number
-  status: 'all_executed' | 'partial' | 'pending' | 'rejected'
-}
-
-interface DisplayRow {
-  // 标识行类型
-  isGroupHeader: boolean
-  position_id?: number | null
-  base_asset?: string | null
-  order_uuid?: string | null
-  orders?: OrderRow[]
-  total_amount?: number
-  executed_amount?: number
-  groupStatus?: 'all_executed' | 'partial' | 'pending' | 'rejected'
-  isExpanded?: boolean  // deprecated, kept for interface compat
-  // 明细行字段（继承 OrderRow）
-  id?: number
-  created_at?: string | null
-  market_type?: string | null
-  trade_direction?: string | null
-  order_side?: string | null
-  status?: string | null
-  channel?: string | null
-  target_qty?: number | null
-  target_amount?: number | null
-  exec_price?: number | null
-  exec_qty?: number | null
-  exec_amount?: number | null
-  coverage_ratio?: number | null
-  // 开仓时刻风控指标
-  open_coverage?: number | null
-  open_vwap_basis_bps?: number | null
-  risk_relief_bps?: number | null
-  open_marginal_basis_bps?: number | null
-  funding_rate_24h?: number | null
-  reject_reason?: string | null
-  // 前端计算字段（平仓明细行）
-  _close_basis_bps?: number | null
+  base_asset: string
+  status: string  // holding / closed
+  opened_at: string | null
+  closed_at: string | null
+  spot_open_qty: number | null
+  spot_open_price: number | null
+  spot_open_amount: number | null
+  future_open_qty: number | null
+  future_open_price: number | null
+  future_open_contracts: number | null
+  open_spread_bps: number | null
+  open_reason: string | null
+  spot_close_price: number | null
+  spot_close_amount: number | null
+  future_close_price: number | null
+  future_close_amount: number | null
+  close_spread_bps: number | null
+  close_reason: string | null
+  funding_rate_sum_bps: number | null
+  funding_payments_count: number | null
+  funding_total_pnl: number | null
+  total_pnl: number | null
+  // 子查询注入字段
+  channel: string | null
+  order_count: number | null
 }
 
 /* ───── 状态 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
-const rowData = shallowRef<OrderRow[]>([])
-let gridApi: GridApi<DisplayRow> | null = null
+const rowData = shallowRef<PositionRow[]>([])
+let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)
 const statusFilter = ref<string>('')
 const channelFilter = ref<string>('')
@@ -118,6 +100,7 @@ const assetOptions = computed(() => {
 const detailDialogVisible = ref(false)
 const detailOrders = ref<OrderRow[]>([])
 const detailPositionId = ref<number | null>(null)
+const detailLoading = ref(false)
 
 /** 列状态持久化（数据库版） */
 const PAGE_KEY = 'order_management'
@@ -152,102 +135,18 @@ function formatAmount(val: number | null | undefined): string {
   return val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
-function findOrderBySideMarket(orders: OrderRow[] | undefined, side: string, marketType: string): OrderRow | undefined {
-  return orders?.find(o => o.order_side === side && o.market_type === marketType)
-}
 
-function formatSpotFuturePair(
-  spotVal: number | null | undefined,
-  futureVal: number | null | undefined,
-  formatter: (v: number) => string,
-): string {
-  const spotStr = spotVal != null && Number.isFinite(spotVal) ? formatter(spotVal) : '-'
-  const futureStr = futureVal != null && Number.isFinite(futureVal) ? formatter(futureVal) : '-'
-  if (spotStr === '-' && futureStr === '-') return ''
-  return `${spotStr}/${futureStr}`
-}
 
-/** 计算一组订单中平仓对的 VWAP 基差(bps) */
-function computeCloseBasisBps(orders: OrderRow[] | undefined): number | null {
-  const closeSpot = findOrderBySideMarket(orders, 'close', 'spot')
-  const closeFuture = findOrderBySideMarket(orders, 'close', 'future')
-  if (!closeSpot?.exec_price || !closeFuture?.exec_price) return null
-  return (closeFuture.exec_price - closeSpot.exec_price) / closeSpot.exec_price * 10000
-}
 
-/** 开/平VWAP汇总：开仓spot/future｜平仓spot/future */
-function formatSummaryVwap(orders: OrderRow[] | undefined): string {
-  const openSpot = findOrderBySideMarket(orders, 'open', 'spot')
-  const openFuture = findOrderBySideMarket(orders, 'open', 'future')
-  const closeSpot = findOrderBySideMarket(orders, 'close', 'spot')
-  const closeFuture = findOrderBySideMarket(orders, 'close', 'future')
-  const fmt = (v: number) => formatDecimal(v, 4)
-
-  const openPair = formatSpotFuturePair(openSpot?.exec_price, openFuture?.exec_price, fmt)
-  const closePair = formatSpotFuturePair(closeSpot?.exec_price, closeFuture?.exec_price, fmt)
-
-  if (openPair && closePair) return `${openPair}\u2502${closePair}`
-  return openPair || closePair || ''
-}
-
-/** 开/平盘口覆盖汇总：开仓spot/future｜平仓spot/future */
-function formatSummaryCoverage(orders: OrderRow[] | undefined): string {
-  const openSpot = findOrderBySideMarket(orders, 'open', 'spot')
-  const openFuture = findOrderBySideMarket(orders, 'open', 'future')
-  const closeSpot = findOrderBySideMarket(orders, 'close', 'spot')
-  const closeFuture = findOrderBySideMarket(orders, 'close', 'future')
-  const fmt = (v: number) => (v * 100).toFixed(1) + '%'
-
-  const openPair = formatSpotFuturePair(openSpot?.open_coverage, openFuture?.open_coverage, fmt)
-  const closePair = formatSpotFuturePair(closeSpot?.coverage_ratio, closeFuture?.coverage_ratio, fmt)
-
-  if (openPair && closePair) return `${openPair}\u2502${closePair}`
-  return openPair || closePair || ''
-}
-
-/** 开/平VWAP基差汇总：开仓bps｜平仓bps */
-function formatSummaryBasis(orders: OrderRow[] | undefined, field: 'open_vwap_basis_bps' | 'open_marginal_basis_bps'): string {
-  const openSpot = findOrderBySideMarket(orders, 'open', 'spot')
-  const openVal = openSpot?.[field]
-  const closeVal = computeCloseBasisBps(orders)
-
-  const openStr = openVal != null ? Number(openVal).toFixed(2) : null
-  const closeStr = closeVal != null ? closeVal.toFixed(2) : null
-
-  if (openStr && closeStr) return `${openStr}\u2502${closeStr} bps`
-  if (openStr) return `${openStr} bps`
-  if (closeStr) return `${closeStr} bps`
-  return ''
-}
-
-const priceFormatter = (params: ValueFormatterParams) => {
-  if (params.value == null) return ''
-  return formatDecimal(params.value, 8)
-}
-
-const volumeFormatter = (params: ValueFormatterParams) => {
-  if (params.value == null) return ''
-  return formatDecimal(params.value, 4)
-}
 
 const amountFormatter = (params: ValueFormatterParams) => {
   if (params.value == null) return ''
   return Number(params.value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
-const percentFormatter = (params: ValueFormatterParams) => {
-  if (params.value == null) return ''
-  return (params.value * 100).toFixed(1) + '%'
-}
-
 const bpsFormatter = (params: ValueFormatterParams) => {
   if (params.value == null) return ''
   return Number(params.value).toFixed(2) + ' bps'
-}
-
-const fundingRateFormatter = (params: ValueFormatterParams) => {
-  if (params.value == null) return ''
-  return (Number(params.value) * 100).toFixed(4) + '%'
 }
 
 const timeFormatter = (params: ValueFormatterParams) => {
@@ -263,27 +162,6 @@ const timeFormatter = (params: ValueFormatterParams) => {
   return `${year}-${month}-${day} ${hour}:${minute}:${second}`
 }
 
-const statusFormatter = (params: ValueFormatterParams) => {
-  const map: Record<string, string> = {
-    pending: '待执行',
-    executed: '已成交',
-    rejected: '已拒单',
-    failed: '失败',
-  }
-  return map[params.value] ?? params.value ?? ''
-}
-
-const statusCellStyle = (params: ValueFormatterParams) => {
-  const colorMap: Record<string, string> = {
-    pending: '#e6a23c',
-    executed: '#67c23a',
-    rejected: '#f56c6c',
-    failed: '#f56c6c',
-  }
-  const color = colorMap[params.value] ?? '#909399'
-  return { color }
-}
-
 const channelFormatter = (params: ValueFormatterParams) => {
   const map: Record<string, string> = {
     Mock: 'Mock',
@@ -293,121 +171,34 @@ const channelFormatter = (params: ValueFormatterParams) => {
   return map[params.value] ?? params.value ?? ''
 }
 
-const orderSideFormatter = (params: ValueFormatterParams) => {
-  const map: Record<string, string> = {
-    open: '开仓',
-    close: '平仓',
-  }
-  return map[params.value] ?? params.value ?? ''
-}
-
 /* ───── 列定义 ───── */
-const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
+const columnDefs = computed((): ColDef[] => [
   {
-    headerName: '下单时间',
-    field: 'created_at',
+    headerName: '开仓时间',
+    field: 'opened_at',
     width: 180,
     valueFormatter: timeFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        const firstOrder = group.orders?.[0]
-        return firstOrder?.created_at ? formatTime(firstOrder.created_at) : ''
-      }
-      return timeFormatter(params)
-    },
   },
   {
     headerName: '标的资产',
     field: 'base_asset',
-    width: 100,
+    width: 120,
     pinned: 'left',
     cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        const count = group.orders?.length ?? 0
-        return `<strong class="group-asset">${group.base_asset} (${count})</strong>`
-      }
-      return params.value ?? ''
+      const row = params.data as PositionRow
+      const count = row?.order_count ?? 0
+      return `<strong class="group-asset">${row?.base_asset ?? ''} (${count})</strong>`
     },
   },
   {
-    headerName: '订单方向',
-    field: 'order_side',
-    width: 90,
-    valueFormatter: orderSideFormatter,
-    cellStyle: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        const hasClose = group.orders?.some((o: any) => o.order_side === 'close')
-        return { color: hasClose ? '#e6a23c' : '#67c23a' }
-      }
-      if (params.data?.order_side === 'close') return { color: '#e6a23c' }
-      if (params.data?.order_side === 'open') return { color: '#67c23a' }
-      return null
-    },
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        // 汇总行：全开仓显示“开仓”，有平仓显示“平仓”
-        const group = params.data as DisplayRow
-        const hasClose = group.orders?.some(o => o.order_side === 'close')
-        return hasClose ? '平仓' : '开仓'
-      }
-      return orderSideFormatter(params)
-    },
-  },
-  {
-    headerName: '市场',
-    field: 'market_type',
-    width: 80,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return ''
-      }
-      return params.value ?? ''
-    },
-  },
-  {
-    headerName: '交易方向',
-    field: 'trade_direction',
-    width: 80,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return ''
-      }
-      return params.value ?? ''
-    },
-  },
-  {
-    headerName: '状态',
+    headerName: '方向',
     field: 'status',
-    width: 100,
-    valueFormatter: statusFormatter,
+    width: 80,
     cellStyle: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        // 汇总行状态样式
-        const statusMap: Record<string, string> = {
-          all_executed: '#67c23a',
-          partial: '#e6a23c',
-          pending: '#909399',
-          rejected: '#f56c6c',
-        }
-        const color = statusMap[params.data.groupStatus ?? 'pending'] ?? '#909399'
-        return { color }
-      }
-      return statusCellStyle(params)
+      return { color: params.value === 'closed' ? '#e6a23c' : '#67c23a' }
     },
     cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const statusMap: Record<string, string> = {
-          all_executed: '全部成交',
-          partial: '部分成交',
-          pending: '待执行',
-          rejected: '被拒',
-        }
-        return statusMap[params.data.groupStatus ?? 'pending'] ?? '待执行'
-      }
-      return statusFormatter(params)
+      return params.value === 'closed' ? '平仓' : '开仓'
     },
   },
   {
@@ -415,248 +206,102 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     field: 'channel',
     width: 90,
     valueFormatter: channelFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        const ch = group.orders?.[0]?.channel
-        return ch ? channelFormatter({ value: ch } as any) : ''
-      }
-      return channelFormatter(params)
-    },
   },
   {
-    headerName: '目标金额',
-    field: 'target_amount',
+    headerName: '开仓金额',
+    field: 'spot_open_amount',
     width: 120,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
     valueFormatter: amountFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        return `<strong>${formatAmount(group.total_amount)}</strong>`
-      }
-      return amountFormatter(params)
-    },
   },
   {
-    headerName: '开/平金额',
-    field: 'exec_amount',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: amountFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const group = params.data as DisplayRow
-        return `<strong class="group-executed">${formatAmount(group.executed_amount)}</strong>`
-      }
-      return amountFormatter(params)
-    },
-  },
-  {
-    headerName: '开/平VWAP',
-    field: 'exec_price',
-    width: 140,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: priceFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return ''
-      }
-      return priceFormatter(params)
-    },
-  },
-  {
-    headerName: '成交数量',
-    field: 'exec_qty',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: volumeFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return ''
-      }
-      return volumeFormatter(params)
-    },
-  },
-  {
-    headerName: '目标数量',
-    field: 'target_qty',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: volumeFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return ''
-      }
-      return volumeFormatter(params)
-    },
-  },
-  {
-    headerName: '开/平盘口覆盖',
-    field: 'open_coverage',
-    width: 130,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: percentFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return ''
-      }
-      // 开仓行显示 open_coverage，平仓行显示 coverage_ratio
-      const val = params.data?.order_side === 'close'
-        ? params.data?.coverage_ratio
-        : params.data?.open_coverage
-      if (val == null) return ''
-      return (Number(val) * 100).toFixed(1) + '%'
-    },
-  },
-  {
-    headerName: '开/平VWAP基差(bps)',
-    field: 'open_vwap_basis_bps',
+    headerName: '开仓VWAP(S/F)',
+    colId: 'open_vwap',
     width: 160,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
-    valueFormatter: bpsFormatter,
     cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return formatSummaryBasis((params.data as DisplayRow).orders, 'open_vwap_basis_bps')
-      }
-      // 开仓 spot 行显示 open_vwap_basis_bps，平仓 spot 行显示计算的平仓基差
-      if (params.data?.market_type !== 'spot') return ''
-      if (params.data?.order_side === 'close') {
-        const val = params.data?._close_basis_bps
-        return val != null ? val.toFixed(2) + ' bps' : ''
-      }
-      const val = params.data?.open_vwap_basis_bps
-      return val != null ? Number(val).toFixed(2) + ' bps' : ''
+      const row = params.data as PositionRow
+      const sp = row?.spot_open_price
+      const fp = row?.future_open_price
+      const fmt = (v: number | null) => v != null ? formatDecimal(v, 4) : '-'
+      return `${fmt(sp)}/${fmt(fp)}`
     },
   },
   {
-    headerName: '风险缓释',
-    field: 'risk_relief_bps',
+    headerName: '开仓基差(bps)',
+    field: 'open_spread_bps',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '平仓基差(bps)',
+    field: 'close_spread_bps',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '资金费次数',
+    field: 'funding_payments_count',
     width: 100,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
-    valueFormatter: bpsFormatter,
-    cellRenderer: (params: any) => {
-      if (!params.data?.isGroupHeader) return ''
-      const val = params.data?.risk_relief_bps
-      if (val == null) return ''
-      return Number(val).toFixed(2) + ' bps'
-    },
   },
   {
-    headerName: '开/平边际基差(bps)',
-    field: 'open_marginal_basis_bps',
-    width: 160,
+    headerName: '资金费PnL',
+    field: 'funding_total_pnl',
+    width: 110,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
-    valueFormatter: bpsFormatter,
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        return formatSummaryBasis((params.data as DisplayRow).orders, 'open_marginal_basis_bps')
-      }
-      // 开仓 spot 行显示 open_marginal_basis_bps，平仓 spot 行显示计算的平仓基差
-      if (params.data?.market_type !== 'spot') return ''
-      if (params.data?.order_side === 'close') {
-        const val = params.data?._close_basis_bps
-        return val != null ? val.toFixed(2) + ' bps' : ''
-      }
-      const val = params.data?.open_marginal_basis_bps
-      return val != null ? Number(val).toFixed(2) + ' bps' : ''
-    },
-  },
-  {
-    headerName: '24h资金费率',
-    field: 'funding_rate_24h',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: fundingRateFormatter,
-    cellRenderer: (params: any) => {
-      const isSummary = params.data?.isGroupHeader
-      const isFuture = params.data?.market_type === 'future'
-      if (!isSummary && !isFuture) return ''
-      const val = params.value
-      if (val == null) return ''
-      return (Number(val) * 100).toFixed(4) + '%'
+    valueFormatter: (params: ValueFormatterParams) => {
+      if (params.value == null) return ''
+      return Number(params.value).toFixed(2)
     },
     cellStyle: (params: any) => {
-      const isSummary = params.data?.isGroupHeader
-      const isFuture = params.data?.market_type === 'future'
-      if ((!isSummary && !isFuture) || params.value == null) {
-        return null
-      }
-      const v = params.value
-      if (v > 0) return { color: '#67c23a' }
-      if (v < 0) return { color: '#f56c6c' }
-      return null
+      if (params.value == null) return null
+      return { color: params.value > 0 ? '#67c23a' : params.value < 0 ? '#f56c6c' : '#909399' }
     },
   },
   {
-    headerName: '开平仓原因',
-    field: 'reject_reason',
-    colId: 'trade_reason',
-    width: 200,
-    tooltipComponent: LongTextTooltip,
-    tooltipValueGetter: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status !== 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
-        return reasons.length ? reasons.join(' | ') : null
-      }
-      if (params.data?.market_type !== 'spot') return null
-      if (params.data?.status === 'rejected') return null
-      return params.data?.reject_reason || null
+    headerName: '总盈亏',
+    field: 'total_pnl',
+    width: 110,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (params: ValueFormatterParams) => {
+      if (params.value == null) return ''
+      return Number(params.value).toFixed(2)
     },
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status !== 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
-        return reasons.length ? reasons.join(' | ') : ''
-      }
-      if (params.data?.market_type !== 'spot') return ''
-      if (params.data?.status === 'rejected') return ''
-      return params.data?.reject_reason ?? ''
+    cellStyle: (params: any) => {
+      if (params.value == null) return null
+      return { color: params.value > 0 ? '#67c23a' : params.value < 0 ? '#f56c6c' : '#909399' }
     },
   },
   {
-    headerName: '拒单原因',
-    field: 'reject_reason',
-    colId: 'reject_reason',
-    width: 200,
+    headerName: '开仓原因',
+    field: 'open_reason',
+    width: 160,
     tooltipComponent: LongTextTooltip,
-    tooltipValueGetter: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status === 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
-        return reasons.length ? reasons.join(' | ') : null
-      }
-      if (params.data?.market_type !== 'spot') return null
-      if (params.data?.status !== 'rejected') return null
-      return params.data?.reject_reason ?? null
-    },
-    cellRenderer: (params: any) => {
-      if (params.data?.isGroupHeader) {
-        const reasons = (params.data.orders ?? []).filter((o: OrderRow) => o.market_type === 'spot' && o.status === 'rejected' && o.reject_reason).map((o: OrderRow) => o.reject_reason)
-        return reasons.length ? reasons.join(' | ') : ''
-      }
-      if (params.data?.market_type !== 'spot') return ''
-      if (params.data?.status !== 'rejected') return ''
-      return params.data?.reject_reason ?? ''
-    },
+    tooltipValueGetter: (params: any) => params.data?.open_reason || null,
+  },
+  {
+    headerName: '平仓原因',
+    field: 'close_reason',
+    width: 160,
+    tooltipComponent: LongTextTooltip,
+    tooltipValueGetter: (params: any) => params.data?.close_reason || null,
   },
   {
     headerName: '操作',
@@ -669,16 +314,12 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     sortable: false,
     filter: false,
     cellRenderer: (params: any) => {
-      if (!params.data?.isGroupHeader) return ''
-      const group = params.data as DisplayRow
-      const hasClose = group.orders?.some((o: any) => o.order_side === 'close')
-      const openOrders = group.orders?.filter((o: any) => o.order_side === 'open') ?? []
-      const allOpenExecuted = openOrders.length > 0 && openOrders.every((o: any) => o.status === 'executed')
-      // 详情按钮始终显示，一键平仓仅开仓成功且未平仓时显示
+      const row = params.data as PositionRow
+      if (!row) return ''
       let html = `<span class="action-btns">`
-      html += `<button class="detail-btn" onclick="window.openDetailDialog(${group.position_id})">详情</button>`
-      if (!hasClose && allOpenExecuted) {
-        html += `<button class="manual-close-btn" onclick="window.handleManualClose(${group.position_id})">平仓</button>`
+      html += `<button class="detail-btn" onclick="window.openDetailDialog(${row.id})">详情</button>`
+      if (row.status === 'holding') {
+        html += `<button class="manual-close-btn" onclick="window.handleManualClose(${row.id})">平仓</button>`
       }
       html += `</span>`
       return html
@@ -695,106 +336,26 @@ const defaultColDef: ColDef = {
   enableValue: false,
 }
 
-const localeText = {
-  generalMenuTab: '常规',
-  filterMenuTab: '筛选',
-  columnsMenuTab: '列',
-  pinColumn: '固定列',
-  autosizeThisColumn: '自适应列',
-  autosizeAllColumns: '全部列自适应',
-  resetColumns: '重置列',
-  expandAll: '展开所有行',
-  contractAll: '折叠所有行',
+const getRowId = (params: GetRowIdParams<PositionRow>) => {
+  return `pos_${params.data?.id ?? ''}`
 }
 
-const getRowId = (params: GetRowIdParams<DisplayRow>) => {
-  // 汇总行用 position_id，明细行用 id
-  if (params.data?.isGroupHeader) {
-    return `group_${params.data.position_id ?? params.data.order_uuid}`
-  }
-  return `order_${params.data?.id ?? ''}`
-}
-
-/* ───── 分组数据转换 ───── */
-/**
- * 将扁平订单转换为分组展示数据
- * 每个 position_id 对应一条主记录行（不再支持展开明细）
- */
-const displayRows = computed<DisplayRow[]>(() => {
-  const groups = new Map<number, OrderGroup>()
-  
-  // 按 position_id 分组
-  for (const order of rowData.value) {
-    const pid = order.position_id
-    if (pid == null) continue
-    
-    if (!groups.has(pid)) {
-      groups.set(pid, {
-        position_id: pid,
-        base_asset: order.base_asset ?? '',
-        order_uuid: order.order_uuid,
-        orders: [],
-        total_amount: 0,
-        executed_amount: 0,
-        status: 'pending',
-      })
-    }
-    
-    const group = groups.get(pid)!
-    group.orders.push(order)
-    
-    // 计算汇总
-    group.total_amount += order.target_amount ?? 0
-    if (order.status === 'executed') {
-      group.executed_amount += order.exec_amount ?? 0
-    }
-  }
-  
-  // 计算分组状态
-  for (const group of groups.values()) {
-    const executedCount = group.orders.filter(o => o.status === 'executed').length
-    const rejectedCount = group.orders.filter(o => o.status === 'rejected').length
-    if (executedCount === group.orders.length) {
-      group.status = 'all_executed'
-    } else if (rejectedCount > 0) {
-      group.status = 'rejected'
-    } else if (executedCount > 0) {
-      group.status = 'partial'
-    } else {
-      group.status = 'pending'
-    }
-  }
-  
-  // 生成展示行（每个 position 一行，按 position_id 降序）
-  const sortedGroups = Array.from(groups.values()).sort((a, b) => 
-    (b.position_id ?? 0) - (a.position_id ?? 0)
-  )
-  
-  return sortedGroups.map(group => ({
-    isGroupHeader: true,
-    position_id: group.position_id,
-    base_asset: group.base_asset,
-    order_uuid: group.order_uuid,
-    orders: group.orders,
-    total_amount: group.total_amount,
-    executed_amount: group.executed_amount,
-    groupStatus: group.status,
-    // 风控指标
-    open_vwap_basis_bps: group.orders[0]?.open_vwap_basis_bps ?? null,
-    risk_relief_bps: group.orders[0]?.risk_relief_bps ?? null,
-    open_marginal_basis_bps: group.orders[0]?.open_marginal_basis_bps ?? null,
-    funding_rate_24h: group.orders[0]?.funding_rate_24h ?? null,
-  }))
-})
-
-/** 打开订单详情弹窗 */
-function openDetailDialog(positionId: number | null) {
+/** 打开订单详情弹窗（通过API加载订单明细） */
+async function openDetailDialog(positionId: number | null) {
   if (positionId == null) return
-  const row = displayRows.value.find(r => r.position_id === positionId)
-  if (!row?.orders?.length) return
   detailPositionId.value = positionId
-  detailOrders.value = row.orders
+  detailOrders.value = []
   detailDialogVisible.value = true
+  detailLoading.value = true
+  try {
+    const res = await get(`/api/trading/positions/${positionId}/orders`)
+    const data = await res.json()
+    detailOrders.value = data.orders || []
+  } catch {
+    showError('加载订单明细失败')
+  } finally {
+    detailLoading.value = false
+  }
 }
 
 /** 快捷时间过滤 */
@@ -936,7 +497,7 @@ async function loadColumnState() {
 }
 
 /* ───── AG Grid 回调 ───── */
-function onGridReady(params: GridReadyEvent<DisplayRow>) {
+function onGridReady(params: GridReadyEvent) {
   gridApi = params.api
   loadColumnState()
   setupGridCopy(params.api)
@@ -944,33 +505,11 @@ function onGridReady(params: GridReadyEvent<DisplayRow>) {
 
 /** 双击行打开详情弹窗 */
 function onRowDoubleClicked(params: any) {
-  const positionId = params.data?.position_id
+  const positionId = params.data?.id
   if (positionId != null) {
     openDetailDialog(positionId)
   }
 }
-
-/* ───── 状态标签快捷选项 ───── */
-const statusOptions = [
-  { label: '全部', value: '' },
-  { label: '待执行', value: 'pending' },
-  { label: '已成交', value: 'executed' },
-  { label: '已拒单', value: 'rejected' },
-  { label: '失败', value: 'failed' },
-]
-
-const channelOptions = [
-  { label: '全部', value: '' },
-  { label: 'Mock', value: 'Mock' },
-  { label: '模拟盘', value: 'SimTrade' },
-  { label: '实盘', value: 'Live' },
-]
-
-const orderSideOptions = [
-  { label: '全部', value: '' },
-  { label: '开仓', value: 'open' },
-  { label: '平仓', value: 'close' },
-]
 
 /* ───── WebSocket 自动刷新 ───── */
 let ws: WebSocket | null = null
@@ -1172,7 +711,7 @@ onUnmounted(() => {
         class="orderbook-grid"
         :theme="orderbookGridTheme"
         :columnDefs="columnDefs"
-        :rowData="displayRows"
+        :rowData="rowData"
         :defaultColDef="defaultColDef"
         :getRowId="getRowId"
         :header-height="32"
@@ -1236,7 +775,7 @@ onUnmounted(() => {
       width="1100px"
       destroy-on-close
     >
-      <el-table :data="detailOrders" border stripe size="small" style="width: 100%">
+      <el-table :data="detailOrders" v-loading="detailLoading" border stripe size="small" style="width: 100%">
         <el-table-column prop="order_side" label="方向" width="70" :formatter="(row: OrderRow) => row.order_side === 'open' ? '开仓' : '平仓'">
           <template #default="{ row }">
             <span :style="{ color: row.order_side === 'close' ? '#e6a23c' : '#67c23a' }">
