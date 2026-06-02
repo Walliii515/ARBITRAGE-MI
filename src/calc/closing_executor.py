@@ -648,7 +648,7 @@ class ClosingExecutor:
         for market_key in ['spot_order', 'future_order']:
             order = order_group[market_key].copy()
             order['position_id'] = position_id
-            order['channel'] = 'Mock'
+            order['channel'] = self.executor_client.channel
             # 平仓订单无开仓风控指标，置 None
             order['open_coverage'] = None
             order['open_vwap_basis_bps'] = None

@@ -28,7 +28,24 @@ class ExecutorClient:
         """
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
-        logger.info(f'ExecutorClient 已初始化: url={self.base_url}, timeout={self.timeout}s')
+        # 渠道标识：供订单写入与 cooldown 查询统一引用，
+        # 避免 'Mock' 这种常量在多处硬编码造成写查不一致。
+        # 初始化时调 /api/health 探测 engine 类型：real → 'Live'，virtual → 'Mock'。
+        self.channel = self._detect_channel()
+        logger.info(f'ExecutorClient 已初始化: url={self.base_url}, timeout={self.timeout}s, channel={self.channel}')
+
+    def _detect_channel(self) -> str:
+        """探测后端成交引擎类型，映射为订单 channel 值。
+
+        返回值：'Live'（实盘）/ 'Mock'（虚拟、连不上、异常）。
+        探测失败时默认 'Mock'，与历史默认行为保持一致。
+        """
+        try:
+            health = self.check_health()
+            return 'Live' if health.get('engine') == 'real' else 'Mock'
+        except Exception as e:
+            logger.warning(f'channel 探测失败，默认 Mock: {e}')
+            return 'Mock'
 
     def execute(self, order_group: Dict, orderbook_row: Dict) -> Dict:
         """

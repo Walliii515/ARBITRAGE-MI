@@ -917,10 +917,10 @@ class TradingExecutor:
               AND market_type = 'spot' 
               AND order_side = 'open' 
               AND status = 'executed'
-              AND channel = 'Mock'
+              AND channel = %s
         """
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, (base_asset,))
+            cursor.execute(sql, (base_asset, self.executor_client.channel))
             row = cursor.fetchone()
             
             if not row or not row['last_open_time']:
@@ -1042,7 +1042,7 @@ class TradingExecutor:
             order['funding_rate_24h'] = order_group.get('funding_rate_24h')
             
             # 注入渠道和持仓关联
-            order['channel'] = 'Mock'
+            order['channel'] = self.executor_client.channel
             order['position_id'] = position_id
             
             # 更新成交信息
