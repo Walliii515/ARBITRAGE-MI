@@ -417,7 +417,9 @@ const columnDefs = computed<ColDef<DisplayRow>[]>(() => [
     valueFormatter: channelFormatter,
     cellRenderer: (params: any) => {
       if (params.data?.isGroupHeader) {
-        return 'Mock' // 汇总行默认显示 Mock
+        const group = params.data as DisplayRow
+        const ch = group.orders?.[0]?.channel
+        return ch ? channelFormatter({ value: ch } as any) : ''
       }
       return channelFormatter(params)
     },
@@ -1185,7 +1187,7 @@ onUnmounted(() => {
     <!-- 底部分页控件 -->
     <div class="pagination-bar">
       <div class="pagination-info">
-        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+        共 {{ paginationTotal }} 条持仓，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
       </div>
       <div class="pagination-controls">
         <el-button
@@ -1231,7 +1233,7 @@ onUnmounted(() => {
     <el-dialog
       v-model="detailDialogVisible"
       :title="`订单详情 - 持仓 #${detailPositionId}`"
-      width="900px"
+      width="1100px"
       destroy-on-close
     >
       <el-table :data="detailOrders" border stripe size="small" style="width: 100%">
