@@ -5,11 +5,11 @@
 """
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 from common.database import db_manager
-from common.config import config
 from common.logger import get_logger
 
 logger = get_logger(__name__)
@@ -18,17 +18,63 @@ from calc.executor_client import ExecutorClient
 from exchange_apis.get_gate_future_contracts import get_single_contract_funding_rate
 
 
+@dataclass
+class TradingExecutorConfig:
+    """交易执行器配置（由 api/ 层从 config.yaml 加载后注入）"""
+
+    # ─── 成交引擎 ───
+    executor_url: str = 'http://localhost:8081'
+    executor_timeout: int = 5
+
+    # ─── 开仓策略 ───
+    coverage_threshold: float = 0.8
+    basis_threshold_bps: float = -60
+    cooldown_sec: int = 3600
+    min_funding_rate_bps: float = -6.0
+    open_amount_usdt: float = 5.0
+    max_positions_per_asset: int = 1
+    reject_cooldown_sec: int = 300
+    max_orderbook_stale_sec: float = 5.0
+
+    # ─── 手续费率 ───
+    fee_spot_open: float = 0.00075
+    fee_spot_close: float = 0.00075
+    fee_future_open: float = 0.00075
+    fee_future_close: float = 0.00075
+
+    # ─── VWAP基差阈值 ───
+    close_threshold_percentile: str = 'close_basis_p20'
+
+    # ─── 成交量过滤 ───
+    min_spot_volume_24h_usdt: float = 0
+    min_future_volume_24h_usdt: float = 0
+
+    # ─── 峰值回落策略 ───
+    peak_pullback_pct: float = 0.10
+    peak_monitor_timeout_sec: int = 60
+    peak_timeout_cooldown_sec: int = 300
+
+    # ─── p10持续确认 ───
+    p10_sustain_sec: float = 3.0
+
+    # ─── 保证金风控 ───
+    margin_warning_pct: float = 8.0
+
+    # ─── 风险缓释 ───
+    risk_relief_bps: float = 10.0
+
+
 class TradingExecutor:
     """交易执行器(开仓判断 + 订单生成 + 持久化，通过 ExecutorClient 调用成交引擎服务)"""
     
-    def __init__(self, contract_meta: Dict, spot_meta: Dict, threshold_meta: Dict = None,
+    def __init__(self, cfg: TradingExecutorConfig, contract_meta: Dict, spot_meta: Dict,
                  vwap_threshold_meta: Optional[Dict[str, float]] = None,
                  close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None):
         """
         Args:
+            cfg: 配置 dataclass（由 api/ 层构造后注入）
             contract_meta: base_asset -> {quanto_multiplier, order_size_min, price_decimal, size_decimal, ...}
             spot_meta: base_asset -> {step_size, min_qty, ...}
-            threshold_meta: 已废弃，保留参数兼容调用方
             vwap_threshold_meta: base_asset -> threshold_bps (按标的VWAP基差阈值)
             close_vwap_threshold_meta: base_asset -> {close_basis_p10..p40} (平仓基差阈值，用于盈利性守卫)
         """
@@ -38,54 +84,58 @@ class TradingExecutor:
         self.close_vwap_threshold_meta = close_vwap_threshold_meta or {}
         
         # 通过 HTTP 客户端调用独立的成交引擎服务（虚拟/实盘），实现虚实分离
-        executor_url = config.get_executor_url()
-        executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
-        self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
+        self.executor_client = ExecutorClient(cfg.executor_url, timeout=cfg.executor_timeout)
         
-        # 从配置读取阈值
-        self.coverage_threshold = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)
-        self.basis_threshold_bps = config.get_float('trade.open.vwap_basis_threshold_bps', -60)
-        self.cooldown_sec = config.get_int('trade.open.cooldown_sec', 3600)
-        self.min_funding_rate_bps = config.get_float('trade.open.min_funding_rate_bps', -6.0)
+        # 从 dataclass 读取策略参数
+        self.coverage_threshold = cfg.coverage_threshold
+        self.basis_threshold_bps = cfg.basis_threshold_bps
+        self.cooldown_sec = cfg.cooldown_sec
+        self.min_funding_rate_bps = cfg.min_funding_rate_bps
 
         # 手续费率（用于盈利性守卫计算）
         self.fee_cost_bps = -calc_full_fee_bps(
-            config.get_float('trade.fee.spot_open', 0.00075),
-            config.get_float('trade.fee.spot_close', 0.00075),
-            config.get_float('trade.fee.future_open', 0.00075),
-            config.get_float('trade.fee.future_close', 0.00075)
+            cfg.fee_spot_open, cfg.fee_spot_close,
+            cfg.fee_future_open, cfg.fee_future_close
         )
+        # 单纯开仓费率（用于持久化计算边际基差）
+        self._fee_spot_open = cfg.fee_spot_open
+        self._fee_future_open = cfg.fee_future_open
+        self._risk_relief_bps = cfg.risk_relief_bps
 
         # 盈利性守卫使用的平仓基差分位字段名
-        self.close_threshold_col = config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20')
+        self.close_threshold_col = cfg.close_threshold_percentile
 
         # 24小时成交量过滤阈值（USDT）
-        self.min_spot_volume = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
-        self.min_future_volume = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
+        self.min_spot_volume = cfg.min_spot_volume_24h_usdt
+        self.min_future_volume = cfg.min_future_volume_24h_usdt
 
         # 峰值回落开仓策略
-        self.peak_pullback_pct = config.get_float('trade.peak_pullback.pullback_pct', 0.10)
-        self.peak_monitor_timeout_sec = config.get_int('trade.peak_pullback.monitor_timeout_sec', 60)
-        self.peak_timeout_cooldown_sec = config.get_int('trade.peak_pullback.timeout_cooldown_sec', 300)
+        self.peak_pullback_pct = cfg.peak_pullback_pct
+        self.peak_monitor_timeout_sec = cfg.peak_monitor_timeout_sec
+        self.peak_timeout_cooldown_sec = cfg.peak_timeout_cooldown_sec
         self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, signal_id}
         self._timeout_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 超时冷却截止时间
 
+        # p10持续确认：基差连续 >= p10 持续 N 秒才触发直开，过滤高频脉冲
+        self.p10_sustain_sec = cfg.p10_sustain_sec
+        self._p10_sustain_state: Dict[str, Dict] = {}  # base_asset -> {start_time, min_basis}
+
         # 保证金风控：距爆仓距离低于此值时禁止开仓
-        self.margin_warning_pct = config.get_float('margin.warning_pct', 8.0)
+        self.margin_warning_pct = cfg.margin_warning_pct
         # 持仓距爆仓距离缓存: base_asset -> liq_distance_pct
         self._holding_liq_distance: Dict[str, float] = {}
         self._holding_count: Dict[str, int] = {}  # base_asset -> 持仓中仓位数量
-        self.max_positions_per_asset = config.get_int('trade.open.max_positions_per_asset', 1)
+        self.max_positions_per_asset = cfg.max_positions_per_asset
 
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
-        self.reject_cooldown_sec = config.get_int('trade.open.reject_cooldown_sec', 300)
+        self.reject_cooldown_sec = cfg.reject_cooldown_sec
         self._reject_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 冷却截止时间
 
         # 开仓金额（用于 min_notional 前置校验）
-        self.open_amount_usdt = config.get_float('trade.open.amount_usdt', 5)
+        self.open_amount_usdt = cfg.open_amount_usdt
 
         # 最终风控旁路：盘口最大允许陈旧时间（秒）
-        self._max_orderbook_stale_sec = config.get_float('trade.open.max_orderbook_stale_sec', 5.0)
+        self._max_orderbook_stale_sec = cfg.max_orderbook_stale_sec
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -104,26 +154,53 @@ class TradingExecutor:
 
     def update_holding_margin_status(self, positions: List[Dict]):
         """
-        更新持仓的保证金状态缓存（由调用方在每个开仓检查周期前调用）
+        更新持仓的距爆仓距离缓存（由 _margin_status_loop 每 5s 调用一次）
+
+        注意：本方法不再维护 self._holding_count。
+        持仓数量计数由 _refresh_holding_count_from_db() 在每轮 check_and_open 开始时
+        从 DB 实时刷新，避免 5s 刷新窗口被高频开仓循环（0.5s）穿透。
 
         Args:
             positions: 已由 calculate_realtime_pnl 富化的持仓列表（含 liq_distance_pct）
         """
         self._holding_liq_distance.clear()
-        self._holding_count.clear()
         for pos in positions:
             if pos.get('status') != 'holding':
                 continue
             ba = pos.get('base_asset', '')
             if not ba:
                 continue
-            # 统计同标的持仓数量
-            self._holding_count[ba] = self._holding_count.get(ba, 0) + 1
             liq_dist = pos.get('liq_distance_pct')
             if liq_dist is not None:
                 # 同一标的多个仓位时，取最小距爆仓距离（最危险的）
                 if ba not in self._holding_liq_distance or liq_dist < self._holding_liq_distance[ba]:
                     self._holding_liq_distance[ba] = liq_dist
+
+    def _refresh_holding_count_from_db(self):
+        """
+        从 DB 实时刷新各标的持仓中仓位数量（每轮 check_and_open 开始时调用）。
+
+        设计目的：
+        - 消除 _margin_status_loop 5s 刷新与 _open_position_loop 0.5s 检查之间的时间窗口；
+        - 消除服务启动后首个 5s 内 _holding_count 为空的窗口（仅靠 cooldown_sec 兜底易失效）；
+        - 与 DB 单一真理源一致，避免内存计数与 DB 偏离（如 margin_loop 异常时 _holding_count 残留）。
+
+        热路径开销：单次 SELECT + GROUP BY，在 holding 仓位有限（<<100）时延迟 < 5ms，可接受。
+        """
+        try:
+            sql = """
+                SELECT base_asset, COUNT(*) AS cnt
+                FROM mi_trade_position
+                WHERE status = 'holding'
+                GROUP BY base_asset
+            """
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+            self._holding_count = {r['base_asset']: int(r['cnt']) for r in rows if r.get('base_asset')}
+        except Exception as e:
+            # 查询失败时保留旧计数（保守策略：宁可拦截过多也不绕过上限）
+            logger.error(f"刷新 _holding_count 失败，沿用旧计数: {e}")
 
     def check_and_open(self, orderbook_rows: List[Dict]) -> List[Dict]:
         """
@@ -138,7 +215,11 @@ class TradingExecutor:
         results = []
         # 记录本轮风控通过的标的，用于清理已不满足条件的峰值状态
         risk_passed_assets = set()
-        
+
+        # 每轮开始时从 DB 实时刷新持仓数量计数（DB 作为单一真理源），
+        # 避免依赖 5s 间隔的 margin_loop 导致计数滞后被高频检查穿透。
+        self._refresh_holding_count_from_db()
+
         for row in orderbook_rows:
             try:
                 base_asset = row.get('base_asset', '')
@@ -181,12 +262,16 @@ class TradingExecutor:
                 direct_open = self._is_direct_open(base_asset, open_vwap_basis)
 
                 if direct_open:
-                    # 通道B: 基差>=p10，实时费率校验后直接开仓
+                    # 通道B: 基差>=p10，持续确认后实时费率校验再开仓
+                    if not self._pass_p10_sustain_check(base_asset, open_vwap_basis):
+                        continue
                     contract = row.get('contract', '')
                     if not self._verify_realtime_funding_rate(base_asset, contract):
                         continue
                 else:
                     # 通道A: 基差>=p20，走峰值回落确认
+                    # 基差跌回p20区间时，清除p10持续状态（已不再满足p10）
+                    self._p10_sustain_state.pop(base_asset, None)
                     if not self._pass_peak_check(base_asset, open_vwap_basis, row):
                         continue
                 
@@ -370,12 +455,56 @@ class TradingExecutor:
         return True
     
     def _is_direct_open(self, base_asset: str, current_basis_bps: float) -> bool:
-        """判断是否走直接开仓通道（基差 >= p10，跳过峰值回落确认）"""
+        """判断是否走直接开仓通道（基差 >= p10）"""
         if base_asset in self.vwap_threshold_meta:
             p10 = self.vwap_threshold_meta[base_asset].get('p10')
             if p10 is not None:
                 return current_basis_bps >= p10
         return False  # 无p10数据时回退到回落确认通道
+
+    def _pass_p10_sustain_check(self, base_asset: str, current_basis_bps: float) -> bool:
+        """
+        p10持续确认：基差连续 >= p10 持续 N 秒才确认开仓。
+        过滤高频套利算法触发的瞬时基差脉冲。
+
+        状态机:
+        - 首次触发p10: 记录开始时间，返回 False(等待)
+        - 后续仍 >= p10: 累计时间，达到 sustain_sec 返回 True(确认)
+        - 基差跌破p10: 外层逻辑会清除状态（direct_open=False 时 pop）
+        """
+        now = datetime.now()
+        state = self._p10_sustain_state.get(base_asset)
+
+        if state is None:
+            # 首次触发 p10，开始计时
+            self._p10_sustain_state[base_asset] = {
+                'start_time': now,
+                'min_basis': current_basis_bps,
+            }
+            logger.info(
+                f"p10持续确认开始 | {base_asset} | "
+                f"basis={current_basis_bps:.2f}bps | 需持续{self.p10_sustain_sec}s"
+            )
+            return False
+
+        # 更新期间最低基差（用于日志复盘）
+        if current_basis_bps < state['min_basis']:
+            state['min_basis'] = current_basis_bps
+
+        # 检查是否持续足够时间
+        elapsed = (now - state['start_time']).total_seconds()
+        if elapsed >= self.p10_sustain_sec:
+            # 持续确认通过，清除状态
+            min_basis = state['min_basis']
+            self._p10_sustain_state.pop(base_asset, None)
+            logger.info(
+                f"p10持续确认通过 | {base_asset} | "
+                f"sustained={elapsed:.1f}s | min_basis={min_basis:.1f}bps | "
+                f"current={current_basis_bps:.1f}bps"
+            )
+            return True
+
+        return False
 
     def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
         """
@@ -876,10 +1005,10 @@ class TradingExecutor:
             order_group['open_vwap_basis_bps'] = actual_basis_bps
             # 重算开仓边际基差
             open_fee_bps = calc_open_fee_bps(
-                config.get_float('trade.fee.spot_open', 0.00075),
-                config.get_float('trade.fee.future_open', 0.00075)
+                self._fee_spot_open,
+                self._fee_future_open
             )
-            risk_relief_bps = config.get_float('trade.open.risk_relief_bps', 10)
+            risk_relief_bps = self._risk_relief_bps
             if actual_basis_bps is not None:
                 order_group['open_marginal_basis_bps'] = round(actual_basis_bps + open_fee_bps + risk_relief_bps, 2)
         

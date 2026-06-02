@@ -84,6 +84,9 @@ const filterDays = ref<number>(1) // 默认今日
 const openPaused = ref(false)
 const openPauseLoading = ref(false)
 
+// 一键全部平仓
+const closeAllLoading = ref(false)
+
 // 分页配置
 const paginationPageSize = ref<number>(500)
 const paginationPageSizeOptions = [500, 1000, 2000, 5000]
@@ -538,7 +541,7 @@ function connectWs() {
   }
 }
 
-/* ───── 一键平仓 ───── */
+/* ───── 一键平仓（单个持仓） ───── */
 const closingPositionId = ref<number | null>(null)
 
 async function handleManualClose(positionId: number) {
@@ -572,6 +575,41 @@ async function handleManualClose(positionId: number) {
     }
   } finally {
     closingPositionId.value = null
+  }
+}
+
+/* ───── 一键全部平仓 ───── */
+async function handleCloseAll() {
+  try {
+    await ElMessageBox.confirm(
+      '确认对所有持仓中的仓位执行一键平仓？\n系统将逐个发送现货卖单和期货买单。',
+      '❗ 一键全部平仓',
+      {
+        confirmButtonText: '确认全部平仓',
+        cancelButtonText: '取消',
+        type: 'error',
+      }
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  closeAllLoading.value = true
+  try {
+    const res = await post('/api/trading/positions/close-all')
+    const data = await res.json()
+    if (data.success) {
+      showSuccess(data.message || `已平仓 ${data.closed}/${data.total} 个持仓`)
+      fetchOrders()
+    } else {
+      showError(`平仓失败: ${data.message || '未知错误'}`)
+    }
+  } catch (e: any) {
+    if (e?.message && !e.message.includes('未授权') && !e.message.includes('权限不足')) {
+      showError(`平仓请求失败: ${e.message}`)
+    }
+  } finally {
+    closeAllLoading.value = false
   }
 }
 
@@ -669,6 +707,15 @@ onUnmounted(() => {
           @click="toggleOpenPause"
         >
           {{ openPaused ? '▶ 恢复开仓' : '⏸ 暂停开仓' }}
+        </el-button>
+
+        <el-button
+          size="small"
+          type="danger"
+          :loading="closeAllLoading"
+          @click="handleCloseAll"
+        >
+          ✖ 一键平仓
         </el-button>
       </div>
     </el-card>

@@ -36,7 +36,7 @@ from common.meta_loader import fetch_contract_meta, fetch_spot_meta
 
 from api.trading_api import router as trading_router
 from api.auth import router as auth_router, verify_token_dependency, verify_ws_token
-from calc.trading_executor import TradingExecutor
+from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -737,6 +737,80 @@ async def manual_close_position(position_id: int):
     }
 
 
+@app.post('/api/trading/positions/close-all', dependencies=[Depends(verify_token_dependency)])
+async def close_all_positions():
+    """一键平仓：对所有 holding 状态的持仓执行平仓（跳过条件检查，直接平仓）"""
+    # 1. 检查服务状态
+    if not svc or svc.state != SERVICE_RUNNING:
+        raise HTTPException(status_code=503, detail='服务未运行，无法执行平仓')
+
+    if not svc._gate_ws_connected() or not svc._binance_ws_connected():
+        raise HTTPException(status_code=503, detail='WebSocket 未连接，无法获取实时盘口数据')
+
+    # 2. 获取所有持仓中的仓位
+    def _query_holdings():
+        with db_manager.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM mi_trade_position WHERE status = 'holding'")
+            return cursor.fetchall()
+
+    positions = await asyncio.to_thread(_query_holdings)
+    if not positions:
+        return {'success': True, 'message': '无持仓中的仓位', 'results': [], 'total': 0, 'closed': 0}
+
+    # 3. 获取最新盘口数据
+    merged_rows = _get_merged_rows()
+    orderbook_map: Dict[str, Dict] = {}
+    for row in merged_rows:
+        ba = row.get('base_asset', '')
+        if ba:
+            orderbook_map[ba] = row
+
+    # 4. 初始化平仓执行器
+    global _closing_executor
+    if _closing_executor is None:
+        from calc.closing_executor import ClosingExecutor
+        _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
+        if svc:
+            _closing_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
+
+    # 5. 逐个执行平仓
+    results = []
+    for pos in positions:
+        ba = pos.get('base_asset', '')
+        orderbook_row = orderbook_map.get(ba)
+        if not orderbook_row:
+            results.append({'base_asset': ba, 'success': False, 'message': f'无盘口数据'})
+            continue
+        try:
+            result = await asyncio.to_thread(_closing_executor.manual_close, pos, orderbook_row)
+            results.append(result)
+        except Exception as e:
+            results.append({'base_asset': ba, 'success': False, 'message': str(e)})
+
+    # 6. 推送 WebSocket 通知
+    success_count = sum(1 for r in results if r.get('success'))
+    if success_count > 0 and event_loop and broadcast_queue:
+        close_payload = {
+            'type': 'close_position_result',
+            'results': results,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        await broadcast_queue.put(close_payload)
+        order_payload = {
+            'type': 'order_update',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        await broadcast_queue.put(order_payload)
+
+    return {
+        'success': True,
+        'message': f'已平仓 {success_count}/{len(positions)} 个持仓',
+        'results': results,
+        'total': len(positions),
+        'closed': success_count,
+    }
+
+
 @app.websocket('/ws/orderbook')
 async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
     # 验证 token
@@ -815,8 +889,33 @@ async def _open_position_loop():
 
                 global _trading_executor
                 if _trading_executor is None:
+                    _trading_cfg = TradingExecutorConfig(
+                        executor_url=config.get_executor_url(),
+                        executor_timeout=config.get_int('trade.executor.timeout_sec', 5),
+                        coverage_threshold=config.get_float('trade.open.orderbook_coverage_threshold', 0.8),
+                        basis_threshold_bps=config.get_float('trade.open.vwap_basis_threshold_bps', -60),
+                        cooldown_sec=config.get_int('trade.open.cooldown_sec', 3600),
+                        min_funding_rate_bps=config.get_float('trade.open.min_funding_rate_bps', -6.0),
+                        open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
+                        max_positions_per_asset=config.get_int('trade.open.max_positions_per_asset', 1),
+                        reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 300),
+                        max_orderbook_stale_sec=config.get_float('trade.open.max_orderbook_stale_sec', 5.0),
+                        fee_spot_open=config.get_float('trade.fee.spot_open', 0.00075),
+                        fee_spot_close=config.get_float('trade.fee.spot_close', 0.00075),
+                        fee_future_open=config.get_float('trade.fee.future_open', 0.00075),
+                        fee_future_close=config.get_float('trade.fee.future_close', 0.00075),
+                        close_threshold_percentile=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20'),
+                        min_spot_volume_24h_usdt=config.get_float('trade.filter.min_spot_volume_24h_usdt', 0),
+                        min_future_volume_24h_usdt=config.get_float('trade.filter.min_future_volume_24h_usdt', 0),
+                        peak_pullback_pct=config.get_float('trade.peak_pullback.pullback_pct', 0.10),
+                        peak_monitor_timeout_sec=config.get_int('trade.peak_pullback.monitor_timeout_sec', 60),
+                        peak_timeout_cooldown_sec=config.get_int('trade.peak_pullback.timeout_cooldown_sec', 300),
+                        p10_sustain_sec=config.get_float('trade.direct_open.sustain_sec', 3.0),
+                        margin_warning_pct=config.get_float('margin.warning_pct', 8.0),
+                        risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
+                    )
                     _trading_executor = TradingExecutor(
-                        _contract_meta, _spot_meta, _threshold_meta,
+                        _trading_cfg, _contract_meta, _spot_meta,
                         _vwap_threshold_meta, _close_vwap_threshold_meta
                     )
                     _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
@@ -904,7 +1003,11 @@ async def _margin_status_loop():
             _trading_executor.update_holding_margin_status(_margin_positions)
 
         except Exception as e:
-            logger.debug(f"保证金状态更新失败(不影响开仓): {e}")
+            # 以前这里是 logger.debug，在 INFO 级别下被静默吞掉，
+            # 导致 margin_loop 一直在报错但无人知晓，
+            # 进而 _holding_liq_distance 也从未被刷新（保证金风控失效）。
+            # 此处提升为 warning 并带 traceback，避免同类隐藏问题。
+            logger.warning(f"保证金状态更新失败(不影响开仓): {e}", exc_info=True)
 
 
 async def _position_funding_loop():

@@ -64,6 +64,10 @@ trade:
     # 期货24h成交额低于此值不开仓
     min_future_volume_24h_usdt: 50000
 
+  # ─── p10直开持续确认 ───
+  direct_open:
+    sustain_sec: 5                          # 基差连续>=p10持续此秒数才触发直开，过滤高频脉冲
+
   # ─── 峰值回落策略（开仓确认） ───
   peak_pullback:
     pullback_pct: 0.05                    # 从峰值回落百分比(5%)确认开仓
