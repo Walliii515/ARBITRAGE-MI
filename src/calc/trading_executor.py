@@ -272,10 +272,13 @@ class TradingExecutor:
                 })
                 
                 if exec_result['success']:
+                    # 立即递增持仓计数，避免下一轮循环（0.5s后）在margin_loop刷新前绕过上限检查
+                    self._holding_count[base_asset] = self._holding_count.get(base_asset, 0) + 1
                     logger.info(
                         f"开仓成功 | {base_asset} | "
                         f"spot_vwap={exec_result['spot_order']['exec_price']} | "
-                        f"future_vwap={exec_result['future_order']['exec_price']}"
+                        f"future_vwap={exec_result['future_order']['exec_price']} | "
+                        f"holding_count={self._holding_count[base_asset]}/{self.max_positions_per_asset}"
                     )
                 else:
                     logger.warning(f"开仓拒单 | {base_asset} | reason={exec_result['message']}")
