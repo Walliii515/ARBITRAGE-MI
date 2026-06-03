@@ -54,6 +54,7 @@ trade:
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
     min_funding_rate_bps: 0                # 24h资金费率下限(bps)，低于此值不开仓
+    max_orderbook_lag_ms: 200               # 旁路风控新鲜度硬约束：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 开仓过滤 ───
   filter:
@@ -66,9 +67,10 @@ trade:
 
   # ─── 盘口健康度门禁（sustain / 旁路风控共用） ───
   # 作用：拦截呆滞盘口。峰值监控起点记录 update_count_start，校验时要求
-  # update_count 增量 >= min_update_count，不达标判为“盘口呆滞”拒开/拒平
-  orderbook_health:
-    min_update_count: 5                     # sustain 窗口内至少需 5 次 WS 更新
+  # update_count 增量 ≥ 阈值，不达标判为“盘口呆滞”拒开/拒平
+  # ⚠️ 阈值已从静态 min_update_count 改为运行时动态 = sustain_sec × 2，无需配置
+  # orderbook_health: (已废弃)
+  #   min_update_count: 5
 
   # ─── 峰值回落 + sustain 确认（开仓唯一通道） ───
   peak_pullback:
@@ -87,6 +89,7 @@ trade:
     # max_funding_payments: 2                # 最大资金费支付次数，超过强制平仓
     funding_cost_tolerance_ratio: 0.2        # 累计资金费超过预期收敛空间此比例时平仓
     funding_cost_min_threshold_bps: 10       # 累计资金费收敛空间保底值(bps)，防止open/close倒挂时阈值为0
+    max_orderbook_lag_ms: 200               # 旁路风控新鲜度硬约束：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 谷底反弹策略（平仓确认） ───
   valley_rebound:

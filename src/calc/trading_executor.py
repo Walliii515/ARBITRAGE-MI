@@ -34,7 +34,9 @@ class TradingExecutorConfig:
     open_amount_usdt: float = 5.0
     max_positions_per_asset: int = 1
     reject_cooldown_sec: int = 300
-    max_orderbook_stale_sec: float = 5.0
+    # 旁路风控新鲜度硬约束：本地接收最近一次 WS 盘口与当前下单时刻的允许最大延迟（毫秒）
+    # 阐释：update_time(交易所时间戳) 不可靠，只以本地 last_update_time 判定“现在距上次收到行情多久”
+    max_orderbook_lag_ms: float = 200.0
 
     # ─── 手续费率 ───
     fee_spot_open: float = 0.00075
@@ -56,8 +58,7 @@ class TradingExecutorConfig:
     sustain_sec: float = 5.0                # 峰值监控最低持续秒数（与 update_count 闸共同过滤脉冲/呆滞）
 
     # ─── 盘口健康度门禁（更新次数闸） ───
-    # 回落判定窗口内 update_count 增量 < min_update_count 视为呆滞拒开
-    min_update_count: int = 5
+    # 阈值不再静态配置，运行时按 sustain_sec × 2 动态计算（sustain 越长 → 要求增量越多）
 
     # ─── 保证金风控 ───
     margin_warning_pct: float = 8.0
@@ -121,8 +122,9 @@ class TradingExecutor:
         # 临时槽位：实时费率校验通过时记录的实时费率(bps)，供 _build_open_reason 取用
         self._last_realtime_rate_bps: Dict[str, float] = {}
 
-        # 盘口健康度门禁：回落确认窗口内 update_count 增量下限
-        self.min_update_count = max(0, int(cfg.min_update_count))
+        # 盘口健康度门禁：update_count 闸阈值 ─ 动态 = sustain_sec × 2（sustain 窗口内至少要求这么多次 WS 增量）
+        # 唯一计算点：_check_update_count_freshness / _pass_peak_check / 日志描述均复用该成员，避免表达式重复
+        self.min_update_count = max(1, int(self.sustain_sec * 2))
 
         # 保证金风控：距爆仓距离低于此值时禁止开仓
         self.margin_warning_pct = cfg.margin_warning_pct
@@ -143,8 +145,10 @@ class TradingExecutor:
         # 开仓金额（用于 min_notional 前置校验）
         self.open_amount_usdt = cfg.open_amount_usdt
 
-        # 最终风控旁路：盘口最大允许陈旧时间（秒）
-        self._max_orderbook_stale_sec = cfg.max_orderbook_stale_sec
+        # 旁路风控新鲜度硬约束：以本地 last_update_time 为准，超过阈值判为“行情滞后”拒开
+        self._max_orderbook_lag_ms = float(cfg.max_orderbook_lag_ms)
+        # 临时槽位：旁路风控通过时记录的 (gate_lag_ms, spot_lag_ms)，供 _build_open_reason 拼到开仓原因
+        self._last_orderbook_lag_ms: Dict[str, tuple] = {}
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -476,13 +480,14 @@ class TradingExecutor:
         spot_uc_start: Optional[int],
     ) -> tuple:
         """
-        “更新次数闸”校验：sustain 窗口内 gate 与 spot 任一侧 update_count 增量均需 ≥ min_update_count。
+        “更新次数闸”校验：sustain 窗口内 gate 与 spot 任一侧 update_count 增量均需 ≥ self.min_update_count。
 
         返回:
             (passed: bool, reason: str)
         依赖状态缺失时退化为放行（忽略）。
         """
-        if self.min_update_count <= 0:
+        threshold = self.min_update_count
+        if threshold <= 0:
             return True, ''
         if gate_uc_now is None or spot_uc_now is None:
             return True, ''  # 未注入 manager 或盘口缺失，不阶步拦截
@@ -490,10 +495,10 @@ class TradingExecutor:
             return True, ''  # 状态丢失时退化为放行（避免间歇误拒）
         gate_delta = gate_uc_now - gate_uc_start
         spot_delta = spot_uc_now - spot_uc_start
-        if gate_delta < self.min_update_count or spot_delta < self.min_update_count:
+        if gate_delta < threshold or spot_delta < threshold:
             return False, (
                 f'盘口呆滞(gate增量={gate_delta}, spot增量={spot_delta}, '
-                f'需≥{self.min_update_count})'
+                f'需≥{threshold}=sustain{self.sustain_sec:.0f}s×2)'
             )
         return True, ''
 
@@ -553,15 +558,25 @@ class TradingExecutor:
             gate_row = gate_ob.to_dict_row()
             spot_row = spot_ob.to_dict_row()
 
-            # ── 2. 盘口新鲜度检查 ──
+            # ── 2. 盘口新鲜度硬约束：以本地 last_update_time 为准计算 lag_ms（破除同源缺陷）──
+            # 原因：update_time(交易所推送时间戳) 在快照重建后会立刻“看起来很新”，
+            # 但内容可能就是异常价。只有 last_update_time（本地接收时刻）能客观反映“现在距上次收到行情多久”。
             now_ts = time.time()
-            gate_age = now_ts - (gate_row.get('update_time') or 0)
-            spot_age = now_ts - (spot_row.get('update_time') or 0)
+            gate_local_ts = float(getattr(gate_ob, 'last_update_time', 0) or 0)
+            spot_local_ts = float(getattr(spot_ob, 'last_update_time', 0) or 0)
+            gate_lag_ms = (now_ts - gate_local_ts) * 1000.0 if gate_local_ts > 0 else float('inf')
+            spot_lag_ms = (now_ts - spot_local_ts) * 1000.0 if spot_local_ts > 0 else float('inf')
 
-            if gate_age > self._max_orderbook_stale_sec or spot_age > self._max_orderbook_stale_sec:
+            if gate_lag_ms > self._max_orderbook_lag_ms or spot_lag_ms > self._max_orderbook_lag_ms:
+                logger.info(
+                    f"开仓旁路-行情滞后拦截 | {base_asset} | "
+                    f"now={now_ts:.3f} | gate_local={gate_local_ts:.3f}(lag={gate_lag_ms:.0f}ms) | "
+                    f"spot_local={spot_local_ts:.3f}(lag={spot_lag_ms:.0f}ms) | "
+                    f"max={self._max_orderbook_lag_ms:.0f}ms"
+                )
                 return False, None, None, (
-                    f'盘口过期(gate_age={gate_age:.1f}s, spot_age={spot_age:.1f}s, '
-                    f'max={self._max_orderbook_stale_sec}s)'
+                    f'行情滞后(gate_lag={gate_lag_ms:.0f}ms, spot_lag={spot_lag_ms:.0f}ms, '
+                    f'max={self._max_orderbook_lag_ms:.0f}ms)'
                 )
 
             # ── 2.5 更新次数闸：拦截“盘口时间戳新 / 但期间未真正更新”的呆滞场景 ──
@@ -574,6 +589,13 @@ class TradingExecutor:
                     uc_state.get('gate_uc_start'), uc_state.get('spot_uc_start'),
                 )
                 if not uc_passed:
+                    logger.info(
+                        f"开仓旁路-update_count闸拦截 | {base_asset} | "
+                        f"uc_now(gate={gate_uc_now},spot={spot_uc_now}) | "
+                        f"uc_start(gate={uc_state.get('gate_uc_start')},spot={uc_state.get('spot_uc_start')}) | "
+                        f"sustained={(datetime.now() - uc_state['start_time']).total_seconds():.1f}s | "
+                        f"原因:{uc_reason}"
+                    )
                     return False, None, None, uc_reason
 
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
@@ -601,11 +623,21 @@ class TradingExecutor:
             if base_asset in self.vwap_threshold_meta:
                 p20 = self.vwap_threshold_meta[base_asset].get('p20')
                 if p20 is not None and gate_basis_bps < p20:
+                    logger.info(
+                        f"开仓旁路-基差衰减拦截 | {base_asset} | "
+                        f"gate_basis={gate_basis_bps:.2f}bps < p20={p20:.2f}bps | "
+                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
                     return False, row, gate_basis_bps, (
                         f'基差衰减({gate_basis_bps:.1f}bps < 阈值p20={p20:.1f})'
                     )
             else:
                 if gate_basis_bps < self.basis_threshold_bps:
+                    logger.info(
+                        f"开仓旁路-基差衰减(全局阈值)拦截 | {base_asset} | "
+                        f"gate_basis={gate_basis_bps:.2f}bps < threshold={self.basis_threshold_bps}bps | "
+                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
                     return False, row, gate_basis_bps, (
                         f'基差衰减({gate_basis_bps:.1f}bps < 全局阈值{self.basis_threshold_bps})'
                     )
@@ -616,6 +648,12 @@ class TradingExecutor:
                 close_threshold = close_data.get(self.close_threshold_col)
                 if close_threshold is not None:
                     if gate_basis_bps <= float(close_threshold) + self.fee_cost_bps:
+                        logger.info(
+                            f"开仓旁路-盈利性守卫拦截 | {base_asset} | "
+                            f"gate_basis={gate_basis_bps:.2f}bps <= "
+                            f"close_thr={float(close_threshold):.2f}+fee={self.fee_cost_bps:.0f} | "
+                            f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                        )
                         return False, row, gate_basis_bps, (
                             f'盈利性守卫拦截(basis={gate_basis_bps:.1f} <= '
                             f'close_thr={float(close_threshold):.1f}+fee={self.fee_cost_bps:.0f})'
@@ -624,11 +662,23 @@ class TradingExecutor:
             # ── 7. 盘口覆盖校验 ──
             open_coverage = row.get('open_coverage')
             if open_coverage is not None and float(open_coverage) > self.coverage_threshold:
+                logger.info(
+                    f"开仓旁路-覆盖超限拦截 | {base_asset} | "
+                    f"coverage={float(open_coverage):.3f} > {self.coverage_threshold} | "
+                    f"gate_basis={gate_basis_bps:.2f}bps"
+                )
                 return False, row, gate_basis_bps, (
                     f'盘口覆盖超限({float(open_coverage):.2f} > {self.coverage_threshold})'
                 )
 
             # ── 全部通过 ──
+            # 记录本次旁路风控读取到的 lag，供 _build_open_reason 拼接到开仓原因
+            self._last_orderbook_lag_ms[base_asset] = (gate_lag_ms, spot_lag_ms)
+            logger.info(
+                f"开仓旁路通过 | {base_asset} | "
+                f"gate_basis={gate_basis_bps:.2f}bps | coverage={open_coverage} | "
+                f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms,max={self._max_orderbook_lag_ms:.0f}ms)"
+            )
             return True, row, gate_basis_bps, ''
 
         except Exception as e:
@@ -670,6 +720,8 @@ class TradingExecutor:
             logger.info(
                 f"峰值监控开始 | {base_asset} | "
                 f"basis={current_basis_bps:.2f}bps | 需持续{self.sustain_sec}s且回落{self.peak_pullback_pct*100:.0f}% | "
+                f"start_time={now.strftime('%H:%M:%S.%f')[:-3]} | "
+                f"uc阈值≥{self.min_update_count}(=sustain×2) | "
                 f"uc_start(gate={gate_uc_now}, spot={spot_uc_now})"
             )
             return False
@@ -722,12 +774,16 @@ class TradingExecutor:
             return False
 
         state['trigger'] = 'pullback'
+        # 所有“通过”路径必须打日志：其后走入 _pre_execution_gate 、下单，不可静默
+        gate_delta = (gate_uc_now or 0) - (state.get('gate_uc_start') or 0)
+        spot_delta = (spot_uc_now or 0) - (state.get('spot_uc_start') or 0)
         logger.info(
             f"峰值回落确认，执行开仓 | {base_asset} | "
-            f"peak={state['peak_bps']:.2f} | current={current_basis_bps:.2f} | "
-            f"sustained={elapsed_sec:.1f}s | pullback={self.peak_pullback_pct*100:.0f}% | "
-            f"uc增量(gate={(gate_uc_now or 0)-(state.get('gate_uc_start') or 0)}, "
-            f"spot={(spot_uc_now or 0)-(state.get('spot_uc_start') or 0)})"
+            f"peak={state['peak_bps']:.2f}bps | current={current_basis_bps:.2f}bps | "
+            f"sustained={elapsed_sec:.1f}s≥{self.sustain_sec}s | pullback={self.peak_pullback_pct*100:.0f}% | "
+            f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"
+            f"now={now.strftime('%H:%M:%S.%f')[:-3]} | "
+            f"uc增量(gate={gate_delta}, spot={spot_delta})≥{self.min_update_count}"
         )
         return True
 
@@ -896,12 +952,28 @@ class TradingExecutor:
             else:
                 parts.append(f"峰值{peak_bps:.1f}")
 
-        # 5. 盈利性守卫
+        # 5. 盈利性守卫（始终打印：无平仓阈值时显式标注，避免日志间歇缺失影响排查）
         if base_asset in self.close_vwap_threshold_meta:
             close_data = self.close_vwap_threshold_meta[base_asset]
             close_thr = close_data.get(self.close_threshold_col)
             if close_thr is not None:
                 parts.append(f"守卫({open_vwap_basis:.1f}>{float(close_thr):.1f}+{self.fee_cost_bps:.0f}费)")
+            else:
+                parts.append(f"守卫(无{self.close_threshold_col}阈值,跳过)")
+        else:
+            parts.append("守卫(无平仓阈值,跳过)")
+
+        # 5.5 行情新鲜度（旁路风控读取到的 lag）─ 反映“下单时刻距上次收到行情多久”
+        lag = self._last_orderbook_lag_ms.pop(base_asset, None)
+        if lag is not None:
+            gate_lag_ms, spot_lag_ms = lag
+            def _fmt(ms):
+                if ms is None or ms == float('inf'):
+                    return 'NA'
+                return f'{ms:.0f}ms'
+            parts.append(f"鲜度(gate={_fmt(gate_lag_ms)},spot={_fmt(spot_lag_ms)})")
+        else:
+            parts.append("鲜度(NA)")
 
         # 6. 24h成交量（现货/期货）
         vol_parts = []

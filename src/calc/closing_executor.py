@@ -73,10 +73,15 @@ class ClosingExecutor:
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
 
-        # 最终风控旁路：盘口最大允许陈旧时间（秒）
-        self._max_orderbook_stale_sec = config.get_float('trade.close.max_orderbook_stale_sec', 5.0)
-        # 盘口健康度门禁：sustain/valley 窗口内 update_count 增量下限
-        self.min_update_count = max(0, config.get_int('trade.orderbook_health.min_update_count', 5))
+        # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
+        self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
+        # 盘口健康度门禁：update_count 闸阈值 ─ 动态 = sustain_sec × 2（与开仓侧阈值一致）
+        # 唯一计算点：_check_update_count_freshness / _pass_valley_check / 日志描述均复用该成员
+        sustain_sec = config.get_float('trade.peak_pullback.sustain_sec', 3.0)
+        self.sustain_sec = sustain_sec
+        self.min_update_count = max(1, int(sustain_sec * 2))
+        # 临时槽位：旁路风控读取到的 (gate_lag_ms, spot_lag_ms)，供平仓原因拼接
+        self._last_orderbook_lag_ms: Dict[str, tuple] = {}
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -117,8 +122,9 @@ class ClosingExecutor:
         gate_uc_start,
         spot_uc_start,
     ) -> tuple:
-        """“更新次数闸”校验：gate 与 spot 任一侧增量 < min_update_count 即拒。依赖状态缺失退化为放行。"""
-        if self.min_update_count <= 0:
+        """“更新次数闸”校验：gate 与 spot 任一侧增量 < self.min_update_count 即拒。依赖状态缺失退化为放行。"""
+        threshold = self.min_update_count
+        if threshold <= 0:
             return True, ''
         if gate_uc_now is None or spot_uc_now is None:
             return True, ''
@@ -126,10 +132,10 @@ class ClosingExecutor:
             return True, ''
         gate_delta = gate_uc_now - gate_uc_start
         spot_delta = spot_uc_now - spot_uc_start
-        if gate_delta < self.min_update_count or spot_delta < self.min_update_count:
+        if gate_delta < threshold or spot_delta < threshold:
             return False, (
                 f'盘口呆滞(gate增量={gate_delta}, spot增量={spot_delta}, '
-                f'需≥{self.min_update_count})'
+                f'需≥{threshold}=sustain{self.sustain_sec:.0f}s×2)'
             )
         return True, ''
 
@@ -391,15 +397,25 @@ class ClosingExecutor:
             gate_row = gate_ob.to_dict_row()
             spot_row = spot_ob.to_dict_row()
 
-            # ── 2. 盘口新鲜度检查 ──
+            # ── 2. 盘口新鲜度硬约束：以本地 last_update_time 为准计算 lag_ms（破除同源缺陷）──
+            # 原因：update_time(交易所推送时间戳) 在快照重建后会立刻“看起来很新”但内容可能是异常价。
+            # 只有 last_update_time（本地接收时刻）能客观反映“现在距上次收到 WS 增量多久”。
             now_ts = time.time()
-            gate_age = now_ts - (gate_row.get('update_time') or 0)
-            spot_age = now_ts - (spot_row.get('update_time') or 0)
+            gate_local_ts = float(getattr(gate_ob, 'last_update_time', 0) or 0)
+            spot_local_ts = float(getattr(spot_ob, 'last_update_time', 0) or 0)
+            gate_lag_ms = (now_ts - gate_local_ts) * 1000.0 if gate_local_ts > 0 else float('inf')
+            spot_lag_ms = (now_ts - spot_local_ts) * 1000.0 if spot_local_ts > 0 else float('inf')
 
-            if gate_age > self._max_orderbook_stale_sec or spot_age > self._max_orderbook_stale_sec:
+            if gate_lag_ms > self._max_orderbook_lag_ms or spot_lag_ms > self._max_orderbook_lag_ms:
+                logger.info(
+                    f"平仓旁路-行情滞后拦截 | {base_asset} | "
+                    f"now={now_ts:.3f} | gate_local={gate_local_ts:.3f}(lag={gate_lag_ms:.0f}ms) | "
+                    f"spot_local={spot_local_ts:.3f}(lag={spot_lag_ms:.0f}ms) | "
+                    f"max={self._max_orderbook_lag_ms:.0f}ms"
+                )
                 return False, None, None, (
-                    f'盘口过期(gate_age={gate_age:.1f}s, spot_age={spot_age:.1f}s, '
-                    f'max={self._max_orderbook_stale_sec}s)'
+                    f'行情滞后(gate_lag={gate_lag_ms:.0f}ms, spot_lag={spot_lag_ms:.0f}ms, '
+                    f'max={self._max_orderbook_lag_ms:.0f}ms)'
                 )
 
             # ── 2.5 更新次数闸：拦截“盘口冻住 / 快照刚重建”呆滞场景 ──
@@ -412,6 +428,13 @@ class ClosingExecutor:
                     valley_state.get('gate_uc_start'), valley_state.get('spot_uc_start'),
                 )
                 if not uc_passed:
+                    logger.info(
+                        f"平仓旁路-update_count闸拦截 | {base_asset} | "
+                        f"uc_now(gate={gate_uc_now},spot={spot_uc_now}) | "
+                        f"uc_start(gate={valley_state.get('gate_uc_start')},spot={valley_state.get('spot_uc_start')}) | "
+                        f"sustained={(datetime.now() - valley_state['start_time']).total_seconds():.1f}s | "
+                        f"原因:{uc_reason}"
+                    )
                     return False, None, None, uc_reason
 
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
@@ -438,9 +461,14 @@ class ClosingExecutor:
 
             # ── 5. 盈利性校验：确认平仓仍有利可图 ──
             # 平仓基差应 < 开仓基差（即价差已收敛）
-            # 如果新基差 >= 开仓基差，说明收敛已完全逆转，平仓会亨损
+            # 如果新基差 >= 开仓基差，说明收敛已完全逆转，平仓会亏损
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
             if gate_basis_bps >= open_spread_bps:
+                logger.info(
+                    f"平仓旁路-收敛逆转拦截 | {base_asset} | "
+                    f"gate_basis={gate_basis_bps:.2f}bps >= open_spread={open_spread_bps:.2f}bps | "
+                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                )
                 return False, row, gate_basis_bps, (
                     f'收敛逆转(平仓基差{gate_basis_bps:.1f}bps >= '
                     f'开仓基差{open_spread_bps:.1f}bps, 无收敛利润)'
@@ -453,12 +481,25 @@ class ClosingExecutor:
             if original_convergence > 0 and convergence_total > 0:
                 reversion_ratio = (gate_basis_bps - float(pos.get('current_spread_bps') or gate_basis_bps)) / original_convergence
                 if reversion_ratio > 0.5:
+                    logger.info(
+                        f"平仓旁路-基差回弹过大拦截 | {base_asset} | "
+                        f"reversion_ratio={reversion_ratio:.2%} | "
+                        f"trigger_basis={pos.get('current_spread_bps')}bps→gate_basis={gate_basis_bps:.2f}bps"
+                    )
                     return False, row, gate_basis_bps, (
                         f'基差回弹过大(回弹{reversion_ratio:.0%}, '
                         f'触发时{pos.get("current_spread_bps")}bps→当前{gate_basis_bps}bps)'
                     )
 
             # ── 全部通过 ──
+            # 记录本次旁路风控读取到的 lag，供 _build_take_profit_detail 拼接到平仓原因
+            self._last_orderbook_lag_ms[base_asset] = (gate_lag_ms, spot_lag_ms)
+            logger.info(
+                f"平仓旁路通过 | {base_asset} | "
+                f"gate_basis={gate_basis_bps:.2f}bps | open_spread={open_spread_bps:.2f}bps | "
+                f"trigger_basis={pos.get('current_spread_bps')}bps | "
+                f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms,max={self._max_orderbook_lag_ms:.0f}ms)"
+            )
             return True, row, gate_basis_bps, ''
 
         except Exception as e:
@@ -477,11 +518,13 @@ class ClosingExecutor:
         now = datetime.now()
         state = self._valley_state.get(base_asset)
 
+        contract = pos.get('future_contract', '')
+        symbol = pos.get('spot_symbol') or f"{base_asset}USDT"
+        uc_threshold = self.min_update_count
+
         if state is None:
             # 首次进入监控，记录谷底、开始时间 及 update_count 起点
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
-            contract = pos.get('future_contract', '')
-            symbol = pos.get('spot_symbol') or f"{base_asset}USDT"
             gate_uc_start, spot_uc_start = self._get_orderbook_update_counts(contract, symbol)
             self._valley_state[base_asset] = {
                 'valley_bps': current_spread_bps,
@@ -493,7 +536,9 @@ class ClosingExecutor:
             }
             logger.info(
                 f"止盈谷底监控开始 | {base_asset} | "
-                f"spread={current_spread_bps:.2f}bps | "
+                f"spread={current_spread_bps:.2f}bps | open_spread={open_spread_bps:.2f}bps | "
+                f"start_time={now.strftime('%H:%M:%S.%f')[:-3]} | "
+                f"uc_threshold≥{uc_threshold}(=sustain{self.sustain_sec:.0f}s×2) | "
                 f"uc_start(gate={gate_uc_start}, spot={spot_uc_start})"
             )
             return False
@@ -505,11 +550,18 @@ class ClosingExecutor:
         # 检查超时
         elapsed_sec = (now - state['start_time']).total_seconds()
         if elapsed_sec >= self.valley_monitor_timeout_sec:
+            # 所有“通过”路径必须打日志：超时直接放行，记录完整时间戳与 uc 增量供复盘
+            gate_uc_now, spot_uc_now = self._get_orderbook_update_counts(contract, symbol)
+            gate_delta = (gate_uc_now or 0) - (state.get('gate_uc_start') or 0)
+            spot_delta = (spot_uc_now or 0) - (state.get('spot_uc_start') or 0)
             state['trigger'] = 'timeout'
             logger.info(
                 f"止盈谷底监控超时，直接平仓 | {base_asset} | "
-                f"valley={state['valley_bps']:.2f} | current={current_spread_bps:.2f} | "
-                f"elapsed={elapsed_sec:.0f}s"
+                f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
+                f"elapsed={elapsed_sec:.1f}s≥{self.valley_monitor_timeout_sec}s | "
+                f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"
+                f"now={now.strftime('%H:%M:%S.%f')[:-3]} | "
+                f"uc增量(gate={gate_delta}, spot={spot_delta})"
             )
             return True
 
@@ -521,22 +573,37 @@ class ClosingExecutor:
         if convergence_range > 0:
             rebound_threshold = state['valley_bps'] + convergence_range * self.valley_rebound_pct
         else:
-            # 异常: 谷底高于开仓基差，直接平仓
+            # 异常: 谷底高于开仓基差，直接平仓（罕见场景，仍打详细日志）
+            logger.info(
+                f"止盈谷底异常(谷底>=开仓基差)，直接平仓 | {base_asset} | "
+                f"valley={state['valley_bps']:.2f} | open_spread={open_spread_bps:.2f} | "
+                f"current={current_spread_bps:.2f}"
+            )
+            state['trigger'] = 'rebound'
             return True
 
         if current_spread_bps >= rebound_threshold:
+            # 所有“通过”路径必须打日志：反弹确认放行，含 uc 增量与时间戳
+            gate_uc_now, spot_uc_now = self._get_orderbook_update_counts(contract, symbol)
+            gate_delta = (gate_uc_now or 0) - (state.get('gate_uc_start') or 0)
+            spot_delta = (spot_uc_now or 0) - (state.get('spot_uc_start') or 0)
             state['trigger'] = 'rebound'
             logger.info(
                 f"止盈谷底反弹确认，执行平仓 | {base_asset} | "
-                f"valley={state['valley_bps']:.2f} | current={current_spread_bps:.2f} | "
-                f"rebound_thr={rebound_threshold:.2f}"
+                f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
+                f"rebound_thr={rebound_threshold:.2f}bps | "
+                f"open_spread={open_spread_bps:.2f}bps | rebound_pct={self.valley_rebound_pct*100:.0f}% | "
+                f"sustained={elapsed_sec:.1f}s | "
+                f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"
+                f"now={now.strftime('%H:%M:%S.%f')[:-3]} | "
+                f"uc增量(gate={gate_delta}, spot={spot_delta})≥{uc_threshold}"
             )
             return True
 
         return False
 
     def _build_take_profit_detail(self, pos: Dict, current_spread_bps: float) -> str:
-        """构建止盈平仓的详细原因字符串"""
+        """构建止盈平仓的详细原因字符串（含谷底确认信息 + 行情新鲜度）"""
         ba = pos.get('base_asset', '')
         open_spread_bps = float(pos.get('open_spread_bps') or 0)
         spread_profit_bps = open_spread_bps - current_spread_bps
@@ -565,6 +632,18 @@ class ClosingExecutor:
             elif trigger == 'timeout':
                 elapsed = (datetime.now() - valley_state['start_time']).total_seconds()
                 detail += f"|谷底超时(谷{valley_bps:.1f},{elapsed:.0f}s)"
+
+        # 行情新鲜度（旁路风控读取到的 lag）─ 反映“下单时刻距上次收到 WS 增量多久”
+        lag = self._last_orderbook_lag_ms.pop(ba, None)
+        if lag is not None:
+            gate_lag_ms, spot_lag_ms = lag
+            def _fmt(ms):
+                if ms is None or ms == float('inf'):
+                    return 'NA'
+                return f'{ms:.0f}ms'
+            detail += f"|鲜度(gate={_fmt(gate_lag_ms)},spot={_fmt(spot_lag_ms)})"
+        else:
+            detail += "|鲜度(NA)"
 
         return detail
 

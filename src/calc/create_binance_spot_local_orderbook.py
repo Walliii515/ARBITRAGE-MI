@@ -45,6 +45,8 @@ class LocalOrderBook:
         self.base_asset = base_asset
         self.last_update_id = 0
         self.update_time = 0.0
+        # 与 Gate 期货接口对齐：本地接收 WS 数据的最近时刻（秒），供旁路风控做新鲜度（lag_ms）判定
+        self.last_update_time = 0.0
 
         self.bids: List[tuple] = []
         self.asks: List[tuple] = []
@@ -77,6 +79,7 @@ class LocalOrderBook:
                 for a in data.get('asks', [])[:LEVEL]
             ]
             self.update_time = time.time()
+            self.last_update_time = self.update_time
             self.update_count += 1
 
     def to_dict_row(self) -> Dict:

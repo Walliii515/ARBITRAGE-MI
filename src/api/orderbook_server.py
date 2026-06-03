@@ -899,7 +899,7 @@ async def _open_position_loop():
                         open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
                         max_positions_per_asset=config.get_int('trade.open.max_positions_per_asset', 1),
                         reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 300),
-                        max_orderbook_stale_sec=config.get_float('trade.open.max_orderbook_stale_sec', 5.0),
+                        max_orderbook_lag_ms=config.get_float('trade.open.max_orderbook_lag_ms', 200.0),
                         fee_spot_open=config.get_float('trade.fee.spot_open', 0.00075),
                         fee_spot_close=config.get_float('trade.fee.spot_close', 0.00075),
                         fee_future_open=config.get_float('trade.fee.future_open', 0.00075),
@@ -911,7 +911,7 @@ async def _open_position_loop():
                         peak_monitor_timeout_sec=config.get_int('trade.peak_pullback.monitor_timeout_sec', 60),
                         peak_timeout_cooldown_sec=config.get_int('trade.peak_pullback.timeout_cooldown_sec', 300),
                         sustain_sec=config.get_float('trade.peak_pullback.sustain_sec', 5.0),
-                        min_update_count=config.get_int('trade.orderbook_health.min_update_count', 5),
+                        # min_update_count 已废弃：运行时按 sustain_sec × 2 动态计算，无需配置
                         margin_warning_pct=config.get_float('margin.warning_pct', 8.0),
                         risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
                     )
