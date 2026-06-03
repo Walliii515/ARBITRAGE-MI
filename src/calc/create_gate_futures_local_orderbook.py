@@ -2,7 +2,7 @@
 """
 Gate.io 永续合约本地订单簿管理器
 合并 REST 快照和 WebSocket 增量更新
-统一使用 frequency=100ms, level=5 维护5档盘口
+WS/REST 使用 level=20（Gate.io 支持的最小档位），输出前5档供 VWAP 计算
 """
 import json
 import math
@@ -26,7 +26,8 @@ logger = get_logger(__name__)
 
 # 固定参数
 FREQUENCY = '100ms'
-LEVEL = 5
+WS_LEVEL = 20       # WS 订阅 & REST 快照深度（Gate.io 仅支持 100/50/20）
+DISPLAY_LEVEL = 5   # 输出/VWAP 计算使用的档位数
 
 
 def _json_safe_scalar(val):
@@ -196,8 +197,8 @@ class LocalOrderBook:
             }
             
             # 买单（前5档）
-            bids_list = list(self.bids.items())[:LEVEL]
-            for i in range(LEVEL):
+            bids_list = list(self.bids.items())[:DISPLAY_LEVEL]
+            for i in range(DISPLAY_LEVEL):
                 if i < len(bids_list):
                     row[f'future_price_bid_{i+1}'] = bids_list[i][0]
                     row[f'future_volume_bid_{i+1}'] = bids_list[i][1]
@@ -206,8 +207,8 @@ class LocalOrderBook:
                     row[f'future_volume_bid_{i+1}'] = None
             
             # 卖单（前5档）
-            asks_list = list(self.asks.items())[:LEVEL]
-            for i in range(LEVEL):
+            asks_list = list(self.asks.items())[:DISPLAY_LEVEL]
+            for i in range(DISPLAY_LEVEL):
                 if i < len(asks_list):
                     row[f'future_price_ask_{i+1}'] = asks_list[i][0]
                     row[f'future_volume_ask_{i+1}'] = asks_list[i][1]
@@ -261,7 +262,7 @@ class OrderBookManager:
             snapshot = get_futures_order_book(
                 contract=contract,
                 settle=self.settle,
-                limit=LEVEL,
+                limit=WS_LEVEL,
                 with_id=True
             )
             
@@ -275,7 +276,7 @@ class OrderBookManager:
             
             # 如果 WebSocket 已连接，立即订阅
             if self.ws_client:
-                self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=LEVEL)
+                self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=WS_LEVEL)
 
     def add_contracts_bulk(
         self,
@@ -329,7 +330,7 @@ class OrderBookManager:
             return contract, get_futures_order_book(
                 contract=contract,
                 settle=self.settle,
-                limit=LEVEL,
+                limit=WS_LEVEL,
                 with_id=True
             )
         
@@ -379,7 +380,7 @@ class OrderBookManager:
         # 3. 若 WS 已连接，为成功的合约补订阅
         if self.ws_client:
             for contract in success:
-                self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=LEVEL)
+                self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=WS_LEVEL)
         
         log_print(f"▶ 批量初始化完成：成功 {len(success)}，失败 {len(failed_details)}")
         return success, failed_details
@@ -456,7 +457,7 @@ class OrderBookManager:
                 snapshot = get_futures_order_book(
                     contract=contract,
                     settle=self.settle,
-                    limit=LEVEL,
+                    limit=WS_LEVEL,
                     with_id=True
                 )
                 if snapshot:
@@ -491,7 +492,7 @@ class OrderBookManager:
         targets = contracts if contracts is not None else list(self.orderbooks.keys())
         total = len(targets)
         for i, contract in enumerate(targets):
-            self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=LEVEL)
+            self.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=WS_LEVEL)
             if on_progress:
                 on_progress(i + 1, total)
                 time.sleep(0.03)  # 留出推送间隔，便于前端看到订阅进度变化
@@ -506,7 +507,7 @@ class OrderBookManager:
         snapshot = get_futures_order_book(
             contract=contract,
             settle=self.settle,
-            limit=LEVEL,
+            limit=WS_LEVEL,
             with_id=True
         )
         
@@ -551,6 +552,6 @@ def run_manager_example():
 
 if __name__ == '__main__':
     log_print("Gate.io 永续合约本地订单簿管理器")
-    log_print(f"参数: frequency={FREQUENCY}, level={LEVEL}")
+    log_print(f"参数: frequency={FREQUENCY}, ws_level={WS_LEVEL}, display_level={DISPLAY_LEVEL}")
     log_print("=" * 80)
     run_manager_example()

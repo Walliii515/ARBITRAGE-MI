@@ -360,7 +360,7 @@ def run_ws_client():
     # 根据官方文档：
     # - frequency: '20ms' 或 '100ms'
     # - level: 100, 50, 20 (20ms频率只支持level=20)
-    client.subscribe_order_book('BTC_USDT', frequency='100ms', level=5)
+    client.subscribe_order_book('BTC_USDT', frequency='100ms', level=20)
 
     # 保持运行
     try:
