@@ -75,11 +75,6 @@ class ClosingExecutor:
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
-        # 盘口健康度门禁：update_count 闸阈值 ─ 动态 = sustain_sec × 2（与开仓侧阈值一致）
-        # 唯一计算点：_check_update_count_freshness / _pass_valley_check / 日志描述均复用该成员
-        sustain_sec = config.get_float('trade.peak_pullback.sustain_sec', 3.0)
-        self.sustain_sec = sustain_sec
-        self.min_update_count = max(1, int(sustain_sec * 2))
         # 临时槽位：旁路风控读取到的 (gate_lag_ms, spot_lag_ms)，供平仓原因拼接
         self._last_orderbook_lag_ms: Dict[str, tuple] = {}
         # OrderBookManager 引用（由外部注入）
@@ -89,7 +84,7 @@ class ClosingExecutor:
     def set_orderbook_managers(self, gate_manager, spot_manager):
         """
         注入 OrderBookManager 引用，供平仓最终风控旁路直接读取单标的盘口。
-
+    
         Args:
             gate_manager: Gate 期货 OrderBookManager 实例
             spot_manager: Binance 现货 OrderBookManager 实例
@@ -97,47 +92,6 @@ class ClosingExecutor:
         self._gate_manager = gate_manager
         self._spot_manager = spot_manager
         logger.info('OrderBookManager 已注入 ClosingExecutor（平仓最终风控旁路就绪）')
-
-    def _get_orderbook_update_counts(self, contract: str, symbol: str) -> tuple:
-        """从 OrderBookManager 读取 gate / spot 盘口的 update_count。任一缺失时返回 None。"""
-        gate_count = None
-        spot_count = None
-        try:
-            if self._gate_manager is not None:
-                gob = self._gate_manager.get_orderbook(contract)
-                if gob is not None:
-                    gate_count = int(getattr(gob, 'update_count', 0) or 0)
-            if self._spot_manager is not None:
-                sob = self._spot_manager.get_orderbook(symbol)
-                if sob is not None:
-                    spot_count = int(getattr(sob, 'update_count', 0) or 0)
-        except Exception as e:
-            logger.debug(f'读取 update_count 异常(忽略): {e}')
-        return gate_count, spot_count
-
-    def _check_update_count_freshness(
-        self,
-        gate_uc_now,
-        spot_uc_now,
-        gate_uc_start,
-        spot_uc_start,
-    ) -> tuple:
-        """“更新次数闸”校验：gate 与 spot 任一侧增量 < self.min_update_count 即拒。依赖状态缺失退化为放行。"""
-        threshold = self.min_update_count
-        if threshold <= 0:
-            return True, ''
-        if gate_uc_now is None or spot_uc_now is None:
-            return True, ''
-        if gate_uc_start is None or spot_uc_start is None:
-            return True, ''
-        gate_delta = gate_uc_now - gate_uc_start
-        spot_delta = spot_uc_now - spot_uc_start
-        if gate_delta < threshold or spot_delta < threshold:
-            return False, (
-                f'盘口呆滞(gate增量={gate_delta}, spot增量={spot_delta}, '
-                f'需≥{threshold}=sustain{self.sustain_sec:.0f}s×2)'
-            )
-        return True, ''
 
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
@@ -418,25 +372,6 @@ class ClosingExecutor:
                     f'max={self._max_orderbook_lag_ms:.0f}ms)'
                 )
 
-            # ── 2.5 更新次数闸：拦截“盘口冻住 / 快照刚重建”呆滞场景 ──
-            valley_state = self._valley_state.get(base_asset)
-            if valley_state:
-                gate_uc_now = int(getattr(gate_ob, 'update_count', 0) or 0)
-                spot_uc_now = int(getattr(spot_ob, 'update_count', 0) or 0)
-                uc_passed, uc_reason = self._check_update_count_freshness(
-                    gate_uc_now, spot_uc_now,
-                    valley_state.get('gate_uc_start'), valley_state.get('spot_uc_start'),
-                )
-                if not uc_passed:
-                    logger.info(
-                        f"平仓旁路-update_count闸拦截 | {base_asset} | "
-                        f"uc_now(gate={gate_uc_now},spot={spot_uc_now}) | "
-                        f"uc_start(gate={valley_state.get('gate_uc_start')},spot={valley_state.get('spot_uc_start')}) | "
-                        f"sustained={(datetime.now() - valley_state['start_time']).total_seconds():.1f}s | "
-                        f"原因:{uc_reason}"
-                    )
-                    return False, None, None, uc_reason
-
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
             from calc.merge_cross_exchange_orderbook import merge_orderbook_records
             from calc.calculate_hedge_metrics import calculate_hedge_metrics
@@ -517,54 +452,40 @@ class ClosingExecutor:
         """
         now = datetime.now()
         state = self._valley_state.get(base_asset)
-
-        contract = pos.get('future_contract', '')
-        symbol = pos.get('spot_symbol') or f"{base_asset}USDT"
-        uc_threshold = self.min_update_count
-
+    
         if state is None:
-            # 首次进入监控，记录谷底、开始时间 及 update_count 起点
+            # 首次进入监控，记录谷底、开始时间
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
-            gate_uc_start, spot_uc_start = self._get_orderbook_update_counts(contract, symbol)
             self._valley_state[base_asset] = {
                 'valley_bps': current_spread_bps,
                 'start_time': now,
                 'open_spread_bps': open_spread_bps,
                 'trigger': None,
-                'gate_uc_start': gate_uc_start,
-                'spot_uc_start': spot_uc_start,
             }
             logger.info(
                 f"止盈谷底监控开始 | {base_asset} | "
                 f"spread={current_spread_bps:.2f}bps | open_spread={open_spread_bps:.2f}bps | "
-                f"start_time={now.strftime('%H:%M:%S.%f')[:-3]} | "
-                f"uc_threshold≥{uc_threshold}(=sustain{self.sustain_sec:.0f}s×2) | "
-                f"uc_start(gate={gate_uc_start}, spot={spot_uc_start})"
+                f"start_time={now.strftime('%H:%M:%S.%f')[:-3]}"
             )
             return False
-
+    
         # 更新谷底
         if current_spread_bps < state['valley_bps']:
             state['valley_bps'] = current_spread_bps
-
+    
         # 检查超时
         elapsed_sec = (now - state['start_time']).total_seconds()
         if elapsed_sec >= self.valley_monitor_timeout_sec:
-            # 所有“通过”路径必须打日志：超时直接放行，记录完整时间戳与 uc 增量供复盘
-            gate_uc_now, spot_uc_now = self._get_orderbook_update_counts(contract, symbol)
-            gate_delta = (gate_uc_now or 0) - (state.get('gate_uc_start') or 0)
-            spot_delta = (spot_uc_now or 0) - (state.get('spot_uc_start') or 0)
             state['trigger'] = 'timeout'
             logger.info(
                 f"止盈谷底监控超时，直接平仓 | {base_asset} | "
                 f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
                 f"elapsed={elapsed_sec:.1f}s≥{self.valley_monitor_timeout_sec}s | "
                 f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"
-                f"now={now.strftime('%H:%M:%S.%f')[:-3]} | "
-                f"uc增量(gate={gate_delta}, spot={spot_delta})"
+                f"now={now.strftime('%H:%M:%S.%f')[:-3]}"
             )
             return True
-
+    
         # 检查反弹确认: 基差从谷底回升超过 X%
         # 使用开仓基差与谷底的差值作为参考范围，避免小值/零值问题
         # rebound_threshold = valley + (open_spread - valley) * rebound_pct
@@ -581,12 +502,8 @@ class ClosingExecutor:
             )
             state['trigger'] = 'rebound'
             return True
-
+    
         if current_spread_bps >= rebound_threshold:
-            # 所有“通过”路径必须打日志：反弹确认放行，含 uc 增量与时间戳
-            gate_uc_now, spot_uc_now = self._get_orderbook_update_counts(contract, symbol)
-            gate_delta = (gate_uc_now or 0) - (state.get('gate_uc_start') or 0)
-            spot_delta = (spot_uc_now or 0) - (state.get('spot_uc_start') or 0)
             state['trigger'] = 'rebound'
             logger.info(
                 f"止盈谷底反弹确认，执行平仓 | {base_asset} | "
@@ -595,11 +512,10 @@ class ClosingExecutor:
                 f"open_spread={open_spread_bps:.2f}bps | rebound_pct={self.valley_rebound_pct*100:.0f}% | "
                 f"sustained={elapsed_sec:.1f}s | "
                 f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"
-                f"now={now.strftime('%H:%M:%S.%f')[:-3]} | "
-                f"uc增量(gate={gate_delta}, spot={spot_delta})≥{uc_threshold}"
+                f"now={now.strftime('%H:%M:%S.%f')[:-3]}"
             )
             return True
-
+    
         return False
 
     def _build_take_profit_detail(self, pos: Dict, current_spread_bps: float) -> str:

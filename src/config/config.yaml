@@ -65,19 +65,12 @@ trade:
     # 期货24h成交额低于此值不开仓
     min_future_volume_24h_usdt: 50000
 
-  # ─── 盘口健康度门禁（sustain / 旁路风控共用） ───
-  # 作用：拦截呆滞盘口。峰值监控起点记录 update_count_start，校验时要求
-  # update_count 增量 ≥ 阈值，不达标判为“盘口呆滞”拒开/拒平
-  # ⚠️ 阈值已从静态 min_update_count 改为运行时动态 = sustain_sec × 2，无需配置
-  # orderbook_health: (已废弃)
-  #   min_update_count: 5
-
   # ─── 峰值回落 + sustain 确认（开仓唯一通道） ───
   peak_pullback:
     pullback_pct: 0.05                      # 从峰值回落百分比(5%)确认开仓
-    sustain_sec: 3                          # 峰值监控最低持续秒数（与 update_count 闸共同过滤脉冲／呆滞）
-    monitor_timeout_sec: 30                 # 监控超时（秒），超时后直接开仓
-    timeout_cooldown_sec: 120               # 超时开仓后冷却期（秒）
+    sustain_sec: 1.5                          # 峰值监控最低持续秒数（过滤脉冲信号），从大于P20开始计算，防止1秒内迅速拉升回调的信号
+    monitor_timeout_sec: 60                 # 监控超时（秒），超时后直接放弃
+    timeout_cooldown_sec: 300               # 超时冷却期（秒），超时放弃后，基差大概率仍在 p20 之上。没有冷却的话，下一个 0.2s 循环会立刻检测到"基差 ≥ p20"，于是重新进入峰值监控状态机，
 
   # ─── 平仓策略 ───
   close:

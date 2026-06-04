@@ -102,75 +102,26 @@ def make_closing_executor():
 # TradingExecutor 测试
 # ══════════════════════════════════════════════════════════════════
 
-class TestTradingExecutorUpdateCountFreshness(unittest.TestCase):
-    """update_count 闸通用校验（开仓侧）"""
-
-    def setUp(self):
-        # sustain_sec=3 → min_update_count = 6
-        self.te = make_trading_executor(sustain_sec=3.0)
-
-    def test_threshold_dynamic_calculation(self):
-        """阈值 = max(1, int(sustain_sec * 2))"""
-        self.assertEqual(self.te.min_update_count, 6)
-
-        te2 = make_trading_executor(sustain_sec=0.0)
-        self.assertEqual(te2.min_update_count, 1)  # 兜底 max(1, ...)
-
-        te3 = make_trading_executor(sustain_sec=5.0)
-        self.assertEqual(te3.min_update_count, 10)
-
-    def test_state_missing_passes(self):
-        """状态缺失（now/start 任一为 None）退化为放行"""
-        passed, _ = self.te._check_update_count_freshness(None, 100, 90, 90)
-        self.assertTrue(passed)
-
-        passed, _ = self.te._check_update_count_freshness(100, 100, None, 90)
-        self.assertTrue(passed)
-
-    def test_increment_insufficient_blocks(self):
-        """gate 或 spot 任一侧增量 < 阈值 → 拦截"""
-        # gate 增量 = 5 < 6, spot = 10
-        passed, reason = self.te._check_update_count_freshness(105, 110, 100, 100)
-        self.assertFalse(passed)
-        self.assertIn('盘口呆滞', reason)
-        self.assertIn('gate增量=5', reason)
-
-    def test_both_increments_pass(self):
-        """gate 与 spot 增量都 ≥ 阈值 → 通过"""
-        # gate 增量 = 6, spot = 7
-        passed, reason = self.te._check_update_count_freshness(106, 107, 100, 100)
-        self.assertTrue(passed)
-        self.assertEqual(reason, '')
-
-
 class TestTradingExecutorPeakCheck(unittest.TestCase):
     """峰值回落 + sustain 确认（开仓唯一通道）"""
 
     def setUp(self):
         self.te = make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                                         peak_monitor_timeout_sec=60)
-        # min_update_count = 4
 
         # mock 副作用：实时费率校验恒通过、信号写库返回固定 ID
         self.te._verify_realtime_funding_rate = MagicMock(return_value=True)
         self.te._create_signal = MagicMock(return_value=1001)
         self.te._resolve_signal = MagicMock()
 
-        # 注入 manager，模拟 update_count 起点 = 0
-        self.gate_mgr = FakeManager({'BTC_USDT': FakeOrderBook(update_count=0)})
-        self.spot_mgr = FakeManager({'BTCUSDT': FakeOrderBook(update_count=0)})
-        self.te.set_orderbook_managers(self.gate_mgr, self.spot_mgr)
-
         self.row = {'contract': 'BTC_USDT', 'symbol': 'BTCUSDT'}
 
     def test_first_entry_records_peak_returns_false(self):
-        """首次进入：记录峰值与 uc 起点，返回 False"""
+        """首次进入：记录峰值，返回 False"""
         ret = self.te._pass_peak_check('BTC', 100.0, self.row)
         self.assertFalse(ret)
         state = self.te._peak_state['BTC']
         self.assertEqual(state['peak_bps'], 100.0)
-        self.assertEqual(state['gate_uc_start'], 0)
-        self.assertEqual(state['spot_uc_start'], 0)
         self.te._verify_realtime_funding_rate.assert_called_once()
         self.te._create_signal.assert_called_once()
 
@@ -198,24 +149,10 @@ class TestTradingExecutorPeakCheck(unittest.TestCase):
         self.assertFalse(ret)
         self.assertIn('BTC', self.te._peak_state)
 
-    def test_pullback_sustain_uc_insufficient_returns_false(self):
-        """回落 + sustain 都达标，但 uc 增量不足 → 等待（不重置）"""
-        self.te._pass_peak_check('BTC', 100.0, self.row)
-        # 模拟 sustain 已过：手工把 start_time 推早 3s
-        self.te._peak_state['BTC']['start_time'] = datetime.now() - timedelta(seconds=3)
-        # uc 不变（=0）：增量 = 0 < 4 → 拦截
-        ret = self.te._pass_peak_check('BTC', 90.0, self.row)
-        self.assertFalse(ret)
-        # 状态保留（不重置）
-        self.assertIn('BTC', self.te._peak_state)
-
     def test_full_pass_returns_true(self):
-        """回落 + sustain + uc 全部达标 → 通过，trigger=pullback"""
+        """回落 + sustain 达标 → 通过，trigger=pullback"""
         self.te._pass_peak_check('BTC', 100.0, self.row)
         self.te._peak_state['BTC']['start_time'] = datetime.now() - timedelta(seconds=3)
-        # uc 增量 +5 ≥ 4
-        self.gate_mgr._books['BTC_USDT'].update_count = 5
-        self.spot_mgr._books['BTCUSDT'].update_count = 5
 
         ret = self.te._pass_peak_check('BTC', 90.0, self.row)
         self.assertTrue(ret)
@@ -304,23 +241,6 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn('行情滞后', reason)
 
-    def test_uc_gate_blocks(self):
-        """update_count 闸：起点已记录但增量不足 → 拦截"""
-        # peak_state 已记录起点 100/100；uc_now = 102/102，增量 = 2 < 4
-        self.te._peak_state['BTC'] = {
-            'peak_bps': 50.0,
-            'start_time': datetime.now() - timedelta(seconds=3),
-            'trigger': None,
-            'signal_id': 1,
-            'gate_uc_start': 100,
-            'spot_uc_start': 100,
-        }
-        self._setup_books(gate_uc=102, spot_uc=102)
-
-        passed, _, _, reason = self.te._pre_execution_gate('BTC', 'BTC_USDT', 'BTCUSDT')
-        self.assertFalse(passed)
-        self.assertIn('盘口呆滞', reason)
-
     def test_basis_decay_blocks(self):
         """VWAP 基差 < p20 → 基差衰减拦截"""
         self._setup_books()
@@ -383,50 +303,11 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
 # ClosingExecutor 测试
 # ══════════════════════════════════════════════════════════════════
 
-class TestClosingExecutorUpdateCountFreshness(unittest.TestCase):
-    """update_count 闸通用校验（平仓侧）"""
-
-    def setUp(self):
-        self.ce = make_closing_executor()
-
-    def test_threshold_dynamic_with_sustain(self):
-        """阈值 = max(1, int(sustain_sec * 2))，sustain 取自 config"""
-        self.assertEqual(self.ce.min_update_count, max(1, int(self.ce.sustain_sec * 2)))
-        self.assertGreaterEqual(self.ce.min_update_count, 1)
-
-    def test_state_missing_passes(self):
-        passed, _ = self.ce._check_update_count_freshness(None, 100, 90, 90)
-        self.assertTrue(passed)
-        passed, _ = self.ce._check_update_count_freshness(100, 100, 90, None)
-        self.assertTrue(passed)
-
-    def test_increment_insufficient_blocks(self):
-        thr = self.ce.min_update_count
-        # spot 增量 = thr - 1 → 拦截
-        passed, reason = self.ce._check_update_count_freshness(
-            100 + thr, 100 + thr - 1, 100, 100
-        )
-        self.assertFalse(passed)
-        self.assertIn('盘口呆滞', reason)
-
-    def test_both_increments_pass(self):
-        thr = self.ce.min_update_count
-        passed, reason = self.ce._check_update_count_freshness(
-            100 + thr, 100 + thr, 100, 100
-        )
-        self.assertTrue(passed)
-        self.assertEqual(reason, '')
-
-
 class TestClosingExecutorValleyCheck(unittest.TestCase):
     """谷底反弹确认（止盈唯一确认通道）"""
 
     def setUp(self):
         self.ce = make_closing_executor()
-        # 注入 manager
-        self.gate_mgr = FakeManager({'BTC_USDT': FakeOrderBook(update_count=0)})
-        self.spot_mgr = FakeManager({'BTCUSDT': FakeOrderBook(update_count=0)})
-        self.ce.set_orderbook_managers(self.gate_mgr, self.spot_mgr)
 
         self.pos = {
             'base_asset': 'BTC',
@@ -436,13 +317,12 @@ class TestClosingExecutorValleyCheck(unittest.TestCase):
         }
 
     def test_first_entry_records_valley_returns_false(self):
-        """首次进入：记录谷底 + uc 起点，返回 False"""
+        """首次进入：记录谷底，返回 False"""
         ret = self.ce._pass_valley_check('BTC', 50.0, self.pos)
         self.assertFalse(ret)
         state = self.ce._valley_state['BTC']
         self.assertEqual(state['valley_bps'], 50.0)
         self.assertEqual(state['open_spread_bps'], 100.0)
-        self.assertEqual(state['gate_uc_start'], 0)
         self.assertIsNone(state['trigger'])
 
     def test_lower_spread_updates_valley(self):
@@ -549,22 +429,22 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn('行情滞后', reason)
 
-    def test_uc_gate_blocks(self):
-        """有 valley_state + 增量不足 → 拦截"""
-        thr = self.ce.min_update_count
+    def test_uc_gate_removed_no_longer_blocks(self):
+        """已移除 update_count 闸：有 valley_state 但不再校验 uc 增量，仅依赖 lag_ms"""
         self.ce._valley_state['BTC'] = {
             'valley_bps': 30.0,
             'start_time': datetime.now() - timedelta(seconds=3),
             'open_spread_bps': 100.0,
             'trigger': 'rebound',
-            'gate_uc_start': 100,
-            'spot_uc_start': 100,
         }
-        # 增量 = thr - 1 → 拦截
-        self._setup_books(gate_uc=100 + thr - 1, spot_uc=100 + thr - 1)
-        passed, _, _, reason = self.ce._pre_execution_gate('BTC', 'BTC_USDT', 'BTCUSDT', self.pos)
-        self.assertFalse(passed)
-        self.assertIn('盘口呆滞', reason)
+        # lag 小于阈值，不会被 uc 闸拦截
+        self._setup_books(gate_uc=101, spot_uc=101)
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(vwap_basis_bps=35)
+        with m_merge, m_hedge, m_vwap:
+            passed, _, _, reason = self.ce._pre_execution_gate(
+                'BTC', 'BTC_USDT', 'BTCUSDT', self.pos
+            )
+        self.assertTrue(passed)
 
     def test_convergence_reversed_blocks(self):
         """收敛逆转：gate_basis ≥ open_spread → 拦截"""
@@ -621,7 +501,6 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
             'start_time': datetime.now(),
             'open_spread_bps': 100.0,
             'trigger': 'rebound',
-            'gate_uc_start': 0, 'spot_uc_start': 0,
         }
         detail = self.ce._build_take_profit_detail(self.pos, 35.0)
         self.assertIn('鲜度(gate=', detail)
