@@ -26,6 +26,7 @@ orderbook:
 trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
   # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
+  # mode: virtual
   mode: live
 
   # ─── 成交引擎 ───
@@ -95,7 +96,7 @@ trade:
     snapshot_retention_days: 60             # 快照保留天数
     threshold_lookback_days: 7              # 阈值回溯天数（用于每日统计分析）
     # 平仓基差阈值分位列（用于开仓盈利性守卫：开仓基差需明显高于未来可能的平仓基差）
-    # 可选值: close_basis_p10 / close_basis_p20 / close_basis_p30 / close_basis_p40
+    # 可选值: close_basis_p10 / close_basis_p20
     close_threshold_percentile: close_basis_p20
 
   # ─── 持仓管理 ───
