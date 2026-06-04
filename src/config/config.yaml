@@ -12,7 +12,7 @@ orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
   settle: usdt
   # 最大订阅合约数（从 mi_base_asset 加载的上限）
-  max_contracts: 999
+  max_contracts: 998
   # 进程启动后自动启动 WS 服务（设为 true 则崩溃重启后自动恢复连接）
   auto_start: true
 
