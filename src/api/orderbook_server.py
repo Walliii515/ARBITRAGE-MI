@@ -270,6 +270,7 @@ def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
     """从 mi_vwap_basis_threshold 加载最新一天的全部4个平仓分位基差阈值
 
     返回格式: base_asset -> {close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40}
+    若加载失败或结果为空，返回空字典 {} （调用方需保留旧缓存）
     """
     sql = """
         SELECT base_asset, open_basis_p20, close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40
@@ -280,20 +281,29 @@ def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
             rows = cursor.fetchall()
+            if not rows:
+                logger.warning('平仓VWAP基差阈值查询结果为空（mi_vwap_basis_threshold 表可能无数据或 calc_date 异常）')
+                return {}
             result: Dict[str, Dict] = {}
+            null_close_p20_assets = []
             for row in rows:
                 ba = row['base_asset']
+                close_p20_val = row.get('close_basis_p20')
+                if close_p20_val is None:
+                    null_close_p20_assets.append(ba)
                 result[ba] = {
                     'open_basis_p20': float(row['open_basis_p20']) if row.get('open_basis_p20') is not None else None,
                     'close_basis_p10': float(row['close_basis_p10']) if row.get('close_basis_p10') is not None else None,
-                    'close_basis_p20': float(row['close_basis_p20']) if row.get('close_basis_p20') is not None else None,
+                    'close_basis_p20': float(close_p20_val) if close_p20_val is not None else None,
                     'close_basis_p30': float(row['close_basis_p30']) if row.get('close_basis_p30') is not None else None,
                     'close_basis_p40': float(row['close_basis_p40']) if row.get('close_basis_p40') is not None else None,
                 }
+            if null_close_p20_assets:
+                logger.warning(f'以下标的 close_basis_p20 为 NULL: {null_close_p20_assets[:10]}')
             logger.info(f'已加载平仓VWAP基差阈值 {len(result)} 条（4个分位）')
             return result
     except Exception as e:
-        logger.error(f'加载平仓VWAP基差阈值失败: {e}')
+        logger.error(f'加载平仓VWAP基差阈值失败: {e}', exc_info=True)
         return {}
 
 
@@ -454,7 +464,11 @@ async def lifespan(app: FastAPI):
                 _spot_meta = fetch_spot_meta()
                 _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
-                _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
+                new_close_meta = fetch_close_vwap_threshold_meta()
+                if new_close_meta:
+                    _close_vwap_threshold_meta = new_close_meta
+                else:
+                    logger.warning(f'平仓VWAP基差阈值刷新结果为空，保留旧缓存（{len(_close_vwap_threshold_meta)} 条）')
                 _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 logger.info(f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, 阈値 {len(_threshold_meta)} 条, VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, 费率p40 {len(_funding_rate_p40_meta)} 条')
                 # 重置执行器单例，下次循环用新元数据重建

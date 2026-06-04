@@ -422,12 +422,16 @@ class TradingExecutor:
         
         # 盈利性守卫: 开仓基差 > 平仓基差阈值 + 手续费成本
         # 确保即使按历史分位平仓，利润仍能覆盖手续费（过滤结构性亏损标的）
-        if open_vwap_basis is not None and base_asset in self.close_vwap_threshold_meta:
+        # 若平仓阈值缺失（未加载到或该标的无数据），直接拒单以防止无守卫开仓
+        if open_vwap_basis is not None:
+            if base_asset not in self.close_vwap_threshold_meta:
+                return False
             close_data = self.close_vwap_threshold_meta[base_asset]
             close_threshold = close_data.get(self.close_threshold_col)
-            if close_threshold is not None:
-                if float(open_vwap_basis) <= float(close_threshold) + self.fee_cost_bps:
-                    return False
+            if close_threshold is None:
+                return False
+            if float(open_vwap_basis) <= float(close_threshold) + self.fee_cost_bps:
+                return False
         
         # 24小时成交量检查（期货）
         if self.min_future_volume > 0 and base_asset in self.contract_meta:
@@ -564,21 +568,33 @@ class TradingExecutor:
                     )
 
             # ── 6. 盈利性守卫 ──
-            if base_asset in self.close_vwap_threshold_meta:
-                close_data = self.close_vwap_threshold_meta[base_asset]
-                close_threshold = close_data.get(self.close_threshold_col)
-                if close_threshold is not None:
-                    if gate_basis_bps <= float(close_threshold) + self.fee_cost_bps:
-                        logger.info(
-                            f"开仓旁路-盈利性守卫拦截 | {base_asset} | "
-                            f"gate_basis={gate_basis_bps:.2f}bps <= "
-                            f"close_thr={float(close_threshold):.2f}+fee={self.fee_cost_bps:.0f} | "
-                            f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
-                        )
-                        return False, row, gate_basis_bps, (
-                            f'盈利性守卫拦截(basis={gate_basis_bps:.1f} <= '
-                            f'close_thr={float(close_threshold):.1f}+fee={self.fee_cost_bps:.0f})'
-                        )
+            if base_asset not in self.close_vwap_threshold_meta:
+                logger.info(
+                    f"开仓旁路-盈利性守卫拦截(无平仓阈值) | {base_asset} | "
+                    f"close_vwap_threshold_meta 未包含该标的 | "
+                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                )
+                return False, row, gate_basis_bps, '盈利性守卫拦截(无平仓阈值,拒绝开仓)'
+            close_data = self.close_vwap_threshold_meta[base_asset]
+            close_threshold = close_data.get(self.close_threshold_col)
+            if close_threshold is None:
+                logger.info(
+                    f"开仓旁路-盈利性守卫拦截(阈值为NULL) | {base_asset} | "
+                    f"{self.close_threshold_col}=None | "
+                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                )
+                return False, row, gate_basis_bps, f'盈利性守卫拦截({self.close_threshold_col}为NULL,拒绝开仓)'
+            if gate_basis_bps <= float(close_threshold) + self.fee_cost_bps:
+                logger.info(
+                    f"开仓旁路-盈利性守卫拦截 | {base_asset} | "
+                    f"gate_basis={gate_basis_bps:.2f}bps <= "
+                    f"close_thr={float(close_threshold):.2f}+fee={self.fee_cost_bps:.0f} | "
+                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                )
+                return False, row, gate_basis_bps, (
+                    f'盈利性守卫拦截(basis={gate_basis_bps:.1f} <= '
+                    f'close_thr={float(close_threshold):.1f}+fee={self.fee_cost_bps:.0f})'
+                )
 
             # ── 7. 盘口覆盖校验 ──
             open_coverage = row.get('open_coverage')
@@ -858,9 +874,9 @@ class TradingExecutor:
             if close_thr is not None:
                 parts.append(f"守卫({open_vwap_basis:.1f}>{float(close_thr):.1f}+{self.fee_cost_bps:.0f}费)")
             else:
-                parts.append(f"守卫(无{self.close_threshold_col}阈值,跳过)")
+                parts.append(f"守卫(无{self.close_threshold_col}阈值,已拒单)")
         else:
-            parts.append("守卫(无平仓阈值,跳过)")
+            parts.append("守卫(无平仓阈值,已拒单)")
 
         # 5.5 行情新鲜度（旁路风控读取到的 lag）─ 反映“下单时刻距上次收到行情多久”
         lag = self._last_orderbook_lag_ms.pop(base_asset, None)
