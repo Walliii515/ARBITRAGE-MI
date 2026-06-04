@@ -110,7 +110,7 @@ _enrich_cfg = EnrichConfig(
     spot_close_fee=SPOT_CLOSE_FEE,
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
-    close_threshold_col=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20'),
+    close_threshold_col=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20').strip(),
 )
 
 # 盈亏计算配置实例（持仓实时推送用）
@@ -175,6 +175,11 @@ _cached_merged_ts: float = 0.0
 # 完整广播 payload 缓存（预序列化 JSON 字符串，避免多客户端重复序列化）
 _cached_payload_json: str = ''
 _cached_payload_ts: float = 0.0
+
+
+def _normalize_base_asset(value) -> str:
+    """统一元数据索引键，避免 DB 小写/混合大小写导致前端阈值匹配失败。"""
+    return str(value or '').strip().upper()
 
 
 def _get_merged_rows() -> List[Dict]:
@@ -258,7 +263,7 @@ def fetch_vwap_threshold_meta() -> Dict[str, Dict[str, float]]:
                 if row.get('open_basis_p20') is not None:
                     entry['p20'] = float(row['open_basis_p20'])
                 if entry:
-                    result[row['base_asset']] = entry
+                    result[_normalize_base_asset(row['base_asset'])] = entry
             logger.info(f'已加载VWAP开仓基差阈值 {len(result)} 条 (p10+p20)')
             return result
     except Exception as e:
@@ -267,27 +272,44 @@ def fetch_vwap_threshold_meta() -> Dict[str, Dict[str, float]]:
 
 
 def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
-    """从 mi_vwap_basis_threshold 加载最新一天的全部4个平仓分位基差阈值
+    """从 mi_vwap_basis_threshold 加载每个标的最近可用的平仓分位基差阈值
 
     返回格式: base_asset -> {close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40}
     若加载失败或结果为空，返回空字典 {} （调用方需保留旧缓存）
+
+    注意：不能只按整表 MAX(calc_date) 加载。某些标的最新批次可能只有开仓样本、
+    平仓分位为 NULL；此时旧日期明明有平仓阈值，前端却会显示为空。这里改为
+    按 base_asset 取最近一条“至少一个平仓分位非空”的记录。
     """
     sql = """
-        SELECT base_asset, open_basis_p20, close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40
-        FROM mi_vwap_basis_threshold
-        WHERE calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)
+        SELECT t.base_asset, t.calc_date, t.open_basis_p20,
+               t.close_basis_p10, t.close_basis_p20, t.close_basis_p30, t.close_basis_p40
+        FROM mi_vwap_basis_threshold t
+        JOIN (
+            SELECT base_asset, MAX(calc_date) AS calc_date
+            FROM mi_vwap_basis_threshold
+            WHERE close_basis_p10 IS NOT NULL
+               OR close_basis_p20 IS NOT NULL
+               OR close_basis_p30 IS NOT NULL
+               OR close_basis_p40 IS NOT NULL
+            GROUP BY base_asset
+        ) latest
+          ON latest.base_asset = t.base_asset
+         AND latest.calc_date = t.calc_date
     """
     try:
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
             rows = cursor.fetchall()
             if not rows:
-                logger.warning('平仓VWAP基差阈值查询结果为空（mi_vwap_basis_threshold 表可能无数据或 calc_date 异常）')
+                logger.warning('平仓VWAP基差阈值查询结果为空（mi_vwap_basis_threshold 表无非空平仓分位数据）')
                 return {}
             result: Dict[str, Dict] = {}
             null_close_p20_assets = []
+            dates = set()
             for row in rows:
-                ba = row['base_asset']
+                ba = _normalize_base_asset(row['base_asset'])
+                dates.add(str(row.get('calc_date')))
                 close_p20_val = row.get('close_basis_p20')
                 if close_p20_val is None:
                     null_close_p20_assets.append(ba)
@@ -300,7 +322,7 @@ def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
                 }
             if null_close_p20_assets:
                 logger.warning(f'以下标的 close_basis_p20 为 NULL: {null_close_p20_assets[:10]}')
-            logger.info(f'已加载平仓VWAP基差阈值 {len(result)} 条（4个分位）')
+            logger.info(f'已加载平仓VWAP基差阈值 {len(result)} 条（按标的最近非空记录，日期数={len(dates)}）')
             return result
     except Exception as e:
         logger.error(f'加载平仓VWAP基差阈值失败: {e}', exc_info=True)
@@ -918,7 +940,7 @@ async def _open_position_loop():
                         fee_spot_close=config.get_float('trade.fee.spot_close', 0.00075),
                         fee_future_open=config.get_float('trade.fee.future_open', 0.00075),
                         fee_future_close=config.get_float('trade.fee.future_close', 0.00075),
-                        close_threshold_percentile=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20'),
+                        close_threshold_percentile=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20').strip(),
                         min_spot_volume_24h_usdt=config.get_float('trade.filter.min_spot_volume_24h_usdt', 0),
                         min_future_volume_24h_usdt=config.get_float('trade.filter.min_future_volume_24h_usdt', 0),
                         peak_pullback_pct=config.get_float('trade.peak_pullback.pullback_pct', 0.10),
