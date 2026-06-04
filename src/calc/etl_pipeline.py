@@ -53,6 +53,10 @@ def load_etl_config() -> dict:
 _etl_config = load_etl_config()
 
 
+def _is_vwap_threshold_update_enabled() -> bool:
+    return config.get_bool('trade.vwap.update_threshold_enabled', True)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 任务定义
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -184,6 +188,10 @@ def _run_daily_vwap_analysis():
         close_basis_pX = 升序第 X 分位，基差越小越有利（价差已收敛）
     用途：按标的设置差异化开仓/平仓 VWAP 基差阈值
     """
+    if not _is_vwap_threshold_update_enabled():
+        logger.info('已关闭 VWAP 基差分位阈值更新，跳过 mi_vwap_basis_threshold 写入')
+        return
+
     from calc.calculate_vwap_basis_threshold import run_analysis
 
     lookback_days = config.get_int('trade.vwap.threshold_lookback_days', 7)
@@ -256,7 +264,10 @@ ETL_TASKS: List[ETLTask] = [
         schedule='daily',
         daily_hour=_etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('daily_hour', 0),
         daily_minute=_etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('daily_minute', 0),
-        enabled=_etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('enabled', True),
+        enabled=(
+            _etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('enabled', True)
+            and _is_vwap_threshold_update_enabled()
+        ),
     ),
 ]
 

@@ -392,6 +392,12 @@ _threshold_calc_running = False
 async def trigger_threshold_calculate():
     """手动触发 VWAP 基差分位阈值计算"""
     global _threshold_calc_running
+    if not config.get_bool('trade.vwap.update_threshold_enabled', True):
+        return {
+            "success": False,
+            "message": "VWAP基差分位阈值更新已关闭，仅保留 mi_vwap_basis_snapshot 快照",
+        }
+
     if _threshold_calc_running:
         return {"success": False, "message": "计算任务正在执行中，请稍后再试"}
 

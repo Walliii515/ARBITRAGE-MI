@@ -97,6 +97,8 @@ tasks:
   #   - 开仓：按 base_asset 分组，计算 open_vwap_basis_bps 的 max/min/mean/std/p10~p40
   #   - 平仓：按 base_asset 分组，计算 close_vwap_basis_bps 的 max/min/mean/std/p10~p40
   # 用途：按标的设置差异化开仓/平仓 VWAP 基差阈值
+  # 业务开关：同时受 config.yaml 的 trade.vwap.update_threshold_enabled 控制；
+  #          关闭后系统仍会写 mi_vwap_basis_snapshot，但不会更新 mi_vwap_basis_threshold
   daily_vwap_threshold:
     enabled: true
     schedule: daily

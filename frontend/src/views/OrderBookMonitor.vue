@@ -8,7 +8,6 @@ import type {
   GridReadyEvent,
   RowSelectionOptions,
   ValueFormatterParams,
-  ColumnState,
 } from 'ag-grid-community'
 import { ElDrawer } from 'element-plus'
 import { Search, Refresh } from '@element-plus/icons-vue'
@@ -18,6 +17,7 @@ import { useGridCopy } from '../ag-grid/useGridCopy'
 import type { OrderBookRow } from './orderbookTypes'
 import { get, post } from '../utils/request'
 import { getToken } from '../utils/auth'
+import { useConnectionMonitor } from '../composables/useConnectionMonitor'
 
 interface WsMessage {
   type: string
@@ -29,10 +29,6 @@ interface WsMessage {
   binance_ws_connected?: boolean
   gate_ws_latency_ms?: number | null
   binance_ws_latency_ms?: number | null
-  gate_snapshot?: ProgressInfo
-  gate_ws?: ProgressInfo
-  binance_ws?: ProgressInfo
-  binance_data?: ProgressInfo
   funding_threshold_percentile?: string
   min_funding_rate_bps?: number
   orderbook_coverage_threshold?: number
@@ -43,24 +39,12 @@ interface WsMessage {
   ts?: number  // pong 回复的时间戳
 }
 
-interface ProgressInfo {
-  success: number
-  failed?: number
-  total: number
-  percent: number
-}
-
 interface ServiceStatus {
   state: 'idle' | 'starting' | 'running' | 'stopping' | 'error'
   error: string | null
   gate_ws_connected: boolean
   binance_ws_connected: boolean
-  gate_snapshot: ProgressInfo
-  gate_ws: ProgressInfo
-  binance_ws: ProgressInfo
-  binance_data: ProgressInfo
   contracts: string[]
-  spot_symbols: string[]
 }
 
 const rowData = shallowRef<OrderBookRow[]>([])
@@ -74,8 +58,10 @@ const binanceWsConnected = ref(false)
 const wsLatencyMs = ref<number | null>(null)
 const gateWsLatencyMs = ref<number | null>(null)
 const binanceWsLatencyMs = ref<number | null>(null)
-const contracts = ref<string[]>([])
-const spotSymbols = ref<string[]>([])
+const {
+  connectionStats,
+  fetchConnectionStatus,
+} = useConnectionMonitor()
 
 /** 列状态持久化（数据库版） */
 const PAGE_KEY = 'orderbook_monitor'
@@ -90,6 +76,7 @@ interface ColumnVisibility {
 const columnVisibilities = ref<ColumnVisibility[]>([])
 
 const { gridContainerRef, setupGridCopy } = useGridCopy()
+void gridContainerRef
 
 /** 打开列选择面板时，刷新列可见性快照 */
 function refreshColumnVisibilities() {
@@ -151,9 +138,6 @@ async function loadColumnState() {
 
 const serviceState = ref<ServiceStatus['state']>('idle')
 const serviceError = ref<string | null>(null)
-const gateSnapshotProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
-const gateWsProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
-const binanceDataProgress = ref<ProgressInfo>({ success: 0, total: 0, percent: 0 })
 const serviceBusy = ref(false)
 /** 资金费率下限(bps)，从后端动态获取 */
 const minFundingRateBps = ref<number>(-6)
@@ -889,9 +873,6 @@ function clearGridData() {
 function applySnapshotRows(rows: unknown, serverTime?: string, forceFull = false) {
   const normalized = normalizeSnapshotRows(rows)
   if (serverTime) lastUpdate.value = serverTime
-  if (normalized.length > 0) {
-    contracts.value = normalized.map((r) => r.contract)
-  }
 
   if (!gridApi) {
     rowsByContract.clear()
@@ -938,21 +919,6 @@ async function fetchOrderbookSnapshot(forceFull = false) {
   }
 }
 
-const statusTagType = computed(() => {
-  if (wsStatus.value === 'connected') return 'success'
-  if (wsStatus.value === 'connecting') return 'warning'
-  return 'danger'
-})
-
-const statusText = computed(() => {
-  const map = {
-    connecting: '连接中',
-    connected: '已连接',
-    disconnected: '已断开',
-  }
-  return map[wsStatus.value]
-})
-
 const canStart = computed(
   () => !serviceBusy.value && (serviceState.value === 'idle' || serviceState.value === 'error'),
 )
@@ -963,26 +929,6 @@ const canStop = computed(
     serviceState.value === 'stopping' ||
     serviceState.value === 'error',
 )
-
-const showProgress = computed(
-  () =>
-    serviceBusy.value ||
-    serviceState.value === 'starting' ||
-    serviceState.value === 'stopping' ||
-    gateSnapshotProgress.value.total > 0,
-)
-
-function formatProgress(p: ProgressInfo): string {
-  if (p.total <= 0) return '—'
-  const failStr = p.failed ? ` ✘${p.failed}` : ''
-  return `${p.success}/${p.total}${failStr} (${p.percent}%)`
-}
-
-function progressStatus(p: ProgressInfo): '' | 'success' | 'warning' {
-  if (p.total > 0 && p.percent >= 100) return 'success'
-  if (p.failed && p.failed > 0) return 'warning'
-  return ''
-}
 
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -1035,9 +981,6 @@ function connectWs() {
       if (msg.binance_ws_connected !== undefined) binanceWsConnected.value = msg.binance_ws_connected
       if (msg.gate_ws_latency_ms !== undefined) gateWsLatencyMs.value = msg.gate_ws_latency_ms
       if (msg.binance_ws_latency_ms !== undefined) binanceWsLatencyMs.value = msg.binance_ws_latency_ms
-      if (msg.gate_snapshot) gateSnapshotProgress.value = msg.gate_snapshot
-      if (msg.gate_ws) gateWsProgress.value = msg.gate_ws
-      if (msg.binance_data) binanceDataProgress.value = msg.binance_data
       serviceBusy.value = msg.state === 'starting' || msg.state === 'stopping'
       return
     }
@@ -1098,12 +1041,6 @@ function applyServiceStatus(data: ServiceStatus) {
   serviceError.value = data.error
   gateWsConnected.value = data.gate_ws_connected
   binanceWsConnected.value = data.binance_ws_connected ?? false
-  contracts.value = data.contracts ?? []
-  spotSymbols.value = data.spot_symbols ?? []
-  const emptyP: ProgressInfo = { success: 0, total: 0, percent: 0 }
-  gateSnapshotProgress.value = data.gate_snapshot ?? emptyP
-  gateWsProgress.value = data.gate_ws ?? emptyP
-  binanceDataProgress.value = data.binance_data ?? emptyP
   serviceBusy.value = data.state === 'starting' || data.state === 'stopping'
   const contractCount = data.contracts?.length ?? 0
   const rowCount = rowData.value.length
@@ -1122,17 +1059,11 @@ async function fetchServiceStatus() {
     if (!res.ok) return
     const data: ServiceStatus = await res.json()
     applyServiceStatus(data)
+    await fetchConnectionStatus()
   } catch {
     gateWsConnected.value = false
     binanceWsConnected.value = false
   }
-}
-
-function resetProgress() {
-  const emptyP: ProgressInfo = { success: 0, total: 0, percent: 0 }
-  gateSnapshotProgress.value = emptyP
-  gateWsProgress.value = emptyP
-  binanceDataProgress.value = emptyP
 }
 
 async function startService() {
@@ -1140,7 +1071,6 @@ async function startService() {
     serviceBusy.value = true
     serviceState.value = 'starting'
     clearGridData()
-    resetProgress()
     const res = await post('/api/service/start')
     const body = await res.json().catch(() => ({}))
     if (!res.ok) {
@@ -1321,55 +1251,13 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
           </el-tag>
           <el-tag v-else type="danger" size="small">未连接</el-tag>
         </span>
-        <span class="status-item">合约数：{{ contracts.length }}</span>
-        <span class="status-item">现货数：{{ spotSymbols.length }}</span>
+        <span class="status-item">Gate接收中：{{ connectionStats.gateReceiving }}</span>
+        <span class="status-item">Binance接收中：{{ connectionStats.binanceReceiving }}</span>
         <span class="status-item">最后更新：{{ lastUpdate }}</span>
+        <el-button size="small" @click="fetchServiceStatus" :icon="Refresh" circle />
       </div>
-      <div v-if="showProgress" class="progress-row">
-        <div class="progress-block">
-          <div class="progress-label">
-            <span>Gate 快照</span>
-            <span :class="{ 'progress-done': progressStatus(gateSnapshotProgress) === 'success' }">
-              {{ formatProgress(gateSnapshotProgress) }}
-            </span>
-          </div>
-          <el-progress
-            :percentage="gateSnapshotProgress.percent"
-            :status="progressStatus(gateSnapshotProgress)"
-            :stroke-width="8"
-            :show-text="false"
-          />
-        </div>
-        <div class="progress-block">
-          <div class="progress-label">
-            <span>Gate WS</span>
-            <span :class="{ 'progress-done': progressStatus(gateWsProgress) === 'success' }">
-              {{ formatProgress(gateWsProgress) }}
-            </span>
-          </div>
-          <el-progress
-            :percentage="gateWsProgress.percent"
-            :status="progressStatus(gateWsProgress)"
-            :stroke-width="8"
-            :show-text="false"
-          />
-        </div>
-        <div class="progress-block">
-          <div class="progress-label">
-            <span>Binance</span>
-            <span :class="{ 'progress-done': progressStatus(binanceDataProgress) === 'success' }">
-              {{ formatProgress(binanceDataProgress) }}
-            </span>
-          </div>
-          <el-progress
-            :percentage="binanceDataProgress.percent"
-            :status="progressStatus(binanceDataProgress)"
-            :stroke-width="8"
-            :show-text="false"
-          />
-        </div>
-        <el-button size="small" @click="fetchServiceStatus" style="margin-left: 8px" :icon="Refresh" circle />
-        <span v-if="serviceError" class="status-error">{{ serviceError }}</span>
+      <div v-if="serviceError" class="status-message-row">
+        <span class="status-error">{{ serviceError }}</span>
       </div>
     </el-card>
 
@@ -1646,35 +1534,6 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   gap: 8px;
 }
 
-.progress-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 32px;
-  flex-wrap: wrap;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--app-border);
-}
-
-.progress-block {
-  flex: 1;
-  min-width: 220px;
-  max-width: 360px;
-}
-
-.progress-label {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 6px;
-  font-size: 13px;
-  color: var(--app-text-muted);
-}
-
-.progress-label .progress-done {
-  color: #67c23a;
-  font-weight: 500;
-}
-
 .status-item {
   display: inline-flex;
   align-items: center;
@@ -1682,6 +1541,13 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   color: var(--app-text-muted);
   font-size: 13px;
   line-height: 1.4;
+}
+
+.status-message-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .status-error {

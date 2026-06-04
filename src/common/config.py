@@ -76,6 +76,16 @@ class Config:
         value = self.get(key, default, env=env)
         return '' if value is None else str(value)
 
+    def get_bool(self, key: str, default: bool = False, env: Optional[str] = None) -> bool:
+        value = self.get(key, default, env=env)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        return bool(value)
+
     # ─── 运行模式统一入口（virtual / testnet / live） ───
     # 主参数：trade.mode，则其他参数（成交引擎 URL、交易所环境）由它派生。
     # 环境变量 TRADE_MODE 可临时覆盖；EXCHANGE_ENV 仅作为老变量向后兼容。

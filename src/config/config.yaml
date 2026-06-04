@@ -79,6 +79,7 @@ trade:
   vwap:
     snapshot_interval_sec: 10               # 快照采样间隔（秒）
     snapshot_retention_days: 60             # 快照保留天数
+    update_threshold_enabled: true           # 是否由系统更新 mi_vwap_basis_threshold；false 时仅保留 mi_vwap_basis_snapshot 快照
     threshold_lookback_days: 7              # 阈值回溯天数（用于每日统计分析）
     # 平仓基差阈值分位列（用于开仓盈利性守卫：开仓基差需明显高于未来可能的平仓基差）
     # 可选值: close_basis_p10 / close_basis_p20
@@ -103,9 +104,9 @@ margin:
 # 资金管理配置
 capital:
   # Binance 初始入金 (USDT)
-  binance_initial: 50
+  binance_initial: 500
   # Gate 初始入金 (USDT)
-  gate_initial: 50
+  gate_initial: 250
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数
