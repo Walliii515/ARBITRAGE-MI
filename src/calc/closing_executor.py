@@ -372,6 +372,26 @@ class ClosingExecutor:
                     f'max={self._max_orderbook_lag_ms:.0f}ms)'
                 )
 
+            gate_ready = getattr(gate_ob, 'is_ready', lambda: True)()
+            if not gate_ready:
+                logger.info(
+                    f"平仓旁路-Gate本地簿未就绪拦截 | {base_asset} | "
+                    f"update_count={getattr(gate_ob, 'update_count', None)} | "
+                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                )
+                return False, None, None, 'Gate本地簿未接上连续WS增量'
+
+            book_skew_ms = abs(gate_local_ts - spot_local_ts) * 1000.0
+            if book_skew_ms > self._max_orderbook_lag_ms:
+                logger.info(
+                    f"平仓旁路-跨所盘口不同步拦截 | {base_asset} | "
+                    f"skew={book_skew_ms:.0f}ms > max={self._max_orderbook_lag_ms:.0f}ms | "
+                    f"gate_local={gate_local_ts:.3f} | spot_local={spot_local_ts:.3f}"
+                )
+                return False, None, None, (
+                    f'跨所盘口不同步(skew={book_skew_ms:.0f}ms, max={self._max_orderbook_lag_ms:.0f}ms)'
+                )
+
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
             from calc.merge_cross_exchange_orderbook import merge_orderbook_records
             from calc.calculate_hedge_metrics import calculate_hedge_metrics
@@ -433,7 +453,8 @@ class ClosingExecutor:
                 f"平仓旁路通过 | {base_asset} | "
                 f"gate_basis={gate_basis_bps:.2f}bps | open_spread={open_spread_bps:.2f}bps | "
                 f"trigger_basis={pos.get('current_spread_bps')}bps | "
-                f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms,max={self._max_orderbook_lag_ms:.0f}ms)"
+                f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms,"
+                f"skew={book_skew_ms:.0f}ms,max={self._max_orderbook_lag_ms:.0f}ms)"
             )
             return True, row, gate_basis_bps, ''
 

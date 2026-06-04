@@ -35,16 +35,12 @@ CONN_FAILED = 'failed'
 class ServiceLifecycleManager:
     """WS 服务生命周期管理器"""
 
-    def __init__(self, settle: str, batch_size: int = 40, batch_workers: int = 40):
+    def __init__(self, settle: str):
         """
         Args:
             settle: 结算币种 (如 'usdt')
-            batch_size: 快照批次大小
-            batch_workers: 快照并发数
         """
         self._settle = settle
-        self._batch_size = batch_size
-        self._batch_workers = batch_workers
 
         # OrderBook managers
         self.gate_manager: Optional[GateOrderBookManager] = None
@@ -182,6 +178,7 @@ class ServiceLifecycleManager:
                 gate_ob = self.gate_manager.orderbooks.get(contract) if self.gate_manager else None
                 gate_last_update = gate_ob.last_update_time if gate_ob else 0
                 gate_stale = gate_ob.is_stale() if gate_ob else True
+                gate_ready = gate_ob.is_ready() if gate_ob else False
 
                 # 判断 Binance 订单簿是否有实时数据
                 binance_ob = self.spot_manager.orderbooks.get(symbol) if self.spot_manager else None
@@ -192,8 +189,8 @@ class ServiceLifecycleManager:
                     'base_asset': base_asset,
                     'contract': contract,
                     'symbol': symbol,
-                    'gate_snapshot_status': info.get('gate_snapshot', CONN_PENDING),
-                    'gate_snapshot_error': info.get('gate_snapshot_error'),
+                    'gate_snapshot_status': CONN_SUCCESS if gate_ready else info.get('gate_snapshot', CONN_PENDING),
+                    'gate_snapshot_error': None if gate_ready else info.get('gate_snapshot_error'),
                     'gate_ws_subscribed': info.get('gate_ws_subscribed', False),
                     'gate_receiving_data': not gate_stale if gate_ob else False,
                     'gate_last_update': gate_last_update,
@@ -222,7 +219,7 @@ class ServiceLifecycleManager:
     def get_progress_summary(self) -> dict:
         """
         从 _connection_status 实时计算 4 维度进度摘要：
-        - gate_snapshot: Gate REST 快照（success/failed/total）
+        - gate_snapshot: Gate OBU full 快照（success/failed/total）
         - gate_ws: Gate WS 订阅
         - binance_ws: Binance WS 订阅
         - binance_data: Binance 实时数据接收
@@ -249,8 +246,15 @@ class ServiceLifecycleManager:
             empty = {'success': 0, 'failed': 0, 'total': 0, 'percent': 0}
             return {'gate_snapshot': empty, 'gate_ws': {**empty}, 'binance_ws': {**empty}, 'binance_data': {**empty}}
 
-        gate_snap_ok = sum(1 for i in items if i.get('gate_snapshot') == CONN_SUCCESS)
-        gate_snap_fail = sum(1 for i in items if i.get('gate_snapshot') == CONN_FAILED)
+        gate_snap_ok = 0
+        gate_snap_fail = 0
+        if self.gate_manager:
+            for i in items:
+                ob = self.gate_manager.orderbooks.get(i.get('contract', ''))
+                if ob and ob.is_ready():
+                    gate_snap_ok += 1
+                elif i.get('gate_snapshot') == CONN_FAILED:
+                    gate_snap_fail += 1
         gate_ws_ok = sum(1 for i in items if i.get('gate_ws_subscribed'))
         binance_ws_ok = sum(1 for i in items if i.get('binance_ws_subscribed'))
 
@@ -289,20 +293,62 @@ class ServiceLifecycleManager:
     # ───── 合约加载 ─────
 
     def fetch_contracts_from_db(self) -> List[str]:
-        """从 mi_base_asset 查询有效 base_asset，拼接为 Gate 合约名"""
+        """从 mi_base_asset 查询有效 base_asset，拼接为 Gate 合约名。
+
+        启动订阅前先按可交易性、成交量、资金费率过滤，避免低质量交易对挤占 WS。
+        """
         max_contracts = config.get_int('orderbook.max_contracts', 999)
-        sql = f"SELECT base_asset FROM mi_base_asset WHERE is_valid = 'Y' LIMIT {max_contracts}"
+        settle_suffix = self._settle.upper()
+        min_spot_volume = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
+        min_future_volume = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
+        min_funding_rate = config.get_float('trade.open.min_funding_rate_bps', 0) / 10000.0
+        sql = """
+            SELECT
+                b.base_asset,
+                g.funding_rate_24h,
+                g.volume_24h_settle,
+                s.quote_volume
+            FROM mi_base_asset b
+            INNER JOIN mi_gate_future_contracts g
+                ON g.base_asset = UPPER(TRIM(b.base_asset))
+               AND g.name = CONCAT(UPPER(TRIM(b.base_asset)), %s)
+            INNER JOIN mi_binance_spot_info s
+                ON s.base_asset = UPPER(TRIM(b.base_asset))
+               AND s.symbol = CONCAT(UPPER(TRIM(b.base_asset)), %s)
+            WHERE b.is_valid = 'Y'
+              AND g.status = 'trading'
+              AND s.status = 'TRADING'
+              AND s.is_spot_trading_allowed = 1
+              AND COALESCE(g.volume_24h_settle, 0) >= %s
+              AND COALESCE(s.quote_volume, 0) >= %s
+              AND COALESCE(g.funding_rate_24h, -999) >= %s
+            ORDER BY g.funding_rate_24h DESC, g.volume_24h_settle DESC, s.quote_volume DESC
+            LIMIT %s
+        """
         try:
             with db_manager.get_cursor() as cursor:
-                cursor.execute(sql)
+                cursor.execute(
+                    sql,
+                    (
+                        f"_{settle_suffix}",
+                        settle_suffix,
+                        min_future_volume,
+                        min_spot_volume,
+                        min_funding_rate,
+                        max_contracts,
+                    ),
+                )
                 rows = cursor.fetchall()
-                settle_suffix = self._settle.upper()
                 contracts = [
                     f"{row['base_asset'].strip().upper()}_{settle_suffix}"
                     for row in rows
                     if row.get('base_asset') and row['base_asset'].strip()
                 ]
-                log_print(f"从数据库获取到 {len(contracts)} 个合约: {contracts}")
+                log_print(
+                    f"从数据库筛选到 {len(contracts)} 个订阅合约"
+                    f"（max={max_contracts}, min_spot_vol={min_spot_volume}, "
+                    f"min_future_vol={min_future_volume}, min_funding={min_funding_rate:.6f}）: {contracts}"
+                )
                 return contracts
         except Exception as e:
             logger.error(f"从数据库获取合约列表失败: {e}，使用默认合约", exc_info=True)
@@ -312,7 +358,7 @@ class ServiceLifecycleManager:
 
     def retry_contract(self, base_asset: str) -> Tuple[bool, str]:
         """
-        手动重试单个标的：重新拉取 REST 快照 + 订阅 WS
+        手动重试单个标的：重新订阅 Gate OBU + Binance WS
 
         Args:
             base_asset: 标的资产名，如 'CTK'
@@ -330,7 +376,7 @@ class ServiceLifecycleManager:
         contract = f"{ba}_{self._settle.upper()}"
         symbol = f"{ba}USDT"
 
-        # 1. Gate REST 快照
+        # 1. Gate OBU 订阅
         with self._conn_lock:
             if ba in self._connection_status:
                 self._connection_status[ba]['gate_snapshot'] = CONN_PENDING
@@ -346,30 +392,12 @@ class ServiceLifecycleManager:
                 }
 
         try:
-            from exchange_apis.get_gate_future_orderbook import get_futures_order_book
-            from calc.create_gate_futures_local_orderbook import LocalOrderBook as GateLocalOB, LEVEL, FREQUENCY
-
-            snapshot = get_futures_order_book(
-                contract=contract, settle=self._settle, limit=LEVEL, with_id=True
-            )
-            if not snapshot:
-                with self._conn_lock:
-                    self._connection_status[ba]['gate_snapshot'] = CONN_FAILED
-                    self._connection_status[ba]['gate_snapshot_error'] = 'REST快照返回空（瞬时错误，可重试）'
-                return False, f'{contract} 快照返回空'
-
-            # 写入本地订单簿
-            with self.gate_manager.lock:
-                ob = GateLocalOB(contract, base_asset=ba)
-                ob.update_from_snapshot(snapshot)
-                self.gate_manager.orderbooks[contract] = ob
-
-            # Gate WS 订阅
-            if self.gate_manager.ws_client:
-                self.gate_manager.ws_client.subscribe_order_book(contract, frequency=FREQUENCY, level=LEVEL)
+            self.gate_manager.prepare_contracts([contract])
+            if not self.gate_manager.subscribe_contract(contract):
+                return False, f'{contract} Gate OBU 订阅失败'
 
             with self._conn_lock:
-                self._connection_status[ba]['gate_snapshot'] = CONN_SUCCESS
+                self._connection_status[ba]['gate_snapshot'] = CONN_PENDING
                 self._connection_status[ba]['gate_snapshot_error'] = None
                 self._connection_status[ba]['gate_ws_subscribed'] = True
 
@@ -378,16 +406,14 @@ class ServiceLifecycleManager:
             with self._conn_lock:
                 self._connection_status[ba]['gate_snapshot'] = CONN_FAILED
                 self._connection_status[ba]['gate_snapshot_error'] = error_msg
-            logger.error(f'重试 {contract} Gate快照失败: {e}', exc_info=True)
-            return False, f'Gate快照失败: {error_msg}'
+            logger.error(f'重试 {contract} Gate OBU 订阅失败: {e}', exc_info=True)
+            return False, f'Gate OBU订阅失败: {error_msg}'
 
         # 2. Binance Spot WS 订阅
         try:
             if self.spot_manager:
                 if symbol not in self.spot_manager.orderbooks:
                     self.spot_manager.add_symbol(symbol, base_asset=ba)
-                elif self.spot_manager.ws_client:
-                    self.spot_manager.ws_client.subscribe_order_book(symbol)
                 with self._conn_lock:
                     self._connection_status[ba]['binance_ws_subscribed'] = True
         except Exception as e:
@@ -410,28 +436,34 @@ class ServiceLifecycleManager:
 
             contracts = [c.strip() for c in self.fetch_contracts_from_db() if c and c.strip()]
             self._startup_gate_snapshot_total = len(contracts)
+            with self._conn_lock:
+                for contract in contracts:
+                    base_asset = contract.split('_')[0] if '_' in contract else contract
+                    self._connection_status[base_asset] = {
+                        'contract': contract,
+                        'symbol': f"{base_asset}USDT",
+                        'gate_snapshot': CONN_PENDING,
+                        'gate_snapshot_error': None,
+                        'gate_ws_subscribed': False,
+                        'binance_ws_subscribed': False,
+                    }
             self._push_progress()
 
             if self._cancel_event.is_set():
                 raise InterruptedError('启动已取消')
 
-            success = self._bulk_add_contracts(contracts)
-            if self._cancel_event.is_set():
-                raise InterruptedError('启动已取消')
-
-            self._push_snapshot_now()
-
-            if success:
-                self._start_binance_spot_ws(success)
+            self.gate_manager.prepare_contracts(contracts)
 
             self.gate_manager.start_ws()
-            if not (
-                self.gate_manager.ws_client
-                and self.gate_manager.ws_client._connected_event.wait(timeout=8)
-            ):
+            gate_ws_clients = getattr(self.gate_manager, 'ws_clients', None) or []
+            gate_ws_connected = (
+                bool(gate_ws_clients)
+                and all(c._connected_event.is_set() for c in gate_ws_clients)
+            )
+            if not gate_ws_connected:
                 raise RuntimeError('Gate WebSocket 连接超时')
 
-            self._startup_gate_ws_total = len(success)
+            self._startup_gate_ws_total = len(contracts)
             self._startup_gate_ws_done = 0
             self._push_progress()
 
@@ -439,16 +471,19 @@ class ServiceLifecycleManager:
                 self._startup_gate_ws_done = current
                 self._push_progress()
 
-            self.gate_manager.subscribe_all(success, on_progress=on_sub_progress)
-            self._startup_gate_ws_done = len(success)
+            self.gate_manager.subscribe_all(contracts, on_progress=on_sub_progress)
+            self._startup_gate_ws_done = len(contracts)
             self._push_progress()
 
             # 标记 Gate WS 订阅状态
             with self._conn_lock:
-                for contract in success:
+                for contract in contracts:
                     ba = contract.split('_')[0] if '_' in contract else contract
                     if ba in self._connection_status:
                         self._connection_status[ba]['gate_ws_subscribed'] = True
+
+            self._push_snapshot_now()
+            self._start_binance_spot_ws(contracts)
 
             self._state = SERVICE_RUNNING
             log_print('✓ 跨交易所订单簿 WS 服务已启动')
@@ -515,96 +550,6 @@ class ServiceLifecycleManager:
             with self._conn_lock:
                 self._connection_status.clear()
 
-    def _bulk_add_contracts(self, contracts: List[str]) -> List[str]:
-        total = len(contracts)
-        if total == 0:
-            return []
-    
-        # 初始化所有合约的连接状态为 pending
-        with self._conn_lock:
-            for contract in contracts:
-                base_asset = contract.split('_')[0] if '_' in contract else contract
-                self._connection_status[base_asset] = {
-                    'contract': contract,
-                    'symbol': f"{base_asset}USDT",
-                    'gate_snapshot': CONN_PENDING,
-                    'gate_snapshot_error': None,
-                    'gate_ws_subscribed': False,
-                    'binance_ws_subscribed': False,
-                }
-    
-        all_success: List[str] = []
-        # 收集可重试的失败合约（超时/网络错误，非合约不存在）
-        retryable_failures: List[str] = []
-    
-        def on_contract_done(_done: int, _batch_total: int):
-            self._startup_gate_snapshot_done += 1
-            self._push_progress()
-    
-        for batch_idx in range(0, total, self._batch_size):
-            if self._cancel_event.is_set():
-                break
-            batch = contracts[batch_idx:batch_idx + self._batch_size]
-            batch_no = batch_idx // self._batch_size + 1
-            log_print(
-                f"\u25b6 批次 {batch_no} 开始，本批 {len(batch)} 个合约"
-                f"（总进度 {min(batch_idx + len(batch), total)}/{total}）"
-            )
-            success, failed_details = self.gate_manager.add_contracts_bulk_with_status(
-                batch,
-                max_workers=self._batch_workers,
-                on_progress=on_contract_done,
-                cancel_event=self._cancel_event,
-            )
-            all_success.extend(success)
-    
-            # 更新连接状态，收集可重试失败
-            with self._conn_lock:
-                for contract in success:
-                    ba = contract.split('_')[0] if '_' in contract else contract
-                    if ba in self._connection_status:
-                        self._connection_status[ba]['gate_snapshot'] = CONN_SUCCESS
-                for contract, error_msg in failed_details:
-                    ba = contract.split('_')[0] if '_' in contract else contract
-                    if ba in self._connection_status:
-                        self._connection_status[ba]['gate_snapshot'] = CONN_FAILED
-                        self._connection_status[ba]['gate_snapshot_error'] = error_msg
-                    # 超时/网络错误/快照返回空可重试，合约不存在/已下架不重试
-                    if '超时' in error_msg or 'timeout' in error_msg.lower() or '网络' in error_msg or 'Connection' in error_msg or '快照返回空' in error_msg:
-                        retryable_failures.append(contract)
-    
-            log_print(f"\u2713 批次 {batch_no} 完成")
-            self._push_snapshot_now()
-    
-        # 对可重试的失败合约统一重试一次
-        if retryable_failures and not self._cancel_event.is_set():
-            log_print(f"\u25b6 重试 {len(retryable_failures)} 个超时/网络失败的合约...")
-            retry_success, retry_failed = self.gate_manager.add_contracts_bulk_with_status(
-                retryable_failures,
-                max_workers=self._batch_workers,
-                on_progress=None,
-                cancel_event=self._cancel_event,
-            )
-            all_success.extend(retry_success)
-            with self._conn_lock:
-                for contract in retry_success:
-                    ba = contract.split('_')[0] if '_' in contract else contract
-                    if ba in self._connection_status:
-                        self._connection_status[ba]['gate_snapshot'] = CONN_SUCCESS
-                        self._connection_status[ba]['gate_snapshot_error'] = None
-                for contract, error_msg in retry_failed:
-                    ba = contract.split('_')[0] if '_' in contract else contract
-                    if ba in self._connection_status:
-                        self._connection_status[ba]['gate_snapshot'] = CONN_FAILED
-                        self._connection_status[ba]['gate_snapshot_error'] = f'重试仍失败: {error_msg}'
-            if retry_success:
-                log_print(f"\u2713 重试成功 {len(retry_success)} 个，仍失败 {len(retry_failed)} 个")
-            else:
-                log_print(f"\u2717 重试全部失败 ({len(retry_failed)} 个)")
-            self._push_snapshot_now()
-    
-        return all_success
-    
     def _start_binance_spot_ws(self, contracts: List[str]):
         spot_items = contracts_to_spot_items(contracts)
         if not spot_items:
@@ -615,10 +560,12 @@ class ServiceLifecycleManager:
         self.spot_manager.add_symbols(spot_items)
         self.spot_manager.start_ws()
 
-        if not (
-            self.spot_manager.ws_client
-            and self.spot_manager.ws_client._connected_event.wait(timeout=10)
-        ):
+        binance_ws_clients = getattr(self.spot_manager, 'ws_clients', None) or []
+        binance_ws_connected = (
+            bool(binance_ws_clients)
+            and all(c._connected_event.is_set() for c in binance_ws_clients)
+        )
+        if not binance_ws_connected:
             raise RuntimeError('Binance Spot WebSocket 连接超时')
 
         # 标记 Binance WS 订阅状态
@@ -634,20 +581,24 @@ class ServiceLifecycleManager:
     # ───── 内部：进度与连接状态 ─────
 
     def _gate_ws_connected(self) -> bool:
-        if not self.gate_manager or not self.gate_manager.ws_client:
+        if not self.gate_manager:
             return False
-        return (
-            self.gate_manager.ws_client.is_running
-            and self.gate_manager.ws_client._connected_event.is_set()
-        )
+        clients = getattr(self.gate_manager, 'ws_clients', None)
+        if clients:
+            return all(c.is_running and c._connected_event.is_set() for c in clients)
+        if not self.gate_manager.ws_client:
+            return False
+        return self.gate_manager.ws_client.is_running and self.gate_manager.ws_client._connected_event.is_set()
 
     def _binance_ws_connected(self) -> bool:
-        if not self.spot_manager or not self.spot_manager.ws_client:
+        if not self.spot_manager:
             return False
-        return (
-            self.spot_manager.ws_client.is_running
-            and self.spot_manager.ws_client._connected_event.is_set()
-        )
+        clients = getattr(self.spot_manager, 'ws_clients', None)
+        if clients:
+            return all(c.is_running and c._connected_event.is_set() for c in clients)
+        if not self.spot_manager.ws_client:
+            return False
+        return self.spot_manager.ws_client.is_running and self.spot_manager.ws_client._connected_event.is_set()
 
     def _calc_gate_data_age_ms(self) -> Optional[int]:
         """计算 Gate WS 数据新鲜度（最新数据距今多少 ms），作为延迟代理指标"""

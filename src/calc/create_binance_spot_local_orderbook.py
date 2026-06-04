@@ -1,8 +1,8 @@
 # coding: utf-8
 """
 Binance 现货本地订单簿管理器
-使用 Partial Book Depth Streams（@depth5@100ms）维护5档盘口
-每条 WS 消息就是完整的5档快照，无需 REST 铺底和增量同步
+使用 Partial Book Depth Streams（@depth20@100ms）维护20档盘口
+每条 WS 消息就是固定档位快照，无需 REST 铺底和增量同步
 """
 import json
 import math
@@ -17,13 +17,27 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from exchange_apis.get_binance_spot_orderbook_ws import BinanceSpotOrderBookWS
+from common.config import config
 from common.logger import get_logger, log_print
 
 logger = get_logger(__name__)
 
-# 固定参数
+# 默认参数；运行时可通过 config.yaml 覆盖。
 SPEED = '100ms'
-LEVEL = 5
+LEVEL = 20
+
+
+def get_binance_ws_speed() -> str:
+    """读取 Binance Partial Depth 推送频率配置。"""
+    speed = config.get_str('orderbook.binance_ws_speed', SPEED).strip()
+    if speed not in ('100ms', '1000ms'):
+        logger.warning(f"Binance WS speed={speed} 无效，回退到 {SPEED}")
+        return SPEED
+    return speed
+
+
+def get_orderbook_stale_timeout() -> float:
+    return max(1.0, config.get_float('orderbook.stale_timeout_sec', 30.0))
 
 
 def _json_safe_scalar(val):
@@ -38,7 +52,7 @@ def _json_safe_scalar(val):
 
 
 class LocalOrderBook:
-    """本地订单簿 - 维护5档盘口（由 Partial Depth Stream 直接更新）"""
+    """本地订单簿 - 维护固定档位盘口（由 Partial Depth Stream 直接更新）"""
 
     def __init__(self, symbol: str, base_asset: str = ''):
         self.symbol = symbol
@@ -91,6 +105,7 @@ class LocalOrderBook:
                 'update_id': self.last_update_id,
                 'update_time': self.update_time,
                 'update_count': self.update_count,
+                'spot_ready': bool(self.bids and self.asks) and not self.is_stale(get_orderbook_stale_timeout()),
             }
 
             for i in range(LEVEL):
@@ -125,8 +140,31 @@ class OrderBookManager:
     def __init__(self):
         self.orderbooks: Dict[str, LocalOrderBook] = {}
         self.ws_client: Optional[BinanceSpotOrderBookWS] = None
+        self.ws_clients: List[BinanceSpotOrderBookWS] = []
+        self._symbol_ws_clients: Dict[str, BinanceSpotOrderBookWS] = {}
         self.lock = threading.Lock()
         self._broadcast_callbacks: List[Callable[[], None]] = []
+
+    def _build_ws_client(self, symbols: Optional[List[str]] = None) -> BinanceSpotOrderBookWS:
+        client = BinanceSpotOrderBookWS(level=LEVEL, speed=get_binance_ws_speed())
+
+        def on_update(symbol, update_data):
+            orderbook = self.orderbooks.get(symbol)
+            if not orderbook:
+                return
+            orderbook.update_from_partial_depth(update_data)
+
+        client.set_update_callback(on_update)
+        client.connect(symbols=symbols)
+        return client
+
+    @staticmethod
+    def _split_symbols(symbols: List[str], shards: int) -> List[List[str]]:
+        shards = max(1, int(shards or 1))
+        groups: List[List[str]] = [[] for _ in range(shards)]
+        for i, symbol in enumerate(symbols):
+            groups[i % shards].append(symbol)
+        return [g for g in groups if g]
 
     def add_symbols(self, symbols: List[str]):
         """
@@ -158,8 +196,13 @@ class OrderBookManager:
             ba = base_asset or sym.replace('USDT', '')
             self.add_symbols([{'symbol': sym, 'base_asset': ba}])
 
-        if self.ws_client:
-            self.ws_client.subscribe_order_book(sym)
+        if self.ws_clients:
+            client = self._symbol_ws_clients.get(sym)
+            if not client:
+                client = min(self.ws_clients, key=lambda c: len(c.subscriptions))
+                self._symbol_ws_clients[sym] = client
+            if client:
+                client.subscribe_order_book(sym)
 
     def remove_symbol(self, symbol: str):
         """移除交易对"""
@@ -168,8 +211,9 @@ class OrderBookManager:
             if symbol_upper in self.orderbooks:
                 del self.orderbooks[symbol_upper]
                 log_print(f"✓ 已移除交易对: {symbol_upper}")
-        if self.ws_client:
-            self.ws_client.unsubscribe_order_book(symbol_upper)
+        client = self._symbol_ws_clients.pop(symbol_upper, None)
+        if client:
+            client.unsubscribe_order_book(symbol_upper)
 
     def get_orderbook(self, symbol: str) -> Optional[LocalOrderBook]:
         """获取指定交易对的本地订单簿"""
@@ -204,7 +248,7 @@ class OrderBookManager:
 
     def start_ws(self, on_progress: Optional[Callable[[int, int], None]] = None):
         """启动 WebSocket 并订阅所有已添加交易对的 Partial Depth Stream"""
-        if self.ws_client:
+        if self.ws_clients:
             log_print("WebSocket 已运行")
             return
 
@@ -213,17 +257,19 @@ class OrderBookManager:
             log_print("⚠ 没有交易对需要订阅")
             return
 
-        self.ws_client = BinanceSpotOrderBookWS(level=LEVEL, speed=SPEED)
-
-        def on_update(symbol, update_data):
-            orderbook = self.orderbooks.get(symbol)
-            if not orderbook:
-                return
-            orderbook.update_from_partial_depth(update_data)
-            # 注：不再调用 _notify_broadcast()，广播已改为定时轮询模式
-
-        self.ws_client.set_update_callback(on_update)
-        self.ws_client.connect(symbols=symbols)
+        shards = config.get_int('orderbook.binance_ws_shards', 1)
+        groups = self._split_symbols(symbols, shards)
+        for group in groups:
+            client = self._build_ws_client(symbols=group)
+            self.ws_clients.append(client)
+            if self.ws_client is None:
+                self.ws_client = client
+            for sym in group:
+                self._symbol_ws_clients[sym] = client
+        log_print(
+            f"Binance WebSocket 已启动：shards={len(self.ws_clients)}, "
+            f"speed={get_binance_ws_speed()}, level={LEVEL}"
+        )
 
         if on_progress:
             for i, sym in enumerate(symbols):
@@ -235,21 +281,25 @@ class OrderBookManager:
         on_progress: Optional[Callable[[int, int], None]] = None,
     ):
         """为交易对列表订阅 WS（兼容 Gate.io 接口风格）"""
-        if not self.ws_client:
+        if not self.ws_clients:
             return
         targets = symbols if symbols is not None else list(self.orderbooks.keys())
         total = len(targets)
         for i, sym in enumerate(targets):
-            self.ws_client.subscribe_order_book(sym)
+            client = self._symbol_ws_clients.get(sym)
+            if client:
+                client.subscribe_order_book(sym)
             if on_progress:
                 on_progress(i + 1, total)
                 time.sleep(0.03)
 
     def stop_ws(self):
         """停止 WebSocket 客户端"""
-        if self.ws_client:
-            self.ws_client.disconnect()
-            self.ws_client = None
+        for client in list(self.ws_clients):
+            client.disconnect()
+        self.ws_clients.clear()
+        self._symbol_ws_clients.clear()
+        self.ws_client = None
 
     def shutdown(self):
         """停止 WS 并清空所有本地订单簿"""

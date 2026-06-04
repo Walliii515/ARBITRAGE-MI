@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from common.tools import truncate_to_precision
 from calc.orderbook_enricher import calc_vwap
 
-LEVEL = 5
+LEVEL = 20
 
 
 def _lcm_fraction(a: Fraction, b: Fraction) -> Fraction:
@@ -124,6 +124,12 @@ def calculate_hedge_metrics(
 
         # spot 数据未就绪
         if not row.get('spot_ready', False):
+            row.update(_null_fields())
+            result.append(row)
+            continue
+
+        # Gate 本地簿必须已收到 OBU full 快照并接上连续 WS 增量
+        if not row.get('future_ready', True):
             row.update(_null_fields())
             result.append(row)
             continue

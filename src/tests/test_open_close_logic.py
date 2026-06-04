@@ -102,6 +102,100 @@ def make_closing_executor():
 # TradingExecutor 测试
 # ══════════════════════════════════════════════════════════════════
 
+class TestGateLocalOrderBookSequencing(unittest.TestCase):
+    """Gate 本地订单簿使用 OBU full 快照 + 连续增量维护。"""
+
+    def _full(self, book_id=100):
+        return {
+            'full': True,
+            'u': book_id,
+            't': 1,
+            'a': [{'p': '101', 's': '1'}],
+            'b': [{'p': '99', 's': '1'}],
+        }
+
+    def test_obu_full_snapshot_marks_book_ready(self):
+        from calc.create_gate_futures_local_orderbook import LocalOrderBook
+
+        ob = LocalOrderBook('BTC_USDT', 'BTC')
+        ok = ob.apply_obu(self._full(100))
+
+        self.assertTrue(ok)
+        self.assertTrue(ob.is_ready())
+        self.assertEqual(ob.id, 100)
+        self.assertEqual(ob.update_count, 1)
+
+    def test_continuous_obu_update_is_applied(self):
+        from calc.create_gate_futures_local_orderbook import LocalOrderBook
+
+        ob = LocalOrderBook('BTC_USDT', 'BTC')
+        ob.apply_obu(self._full(100))
+
+        ok = ob.apply_obu({
+            'full': False,
+            'U': 101,
+            'u': 101,
+            't': 2,
+            'a': [{'p': '101', 's': '0'}],
+            'b': [{'p': '100', 's': '2'}],
+        })
+
+        self.assertTrue(ok)
+        self.assertTrue(ob.is_ready())
+        self.assertEqual(ob.id, 101)
+        self.assertEqual(ob.update_count, 2)
+
+    def test_obu_update_with_gap_marks_book_not_ready(self):
+        from calc.create_gate_futures_local_orderbook import LocalOrderBook
+
+        ob = LocalOrderBook('BTC_USDT', 'BTC')
+        ob.apply_obu(self._full(100))
+
+        ok = ob.apply_obu({
+            'full': False,
+            'U': 103,
+            'u': 103,
+            't': 2,
+            'a': [],
+            'b': [{'p': '100', 's': '2'}],
+        })
+
+        self.assertFalse(ok)
+        self.assertFalse(ob.is_ready())
+        self.assertEqual(ob.id, 100)
+        self.assertEqual(ob.update_count, 0)
+
+
+class TestGateOrderBookManagerObu(unittest.TestCase):
+    """Gate manager 缺口时不再 REST 重载，只触发 OBU 重订阅。"""
+
+    def test_gap_schedules_resubscribe(self):
+        from calc.create_gate_futures_local_orderbook import OrderBookManager
+
+        manager = OrderBookManager(settle='usdt')
+        manager.prepare_contracts(['BTC_USDT'])
+        manager._schedule_resubscribe = MagicMock()
+
+        manager._handle_ws_update('BTC_USDT', {
+            'full': True,
+            'u': 100,
+            't': 1,
+            'a': [{'p': '101', 's': '1'}],
+            'b': [{'p': '99', 's': '1'}],
+        })
+        manager._handle_ws_update('BTC_USDT', {
+            'full': False,
+            'U': 103,
+            'u': 103,
+            't': 2,
+            'a': [],
+            'b': [],
+        })
+
+        self.assertFalse(manager.get_orderbook('BTC_USDT').is_ready())
+        manager._schedule_resubscribe.assert_called_once_with('BTC_USDT')
+
+
 class TestTradingExecutorPeakCheck(unittest.TestCase):
     """峰值回落 + sustain 确认（开仓唯一通道）"""
 

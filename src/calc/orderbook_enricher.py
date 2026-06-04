@@ -8,6 +8,8 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+LEVEL = 20
+
 
 def calc_vwap(prices: List[Optional[float]], volumes: List[Optional[float]],
               target_qty: float, qty_multiplier: float = 1.0) -> Optional[float]:
@@ -220,7 +222,7 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         # --- 期货每档 USDT ---
         future_bid_total = 0.0
         future_ask_total = 0.0
-        for i in range(1, 6):
+        for i in range(1, LEVEL + 1):
             price = row.get(f'future_price_bid_{i}')
             vol = row.get(f'future_volume_bid_{i}')
             usdt = round(float(price) * float(vol) * quanto_multiplier, 2) if price is not None and vol is not None else None
@@ -241,7 +243,7 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         # --- 现货每档 USDT ---
         spot_bid_total = 0.0
         spot_ask_total = 0.0
-        for i in range(1, 6):
+        for i in range(1, LEVEL + 1):
             price = row.get(f'spot_price_bid_{i}')
             vol = row.get(f'spot_volume_bid_{i}')
             usdt = round(float(price) * float(vol), 2) if price is not None and vol is not None else None

@@ -5,7 +5,7 @@
 """
 from typing import Any, Dict, List
 
-LEVEL = 5
+LEVEL = 20
 
 _SPOT_NULL_FIELDS = {}
 for _side in ('bid', 'ask'):
@@ -114,10 +114,13 @@ def merge_orderbook_records(
             ),
             'future_update_id': future.get('update_id'),
             'future_update_time': future.get('update_time'),
+            'future_ready': future.get('future_ready', True),
+            'future_update_count': future.get('update_count'),
+            'spot_update_count': spot.get('update_count') if spot else None,
         }
         out.update(_copy_level_fields(future, 'future'))
 
-        if spot and _spot_has_data(spot):
+        if spot and spot.get('spot_ready', True) and _spot_has_data(spot):
             out['spot_update_id'] = spot.get('update_id')
             out['spot_update_time'] = spot.get('update_time')
             out['spot_ready'] = True

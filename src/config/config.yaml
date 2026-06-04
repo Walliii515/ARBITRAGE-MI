@@ -8,21 +8,6 @@ auth:
   # Token 有效期 (秒)，默认 1 小时
   token_expire_seconds: 36000
 
-orderbook:
-  # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
-  settle: usdt
-  # 最大订阅合约数（从 mi_base_asset 加载的上限）
-  max_contracts: 998
-  # 进程启动后自动启动 WS 服务（设为 true 则崩溃重启后自动恢复连接）
-  auto_start: true
-
-  # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
-  broadcast_throttle_sec: 1.0
-  # 启动阶段批量加载 REST 初始快照时，每批合约数量
-  snapshot_batch_size: 40
-  # 单批快照加载的最大并发线程数
-  snapshot_batch_workers: 40
-
 trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
   # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
@@ -49,9 +34,9 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
-    max_positions_per_asset: 3              # 同标的最大持仓数
+    max_positions_per_asset: 1              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
-    vwap_basis_threshold_bps: 20            # 全局回退VWAP基差阈值（bps）
+    vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
     min_funding_rate_bps: 0                # 24h资金费率下限(bps)，低于此值不开仓
@@ -118,9 +103,9 @@ margin:
 # 资金管理配置
 capital:
   # Binance 初始入金 (USDT)
-  binance_initial: 516.35
+  binance_initial: 50
   # Gate 初始入金 (USDT)
-  gate_initial: 258.23
+  gate_initial: 50
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数
@@ -128,3 +113,26 @@ capital:
 real_executor:
   # HTTP 请求超时（秒）
   timeout_sec: 10
+
+orderbook:
+  # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
+  settle: usdt
+  # 最大订阅合约数（从 mi_base_asset 加载的上限）
+  max_contracts: 250
+  # Gate OBU WS 连接分片数；若 max_contracts=250 且 level=50，建议设为 5
+  gate_ws_shards: 5
+  # Gate OBU 深度，实测可用: 50 / 400；系统输出仍只取前20档
+  gate_obu_level: 50
+  # Gate WS 建连等待时间；高延迟网络下需要比默认 8 秒更宽松
+  gate_ws_connect_timeout_sec: 30
+  # Binance Spot WS 连接分片数；若 max_contracts=250 且 speed=100ms，建议设为 5
+  binance_ws_shards: 5
+  # Binance Partial Depth 推送频率，可选: 100ms / 1000ms
+  binance_ws_speed: 100ms
+  # 盘口超过该秒数无更新时，不参与交易计算
+  stale_timeout_sec: 30
+  # 进程启动后自动启动 WS 服务（设为 true 则崩溃重启后自动恢复连接）
+  auto_start: true
+
+  # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
+  broadcast_throttle_sec: 2.0

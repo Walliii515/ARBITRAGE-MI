@@ -78,8 +78,6 @@ _meta_update_time: str = ''  # 上次缓存刷新时间
 # 以下参数从 src/config/config.yaml 加载，环境变量可覆盖
 SETTLE = config.get_str('orderbook.settle', 'usdt', env='ORDERBOOK_SETTLE')
 BROADCAST_THROTTLE_SEC = config.get_float('orderbook.broadcast_throttle_sec', 1.0)
-SNAPSHOT_BATCH_SIZE = config.get_int('orderbook.snapshot_batch_size', 40)
-SNAPSHOT_BATCH_WORKERS = config.get_int('orderbook.snapshot_batch_workers', 40)
 # 每次开仓金额（USDT），作为新列推送给前端
 OPEN_AMOUNT_USDT = config.get_float('trade.open.amount_usdt', 5000.0)
 # 资金费率阈值百分位字段名（对应 mi_gate_future_funding_rate_threshold 表的列名，保留给前端展示）
@@ -508,9 +506,7 @@ async def lifespan(app: FastAPI):
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
     start_daily_schedulers()
 
-    svc = ServiceLifecycleManager(
-        settle=SETTLE, batch_size=SNAPSHOT_BATCH_SIZE, batch_workers=SNAPSHOT_BATCH_WORKERS
-    )
+    svc = ServiceLifecycleManager(settle=SETTLE)
     svc.init_managers()
     # 不再注册 per-message 回调，改为定时轮询广播（见 _orderbook_broadcast_loop）
     # svc.register_broadcast(schedule_broadcast)
@@ -571,7 +567,7 @@ async def service_status():
 
 @app.get('/api/service/connections')
 async def service_connections():
-    """获取逐标的资产 REST 快照 / WS 订阅状态（无需认证，用于连接监控）"""
+    """获取逐标的资产 OBU full 快照 / WS 订阅状态（无需认证，用于连接监控）"""
     if not svc:
         return {'items': [], 'state': SERVICE_IDLE}
     return {
@@ -605,7 +601,7 @@ async def exchange_connectivity():
 
 @app.post('/api/service/retry-snapshot', dependencies=[Depends(verify_token_dependency)])
 async def retry_snapshot(body: dict):
-    """手动重试单个标的的 REST 快照初始化 + WS 订阅"""
+    """手动重试单个标的的 OBU 重订阅 + Binance WS 订阅"""
     base_asset = (body.get('base_asset') or '').strip()
     if not base_asset:
         raise HTTPException(status_code=400, detail='base_asset 不能为空')
