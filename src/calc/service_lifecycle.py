@@ -295,13 +295,13 @@ class ServiceLifecycleManager:
     def fetch_contracts_from_db(self) -> List[str]:
         """从 mi_base_asset 查询有效 base_asset，拼接为 Gate 合约名。
 
-        启动订阅前先按可交易性、成交量、资金费率过滤，避免低质量交易对挤占 WS。
+        启动订阅前只按可交易性和成交量做基础过滤。
+        资金费率是动态信号，保留到运行时开仓判断，避免启动时为负而漏掉后续转正机会。
         """
         max_contracts = config.get_int('orderbook.max_contracts', 999)
         settle_suffix = self._settle.upper()
         min_spot_volume = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
         min_future_volume = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
-        min_funding_rate = config.get_float('trade.open.min_funding_rate_bps', 0) / 10000.0
         sql = """
             SELECT
                 b.base_asset,
@@ -321,7 +321,6 @@ class ServiceLifecycleManager:
               AND s.is_spot_trading_allowed = 1
               AND COALESCE(g.volume_24h_settle, 0) >= %s
               AND COALESCE(s.quote_volume, 0) >= %s
-              AND COALESCE(g.funding_rate_24h, -999) >= %s
             ORDER BY g.funding_rate_24h DESC, g.volume_24h_settle DESC, s.quote_volume DESC
             LIMIT %s
         """
@@ -334,7 +333,6 @@ class ServiceLifecycleManager:
                         settle_suffix,
                         min_future_volume,
                         min_spot_volume,
-                        min_funding_rate,
                         max_contracts,
                     ),
                 )
@@ -347,7 +345,7 @@ class ServiceLifecycleManager:
                 log_print(
                     f"从数据库筛选到 {len(contracts)} 个订阅合约"
                     f"（max={max_contracts}, min_spot_vol={min_spot_volume}, "
-                    f"min_future_vol={min_future_volume}, min_funding={min_funding_rate:.6f}）: {contracts}"
+                    f"min_future_vol={min_future_volume}, funding_filter=runtime）: {contracts}"
                 )
                 return contracts
         except Exception as e:
