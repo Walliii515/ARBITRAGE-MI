@@ -55,24 +55,22 @@ def calculate_percentile(sorted_values: list, percentile: int) -> float:
     return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
 
 
-def fetch_distinct_assets(start_time: str) -> list:
+def fetch_valid_base_assets() -> list:
     """
-    获取快照表中指定时间范围内所有有效标的列表
-
-    Args:
-        start_time: 起始时间字符串
+    从 mi_base_asset 获取标的列表。
 
     Returns:
         base_asset 列表
     """
     sql = """
-        SELECT DISTINCT base_asset
-        FROM mi_vwap_basis_snapshot
-        WHERE snapshot_time >= %s
-          AND open_vwap_basis_bps IS NOT NULL
+        SELECT DISTINCT UPPER(TRIM(base_asset)) AS base_asset
+        FROM mi_base_asset
+        WHERE base_asset IS NOT NULL
+          AND TRIM(base_asset) <> ''
+        ORDER BY base_asset
     """
     with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, (start_time,))
+        cursor.execute(sql)
         return [row['base_asset'] for row in cursor.fetchall()]
 
 
@@ -194,10 +192,10 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
 
     start_time = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d %H:%M:%S')
 
-    # 1. 获取有效标的列表（轻量查询）
-    all_assets = fetch_distinct_assets(start_time)
+    # 1. 从标的主表获取有效标的，避免在超大快照表上做 DISTINCT 扫描
+    all_assets = fetch_valid_base_assets()
     if not all_assets:
-        logger.warning("无有效快照数据，跳过分析")
+        logger.warning("无有效标的，跳过分析")
         return
 
     logger.info(f"发现 {len(all_assets)} 个有效标的，开始逐标的计算...")
