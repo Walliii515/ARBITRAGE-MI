@@ -8,7 +8,7 @@
 - AG Grid列配置管理
 """
 import json
-import asyncio
+import threading
 from decimal import Decimal
 from datetime import datetime, date
 from typing import Optional, Any, List, Dict
@@ -361,36 +361,127 @@ async def get_threshold_assets():
 async def get_threshold_data(
     calc_date: Optional[str] = Query(None, description="计算日期，格式 YYYY-MM-DD，默认最新日期"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
-    """查询 mi_vwap_basis_threshold 表数据"""
-    sql = "SELECT * FROM mi_vwap_basis_threshold WHERE 1=1"
+    """查询 mi_vwap_basis_threshold 表数据（后端分页）"""
+    where_sql = " FROM mi_vwap_basis_threshold WHERE 1=1"
     params: list = []
 
     if calc_date:
-        sql += " AND calc_date = %s"
+        where_sql += " AND calc_date = %s"
         params.append(calc_date)
     else:
-        sql += " AND calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)"
+        where_sql += " AND calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)"
 
     if base_asset:
-        sql += " AND base_asset = %s"
+        where_sql += " AND base_asset = %s"
         params.append(base_asset)
 
-    sql += " ORDER BY open_basis_p20 DESC"
+    count_sql = "SELECT COUNT(*) AS total" + where_sql
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(count_sql, params)
+        total_row = cursor.fetchone()
+        total = int(total_row['total']) if total_row and total_row.get('total') is not None else 0
+
+    offset = (page - 1) * page_size
+    sql = """
+        SELECT
+            id, base_asset, calc_date,
+            open_basis_max, open_basis_min,
+            open_basis_p1, open_basis_p2, open_basis_p3, open_basis_p5, open_basis_p10, open_basis_p20,
+            close_basis_max, close_basis_min,
+            close_basis_p1, close_basis_p2, close_basis_p3, close_basis_p5, close_basis_p10, close_basis_p20,
+            updated_at
+    """ + where_sql + " ORDER BY open_basis_p20 DESC, base_asset ASC LIMIT %s OFFSET %s"
+    data_params = [*params, page_size, offset]
 
     with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, params)
+        cursor.execute(sql, data_params)
         rows = cursor.fetchall()
-        return _serialize_rows(rows)
+        return {
+            'rows': _serialize_rows(rows),
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+                'total_pages': (total + page_size - 1) // page_size,
+            },
+        }
 
 
 # 手动执行状态（避免并发重复触发）
 _threshold_calc_running = False
+_threshold_calc_lock = threading.Lock()
+_threshold_calc_status: Dict[str, Any] = {
+    'running': False,
+    'processed': 0,
+    'total': 0,
+    'current_asset': None,
+    'success_count': 0,
+    'skip_count': 0,
+    'fail_count': 0,
+    'message': '未开始',
+    'started_at': None,
+    'finished_at': None,
+    'error': None,
+}
+
+
+def _set_threshold_calc_status(**kwargs):
+    with _threshold_calc_lock:
+        _threshold_calc_status.update(kwargs)
+
+
+def _get_threshold_calc_status() -> Dict[str, Any]:
+    with _threshold_calc_lock:
+        return dict(_threshold_calc_status)
+
+
+def _run_threshold_calculate_job(lookback_days: int):
+    global _threshold_calc_running
+
+    def on_progress(progress: Dict[str, Any]):
+        processed = int(progress.get('processed') or 0)
+        total = int(progress.get('total') or 0)
+        _set_threshold_calc_status(
+            processed=processed,
+            total=total,
+            current_asset=progress.get('current_asset'),
+            success_count=progress.get('success_count', 0),
+            skip_count=progress.get('skip_count', 0),
+            fail_count=progress.get('fail_count', 0),
+            message=f'{processed}/{total}' if total else '准备中',
+        )
+
+    try:
+        from calc.calculate_vwap_basis_threshold import run_analysis
+        run_analysis(lookback_days, progress_callback=on_progress)
+        status = _get_threshold_calc_status()
+        total = int(status.get('total') or 0)
+        _set_threshold_calc_status(
+            running=False,
+            processed=total,
+            message=f'{total}/{total} 计算完成' if total else '计算完成',
+            finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            error=None,
+        )
+    except Exception as e:
+        logger.error(f"手动执行阈值计算失败: {e}", exc_info=True)
+        _set_threshold_calc_status(
+            running=False,
+            message=f'计算失败: {e}',
+            finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            error=str(e),
+        )
+    finally:
+        with _threshold_calc_lock:
+            _threshold_calc_running = False
 
 
 @router.post('/threshold/calculate')
 async def trigger_threshold_calculate():
-    """手动触发 VWAP 基差分位阈值计算"""
+    """手动触发 VWAP 基差分位阈值计算（后台执行）"""
     global _threshold_calc_running
     if not config.get_bool('trade.vwap.update_threshold_enabled', True):
         return {
@@ -398,22 +489,40 @@ async def trigger_threshold_calculate():
             "message": "VWAP基差分位阈值更新已关闭，仅保留 mi_vwap_basis_snapshot 快照",
         }
 
-    if _threshold_calc_running:
-        return {"success": False, "message": "计算任务正在执行中，请稍后再试"}
+    with _threshold_calc_lock:
+        if _threshold_calc_running:
+            return {"success": False, "message": "计算任务正在执行中", "status": dict(_threshold_calc_status)}
 
-    _threshold_calc_running = True
-    try:
         lookback_days = config.get_int('trade.vwap.threshold_lookback_days', 7)
-        # 在线程池中执行，避免阻塞事件循环
-        loop = asyncio.get_event_loop()
-        from calc.calculate_vwap_basis_threshold import run_analysis
-        await loop.run_in_executor(None, run_analysis, lookback_days)
-        return {"success": True, "message": f"计算完成（回溯 {lookback_days} 天）"}
-    except Exception as e:
-        logger.error(f"手动执行阈值计算失败: {e}", exc_info=True)
-        return {"success": False, "message": f"计算失败: {e}"}
-    finally:
-        _threshold_calc_running = False
+        _threshold_calc_running = True
+        _threshold_calc_status.update({
+            'running': True,
+            'processed': 0,
+            'total': 0,
+            'current_asset': None,
+            'success_count': 0,
+            'skip_count': 0,
+            'fail_count': 0,
+            'message': '准备中',
+            'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'finished_at': None,
+            'error': None,
+        })
+
+    thread = threading.Thread(
+        target=_run_threshold_calculate_job,
+        args=(lookback_days,),
+        name='vwap-threshold-calculate',
+        daemon=True,
+    )
+    thread.start()
+    return {"success": True, "message": f"计算已启动（回溯 {lookback_days} 天）", "status": _get_threshold_calc_status()}
+
+
+@router.get('/threshold/calculate/status')
+async def get_threshold_calculate_status():
+    """获取手动 VWAP 阈值计算进度"""
+    return _get_threshold_calc_status()
 
 
 # ─── AG Grid 列配置管理 ───────────────────────────────────────────────────────

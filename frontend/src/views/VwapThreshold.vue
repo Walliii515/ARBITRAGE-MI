@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { ref, shallowRef, computed, onMounted } from 'vue'
+import { ref, shallowRef, computed, onMounted, onUnmounted } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
-  ColumnState,
   GetRowIdParams,
   GridApi,
   GridReadyEvent,
@@ -16,35 +15,42 @@ import { get, post } from '../utils/request'
 
 /* ───── 类型 ───── */
 interface ThresholdRow {
-  id: string
+  id: number | string
   base_asset: string
   calc_date: string
-  open_sample_count: number | null
   open_basis_max: number | null
   open_basis_min: number | null
-  open_basis_mean: number | null
-  open_basis_std: number | null
+  open_basis_p1: number | null
+  open_basis_p2: number | null
+  open_basis_p3: number | null
+  open_basis_p5: number | null
   open_basis_p10: number | null
   open_basis_p20: number | null
-  open_basis_p30: number | null
-  open_basis_p40: number | null
-  close_sample_count: number | null
   close_basis_max: number | null
   close_basis_min: number | null
-  close_basis_mean: number | null
-  close_basis_std: number | null
+  close_basis_p1: number | null
+  close_basis_p2: number | null
+  close_basis_p3: number | null
+  close_basis_p5: number | null
   close_basis_p10: number | null
   close_basis_p20: number | null
-  close_basis_p30: number | null
-  close_basis_p40: number | null
+  updated_at: string | null
 }
 
 /* ───── 状态 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
+void gridContainerRef
 const rowData = shallowRef<ThresholdRow[]>([])
 let gridApi: GridApi<ThresholdRow> | null = null
 const loading = ref(false)
 const calculating = ref(false)
+const calcProgress = ref({ processed: 0, total: 0, message: '', running: false })
+let calcProgressTimer: ReturnType<typeof window.setInterval> | null = null
+
+const paginationPageSize = ref<number>(100)
+const paginationPageSizeOptions = [100, 500, 1000, 5000]
+const paginationCurrentPage = ref<number>(1)
+const paginationTotal = ref<number>(0)
 
 /* 过滤条件 */
 const selectedDate = ref<string>('')
@@ -64,7 +70,7 @@ const bpsFormatter = (params: ValueFormatterParams) => {
   return Number(params.value).toFixed(4)
 }
 
-const intFormatter = (params: ValueFormatterParams) => {
+const dateTimeFormatter = (params: ValueFormatterParams) => {
   if (params.value == null) return ''
   return String(params.value)
 }
@@ -93,25 +99,24 @@ const columnDefs = computed<ColDef<ThresholdRow>[]>(() => [
     width: 120,
   },
   // ── 开仓统计 ──
-  numericCol('开仓样本数', 'open_sample_count', 110, intFormatter),
   numericCol('开仓Max', 'open_basis_max', 110),
   numericCol('开仓Min', 'open_basis_min', 110),
-  numericCol('开仓Mean', 'open_basis_mean', 110),
-  numericCol('开仓Std', 'open_basis_std', 110),
+  numericCol('开仓P1(top1%)', 'open_basis_p1', 135),
+  numericCol('开仓P2(top2%)', 'open_basis_p2', 135),
+  numericCol('开仓P3(top3%)', 'open_basis_p3', 135),
+  numericCol('开仓P5(top5%)', 'open_basis_p5', 135),
   numericCol('开仓P10(top10%)', 'open_basis_p10', 145),
   numericCol('开仓P20(top20%)', 'open_basis_p20', 145),
-  numericCol('开仓P30(top30%)', 'open_basis_p30', 145),
-  numericCol('开仓P40(top40%)', 'open_basis_p40', 145),
   // ── 平仓统计 ──
-  numericCol('平仓样本数', 'close_sample_count', 110, intFormatter),
   numericCol('平仓Max', 'close_basis_max', 110),
   numericCol('平仓Min', 'close_basis_min', 110),
-  numericCol('平仓Mean', 'close_basis_mean', 110),
-  numericCol('平仓Std', 'close_basis_std', 110),
+  numericCol('平仓P1(bot1%)', 'close_basis_p1', 135),
+  numericCol('平仓P2(bot2%)', 'close_basis_p2', 135),
+  numericCol('平仓P3(bot3%)', 'close_basis_p3', 135),
+  numericCol('平仓P5(bot5%)', 'close_basis_p5', 135),
   numericCol('平仓P10(bot10%)', 'close_basis_p10', 145),
   numericCol('平仓P20(bot20%)', 'close_basis_p20', 145),
-  numericCol('平仓P30(bot30%)', 'close_basis_p30', 145),
-  numericCol('平仓P40(bot40%)', 'close_basis_p40', 145),
+  numericCol('更新时间', 'updated_at', 160, dateTimeFormatter),
 ])
 
 const defaultColDef: ColDef = {
@@ -239,6 +244,8 @@ async function fetchData() {
   loading.value = true
   try {
     const params = new URLSearchParams()
+    params.set('page', String(paginationCurrentPage.value))
+    params.set('page_size', String(paginationPageSize.value))
     if (selectedDate.value) params.set('calc_date', selectedDate.value)
     if (selectedAsset.value) params.set('base_asset', selectedAsset.value)
 
@@ -247,13 +254,60 @@ async function fetchData() {
       showError('获取阈值数据失败')
       return
     }
-    const rows = await res.json()
-    // 附加 id 字段供 AG Grid 使用
-    rowData.value = rows.map((r: any, i: number) => ({ ...r, id: `${r.base_asset}_${r.calc_date}_${i}` }))
+    const data = await res.json()
+    const rows = data.rows || []
+    rowData.value = rows.map((r: any, i: number) => ({ ...r, id: r.id ?? `${r.base_asset}_${r.calc_date}_${i}` }))
+    if (data.pagination) {
+      paginationTotal.value = data.pagination.total || 0
+    }
   } catch {
     showError('请求阈值数据失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function pollCalculateStatus(refreshWhenDone = false) {
+  try {
+    const res = await get('/api/trading/threshold/calculate/status')
+    if (!res.ok) return
+    const status = await res.json()
+    calcProgress.value = {
+      processed: status.processed || 0,
+      total: status.total || 0,
+      message: status.message || '',
+      running: !!status.running,
+    }
+    calculating.value = !!status.running
+
+    if (!status.running) {
+      stopCalculatePolling()
+      if (status.error) {
+        showError(status.message || '计算失败')
+      } else if (refreshWhenDone) {
+        showSuccess(status.message || '计算完成')
+        await fetchLatestDate()
+        await fetchDates()
+        await fetchAssets()
+        await fetchData()
+      }
+    }
+  } catch {
+    // ignore polling errors
+  }
+}
+
+function startCalculatePolling() {
+  stopCalculatePolling()
+  calcProgressTimer = window.setInterval(() => {
+    pollCalculateStatus(true)
+  }, 1000)
+}
+
+function stopCalculatePolling() {
+  if (calcProgressTimer != null) {
+    window.clearInterval(calcProgressTimer)
+    calcProgressTimer = null
   }
 }
 
@@ -267,24 +321,62 @@ async function triggerCalculate() {
     }
     const result = await res.json()
     if (result.success) {
-      showSuccess(result.message || '计算完成')
-      // 计算完成后刷新
-      await fetchLatestDate()
-      await fetchDates()
-      await fetchAssets()
-      await fetchData()
+      showSuccess(result.message || '计算已启动')
+      if (result.status) {
+        calcProgress.value = {
+          processed: result.status.processed || 0,
+          total: result.status.total || 0,
+          message: result.status.message || '',
+          running: !!result.status.running,
+        }
+      }
+      startCalculatePolling()
     } else {
       showError(result.message || '计算失败')
+      if (result.status) {
+        calcProgress.value = {
+          processed: result.status.processed || 0,
+          total: result.status.total || 0,
+          message: result.status.message || '',
+          running: !!result.status.running,
+        }
+        if (result.status.running) startCalculatePolling()
+        calculating.value = !!result.status.running
+      } else {
+        calculating.value = false
+      }
     }
   } catch {
     showError('请求失败')
-  } finally {
     calculating.value = false
   }
 }
 
+const calculateProgressText = computed(() => {
+  if (!calculating.value && !calcProgress.value.message) return ''
+  if (calcProgress.value.total > 0) {
+    return `${calcProgress.value.processed}/${calcProgress.value.total}`
+  }
+  return calcProgress.value.message || '准备中'
+})
+
+const totalPages = computed(() => {
+  return Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
+})
+
+function onPageChange(page: number) {
+  paginationCurrentPage.value = page
+  fetchData()
+}
+
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1
+  fetchData()
+}
+
 /* ───── 查询按钮 ───── */
 function onQuery() {
+  paginationCurrentPage.value = 1
   fetchData()
 }
 
@@ -297,10 +389,16 @@ function onGridReady(params: GridReadyEvent<ThresholdRow>) {
 
 /* ───── 生命周期 ───── */
 onMounted(async () => {
+  await pollCalculateStatus(false)
+  if (calcProgress.value.running) startCalculatePolling()
   await fetchLatestDate()
   await fetchDates()
   await fetchAssets()
   await fetchData()
+})
+
+onUnmounted(() => {
+  stopCalculatePolling()
 })
 </script>
 
@@ -363,6 +461,13 @@ onMounted(async () => {
           手动执行计算
         </el-button>
 
+        <span
+          v-if="calculateProgressText"
+          class="calc-progress"
+        >
+          {{ calculateProgressText }}
+        </span>
+
         <span class="filter-label" style="margin-left: auto; font-size: 12px; color: #909399;">
           最新计算日期：{{ latestCalcDate }}
         </span>
@@ -419,6 +524,49 @@ onMounted(async () => {
       />
       </div>
     </el-card>
+
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="(val: number | undefined) => onPageChange(val || 1)"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -447,6 +595,12 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
+.calc-progress {
+  color: var(--el-color-warning);
+  font-size: 13px;
+  min-width: 56px;
+}
+
 /* ───── 表格 ───── */
 .grid-header {
   display: flex;
@@ -462,7 +616,7 @@ onMounted(async () => {
 
 .orderbook-grid {
   width: 100%;
-  height: calc(100vh - 220px);
+  height: calc(100vh - 270px);
   min-height: 480px;
 }
 
@@ -493,5 +647,25 @@ onMounted(async () => {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0 4px;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

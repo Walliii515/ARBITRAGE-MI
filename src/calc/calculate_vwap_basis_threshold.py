@@ -15,6 +15,7 @@ import argparse
 import sys
 import os
 from datetime import date, datetime, timedelta
+from typing import Callable, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -116,21 +117,18 @@ def compute_open_statistics(values: list) -> dict:
     """
     sorted_vals = sorted(values)
     n = len(sorted_vals)
-    mean_val = sum(sorted_vals) / n
-    variance = sum((x - mean_val) ** 2 for x in sorted_vals) / n
-    std_val = variance ** 0.5
 
     return {
-        'open_sample_count': n,
         'open_basis_max': sorted_vals[-1],
         'open_basis_min': sorted_vals[0],
-        'open_basis_mean': round(mean_val, 4),
-        'open_basis_std': round(std_val, 4),
         # 从大到小 top X% 的分界点 = 升序第 (100-X) 分位
+        'open_basis_p1': round(calculate_percentile(sorted_vals, 99), 4),
+        'open_basis_p2': round(calculate_percentile(sorted_vals, 98), 4),
+        'open_basis_p3': round(calculate_percentile(sorted_vals, 97), 4),
+        'open_basis_p5': round(calculate_percentile(sorted_vals, 95), 4),
         'open_basis_p10': round(calculate_percentile(sorted_vals, 90), 4),
         'open_basis_p20': round(calculate_percentile(sorted_vals, 80), 4),
-        'open_basis_p30': round(calculate_percentile(sorted_vals, 70), 4),
-        'open_basis_p40': round(calculate_percentile(sorted_vals, 60), 4),
+        '_open_sample_count': n,
     }
 
 
@@ -153,29 +151,30 @@ def compute_close_statistics(values: list) -> dict:
     """
     sorted_vals = sorted(values)  # 由小到大排序
     n = len(sorted_vals)
-    mean_val = sum(sorted_vals) / n
-    variance = sum((x - mean_val) ** 2 for x in sorted_vals) / n
-    std_val = variance ** 0.5
 
     return {
-        'close_sample_count': n,
         'close_basis_max': sorted_vals[-1],
         'close_basis_min': sorted_vals[0],
-        'close_basis_mean': round(mean_val, 4),
-        'close_basis_std': round(std_val, 4),
         # 由小到大直接取分位点
+        'close_basis_p1': round(calculate_percentile(sorted_vals, 1), 4),
+        'close_basis_p2': round(calculate_percentile(sorted_vals, 2), 4),
+        'close_basis_p3': round(calculate_percentile(sorted_vals, 3), 4),
+        'close_basis_p5': round(calculate_percentile(sorted_vals, 5), 4),
         'close_basis_p10': round(calculate_percentile(sorted_vals, 10), 4),
         'close_basis_p20': round(calculate_percentile(sorted_vals, 20), 4),
-        'close_basis_p30': round(calculate_percentile(sorted_vals, 30), 4),
-        'close_basis_p40': round(calculate_percentile(sorted_vals, 40), 4),
+        '_close_sample_count': n,
     }
 
 
-def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
+def run_analysis(
+    lookback_days: int,
+    coverage_filter: float = 1.0,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+):
     """
     执行分析并写入阈值表（逐标的流式处理，避免全表加载）
 
-    纯统计计算，写入所有分位值（open_basis_p10~p40 + close_basis_p10~p40）。
+    纯统计计算，写入所有分位值（open_basis_p1~p20 + close_basis_p1~p20）。
     使用哪个分位作为阈值由应用层根据配置决定。
 
     改进：不再一次性读取全部快照数据到内存，而是逐标的查询计算，
@@ -184,6 +183,7 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
     Args:
         lookback_days: 回溯天数
         coverage_filter: 盘口覆盖上限过滤（排除流动性不足的样本）
+        progress_callback: 进度回调，用于上报 processed/total/current_asset
     """
     logger.info(
         f"开始VWAP基差分位分析: 回溯{lookback_days}天, "
@@ -199,50 +199,56 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
         return
 
     logger.info(f"发现 {len(all_assets)} 个有效标的，开始逐标的计算...")
+    if progress_callback:
+        progress_callback({
+            'processed': 0,
+            'total': len(all_assets),
+            'current_asset': None,
+            'success_count': 0,
+            'skip_count': 0,
+        })
 
     # UPSERT SQL
     upsert_sql = """
         INSERT INTO mi_vwap_basis_threshold (
             base_asset, calc_date,
-            open_sample_count, open_basis_max, open_basis_min, open_basis_mean, open_basis_std,
-            open_basis_p10, open_basis_p20, open_basis_p30, open_basis_p40,
-            close_sample_count, close_basis_max, close_basis_min, close_basis_mean, close_basis_std,
-            close_basis_p10, close_basis_p20, close_basis_p30, close_basis_p40,
+            open_basis_max, open_basis_min,
+            open_basis_p1, open_basis_p2, open_basis_p3, open_basis_p5, open_basis_p10, open_basis_p20,
+            close_basis_max, close_basis_min,
+            close_basis_p1, close_basis_p2, close_basis_p3, close_basis_p5, close_basis_p10, close_basis_p20,
             updated_at
         ) VALUES (
             %(base_asset)s, %(calc_date)s,
-            %(open_sample_count)s, %(open_basis_max)s, %(open_basis_min)s, %(open_basis_mean)s, %(open_basis_std)s,
-            %(open_basis_p10)s, %(open_basis_p20)s, %(open_basis_p30)s, %(open_basis_p40)s,
-            %(close_sample_count)s, %(close_basis_max)s, %(close_basis_min)s, %(close_basis_mean)s, %(close_basis_std)s,
-            %(close_basis_p10)s, %(close_basis_p20)s, %(close_basis_p30)s, %(close_basis_p40)s,
+            %(open_basis_max)s, %(open_basis_min)s,
+            %(open_basis_p1)s, %(open_basis_p2)s, %(open_basis_p3)s, %(open_basis_p5)s, %(open_basis_p10)s, %(open_basis_p20)s,
+            %(close_basis_max)s, %(close_basis_min)s,
+            %(close_basis_p1)s, %(close_basis_p2)s, %(close_basis_p3)s, %(close_basis_p5)s, %(close_basis_p10)s, %(close_basis_p20)s,
             NOW()
         ) ON DUPLICATE KEY UPDATE
-            open_sample_count = VALUES(open_sample_count),
             open_basis_max = VALUES(open_basis_max),
             open_basis_min = VALUES(open_basis_min),
-            open_basis_mean = VALUES(open_basis_mean),
-            open_basis_std = VALUES(open_basis_std),
+            open_basis_p1 = VALUES(open_basis_p1),
+            open_basis_p2 = VALUES(open_basis_p2),
+            open_basis_p3 = VALUES(open_basis_p3),
+            open_basis_p5 = VALUES(open_basis_p5),
             open_basis_p10 = VALUES(open_basis_p10),
             open_basis_p20 = VALUES(open_basis_p20),
-            open_basis_p30 = VALUES(open_basis_p30),
-            open_basis_p40 = VALUES(open_basis_p40),
-            close_sample_count = VALUES(close_sample_count),
             close_basis_max = VALUES(close_basis_max),
             close_basis_min = VALUES(close_basis_min),
-            close_basis_mean = VALUES(close_basis_mean),
-            close_basis_std = VALUES(close_basis_std),
+            close_basis_p1 = VALUES(close_basis_p1),
+            close_basis_p2 = VALUES(close_basis_p2),
+            close_basis_p3 = VALUES(close_basis_p3),
+            close_basis_p5 = VALUES(close_basis_p5),
             close_basis_p10 = VALUES(close_basis_p10),
             close_basis_p20 = VALUES(close_basis_p20),
-            close_basis_p30 = VALUES(close_basis_p30),
-            close_basis_p40 = VALUES(close_basis_p40),
             updated_at = NOW()
     """
 
     all_keys = [
-        'open_sample_count', 'open_basis_max', 'open_basis_min', 'open_basis_mean', 'open_basis_std',
-        'open_basis_p10', 'open_basis_p20', 'open_basis_p30', 'open_basis_p40',
-        'close_sample_count', 'close_basis_max', 'close_basis_min', 'close_basis_mean', 'close_basis_std',
-        'close_basis_p10', 'close_basis_p20', 'close_basis_p30', 'close_basis_p40',
+        'open_basis_max', 'open_basis_min',
+        'open_basis_p1', 'open_basis_p2', 'open_basis_p3', 'open_basis_p5', 'open_basis_p10', 'open_basis_p20',
+        'close_basis_max', 'close_basis_min',
+        'close_basis_p1', 'close_basis_p2', 'close_basis_p3', 'close_basis_p5', 'close_basis_p10', 'close_basis_p20',
     ]
 
     # 2. 逐标的查询 + 计算 + 写入
@@ -250,6 +256,7 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
     results = []  # 仅用于最终汇总日志
     success_count = 0
     skip_count = 0
+    fail_count = 0
 
     for idx, base_asset in enumerate(all_assets, 1):
         try:
@@ -289,13 +296,13 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
             if len(open_values) >= 10:
                 result.update(compute_open_statistics(open_values))
             else:
-                result['open_sample_count'] = len(open_values)
+                result['_open_sample_count'] = len(open_values)
 
             # 平仓统计
             if len(close_values) >= 10:
                 result.update(compute_close_statistics(close_values))
             else:
-                result['close_sample_count'] = len(close_values)
+                result['_close_sample_count'] = len(close_values)
 
             # 补齐缺失 key
             for key in all_keys:
@@ -315,28 +322,39 @@ def run_analysis(lookback_days: int, coverage_filter: float = 1.0):
                 logger.info(f"  进度: {idx}/{len(all_assets)} 标的已处理")
 
         except Exception as e:
+            fail_count += 1
             logger.error(f"  {base_asset} 计算失败: {e}")
             continue
+        finally:
+            if progress_callback:
+                progress_callback({
+                    'processed': idx,
+                    'total': len(all_assets),
+                    'current_asset': base_asset,
+                    'success_count': success_count,
+                    'skip_count': skip_count,
+                    'fail_count': fail_count,
+                })
 
-    logger.info(f"✓ 已写入 {success_count} 个标的的VWAP基差阈值，跳过 {skip_count} 个 (日期={calc_date})")
+    logger.info(f"✓ 已写入 {success_count} 个标的的VWAP基差阈值，跳过 {skip_count} 个，失败 {fail_count} 个 (日期={calc_date})")
 
     # 3. 输出汇总（只输出 top 20 避免日志刻刷）
     if results:
         logger.info("=" * 90)
-        logger.info(f"分析完成 | 日期={calc_date} | 回溯={lookback_days}天 | 成功={success_count} 跳过={skip_count}")
+        logger.info(f"分析完成 | 日期={calc_date} | 回溯={lookback_days}天 | 成功={success_count} 跳过={skip_count} 失败={fail_count}")
         header = "{:<10} {:<7} {:<10} {:<10} {:<7} {:<10} {:<10}".format(
-            '标的', '开仓N', 'open_p20', 'open_p30', '平仓N', 'close_p20', 'close_p30')
+            '标的', '开仓N', 'open_p10', 'open_p20', '平仓N', 'close_p10', 'close_p20')
         logger.info(header)
         logger.info("-" * 90)
         for r in sorted(results, key=lambda x: x.get('open_basis_p20') or 0, reverse=True)[:20]:
             logger.info(
                 f"{r['base_asset']:<10} "
-                f"{r.get('open_sample_count', 0) or 0:<7} "
+                f"{r.get('_open_sample_count', 0) or 0:<7} "
+                f"{str(r.get('open_basis_p10', '-')):<10} "
                 f"{str(r.get('open_basis_p20', '-')):<10} "
-                f"{str(r.get('open_basis_p30', '-')):<10} "
-                f"{r.get('close_sample_count', 0) or 0:<7} "
+                f"{r.get('_close_sample_count', 0) or 0:<7} "
+                f"{str(r.get('close_basis_p10', '-')):<10} "
                 f"{str(r.get('close_basis_p20', '-')):<10} "
-                f"{str(r.get('close_basis_p30', '-')):<10}"
             )
         if len(results) > 20:
             logger.info(f"  ... 省略 {len(results) - 20} 个标的")
