@@ -11,8 +11,8 @@ auth:
 trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
   # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
-  mode: virtual
-  # mode: live
+  # mode: virtual
+  mode: live
 
   # ─── 成交引擎 ───
   executor:
@@ -40,7 +40,7 @@ trade:
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
     min_funding_rate_bps: 0                # 24h资金费率下限(bps)，低于此值不开仓
-    max_orderbook_lag_ms: 500              # 临时放宽：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
+    max_orderbook_lag_ms: 200              # 临时放宽：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 开仓过滤 ───
   filter:
