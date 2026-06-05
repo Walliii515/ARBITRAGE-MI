@@ -5,6 +5,7 @@ Gate.io 永续合约 OBU WebSocket 客户端
 """
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -24,7 +25,8 @@ class GateFuturesOrderBookWS:
     """Gate.io 永续合约 OBU WebSocket 客户端（含自动重连）"""
 
     def __init__(self, settle='usdt', reconnect_enabled=True,
-                 reconnect_delay=3, max_reconnect_delay=60, connect_timeout=30):
+                 reconnect_delay=3, max_reconnect_delay=60, connect_timeout=30,
+                 subscribe_interval_sec=0.1, reconnect_jitter_sec=2.0):
         self.settle = settle
         self.ws_url = f"wss://fx-ws.gateio.ws/v4/ws/{settle}"
         self.ws = None
@@ -39,8 +41,12 @@ class GateFuturesOrderBookWS:
         self._reconnect_delay = reconnect_delay
         self._max_reconnect_delay = max_reconnect_delay
         self._connect_timeout = connect_timeout
+        self._subscribe_interval_sec = max(0.0, float(subscribe_interval_sec or 0.0))
+        self._reconnect_jitter_sec = max(0.0, float(reconnect_jitter_sec or 0.0))
         self._should_reconnect = False
         self._reconnect_thread: Optional[threading.Thread] = None
+        self._send_lock = threading.Lock()
+        self._last_control_send_at = 0.0
 
     def connect(self):
         """建立 WebSocket 连接"""
@@ -127,7 +133,6 @@ class GateFuturesOrderBookWS:
             return
         for sub in matches:
             self._send_unsubscribe(sub)
-            time.sleep(0.05)
             self._send_subscribe(sub)
 
     def set_update_callback(self, callback: Callable):
@@ -141,7 +146,7 @@ class GateFuturesOrderBookWS:
             "payload": [self._stream_name(sub['contract'], sub['level'])],
         }
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            self.ws.send(json.dumps(msg))
+            self._send_control_message(msg)
             log_print(f"✓ 已订阅 {sub['contract']} Gate OBU (level={sub['level']})")
         else:
             logger.warning("⚠ Gate OBU WebSocket 未连接，订阅将在连接建立后自动发送")
@@ -154,8 +159,22 @@ class GateFuturesOrderBookWS:
             "payload": [self._stream_name(sub['contract'], sub['level'])],
         }
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            self.ws.send(json.dumps(msg))
+            self._send_control_message(msg)
             log_print(f"✓ 已取消订阅 {sub['contract']} Gate OBU")
+
+    def _send_control_message(self, msg: Dict):
+        """按固定最小间隔发送 Gate 控制帧，避免订阅/退订瞬时打满。"""
+        with self._send_lock:
+            ws = self.ws
+            if not (ws and ws.sock and ws.sock.connected):
+                logger.warning("⚠ Gate OBU WebSocket 未连接，控制帧发送已跳过")
+                return
+            now = time.monotonic()
+            wait_sec = self._subscribe_interval_sec - (now - self._last_control_send_at)
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            ws.send(json.dumps(msg))
+            self._last_control_send_at = time.monotonic()
 
     def _on_open(self, ws):
         log_print("Gate OBU WebSocket 连接已建立")
@@ -230,8 +249,10 @@ class GateFuturesOrderBookWS:
         attempt = 0
         while self._should_reconnect:
             attempt += 1
-            logger.info(f'Gate OBU WS 重连尝试 #{attempt}，等待 {delay}s...')
-            time.sleep(delay)
+            jitter = random.uniform(0, self._reconnect_jitter_sec) if self._reconnect_jitter_sec > 0 else 0
+            wait_sec = delay + jitter
+            logger.info(f'Gate OBU WS 重连尝试 #{attempt}，等待 {wait_sec:.2f}s...')
+            time.sleep(wait_sec)
             if not self._should_reconnect:
                 break
             try:

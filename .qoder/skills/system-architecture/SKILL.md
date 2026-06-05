@@ -157,6 +157,54 @@ ETLTask(
 - `interval` 类型由 `_refresh_meta_loop()` 驱动（默认 15 分钟）
 - `daily` 类型由 `DailyScheduler` 守护线程在指定时刻执行
 
+### 3.6 关键交易路径隔离
+
+开仓、平仓、最终旁路风控是系统最高优先级路径，必须与前端查询、WebSocket 广播、报表统计、ETL 等辅助逻辑隔离。
+
+**当前保护层级**：
+
+```
+FastAPI / WebSocket / 前端查询
+        │
+        ├─ 普通 async 后台任务：广播、持仓推送、资金费、ETL
+        │
+        ├─ critical-open  专用单线程：开仓判断 + 开仓旁路风控 + 保证金开仓风控缓存刷新
+        │
+        └─ critical-close 专用单线程：自动平仓 + 平仓旁路风控 + 手动/一键平仓
+```
+
+**规则**：
+- 开仓和平仓关键路径不得直接运行在 FastAPI 事件循环中；同步 DB、HTTP、成交调用必须放入关键路径专用线程或独立进程。
+- 开仓和平仓各自使用 `max_workers=1` 串行执行，防止上一轮未完成时下一轮叠加。
+- 保证金开仓风控缓存与开仓判断共用同一个 `critical-open`，避免并发读写 `_holding_liq_distance` 等状态。
+- 手动平仓、一键平仓与自动平仓共用 `critical-close`，避免并发操作同一个 `ClosingExecutor`。
+- 关键路径超过 1000ms 必须记录 warning 日志，作为排查 DB、盘口服务、成交引擎延迟的入口。
+
+**进一步演进方向**：
+- 若线程级隔离仍无法满足延迟要求，将开仓/平仓拆为独立交易守护进程。
+- 交易守护进程只消费盘口服务、元数据缓存、成交引擎，不承载前端 REST/WS。
+- 前端服务仅查询和展示，不参与交易决策调度。
+
+### 3.7 交易所 WS 订阅保护
+
+WS 订阅和重连属于交易所限流敏感路径，必须防止启动风暴、重连风暴和批量重订阅冲突。
+
+**Binance Spot**：
+- 使用组合流 URL 按 `orderbook.binance_ws_shards` 分片订阅。
+- `binance_ws_speed` 保持 `100ms`，不得为了降低订阅压力改成 `1000ms`；该配置控制行情推送频率，不控制订阅速度。
+
+**Gate Futures OBU**：
+- 使用 `orderbook.gate_ws_shards` 分片连接。
+- 每个 WS 客户端内部必须对 subscribe/unsubscribe 控制帧做最小发送间隔控制。
+- 自动重连必须带随机 jitter，避免多个分片按同一退避节奏同时重连。
+- OBU 缺口触发的重订阅必须进入单 worker 队列，同一合约去重，禁止每个合约各自起线程并发重订阅。
+
+**相关配置**：
+- `orderbook.gate_subscribe_interval_ms`
+- `orderbook.gate_reconnect_jitter_sec`
+- `orderbook.gate_ws_shards`
+- `orderbook.binance_ws_shards`
+
 ---
 
 ## 4. 编码规范
@@ -272,6 +320,9 @@ Gate WS ─────┘           │
 - [ ] **异常处理**：所有 I/O 操作用 `try/except` 包裹并记录日志
 - [ ] **定时任务**：通过 `ETL_TASKS` 注册表管理，不在 `orderbook_server.py` 内联
 - [ ] **虚实分离**：涉及交易执行的功能通过 `ExecutorClient` 调用
+- [ ] **关键路径隔离**：开仓/平仓/旁路风控不得直接运行在 FastAPI 事件循环中
+- [ ] **串行保护**：开仓、平仓各自单线程串行，禁止同一关键路径并发叠加
+- [ ] **WS 限流保护**：新增订阅/重连逻辑必须有分片、节流、jitter、去重
 
 ---
 
@@ -296,6 +347,11 @@ Gate WS ─────┘           │
 |------|------|--------|
 | `orderbook.settle` | 结算币种 | `usdt` |
 | `orderbook.broadcast_throttle_sec` | 广播节流间隔 | `1.0` |
+| `orderbook.gate_ws_shards` | Gate OBU WS 分片数 | `5` |
+| `orderbook.gate_subscribe_interval_ms` | Gate 订阅/退订控制帧最小间隔 | `100` |
+| `orderbook.gate_reconnect_jitter_sec` | Gate 自动重连随机抖动上限 | `2.0` |
+| `orderbook.binance_ws_shards` | Binance Spot WS 分片数 | `5` |
+| `orderbook.binance_ws_speed` | Binance Partial Depth 推送频率 | `100ms` |
 | `trade.executor.url` | 成交引擎地址 | `http://localhost:8081` |
 | `trade.open_amount_usdt` | 开仓金额 | `500` |
 | `trade.fee.*` | 手续费率 | `0.00075` |
@@ -313,8 +369,8 @@ Gate WS ─────┘           │
 
 | 交易所 | 模块 | 常量 | 值 | 约束原因 |
 |---------|------|------|-----|----------|
-| Gate Futures | `create_gate_futures_local_orderbook.py` | `FREQUENCY` | `'100ms'` | 实盘开仓依赖低延迟盘口，1000ms 延迟会导致滑点过大 |
-| Binance Spot | `create_binance_spot_local_orderbook.py` | `SPEED` | `'100ms'` | 同上，VWAP 基差计算需要实时性 |
+| Gate Futures | `create_gate_futures_local_orderbook.py` | `gate_obu_level=50` | OBU 推送 | 实盘开仓依赖低延迟盘口，降频会导致旁路风控误判行情滞后 |
+| Binance Spot | `create_binance_spot_local_orderbook.py` | `binance_ws_speed` | `'100ms'` | VWAP 基差计算和新鲜度风控需要实时性 |
 
 **禁止操作**：
 - ✗ 将频率降为 `1000ms` 以降低 CPU
@@ -324,35 +380,44 @@ Gate WS ─────┘           │
 - ✓ 广播节流（`broadcast_throttle_sec`）
 - ✓ 计算结果缓存（merge + hedge_metrics 缓存）
 - ✓ 定时轮询替代逐消息回调
+- ✓ WS 分片（`gate_ws_shards` / `binance_ws_shards`）
+- ✓ Gate 控制帧限速（`gate_subscribe_interval_ms`）
+- ✓ Gate 重连 jitter（`gate_reconnect_jitter_sec`）
 
-### 9.2 开仓热路径零 IO 约束
+### 9.2 交易关键路径受控 IO 与隔离约束
 
-> `_open_position_loop`（0.5s 间隔）是系统最关键的延迟敏感路径，**必须保持纯内存操作 + 下单**。
+> 开仓、平仓、最终旁路风控是系统最关键的延迟敏感路径。原则不是“绝对零 IO”，而是：**必要 IO 受控、串行、可观测，并与前端/API/广播隔离**。
 
-**热路径允许的操作**：
+**关键路径允许的操作**：
 - ✓ 读取内存 OrderBook（`gate_manager.to_records()` / `spot_manager.to_records()`）
 - ✓ 纯计算（merge、hedge_metrics、enrich_trading_fields）
 - ✓ 读取内存风控状态（`_holding_liq_distance`、`_peak_state`）
-- ✓ 调用 ExecutorClient 下单（唯一允许的网络 IO）
-- ✓ 下单成功后持久化订单（非阻塞关键路径，已在执行结果返回后）
+- ✓ 读取盘口服务 HTTP 快照（必须设置短 timeout，并记录慢调用）
+- ✓ 最终旁路风控读取单标的最新盘口
+- ✓ 调用 `ExecutorClient` 下单（必须设置 timeout）
+- ✓ 下单结果持久化订单/持仓/信号（必须有索引和慢日志）
 
-**热路径禁止的操作**：
-- ✗ 数据库查询（如 `get_holding_positions()`、`get_all_positions()`）
-- ✗ REST API 调用（如实时获取费率、余额查询）
-- ✗ 文件 IO、日志落盘（`logger.info` 允许，但不可做同步文件写入阻塞）
-- ✗ 任何 `time.sleep()` 或同步阻塞等待
+**关键路径禁止的操作**：
+- ✗ 前端分页查询、报表统计、历史信号列表刷新
+- ✗ 大范围 DB 扫描、无索引查询、`SELECT *` 全表统计
+- ✗ 与交易决策无关的 REST API 调用（余额、报表、历史分析）
+- ✗ 在 FastAPI 事件循环里直接执行同步 DB/HTTP/成交调用
+- ✗ 任何无上限等待、无 timeout 的网络/数据库操作
 
 **分频架构**：将不同实时性需求的逻辑拆分为独立循环
 
-| 循环 | 频率 | 操作类型 | 数据来源 |
-|------|------|----------|----------|
-| `_open_position_loop` | 0.5s | **纯内存 + 下单** | 无缓存直读 OrderBook |
-| `_margin_status_loop` | 5s | DB 查询 + PnL 计算 | 带缓存合并数据 |
-| `_close_position_loop` | 5s | DB 查询 + 平仓判断 | 带缓存合并数据 |
-| `_position_realtime_push` | 5s | DB 查询 + 前端推送 | 带缓存合并数据 |
-| `_orderbook_broadcast_loop` | 1s | 序列化 + 前端推送 | 带缓存合并数据 |
+| 循环 | 线程/执行域 | 操作类型 | 数据来源 |
+|------|-------------|----------|----------|
+| `_open_position_loop` | `critical-open` 单线程 | 开仓判断 + 开仓旁路风控 + 下单 | 最新盘口快照 |
+| `_margin_status_loop` | `critical-open` 单线程 | 保证金开仓风控缓存刷新 | DB + 带缓存合并数据 |
+| `_close_position_loop` | `critical-close` 单线程 | 平仓判断 + 平仓旁路风控 + 下单 | DB + 带缓存合并数据 |
+| 手动/一键平仓 | `critical-close` 单线程 | 跳过条件的人工平仓 | 最新盘口快照 |
+| `_position_realtime_push` | 普通 async 任务 | DB 查询 + 前端推送 | 带缓存合并数据 |
+| `_orderbook_broadcast_loop` | 普通 async 任务 | 序列化 + 前端推送 | 带缓存合并数据 |
 
 **设计原则**：
-1. 凡不影响开仓决策实时性的逻辑（保证金状态、持仓推送、前端广播），**必须独立为低频循环**
-2. 开仓热路径的风控状态（如距爆仓距离）由低频循环预计算并写入内存，热路径仅**读取**
-3. 新增开仓前置检查时，若涉及 IO 操作，应在进入峰值监控时（首次触发）执行一次，而非每次循环执行
+1. 凡不影响交易决策实时性的逻辑（前端广播、历史查询、报表统计），必须留在普通任务，不能进入关键线程。
+2. 关键线程内部必须串行执行，不允许同一路径并发叠加。
+3. 新增开仓/平仓前置检查时，优先使用内存缓存；若必须 IO，必须有 timeout、慢日志、索引和降级策略。
+4. 关键路径耗时超过 1000ms 必须打 warning，便于定位 DB、盘口服务或成交引擎卡顿。
+5. 若线程级隔离后仍出现秒级延迟，应升级为独立交易守护进程。

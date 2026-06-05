@@ -1,7 +1,7 @@
 # coding: utf-8
 """
 Binance 现货订单簿 WebSocket 客户端
-接收 Partial Book Depth Streams（@depth5@100ms）快照数据
+接收 Partial Book Depth Streams（@depth20@100ms）快照数据
 使用 data-stream.binance.vision 避免地区限制
 """
 import json
@@ -200,7 +200,7 @@ class BinanceSpotOrderBookWS:
 
         组合流格式:
         {
-            "stream": "btcusdt@depth5@100ms",
+            "stream": "btcusdt@depth20@100ms",
             "data": {
                 "lastUpdateId": 1234567890,
                 "bids": [["price", "qty"], ...],
@@ -312,7 +312,7 @@ class BinanceSpotOrderBookWS:
 
 def run_ws_client():
     """运行 WebSocket 客户端示例"""
-    client = BinanceSpotOrderBookWS(level=5, speed='100ms')
+    client = BinanceSpotOrderBookWS(level=20, speed='100ms')
 
     def on_update(symbol, update_data):
         log_print(f"\n{'='*80}")

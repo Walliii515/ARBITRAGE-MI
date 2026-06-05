@@ -15,6 +15,11 @@ from common.logger import get_logger
 logger = get_logger(__name__)
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps, calc_open_fee_bps
 from calc.executor_client import ExecutorClient
+from calc.orderbook_resiliency import (
+    BookSideSpec,
+    OrderBookResiliencyMonitor,
+    ResiliencyConfig,
+)
 from exchange_apis.get_gate_future_contracts import get_single_contract_funding_rate
 
 
@@ -62,6 +67,16 @@ class TradingExecutorConfig:
 
     # ─── 风险缓释 ───
     risk_relief_bps: float = 10.0
+
+    # ─── 盘口恢复确认 ───
+    resiliency_enabled: bool = True
+    resiliency_window_sec: float = 3.0
+    resiliency_min_samples: int = 5
+    resiliency_min_recovery_ratio: float = 0.65
+    resiliency_max_spread_widen_bps: float = 8.0
+    resiliency_max_basis_volatility_bps: float = 6.0
+    resiliency_min_hold_sec: float = 0.8
+    resiliency_max_wait_sec: float = 3.0
 
 
 class TradingExecutor:
@@ -145,6 +160,26 @@ class TradingExecutor:
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
+
+        self._open_resiliency = OrderBookResiliencyMonitor(
+            ResiliencyConfig(
+                enabled=cfg.resiliency_enabled,
+                window_sec=cfg.resiliency_window_sec,
+                min_samples=cfg.resiliency_min_samples,
+                min_recovery_ratio=cfg.resiliency_min_recovery_ratio,
+                max_spread_widen_bps=cfg.resiliency_max_spread_widen_bps,
+                max_basis_volatility_bps=cfg.resiliency_max_basis_volatility_bps,
+                min_hold_sec=cfg.resiliency_min_hold_sec,
+                max_wait_sec=cfg.resiliency_max_wait_sec,
+                allow_timeout_pass=False,
+            ),
+            [
+                BookSideSpec('spot', 'ask', 1.0, 'spot_ask'),
+                BookSideSpec('future', 'bid', 1.0, 'future_bid', '_future_qty_multiplier'),
+            ],
+            ['spot_open_coverage', 'future_open_coverage'],
+            'open',
+        )
     
     def set_orderbook_managers(self, gate_manager, spot_manager):
         """
@@ -219,8 +254,6 @@ class TradingExecutor:
             开仓结果列表
         """
         results = []
-        # 记录本轮风控通过的标的，用于清理已不满足条件的峰值状态
-        risk_passed_assets = set()
 
         # 每轮开始时从 DB 实时刷新持仓数量计数（DB 作为单一真理源），
         # 避免依赖 5s 间隔的 margin_loop 导致计数滞后被高频检查穿透。
@@ -239,6 +272,7 @@ class TradingExecutor:
                     # 数据不完整时清除峰值状态，避免数据恢复后误触发超时开仓
                     self._resolve_signal(base_asset, 'conditions_lost', '数据不完整(盘口中断)')
                     self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
                     continue
                                 
                 # 1. 风控检查
@@ -251,9 +285,8 @@ class TradingExecutor:
                         exit_basis_bps=float(current_basis) if current_basis is not None else None
                     )
                     self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
                     continue
-                                
-                risk_passed_assets.add(base_asset)
                                 
                 # 2. 冷却检查
                 if not self._pass_cooldown_check(base_asset):
@@ -268,8 +301,17 @@ class TradingExecutor:
                     continue
                                 
                 # 3. 峰值回落 + sustain 确认（单通道）
+                self._annotate_resiliency_row(row)
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
+                self._open_resiliency.observe_shock(base_asset, row)
                 if not self._pass_peak_check(base_asset, open_vwap_basis, row):
+                    if base_asset not in self._peak_state:
+                        self._open_resiliency.clear(base_asset)
+                    continue
+
+                # 3.2 盘口恢复确认：pullback 通过后进入 RESILIENCY_WAIT，
+                # 后续循环持续采样恢复质量，不再反复要求 pullback 条件成立。
+                if not self._pass_open_resiliency_check(base_asset, row, open_vwap_basis):
                     continue
                                 
                 # 3.5 最终风控旁路：单标的最短链路重新校验（拦截信号过期场景）
@@ -287,6 +329,7 @@ class TradingExecutor:
                         trigger_type=peak_state.get('trigger')
                     )
                     self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
                     logger.info(
                         f"最终风控旁路拦截 | {base_asset} | "
                         f"gate_basis={gate_basis}bps | 原因: {gate_reason}"
@@ -337,6 +380,7 @@ class TradingExecutor:
                 
                 # 开仓后清除峰值状态（trigger 仅可能为 'pullback'，超时分支已在 _pass_peak_check 内放弃）
                 self._peak_state.pop(base_asset, None)
+                self._open_resiliency.clear(base_asset)
                 
                 results.append({
                     'base_asset': base_asset,
@@ -367,6 +411,47 @@ class TradingExecutor:
                 })
         
         return results
+
+    def _annotate_resiliency_row(self, row: Dict) -> None:
+        """Attach per-asset contract multiplier for shared depth calculations."""
+        base_asset = row.get('base_asset', '')
+        row['_future_qty_multiplier'] = self._get_quanto_multiplier(base_asset)
+
+    def _pass_open_resiliency_check(self, base_asset: str, row: Dict, open_vwap_basis: float) -> bool:
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        min_basis = threshold_data.get('p20', self.basis_threshold_bps)
+        result = self._open_resiliency.check(
+            base_asset,
+            row,
+            basis_bps=open_vwap_basis,
+            coverage_threshold=self.coverage_threshold,
+            min_basis_bps=float(min_basis) if min_basis is not None else None,
+        )
+        m = result.metrics
+        metric_text = (
+            f"recovery={m.get('recovery_ratio', 0):.2f} | "
+            f"drop={m.get('shock_drop_ratio', 0):.2f} | "
+            f"basis_vol={m.get('basis_volatility_bps', 0):.1f}bps | "
+            f"spread_widen={m.get('max_spread_widen_bps', 0):.1f}bps | "
+            f"coverage={m.get('coverage')}"
+        )
+        if result.passed:
+            logger.info(f"开仓盘口恢复通过 | {base_asset} | {metric_text}")
+            return True
+        if result.terminal:
+            self._resolve_signal(
+                base_asset,
+                'gate_rejected',
+                f'resiliency:{result.reason}|{metric_text}',
+                exit_basis_bps=open_vwap_basis,
+                trigger_type='pullback',
+            )
+            self._peak_state.pop(base_asset, None)
+            self._open_resiliency.clear(base_asset)
+            logger.info(f"开仓盘口恢复终止 | {base_asset} | reason={result.reason} | {metric_text}")
+            return False
+        logger.info(f"开仓盘口恢复等待 | {base_asset} | reason={result.reason} | {metric_text}")
+        return False
     
     def _pass_risk_check(self, row: Dict) -> bool:
         """
@@ -652,7 +737,9 @@ class TradingExecutor:
         - 监控超时(elapsed ≥ monitor_timeout_sec): 基差长期不回落，放弃本轮 + resolve 信号为
           'monitor_timeout' + 进入 timeout_cooldown_sec 冷却, 返回 False（不开劣质单）
         - 从峰值回落 ≥ pullback_pct，且 elapsed ≥ sustain_sec:
-          返回 True (trigger='pullback')；达不到 sustain 要求时仅返回 False 等待（不重置）。
+          设置 trigger='pullback' + resiliency_active=True，进入盘口恢复等待。
+        - resiliency_active 后续轮次：直接返回 True，让恢复检查持续采样；
+          不再反复要求当前 basis 仍满足 pullback 形态。
         """
         now = datetime.now()
         state = self._peak_state.get(base_asset)
@@ -679,6 +766,9 @@ class TradingExecutor:
             )
             return False
 
+        if state.get('resiliency_active'):
+            return True
+
         # 更新峰值
         if current_basis_bps > state['peak_bps']:
             state['peak_bps'] = current_basis_bps
@@ -695,6 +785,7 @@ class TradingExecutor:
                 trigger_type='monitor_timeout',
             )
             self._peak_state.pop(base_asset, None)
+            self._open_resiliency.clear(base_asset)
             self._timeout_cooldown_until[base_asset] = now + timedelta(seconds=self.peak_timeout_cooldown_sec)
             logger.info(
                 f"峰值监控超时放弃 | {base_asset} | "
@@ -714,8 +805,10 @@ class TradingExecutor:
         
         # 持续时间 + 回落均达标，确认开仓
         state['trigger'] = 'pullback'
+        state['resiliency_active'] = True
+        state['resiliency_start_time'] = now
         logger.info(
-            f"峰值回落确认，执行开仓 | {base_asset} | "
+            f"峰值回落确认，进入盘口恢复等待 | {base_asset} | "
             f"peak={state['peak_bps']:.2f}bps | current={current_basis_bps:.2f}bps | "
             f"sustained={elapsed_sec:.1f}s≥{self.sustain_sec}s | pullback={self.peak_pullback_pct*100:.0f}% | "
             f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"

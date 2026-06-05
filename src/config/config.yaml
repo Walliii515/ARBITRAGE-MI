@@ -11,8 +11,8 @@ auth:
 trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
   # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
-  # mode: virtual
-  mode: live
+  mode: virtual
+  # mode: live
 
   # ─── 成交引擎 ───
   executor:
@@ -40,7 +40,7 @@ trade:
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
     min_funding_rate_bps: 0                # 24h资金费率下限(bps)，低于此值不开仓
-    max_orderbook_lag_ms: 200               # 旁路风控新鲜度硬约束：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
+    max_orderbook_lag_ms: 500              # 临时放宽：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 开仓过滤 ───
   filter:
@@ -58,6 +58,17 @@ trade:
     monitor_timeout_sec: 60                 # 监控超时（秒），超时后直接放弃
     timeout_cooldown_sec: 300               # 超时冷却期（秒），超时放弃后，基差大概率仍在 p20 之上。没有冷却的话，下一个 0.2s 循环会立刻检测到"基差 ≥ p20"，于是重新进入峰值监控状态机，
 
+  # ─── 开仓盘口恢复确认 ───
+  resiliency:
+    enabled: true
+    window_sec: 3.0                         # 最近窗口内观察盘口恢复
+    min_samples: 5                          # 窗口内最少样本数
+    min_recovery_ratio: 0.65                # 被冲击侧深度需恢复到监控起点的比例
+    max_spread_widen_bps: 8                 # spot/future 买卖价差相对窗口起点最大扩大
+    max_basis_volatility_bps: 6             # 窗口内开仓基差最大波动
+    min_hold_sec: 0.8                       # 恢复条件连续满足时长
+    max_wait_sec: 3.0                       # 等待恢复超时后放弃本轮信号
+
   # ─── 平仓策略 ───
   close:
     check_interval_sec: 0.2                 # 平仓检查间隔（秒）；与开仓对称
@@ -74,6 +85,19 @@ trade:
   valley_rebound:
     rebound_pct: 0.10                       # 从谷底反弹百分比(10%)确认平仓
     monitor_timeout_sec: 60                 # 监控超时（秒），超时后直接平仓
+
+  # ─── 止盈平仓盘口恢复确认 ───
+  close_resiliency:
+    enabled: true
+    window_sec: 1.5
+    min_samples: 3
+    min_recovery_ratio: 0.55
+    max_spread_widen_bps: 10
+    max_basis_volatility_bps: 8
+    max_basis_rebound_bps: 8                # 等待恢复期间平仓基差允许回弹上限
+    min_hold_sec: 0.3
+    max_wait_sec: 1.5                       # 止盈平仓等待超时后交给最终旁路判定，不无限等待
+    coverage_threshold: 0.6
 
   # ─── VWAP基差阈值 ───
   vwap:
@@ -126,6 +150,10 @@ orderbook:
   gate_obu_level: 50
   # Gate WS 建连等待时间；高延迟网络下需要比默认 8 秒更宽松
   gate_ws_connect_timeout_sec: 30
+  # Gate 订阅/退订控制帧最小发送间隔（毫秒），覆盖启动订阅、重连补订阅和缺口重订阅
+  gate_subscribe_interval_ms: 100
+  # Gate WS 自动重连随机抖动上限（秒），避免多个分片同频重连
+  gate_reconnect_jitter_sec: 2.0
   # Binance Spot WS 连接分片数；若 max_contracts=250 且 speed=100ms，建议设为 5
   binance_ws_shards: 5
   # Binance Partial Depth 推送频率，可选: 100ms / 1000ms

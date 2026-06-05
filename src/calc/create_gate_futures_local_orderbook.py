@@ -10,6 +10,7 @@ Gate.io 永续合约本地订单簿管理器
 import json
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -40,6 +41,15 @@ def get_gate_obu_level() -> int:
 
 def get_gate_ws_connect_timeout() -> int:
     return max(8, config.get_int('orderbook.gate_ws_connect_timeout_sec', 30))
+
+
+def get_gate_subscribe_interval_sec() -> float:
+    interval_ms = config.get_float('orderbook.gate_subscribe_interval_ms', 100.0)
+    return max(0.0, interval_ms / 1000.0)
+
+
+def get_gate_reconnect_jitter_sec() -> float:
+    return max(0.0, config.get_float('orderbook.gate_reconnect_jitter_sec', 2.0))
 
 
 def get_orderbook_stale_timeout() -> float:
@@ -200,12 +210,17 @@ class OrderBookManager:
         self.lock = threading.Lock()
         self._resubscribe_lock = threading.Lock()
         self._resubscribe_inflight = set()
+        self._resubscribe_queue: "queue.Queue[str]" = queue.Queue()
+        self._resubscribe_worker_thread: Optional[threading.Thread] = None
+        self._resubscribe_stop_event = threading.Event()
         self._broadcast_callbacks: List[Callable[[], None]] = []
 
     def _build_ws_client(self) -> GateFuturesOrderBookWS:
         client = GateFuturesOrderBookWS(
             settle=self.settle,
             connect_timeout=get_gate_ws_connect_timeout(),
+            subscribe_interval_sec=get_gate_subscribe_interval_sec(),
+            reconnect_jitter_sec=get_gate_reconnect_jitter_sec(),
         )
 
         def on_update(contract, update_data):
@@ -270,8 +285,28 @@ class OrderBookManager:
             if contract in self._resubscribe_inflight:
                 return
             self._resubscribe_inflight.add(contract)
+            self._ensure_resubscribe_worker_locked()
 
-        def _worker():
+        self._resubscribe_queue.put(contract)
+
+    def _ensure_resubscribe_worker_locked(self) -> None:
+        if self._resubscribe_worker_thread and self._resubscribe_worker_thread.is_alive():
+            return
+        self._resubscribe_stop_event.clear()
+        self._resubscribe_worker_thread = threading.Thread(
+            target=self._resubscribe_worker,
+            name="gate-obu-resubscribe-worker",
+            daemon=True,
+        )
+        self._resubscribe_worker_thread.start()
+
+    def _resubscribe_worker(self) -> None:
+        while not self._resubscribe_stop_event.is_set():
+            try:
+                contract = self._resubscribe_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
             try:
                 client = self._contract_ws_clients.get(contract)
                 if client:
@@ -279,8 +314,7 @@ class OrderBookManager:
             finally:
                 with self._resubscribe_lock:
                     self._resubscribe_inflight.discard(contract)
-
-        threading.Thread(target=_worker, name=f"gate-obu-resub-{contract}", daemon=True).start()
+                self._resubscribe_queue.task_done()
 
     def add_contract(self, contract: str):
         """添加合约并订阅 OBU；等待 WS full 快照填充盘口。"""
@@ -350,11 +384,20 @@ class OrderBookManager:
         self.ws_client = None
 
     def shutdown(self):
+        self._resubscribe_stop_event.set()
+        if self._resubscribe_worker_thread and self._resubscribe_worker_thread.is_alive():
+            self._resubscribe_worker_thread.join(timeout=2)
         self.stop_ws()
         with self.lock:
             self.orderbooks.clear()
         with self._resubscribe_lock:
             self._resubscribe_inflight.clear()
+        while True:
+            try:
+                self._resubscribe_queue.get_nowait()
+                self._resubscribe_queue.task_done()
+            except queue.Empty:
+                break
 
     def subscribe_all(
         self,

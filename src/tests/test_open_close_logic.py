@@ -4,13 +4,13 @@
 
 覆盖目标：
   TradingExecutor:
-    - _check_update_count_freshness（uc 闸通用）
-    - _pass_peak_check（首次/更新峰值/超时/未回落/sustain不足/uc不足/通过）
-    - _pre_execution_gate（manager未注入/lag拦截/uc闸拦截/基差衰减/盈利性守卫/覆盖超限/通过）
+    - _pass_peak_check（首次/更新峰值/超时/未回落/sustain不足/通过）
+    - _pass_open_resiliency_check（盘口恢复等待/通过/超时拒绝）
+    - _pre_execution_gate（manager未注入/lag拦截/基差衰减/盈利性守卫/覆盖超限/通过）
   ClosingExecutor:
-    - _check_update_count_freshness（uc 闸通用）
     - _pass_valley_check（首次/更新谷底/超时通过/谷底>=open异常通过/反弹通过/未达标）
-    - _pre_execution_gate（manager未注入/lag拦截/uc闸拦截/收敛逆转/回弹过大/通过）
+    - _pass_close_resiliency_check（止盈平仓盘口恢复等待/超时放行）
+    - _pre_execution_gate（manager未注入/lag拦截/收敛逆转/回弹过大/通过）
 
 设计原则：
   1) 直接构造对象、注入 fake manager，避免起服务
@@ -244,13 +244,25 @@ class TestTradingExecutorPeakCheck(unittest.TestCase):
         self.assertIn('BTC', self.te._peak_state)
 
     def test_full_pass_returns_true(self):
-        """回落 + sustain 达标 → 通过，trigger=pullback"""
+        """回落 + sustain 达标 → 进入 resiliency_active，trigger=pullback"""
         self.te._pass_peak_check('BTC', 100.0, self.row)
         self.te._peak_state['BTC']['start_time'] = datetime.now() - timedelta(seconds=3)
 
         ret = self.te._pass_peak_check('BTC', 90.0, self.row)
         self.assertTrue(ret)
         self.assertEqual(self.te._peak_state['BTC']['trigger'], 'pullback')
+        self.assertTrue(self.te._peak_state['BTC']['resiliency_active'])
+
+    def test_resiliency_active_keeps_sampling_after_basis_rebounds(self):
+        """进入盘口恢复等待后，不再反复要求 pullback 条件成立"""
+        self.te._pass_peak_check('BTC', 100.0, self.row)
+        self.te._peak_state['BTC']['start_time'] = datetime.now() - timedelta(seconds=3)
+        self.assertTrue(self.te._pass_peak_check('BTC', 90.0, self.row))
+
+        # basis 反弹到 pullback 阈值上方，仍应继续交给 resiliency 采样。
+        ret = self.te._pass_peak_check('BTC', 99.0, self.row)
+        self.assertTrue(ret)
+        self.assertTrue(self.te._peak_state['BTC']['resiliency_active'])
 
     def test_monitor_timeout_resolves_and_cools(self):
         """监控超时（elapsed ≥ 60s）→ 不开单 + 进入 timeout_cooldown，状态清除"""
@@ -391,6 +403,160 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         gate_lag, spot_lag = self.te._last_orderbook_lag_ms['BTC']
         self.assertAlmostEqual(gate_lag, 50, delta=30)
         self.assertAlmostEqual(spot_lag, 60, delta=30)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Shared resiliency monitor 测试
+# ══════════════════════════════════════════════════════════════════
+
+class TestOrderBookResiliencyMonitor(unittest.TestCase):
+    """共享盘口恢复状态机。"""
+
+    def _row(self, future_bid_qty=10, future_ask_qty=10, spot_ask_qty=10,
+             spot_bid_qty=10, basis=50.0, open_cov=0.4, close_cov=0.4):
+        row = {
+            'open_vwap_basis_bps': basis,
+            'close_vwap_basis_bps': basis,
+            'spot_open_coverage': open_cov,
+            'future_open_coverage': open_cov,
+            'spot_close_coverage': close_cov,
+            'future_close_coverage': close_cov,
+            '_future_qty_multiplier': 1.0,
+        }
+        for i in range(1, 21):
+            row[f'spot_price_bid_{i}'] = 99.0
+            row[f'spot_volume_bid_{i}'] = spot_bid_qty
+            row[f'spot_price_ask_{i}'] = 100.0
+            row[f'spot_volume_ask_{i}'] = spot_ask_qty
+            row[f'future_price_bid_{i}'] = 101.0
+            row[f'future_volume_bid_{i}'] = future_bid_qty
+            row[f'future_price_ask_{i}'] = 102.0
+            row[f'future_volume_ask_{i}'] = future_ask_qty
+        return row
+
+    def test_open_resiliency_waits_until_depth_recovers(self):
+        from calc.orderbook_resiliency import (
+            BookSideSpec, OrderBookResiliencyMonitor, ResiliencyConfig
+        )
+
+        monitor = OrderBookResiliencyMonitor(
+            ResiliencyConfig(min_samples=2, min_hold_sec=0, max_wait_sec=5),
+            [
+                BookSideSpec('spot', 'ask', 1.0, 'spot_ask'),
+                BookSideSpec('future', 'bid', 1.0, 'future_bid', '_future_qty_multiplier'),
+            ],
+            ['spot_open_coverage', 'future_open_coverage'],
+            'open',
+        )
+
+        monitor.observe_shock('BTC', self._row(future_bid_qty=10))
+        monitor.observe_shock('BTC', self._row(future_bid_qty=3))
+        waiting = monitor.check('BTC', self._row(future_bid_qty=4), 50, 0.6, min_basis_bps=20)
+        monitor.check('BTC', self._row(future_bid_qty=8), 51, 0.6, min_basis_bps=20)
+        passed = monitor.check('BTC', self._row(future_bid_qty=8), 51, 0.6, min_basis_bps=20)
+
+        self.assertFalse(waiting.passed)
+        self.assertTrue(waiting.waiting)
+        self.assertTrue(passed.passed)
+        self.assertGreaterEqual(passed.metrics['recovery_ratio'], 0.65)
+
+    def test_open_resiliency_timeout_is_terminal(self):
+        from calc.orderbook_resiliency import (
+            BookSideSpec, OrderBookResiliencyMonitor, ResiliencyConfig
+        )
+
+        monitor = OrderBookResiliencyMonitor(
+            ResiliencyConfig(min_samples=1, min_recovery_ratio=0.9, max_wait_sec=0.01),
+            [BookSideSpec('future', 'bid', 1.0, 'future_bid', '_future_qty_multiplier')],
+            ['future_open_coverage'],
+            'open',
+        )
+        monitor.observe_shock('BTC', self._row(future_bid_qty=10))
+        monitor.observe_shock('BTC', self._row(future_bid_qty=2))
+        monitor.check('BTC', self._row(future_bid_qty=3), 50, 0.6, min_basis_bps=20)
+        time.sleep(0.02)
+        result = monitor.check('BTC', self._row(future_bid_qty=3), 50, 0.6, min_basis_bps=20)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(result.terminal)
+        self.assertIn('timeout', result.reason)
+
+    def test_close_resiliency_timeout_can_pass_to_gate(self):
+        from calc.orderbook_resiliency import (
+            BookSideSpec, OrderBookResiliencyMonitor, ResiliencyConfig
+        )
+
+        monitor = OrderBookResiliencyMonitor(
+            ResiliencyConfig(
+                min_samples=1, min_recovery_ratio=0.9, max_wait_sec=0.01,
+                allow_timeout_pass=True,
+            ),
+            [BookSideSpec('future', 'ask', 1.0, 'future_ask', '_future_qty_multiplier')],
+            ['future_close_coverage'],
+            'close',
+        )
+        monitor.observe_shock('BTC', self._row(future_ask_qty=10))
+        monitor.observe_shock('BTC', self._row(future_ask_qty=2))
+        monitor.check('BTC', self._row(future_ask_qty=3), 20, 0.6, max_basis_bps=100)
+        time.sleep(0.02)
+        result = monitor.check('BTC', self._row(future_ask_qty=3), 20, 0.6, max_basis_bps=100)
+
+        self.assertTrue(result.passed)
+        self.assertIn('timeout_pass', result.reason)
+
+
+class TestTradingExecutorOpenFlowResiliency(unittest.TestCase):
+    """开仓主流程里的 RESILIENCY_WAIT 持续采样。"""
+
+    def _row(self, basis):
+        row = {
+            'base_asset': 'BTC',
+            'contract': 'BTC_USDT',
+            'symbol': 'BTCUSDT',
+            'spot_qty': 1.0,
+            'open_vwap_basis_bps': basis,
+            'spot_open_coverage': 0.1,
+            'future_open_coverage': 0.1,
+            'open_coverage': 0.1,
+            'funding_rate_24h': 0.001,
+        }
+        for i in range(1, 21):
+            row[f'spot_price_bid_{i}'] = 99.0
+            row[f'spot_volume_bid_{i}'] = 10.0
+            row[f'spot_price_ask_{i}'] = 100.0
+            row[f'spot_volume_ask_{i}'] = 10.0
+            row[f'future_price_bid_{i}'] = 101.0
+            row[f'future_volume_bid_{i}'] = 10.0
+            row[f'future_price_ask_{i}'] = 102.0
+            row[f'future_volume_ask_{i}'] = 10.0
+        return row
+
+    def test_pullback_enters_resiliency_wait_and_keeps_sampling(self):
+        te = make_trading_executor(
+            sustain_sec=0.0,
+            peak_pullback_pct=0.10,
+            basis_threshold_bps=20,
+            coverage_threshold=0.8,
+            vwap_threshold_meta={'BTC': {'p20': 20}},
+            close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
+        )
+        te._refresh_holding_count_from_db = MagicMock()
+        te._load_open_cooldown_from_db = MagicMock()
+        te._verify_realtime_funding_rate = MagicMock(return_value=True)
+        te._create_signal = MagicMock(return_value=1001)
+        te._resolve_signal = MagicMock()
+        te._pass_open_resiliency_check = MagicMock(return_value=False)
+
+        te.check_and_open([self._row(100.0)])
+        self.assertFalse(te._pass_open_resiliency_check.called)
+
+        te.check_and_open([self._row(90.0)])
+        self.assertEqual(te._pass_open_resiliency_check.call_count, 1)
+        self.assertTrue(te._peak_state['BTC']['resiliency_active'])
+
+        # basis 反弹到 pullback 阈值上方；仍应继续跑 resiliency，而不是回到 peak 等待。
+        te.check_and_open([self._row(99.0)])
+        self.assertEqual(te._pass_open_resiliency_check.call_count, 2)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -632,6 +798,7 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
             patch.object(self.ce, '_check_funding_count', return_value=False),
             patch.object(self.ce, '_check_take_profit', return_value=True),
             patch.object(self.ce, '_pass_valley_check', return_value=True),
+            patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
             patch.object(self.ce, '_execute_close', execute_mock),
             m_merge, m_hedge, m_vwap,
         ):

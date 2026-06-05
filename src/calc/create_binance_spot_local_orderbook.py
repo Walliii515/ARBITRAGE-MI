@@ -66,7 +66,7 @@ class LocalOrderBook:
         self.asks: List[tuple] = []
 
         # WS 更新次数累计（每收到一帧 partial depth +1），用于呆滞盘口检测
-        # Binance Partial Depth Stream 每帧即完整 5 档快照，无 REST 重建场景，无需清零
+        # Binance Partial Depth Stream 每帧即完整 20 档快照，无 REST 重建场景，无需清零
         self.update_count: int = 0
 
         self.lock = threading.Lock()
@@ -135,7 +135,7 @@ class LocalOrderBook:
 class OrderBookManager:
     """
     订单簿管理器 - 管理多个交易对的本地订单簿
-    使用 Partial Book Depth Streams (@depth5@100ms)
+    使用 Partial Book Depth Streams (@depth20@100ms)
     """
 
     def __init__(self):

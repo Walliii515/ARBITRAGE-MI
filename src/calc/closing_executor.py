@@ -21,6 +21,11 @@ from common.config import config
 from common.logger import get_logger
 from calc.executor_client import ExecutorClient
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps
+from calc.orderbook_resiliency import (
+    BookSideSpec,
+    OrderBookResiliencyMonitor,
+    ResiliencyConfig,
+)
 
 logger = get_logger(__name__)
 
@@ -80,6 +85,33 @@ class ClosingExecutor:
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
+
+        self._close_resiliency_max_basis_rebound_bps = config.get_float(
+            'trade.close_resiliency.max_basis_rebound_bps', 8.0
+        )
+        self._close_resiliency_coverage_threshold = config.get_float(
+            'trade.close_resiliency.coverage_threshold',
+            config.get_float('trade.open.orderbook_coverage_threshold', 0.8),
+        )
+        self._close_resiliency = OrderBookResiliencyMonitor(
+            ResiliencyConfig(
+                enabled=config.get_bool('trade.close_resiliency.enabled', True),
+                window_sec=config.get_float('trade.close_resiliency.window_sec', 1.5),
+                min_samples=config.get_int('trade.close_resiliency.min_samples', 3),
+                min_recovery_ratio=config.get_float('trade.close_resiliency.min_recovery_ratio', 0.55),
+                max_spread_widen_bps=config.get_float('trade.close_resiliency.max_spread_widen_bps', 10.0),
+                max_basis_volatility_bps=config.get_float('trade.close_resiliency.max_basis_volatility_bps', 8.0),
+                min_hold_sec=config.get_float('trade.close_resiliency.min_hold_sec', 0.3),
+                max_wait_sec=config.get_float('trade.close_resiliency.max_wait_sec', 1.5),
+                allow_timeout_pass=True,
+            ),
+            [
+                BookSideSpec('spot', 'bid', 1.0, 'spot_bid'),
+                BookSideSpec('future', 'ask', 1.0, 'future_ask', '_future_qty_multiplier'),
+            ],
+            ['spot_close_coverage', 'future_close_coverage'],
+            'close',
+        )
 
     def set_orderbook_managers(self, gate_manager, spot_manager):
         """
@@ -150,6 +182,7 @@ class ClosingExecutor:
                 )
                 # 紧急平仓，清除谷底状态
                 self._valley_state.pop(ba, None)
+                self._close_resiliency.clear(ba)
             elif self._check_funding_count(pos):
                 close_reason = 'funding_count'
                 count = int(pos.get('funding_payments_count') or 0)
@@ -159,18 +192,32 @@ class ClosingExecutor:
                 )
                 # 强制平仓，清除谷底状态
                 self._valley_state.pop(ba, None)
+                self._close_resiliency.clear(ba)
             elif self._check_take_profit(pos, current_spread_bps):
                 # 止盈条件满足，进入谷底反弹确认
+                orderbook_row = orderbook_rows_by_asset.get(ba)
+                if orderbook_row is not None:
+                    self._annotate_resiliency_row(orderbook_row, ba)
+                    close_basis_for_resiliency = orderbook_row.get('close_vwap_basis_bps')
+                    if close_basis_for_resiliency is None:
+                        close_basis_for_resiliency = current_spread_bps
+                    self._close_resiliency.observe_shock(ba, orderbook_row)
                 if self._pass_valley_check(ba, current_spread_bps, pos):
+                    if orderbook_row is not None and not self._pass_close_resiliency_check(
+                        ba, orderbook_row, float(close_basis_for_resiliency), pos
+                    ):
+                        continue
                     close_reason = 'take_profit'
                 # else: 谷底监控中，不平仓
             else:
                 # 止盈不再满足，清除谷底监控状态
                 self._valley_state.pop(ba, None)
+                self._close_resiliency.clear(ba)
                 threshold_data = close_vwap_threshold_meta.get(ba, {})
                 if self._check_funding_cost_exceeded(pos, threshold_data):
                     close_reason = 'funding_cost_exceeded'
                     close_reason_detail = self._build_funding_cost_detail(pos, threshold_data)
+                    self._close_resiliency.clear(ba)
 
             if not close_reason:
                 continue
@@ -215,6 +262,7 @@ class ClosingExecutor:
                 if result.get('success'):
                     # 平仓成功，清除谷底监控状态和冷却记录
                     self._valley_state.pop(ba, None)
+                    self._close_resiliency.clear(ba)
                     self._close_cooldown.pop(ba, None)
                     logger.info(
                         f"平仓成功 | {ba} | reason={close_reason} | "
@@ -225,6 +273,7 @@ class ClosingExecutor:
                     self._close_cooldown[ba] = datetime.now()
                     # 超时触发的谷底状态也需清除，避免下次继续超时重试
                     self._valley_state.pop(ba, None)
+                    self._close_resiliency.clear(ba)
                     logger.warning(
                         f"平仓失败 | {ba} | reason={close_reason} | "
                         f"msg={result.get('message')} | "
@@ -235,6 +284,40 @@ class ClosingExecutor:
                 results.append({'base_asset': ba, 'success': False, 'message': str(e)})
 
         return results
+
+    def _annotate_resiliency_row(self, row: Dict, base_asset: str) -> None:
+        row['_future_qty_multiplier'] = self._get_quanto_multiplier(base_asset)
+
+    def _pass_close_resiliency_check(
+        self, base_asset: str, row: Dict, close_basis_bps: float, pos: Dict
+    ) -> bool:
+        open_spread_bps = float(pos.get('open_spread_bps') or 0)
+        result = self._close_resiliency.check(
+            base_asset,
+            row,
+            basis_bps=close_basis_bps,
+            coverage_threshold=self._close_resiliency_coverage_threshold,
+            max_basis_bps=open_spread_bps,
+            max_basis_rebound_bps=self._close_resiliency_max_basis_rebound_bps,
+        )
+        m = result.metrics
+        metric_text = (
+            f"recovery={m.get('recovery_ratio', 0):.2f} | "
+            f"drop={m.get('shock_drop_ratio', 0):.2f} | "
+            f"basis_vol={m.get('basis_volatility_bps', 0):.1f}bps | "
+            f"spread_widen={m.get('max_spread_widen_bps', 0):.1f}bps | "
+            f"coverage={m.get('coverage')}"
+        )
+        if result.passed:
+            logger.info(f"平仓盘口恢复通过 | {base_asset} | reason={result.reason} | {metric_text}")
+            return True
+        if result.terminal:
+            self._valley_state.pop(base_asset, None)
+            self._close_resiliency.clear(base_asset)
+            logger.info(f"平仓盘口恢复终止 | {base_asset} | reason={result.reason} | {metric_text}")
+            return False
+        logger.info(f"平仓盘口恢复等待 | {base_asset} | reason={result.reason} | {metric_text}")
+        return False
 
     # ──────────────────────────────────────────────────────────────────
     # 条件检查
@@ -699,6 +782,11 @@ class ClosingExecutor:
             'spot_order': spot_order,
             'future_order': future_order,
         }
+
+    def _get_quanto_multiplier(self, base_asset: str) -> float:
+        if base_asset in self.contract_meta:
+            return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
+        return 1.0
 
     # ──────────────────────────────────────────────────────────────────
     # 持久化
