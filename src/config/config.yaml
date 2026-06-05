@@ -62,11 +62,11 @@ trade:
   resiliency:
     enabled: true
     window_sec: 3.0                         # 最近窗口内观察盘口恢复
-    min_samples: 5                          # 窗口内最少样本数
+    min_samples: 3                          # 窗口内最少样本数
     min_recovery_ratio: 0.65                # 被冲击侧深度需恢复到监控起点的比例
     max_spread_widen_bps: 8                 # spot/future 买卖价差相对窗口起点最大扩大
     max_basis_volatility_bps: 6             # 窗口内开仓基差最大波动
-    min_hold_sec: 0.8                       # 恢复条件连续满足时长
+    min_hold_sec: 0.4                       # 恢复条件连续满足时长
     max_wait_sec: 3.0                       # 等待恢复超时后放弃本轮信号
 
   # ─── 平仓策略 ───
