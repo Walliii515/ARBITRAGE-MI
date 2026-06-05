@@ -163,7 +163,6 @@ class ClosingExecutor:
                 # 止盈条件满足，进入谷底反弹确认
                 if self._pass_valley_check(ba, current_spread_bps, pos):
                     close_reason = 'take_profit'
-                    close_reason_detail = self._build_take_profit_detail(pos, current_spread_bps)
                 # else: 谷底监控中，不平仓
             else:
                 # 止盈不再满足，清除谷底监控状态
@@ -194,6 +193,8 @@ class ClosingExecutor:
                 # 使用旁路返回的最新盘口行（确保下单数据 = 校验数据）
                 if gate_row is not None:
                     orderbook_rows_by_asset[ba] = gate_row
+                # 旁路通过后再构建详情，才能把本次旁路写入的 lag 拼入“鲜度”字段
+                close_reason_detail = self._build_take_profit_detail(pos, current_spread_bps)
                 # 补充旁路判定信息到原因详情（供复盘）
                 if gate_basis is not None:
                     drift_bps = gate_basis - current_spread_bps

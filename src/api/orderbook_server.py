@@ -27,7 +27,6 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from calc.calculate_hedge_metrics import calculate_hedge_metrics
-from calc.merge_cross_exchange_orderbook import merge_orderbook_records
 from calc.etl_pipeline import start_daily_schedulers, stop_daily_schedulers, ETL_TASKS, _etl_config
 from common.config import config
 from common.database import db_manager
@@ -42,7 +41,8 @@ from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.capital_tracker import CapitalConfig, calculate_account_summary
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
-from calc.service_lifecycle import ServiceLifecycleManager, SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
+from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
+from calc.orderbook_data_client import OrderBookDataClient
 
 setup_logging()
 logger = get_logger(__name__)
@@ -135,7 +135,7 @@ _capital_cfg = CapitalConfig(
 )
 
 # 服务生命周期管理器（在 lifespan 中初始化）
-svc: Optional[ServiceLifecycleManager] = None
+svc: Optional[OrderBookDataClient] = None
 
 # 运行时全局状态（广播相关）
 event_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -191,9 +191,7 @@ def _get_merged_rows() -> List[Dict]:
     if _cached_merged_rows and (now - _cached_merged_ts) < BROADCAST_THROTTLE_SEC:
         return _cached_merged_rows
 
-    future_rows = svc.gate_manager.to_records() if svc and svc.gate_manager else []
-    spot_rows = svc.spot_manager.to_records() if svc and svc.spot_manager else []
-    rows = merge_orderbook_records(future_rows, spot_rows)
+    rows = svc.get_merged_rows() if svc else []
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
 
     _cached_merged_rows = rows
@@ -506,23 +504,16 @@ async def lifespan(app: FastAPI):
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
     start_daily_schedulers()
 
-    svc = ServiceLifecycleManager(settle=SETTLE)
-    svc.init_managers()
-    # 不再注册 per-message 回调，改为定时轮询广播（见 _orderbook_broadcast_loop）
-    # svc.register_broadcast(schedule_broadcast)
-    svc.set_runtime(event_loop, broadcast_queue, build_payload, schedule_broadcast)
+    svc = OrderBookDataClient()
     asyncio.create_task(_orderbook_broadcast_loop())
     asyncio.create_task(_connectivity_check_loop())
 
-    # 自动启动 WS 服务（进程崩溃重启后自动恢复连接）
-    auto_start = config.get('orderbook.auto_start', False)
-    if auto_start:
-        log_print('ℹ 配置 auto_start=true，自动启动 WS 服务...')
-        svc.start()
+    log_print(f'盘口数据来自独立服务: {svc.base_url}')
 
     yield
 
-    svc.shutdown()
+    if svc:
+        svc.shutdown()
     stop_daily_schedulers()
     worker_task.cancel()
     try:
@@ -878,9 +869,7 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
 
 def _get_fresh_trading_rows() -> List[Dict]:
     """无缓存获取最新盘口+富化数据（用于开仓决策链路，确保数据最新鲜）"""
-    future_rows = svc.gate_manager.to_records() if svc and svc.gate_manager else []
-    spot_rows = svc.spot_manager.to_records() if svc and svc.spot_manager else []
-    rows = merge_orderbook_records(future_rows, spot_rows)
+    rows = svc.get_merged_rows(force=True) if svc else []
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
     enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg)
     return rows
@@ -1358,8 +1347,8 @@ def main():
     host = '0.0.0.0'
     port = 19876
 
-    log_print(f'启动订单簿服务 http://{host}:{port}')
-    log_print('WS 服务需通过前端或 POST /api/service/start 手动启动')
+    log_print(f'启动业务订单簿服务 http://{host}:{port}')
+    log_print('Binance/Gate WS 由独立 orderbook_data_service 维护')
     uvicorn.run(app, host=host, port=port)
 
 

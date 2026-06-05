@@ -159,6 +159,7 @@ class LocalOrderBook:
                 'contract': self.contract,
                 'update_id': self.id,
                 'update_time': self.update_time,
+                'last_update_time': self.last_update_time,
                 'update_count': self.update_count,
                 'future_ready': self.is_ready() and not self.is_stale(get_orderbook_stale_timeout()),
             }

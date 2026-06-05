@@ -603,6 +603,46 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         detail2 = self.ce._build_take_profit_detail(self.pos, 35.0)
         self.assertIn('鲜度(NA)', detail2)
 
+    def test_check_and_close_builds_take_profit_detail_after_gate(self):
+        """真实平仓主流程：旁路先写 lag，止盈详情再消费，避免鲜度显示 NA。"""
+        self._setup_books(gate_lag_sec=0.04, spot_lag_sec=0.05)
+        pos = dict(self.pos)
+        pos.update({
+            'status': 'holding',
+            'current_spread_bps': 35.0,
+            'funding_pnl_bps': 0.0,
+        })
+        self.ce._valley_state['BTC'] = {
+            'valley_bps': 30.0,
+            'start_time': datetime.now(),
+            'open_spread_bps': 100.0,
+            'trigger': 'rebound',
+        }
+
+        execute_mock = MagicMock(return_value={
+            'base_asset': 'BTC',
+            'success': True,
+            'order_uuid': 'test-order',
+            'close_reason': 'take_profit',
+            'message': None,
+        })
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(vwap_basis_bps=36)
+        with (
+            patch.object(self.ce, '_check_margin_liquidation', return_value=False),
+            patch.object(self.ce, '_check_funding_count', return_value=False),
+            patch.object(self.ce, '_check_take_profit', return_value=True),
+            patch.object(self.ce, '_pass_valley_check', return_value=True),
+            patch.object(self.ce, '_execute_close', execute_mock),
+            m_merge, m_hedge, m_vwap,
+        ):
+            results = self.ce.check_and_close([pos], {}, {'BTC': {'old': 'row'}})
+
+        self.assertEqual(len(results), 1)
+        detail = execute_mock.call_args.args[2]
+        self.assertIn('鲜度(gate=', detail)
+        self.assertNotIn('鲜度(NA)', detail)
+        self.assertIn('旁路✓', detail)
+
 
 # ══════════════════════════════════════════════════════════════════
 # 入口

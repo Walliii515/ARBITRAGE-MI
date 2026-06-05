@@ -6,12 +6,12 @@ python src/api/virtual_executor_service.py
     -   实盘启动
 python src/api/real_executor_service.py
 
+python src/api/orderbook_data_service.py
 python src/api/orderbook_server.py
 
 
 前端：
-cd frontend
-npm run dev
+cd frontend && npm run dev
 
 
 # 关闭后端

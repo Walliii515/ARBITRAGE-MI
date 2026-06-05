@@ -72,6 +72,7 @@ def _empty_spot_fields() -> Dict[str, Any]:
     return {
         'spot_update_id': None,
         'spot_update_time': None,
+        'spot_last_update_time': None,
         'spot_ready': False,
         **_SPOT_NULL_FIELDS,
     }
@@ -114,6 +115,7 @@ def merge_orderbook_records(
             ),
             'future_update_id': future.get('update_id'),
             'future_update_time': future.get('update_time'),
+            'future_last_update_time': future.get('last_update_time'),
             'future_ready': future.get('future_ready', True),
             'future_update_count': future.get('update_count'),
             'spot_update_count': spot.get('update_count') if spot else None,
@@ -123,6 +125,7 @@ def merge_orderbook_records(
         if spot and spot.get('spot_ready', True) and _spot_has_data(spot):
             out['spot_update_id'] = spot.get('update_id')
             out['spot_update_time'] = spot.get('update_time')
+            out['spot_last_update_time'] = spot.get('last_update_time')
             out['spot_ready'] = True
             out.update(_copy_level_fields(spot, 'spot'))
         else:

@@ -11,8 +11,8 @@ auth:
 trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
   # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
-  # mode: virtual
-  mode: live
+  mode: virtual
+  # mode: live
 
   # ─── 成交引擎 ───
   executor:
@@ -134,6 +134,11 @@ orderbook:
   stale_timeout_sec: 30
   # 进程启动后自动启动 WS 服务（设为 true 则崩溃重启后自动恢复连接）
   auto_start: true
+  # 独立盘口数据服务地址。orderbook_server 通过该服务读取 Binance/Gate 本地盘口。
+  data_service_url: http://127.0.0.1:19877
+  data_service_host: 0.0.0.0
+  data_service_port: 19877
+  data_service_timeout_sec: 2.0
 
   # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
   broadcast_throttle_sec: 2.0
