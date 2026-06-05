@@ -14,7 +14,7 @@ interface SignalRow {
   base_asset: string
   signal_time: string
   resolved_time: string | null
-  status: 'monitoring' | 'opened' | 'conditions_lost' | 'rejected'
+  status: 'monitoring' | 'opened' | 'conditions_lost' | 'rejected' | 'gate_rejected'
   entry_basis_bps: number | null
   peak_basis_bps: number | null
   exit_basis_bps: number | null
@@ -42,6 +42,7 @@ const loading = ref(false)
 
 // 筛选条件
 const filterStatus = ref<string>('')
+const filterExitReason = ref<string>('')
 const filterDays = ref<number>(1) // 默认今日
 const filterAsset = ref<string>('')
 
@@ -125,7 +126,21 @@ const statusMap: Record<string, { label: string; color: string }> = {
   opened: { label: '已开仓', color: '#67c23a' },
   conditions_lost: { label: '条件消失', color: '#909399' },
   rejected: { label: '被拒', color: '#f56c6c' },
+  gate_rejected: { label: '被拒', color: '#f56c6c' },
 }
+
+const exitReasonOptions = [
+  { label: '盈利性守卫', value: '盈利性守卫' },
+  { label: 'resiliency', value: 'resiliency' },
+  { label: '基差跌回阈值下', value: '基差跌回阈值下' },
+  { label: '旁路风控', value: '旁路' },
+  { label: '保证金风控', value: '保证金风控' },
+  { label: '盘口覆盖超限', value: '盘口覆盖超限' },
+  { label: '资金费率不达标', value: '资金费率不达标' },
+  { label: '最小名义值', value: '最小名义值' },
+  { label: '成交量不足', value: '成交量不足' },
+  { label: '盘口中断', value: '盘口中断' },
+]
 
 const columnDefs = ref<ColDef[]>([
   { headerName: '标的资产', field: 'base_asset', width: 110, pinned: 'left' },
@@ -202,6 +217,7 @@ async function fetchSignals() {
     params.set('page', String(paginationCurrentPage.value))
     params.set('page_size', String(paginationPageSize.value))
     if (filterStatus.value) params.set('status', filterStatus.value)
+    if (filterExitReason.value) params.set('exit_reason', filterExitReason.value)
     if (filterAsset.value.trim()) params.set('base_asset', filterAsset.value.trim())
 
     const res = await get(`/api/trading/signals?${params.toString()}`)
@@ -242,6 +258,12 @@ function onPaginationSizeChange() {
 /* ───── 快捷过滤 ───── */
 function setStatusFilter(status: string) {
   filterStatus.value = status
+  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  fetchSignals()
+}
+
+function setExitReasonFilter(reason: string) {
+  filterExitReason.value = reason
   paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
   fetchSignals()
 }
@@ -360,7 +382,7 @@ onUnmounted(() => {
           <el-button :type="filterStatus === 'monitoring' ? 'primary' : 'default'" @click="setStatusFilter('monitoring')">监控中</el-button>
           <el-button :type="filterStatus === 'opened' ? 'primary' : 'default'" @click="setStatusFilter('opened')">已开仓</el-button>
           <el-button :type="filterStatus === 'conditions_lost' ? 'primary' : 'default'" @click="setStatusFilter('conditions_lost')">条件消失</el-button>
-          <el-button :type="filterStatus === 'rejected' ? 'primary' : 'default'" @click="setStatusFilter('rejected')">被拒</el-button>
+          <el-button :type="filterStatus === 'gate_rejected' ? 'primary' : 'default'" @click="setStatusFilter('gate_rejected')">被拒</el-button>
         </el-button-group>
       </div>
 
@@ -411,6 +433,23 @@ onUnmounted(() => {
           </div>
         </el-popover>
         <el-button size="small" @click="saveColumnState">保存列配置</el-button>
+      </div>
+    </div>
+
+    <div class="filter-bar reason-filter-bar">
+      <div class="filter-group filter-group-wide">
+        <span class="filter-label">结束原因：</span>
+        <el-button-group size="small" class="reason-button-group">
+          <el-button :type="filterExitReason === '' ? 'primary' : 'default'" @click="setExitReasonFilter('')">全部</el-button>
+          <el-button
+            v-for="option in exitReasonOptions"
+            :key="option.value"
+            :type="filterExitReason === option.value ? 'primary' : 'default'"
+            @click="setExitReasonFilter(option.value)"
+          >
+            {{ option.label }}
+          </el-button>
+        </el-button-group>
       </div>
     </div>
 
@@ -549,9 +588,31 @@ onUnmounted(() => {
   gap: 6px;
 }
 
+.filter-group-wide {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
 .filter-label {
   font-size: 13px;
   color: var(--el-text-color-secondary, #909399);
+  line-height: 24px;
+  white-space: nowrap;
+}
+
+.reason-filter-bar {
+  gap: 8px;
+}
+
+.reason-button-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.reason-button-group :deep(.el-button) {
+  margin-left: 0;
+  border-radius: var(--el-border-radius-base);
 }
 
 .grid-container {

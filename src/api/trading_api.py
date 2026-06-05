@@ -624,7 +624,8 @@ async def save_column_config(page_key: str, payload: Dict[str, Any]):
 
 @router.get('/signals')
 async def get_signals(
-    status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected"),
+    status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected/gate_rejected"),
+    exit_reason: Optional[str] = Query(None, description="结束原因模糊过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
     days: int = Query(3, ge=1, le=30, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
@@ -638,6 +639,9 @@ async def get_signals(
     if status:
         count_sql += " AND status = %s"
         count_params.append(status)
+    if exit_reason:
+        count_sql += " AND exit_reason LIKE %s"
+        count_params.append(f"%{exit_reason}%")
     if base_asset:
         count_sql += " AND base_asset LIKE %s"
         count_params.append(f"%{base_asset}%")
@@ -655,6 +659,9 @@ async def get_signals(
     if status:
         sql += " AND status = %s"
         params.append(status)
+    if exit_reason:
+        sql += " AND exit_reason LIKE %s"
+        params.append(f"%{exit_reason}%")
     if base_asset:
         sql += " AND base_asset LIKE %s"
         params.append(f"%{base_asset}%")
@@ -673,7 +680,7 @@ async def get_signals(
         SELECT 
             COUNT(*) as total,
             SUM(CASE WHEN status = 'opened' THEN 1 ELSE 0 END) as opened,
-            SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+            SUM(CASE WHEN status IN ('rejected', 'gate_rejected') THEN 1 ELSE 0 END) as rejected,
             SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END) as conditions_lost,
             SUM(CASE WHEN status = 'monitoring' THEN 1 ELSE 0 END) as monitoring,
             MAX(signal_time) as latest_signal_time
@@ -685,6 +692,9 @@ async def get_signals(
     if status:
         summary_sql += " AND status = %s"
         summary_params.append(status)
+    if exit_reason:
+        summary_sql += " AND exit_reason LIKE %s"
+        summary_params.append(f"%{exit_reason}%")
     if base_asset:
         summary_sql += " AND base_asset LIKE %s"
         summary_params.append(f"%{base_asset}%")
