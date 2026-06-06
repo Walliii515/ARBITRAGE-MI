@@ -1237,14 +1237,14 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
           </el-tag>
         </span>
         <span class="status-item">
-          Gate WS：
+          Gate WS p50：
           <el-tag v-if="gateWsConnected" type="success" size="small">
             {{ gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接' }}
           </el-tag>
           <el-tag v-else type="danger" size="small">未连接</el-tag>
         </span>
         <span class="status-item">
-          Binance WS：
+          Binance WS p50：
           <el-tag v-if="binanceWsConnected" type="success" size="small">
             {{ binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接' }}
           </el-tag>

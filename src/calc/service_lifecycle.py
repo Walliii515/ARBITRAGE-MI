@@ -615,7 +615,7 @@ class ServiceLifecycleManager:
         return self.spot_manager.ws_client.is_running and self.spot_manager.ws_client._connected_event.is_set()
 
     def _calc_gate_data_age_ms(self) -> Optional[int]:
-        """计算 Gate WS 数据新鲜度 p90（订单簿距今多少 ms），作为延迟代理指标"""
+        """计算 Gate WS 数据新鲜度 p50（订单簿距今多少 ms），作为延迟代理指标"""
         if not self.gate_manager or not self.gate_manager.orderbooks:
             return None
         ages = []
@@ -625,10 +625,10 @@ class ServiceLifecycleManager:
                 ages.append((now - ob.last_update_time) * 1000)
         if not ages:
             return None
-        return int(self._p90(ages))
+        return int(self._p50(ages))
 
     def _calc_binance_data_age_ms(self) -> Optional[int]:
-        """计算 Binance WS 数据新鲜度 p90（订单簿距今多少 ms），作为延迟代理指标"""
+        """计算 Binance WS 数据新鲜度 p50（订单簿距今多少 ms），作为延迟代理指标"""
         if not self.spot_manager or not self.spot_manager.orderbooks:
             return None
         ages = []
@@ -639,12 +639,12 @@ class ServiceLifecycleManager:
                 ages.append((now - last_update) * 1000)
         if not ages:
             return None
-        return int(self._p90(ages))
+        return int(self._p50(ages))
 
     @staticmethod
-    def _p90(values: List[float]) -> float:
+    def _p50(values: List[float]) -> float:
         ordered = sorted(values)
-        index = min(len(ordered) - 1, int((len(ordered) - 1) * 0.9))
+        index = min(len(ordered) - 1, int((len(ordered) - 1) * 0.5))
         return ordered[index]
 
     def _freshness_summary(self, side: str) -> dict:

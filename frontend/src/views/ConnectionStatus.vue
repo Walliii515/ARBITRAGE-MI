@@ -325,10 +325,10 @@ onUnmounted(() => {
           服务: {{ serviceState === 'running' ? '运行中' : serviceState === 'idle' ? '未启动' : serviceState }}
         </span>
         <span class="ws-badge" :class="{ connected: gateWsConnected }">
-          Gate WS p90: {{ gateWsConnected ? (gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接') : '未连接' }}
+          Gate WS p50: {{ gateWsConnected ? (gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接') : '未连接' }}
         </span>
         <span class="ws-badge" :class="{ connected: binanceWsConnected }">
-          Binance WS p90: {{ binanceWsConnected ? (binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接') : '未连接' }}
+          Binance WS p50: {{ binanceWsConnected ? (binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接') : '未连接' }}
         </span>
       </div>
 
