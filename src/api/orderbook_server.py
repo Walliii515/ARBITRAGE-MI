@@ -162,7 +162,7 @@ _critical_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='
 _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-close')
 
 # ───── 开仓暂停开关 ─────
-_open_paused: bool = False                   # True 时暂停开仓循环，平仓不受影响
+_open_paused: bool = True                    # 服务启动默认暂停开仓，需人工恢复；平仓不受影响
 
 # ───── 交易链路连通性熔断 ─────
 # 仅实盘模式下启用：Binance + Gate 任一不通即禁止交易
@@ -520,6 +520,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_connectivity_check_loop())
 
     log_print(f'盘口数据来自独立服务: {svc.base_url}')
+    logger.info('开仓默认暂停，需在订单管理页面手动恢复开仓')
 
     yield
 
