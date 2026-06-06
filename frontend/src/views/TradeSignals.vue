@@ -275,27 +275,8 @@ function setDaysFilter(days: number) {
   fetchSignals()
 }
 
-function onAssetSearch() {
-  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
-  fetchSignals()
-}
-
 /* ───── 复制 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
-
-/* ───── 格式化 ───── */
-function formatDuration(sec: number): string {
-  if (!sec || sec === 0) return '0s'
-  if (sec < 60) return `${sec}s`
-  const minutes = Math.floor(sec / 60)
-  const hours = Math.floor(minutes / 60)
-  const remainingMinutes = minutes % 60
-  const seconds = sec % 60
-  if (hours > 0) {
-    return `${hours}h ${remainingMinutes}m ${seconds}s`
-  }
-  return `${remainingMinutes}m ${seconds}s`
-}
 
 /** 格式化时间 */
 function formatTime(timeStr: string | null): string {
@@ -438,19 +419,25 @@ onUnmounted(() => {
     </div>
 
     <div class="filter-bar reason-filter-bar">
-      <div class="filter-group filter-group-wide">
+      <div class="filter-group">
         <span class="filter-label">结束原因：</span>
-        <el-button-group size="small" class="reason-button-group">
-          <el-button :type="filterExitReason === '' ? 'primary' : 'default'" @click="setExitReasonFilter('')">全部</el-button>
-          <el-button
+        <el-select
+          v-model="filterExitReason"
+          placeholder="全部"
+          size="small"
+          clearable
+          filterable
+          class="reason-select"
+          @change="(val: string) => setExitReasonFilter(val || '')"
+        >
+          <el-option label="全部" value="" />
+          <el-option
             v-for="option in exitReasonOptions"
             :key="option.value"
-            :type="filterExitReason === option.value ? 'primary' : 'default'"
-            @click="setExitReasonFilter(option.value)"
-          >
-            {{ option.label }}
-          </el-button>
-        </el-button-group>
+            :label="option.label"
+            :value="option.value"
+          />
+        </el-select>
       </div>
     </div>
 
@@ -589,11 +576,6 @@ onUnmounted(() => {
   gap: 6px;
 }
 
-.filter-group-wide {
-  align-items: flex-start;
-  flex-wrap: wrap;
-}
-
 .filter-label {
   font-size: 13px;
   color: var(--el-text-color-secondary, #909399);
@@ -605,15 +587,8 @@ onUnmounted(() => {
   gap: 8px;
 }
 
-.reason-button-group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.reason-button-group :deep(.el-button) {
-  margin-left: 0;
-  border-radius: var(--el-border-radius-base);
+.reason-select {
+  width: 220px;
 }
 
 .grid-container {

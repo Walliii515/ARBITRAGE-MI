@@ -81,10 +81,6 @@ const orderSideFilter = ref<string>('')
 const baseAssetFilter = ref<string>('')
 const filterDays = ref<number>(1) // 默认今日
 
-// 开仓暂停开关
-const openPaused = ref(false)
-const openPauseLoading = ref(false)
-
 // 一键全部平仓
 const closeAllLoading = ref(false)
 
@@ -494,36 +490,6 @@ function onRowDoubleClicked(params: any) {
   }
 }
 
-/* ───── 开仓暂停开关 ───── */
-async function fetchOpenPausedStatus() {
-  try {
-    const res = await get('/api/trading/open/status')
-    const data = await res.json()
-    openPaused.value = !!data.open_paused
-  } catch { /* ignore */ }
-}
-
-async function toggleOpenPause() {
-  openPauseLoading.value = true
-  try {
-    const url = openPaused.value ? '/api/trading/open/resume' : '/api/trading/open/pause'
-    const res = await post(url)
-    const data = await res.json()
-    if (data.ok) {
-      openPaused.value = data.open_paused
-      if (data.open_paused) {
-        showSuccess('开仓已暂停，平仓不受影响')
-      } else {
-        showSuccess('开仓已恢复')
-      }
-    }
-  } catch (e: any) {
-    showError(`操作失败: ${e.message || '未知错误'}`)
-  } finally {
-    openPauseLoading.value = false
-  }
-}
-
 /* ───── 定时自动刷新 ───── */
 let autoRefreshTimer: ReturnType<typeof setInterval> | null = null
 
@@ -607,7 +573,6 @@ onMounted(() => {
   
   fetchOrders()
   autoRefreshTimer = setInterval(fetchOrders, 2000)
-  fetchOpenPausedStatus()
 })
 
 onUnmounted(() => {
@@ -679,15 +644,6 @@ onUnmounted(() => {
           @click="fetchOrders"
         >
           刷新
-        </el-button>
-
-        <el-button
-          size="small"
-          :type="openPaused ? 'success' : 'warning'"
-          :loading="openPauseLoading"
-          @click="toggleOpenPause"
-        >
-          {{ openPaused ? '▶ 恢复开仓' : '⏸ 暂停开仓' }}
         </el-button>
 
         <el-button

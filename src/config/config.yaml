@@ -162,6 +162,12 @@ real_executor:
   # HTTP 请求超时（秒）
   timeout_sec: 10
 
+# 基础持仓对账配置（Binance 现货 + Gate 期货，只记录差异，不自动修复）
+reconciliation:
+  enabled: true
+  interval_sec: 300
+  retention_days: 30
+
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
   settle: usdt

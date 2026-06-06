@@ -42,6 +42,7 @@ from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.capital_tracker import CapitalConfig, calculate_account_summary
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
+from calc.reconciliation import build_default_reconciler
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
 
@@ -524,6 +525,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
     asyncio.create_task(_position_realtime_push())
+    asyncio.create_task(_reconciliation_loop())
     asyncio.create_task(_vwap_snapshot_loop())
 
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
@@ -1257,6 +1259,27 @@ async def _position_realtime_push():
 
         except Exception as e:
             logger.error(f"持仓实时推送失败: {e}")
+
+
+async def _reconciliation_loop():
+    """定时执行基础持仓对账；只记录差异，不告警、不修复。"""
+    if config.get_trade_mode() == 'virtual':
+        logger.info('virtual 模式跳过交易所对账循环')
+        return
+    if not config.get_bool('reconciliation.enabled', True):
+        logger.info('交易所对账循环已关闭')
+        return
+
+    interval = max(30, config.get_int('reconciliation.interval_sec', 300))
+    await asyncio.sleep(5)
+
+    while True:
+        try:
+            result = await asyncio.to_thread(lambda: build_default_reconciler().run_once())
+            logger.info(f"交易所对账循环完成: {result}")
+        except Exception as e:
+            logger.error(f"交易所对账循环失败: {e}", exc_info=True)
+        await asyncio.sleep(interval)
 
 
 async def _vwap_snapshot_loop():

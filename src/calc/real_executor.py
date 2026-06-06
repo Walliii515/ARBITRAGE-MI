@@ -17,7 +17,7 @@ import hmac
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -293,6 +293,43 @@ class RealExecutor:
             hashlib.sha256
         ).hexdigest()
 
+    def fetch_binance_spot_balances(self) -> List[Dict]:
+        """
+        拉取 Binance 现货账户非零资产余额（只读，对账使用）。
+
+        返回字段保持贴近交易所原始口径：
+        [{asset, free, locked, total}]
+        """
+        timestamp = int(time.time() * 1000)
+        params = {'timestamp': timestamp}
+        query_string = urlencode(params)
+        params['signature'] = self._binance_sign(query_string)
+
+        url = f"{self.config.binance_base_url}/api/v3/account"
+        headers = {'X-MBX-APIKEY': self.config.binance_api_key}
+        resp = self._session.get(url, params=params, headers=headers, timeout=self.config.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Binance account HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        result: List[Dict] = []
+        for item in data.get('balances', []):
+            asset = str(item.get('asset') or '').upper()
+            if not asset or asset == 'USDT':
+                continue
+            free = float(item.get('free') or 0)
+            locked = float(item.get('locked') or 0)
+            total = free + locked
+            if total == 0:
+                continue
+            result.append({
+                'asset': asset,
+                'free': free,
+                'locked': locked,
+                'total': total,
+            })
+        return result
+
     # ──────────────────────────────────────────────────────────────────
     # Gate 期货
     # ──────────────────────────────────────────────────────────────────
@@ -466,6 +503,41 @@ class RealExecutor:
             'Timestamp': timestamp,
             'Content-Type': 'application/json',
         }
+
+    def fetch_gate_futures_positions(self) -> List[Dict]:
+        """
+        拉取 Gate USDT 永续持仓（只读，对账使用）。
+
+        返回字段包含张数 size，空头为负；对账层取 abs(size) 与本地张数比较。
+        """
+        method = 'GET'
+        api_path = '/api/v4/futures/usdt/positions'
+        headers = self._gate_sign(method, api_path, '', '')
+        url = f"{self.config.gate_base_url}{api_path}"
+        resp = self._session.get(url, headers=headers, timeout=self.config.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gate positions HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        result: List[Dict] = []
+        for item in data if isinstance(data, list) else []:
+            contract = str(item.get('contract') or '').upper()
+            if not contract.endswith('_USDT'):
+                continue
+            size = float(item.get('size') or 0)
+            if size == 0:
+                continue
+            result.append({
+                'contract': contract,
+                'base_asset': contract[:-5],
+                'size': size,
+                'entry_price': item.get('entry_price'),
+                'unrealised_pnl': item.get('unrealised_pnl'),
+                'leverage': item.get('leverage'),
+                'margin': item.get('margin'),
+                'mode': item.get('mode'),
+            })
+        return result
 
     # ──────────────────────────────────────────────────────────────────
     # 辅助方法

@@ -7,6 +7,7 @@
 - VWAP基差阈值查询与手动执行
 - AG Grid列配置管理
 """
+import asyncio
 import json
 import threading
 from decimal import Decimal
@@ -17,6 +18,7 @@ from fastapi import APIRouter, Query
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
+from calc.reconciliation import build_default_reconciler
 
 logger = get_logger(__name__)
 
@@ -42,6 +44,11 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = value.strftime('%Y-%m-%d %H:%M:%S')
         elif isinstance(value, date):
             result[key] = value.strftime('%Y-%m-%d')
+        elif key == 'detail' and isinstance(value, str):
+            try:
+                result[key] = json.loads(value)
+            except Exception:
+                result[key] = value
         else:
             result[key] = value
     return result
@@ -338,6 +345,93 @@ async def get_positions_summary():
         cursor.execute(sql)
         row = cursor.fetchone()
         return _serialize_row(row) if row else {}
+
+
+# ─── 基础对账 ────────────────────────────────────────────────────────────────
+
+_recon_running = False
+_recon_lock = threading.Lock()
+
+
+@router.get('/reconciliation/latest')
+async def get_reconciliation_latest():
+    """返回最近一轮对账快照。"""
+    sql = """
+        SELECT *
+        FROM mi_recon_snapshot
+        WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)
+        ORDER BY exchange ASC, base_asset ASC
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+    return {'rows': _serialize_rows(rows)}
+
+
+@router.get('/reconciliation/history')
+async def get_reconciliation_history(
+    days: int = Query(1, ge=1, le=30, description="最近N天"),
+    mismatches_only: bool = Query(False, description="是否仅显示差异/错误"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(500, ge=1, le=5000, description="每页条数"),
+):
+    """查询对账历史快照。"""
+    where_clauses = ["snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    params: List[Any] = [days]
+    if mismatches_only:
+        where_clauses.append("is_match = 0")
+    where_sql = " AND ".join(where_clauses)
+
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(f"SELECT COUNT(*) AS total FROM mi_recon_snapshot WHERE {where_sql}", params)
+        total_row = cursor.fetchone()
+        total = int(total_row['total']) if total_row else 0
+
+    offset = (page - 1) * page_size
+    sql = f"""
+        SELECT *
+        FROM mi_recon_snapshot
+        WHERE {where_sql}
+        ORDER BY snapshot_at DESC, exchange ASC, base_asset ASC
+        LIMIT %s OFFSET %s
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, [*params, page_size, offset])
+        rows = cursor.fetchall()
+    return {
+        'rows': _serialize_rows(rows),
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total': total,
+            'total_pages': (total + page_size - 1) // page_size if total else 0,
+        },
+    }
+
+
+@router.post('/reconciliation/run')
+async def run_reconciliation_now():
+    """手动触发一次对账。virtual 模式下跳过。"""
+    global _recon_running
+    if config.get_trade_mode() == 'virtual':
+        return {'success': False, 'message': 'virtual 模式不执行交易所对账'}
+    if not config.get_bool('reconciliation.enabled', True):
+        return {'success': False, 'message': '对账功能已关闭'}
+
+    with _recon_lock:
+        if _recon_running:
+            return {'success': False, 'message': '对账任务正在执行中'}
+        _recon_running = True
+
+    try:
+        result = await asyncio.to_thread(lambda: build_default_reconciler().run_once())
+        return {'success': True, 'message': '对账完成', **result}
+    except Exception as e:
+        logger.error(f'手动对账失败: {e}', exc_info=True)
+        return {'success': False, 'message': f'对账失败: {e}'}
+    finally:
+        with _recon_lock:
+            _recon_running = False
 
 
 # ─── VWAP 基差阈值 ────────────────────────────────────────────────────────────

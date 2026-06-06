@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch } from '@element-plus/icons-vue'
+import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { removeToken } from './utils/auth'
 import { ElMessage } from 'element-plus'
@@ -10,6 +10,7 @@ import { post, get } from './utils/request'
 const route = useRoute()
 const router = useRouter()
 const isCollapsed = ref(false)
+let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
@@ -36,6 +37,13 @@ const tradingModeColor = computed(() => {
   }
 })
 
+// ───── 开仓暂停开关 ─────
+const openPaused = ref(false)
+const openPauseLoading = ref(false)
+
+const openPauseTitle = computed(() => (openPaused.value ? '恢复开仓' : '暂停开仓'))
+const openPauseIcon = computed(() => (openPaused.value ? VideoPlay : VideoPause))
+
 async function fetchTradingMode() {
   try {
     const resp = await get('/api/service/exchange-connectivity')
@@ -52,10 +60,64 @@ async function fetchTradingMode() {
   }
 }
 
+async function fetchOpenPausedStatus() {
+  try {
+    const res = await get('/api/trading/open/status')
+    const data = await res.json()
+    openPaused.value = !!data.open_paused
+  } catch {
+    // 服务未启动时静默失败
+  }
+}
+
+async function toggleOpenPause() {
+  openPauseLoading.value = true
+  try {
+    const url = openPaused.value ? '/api/trading/open/resume' : '/api/trading/open/pause'
+    const res = await post(url)
+    const data = await res.json()
+    if (data.ok) {
+      openPaused.value = data.open_paused
+      ElMessage.success(data.open_paused ? '开仓已暂停，平仓不受影响' : '开仓已恢复')
+    }
+  } catch (e: any) {
+    ElMessage.error(`操作失败: ${e.message || '未知错误'}`)
+  } finally {
+    openPauseLoading.value = false
+  }
+}
+
+function startOpenPauseStatusTimer() {
+  fetchTradingMode()
+  fetchOpenPausedStatus()
+  if (!openPauseStatusTimer) {
+    openPauseStatusTimer = setInterval(fetchOpenPausedStatus, 10000)
+  }
+}
+
+function stopOpenPauseStatusTimer() {
+  if (openPauseStatusTimer) {
+    clearInterval(openPauseStatusTimer)
+    openPauseStatusTimer = null
+  }
+}
+
 onMounted(() => {
   if (!isLoginPage.value) {
-    fetchTradingMode()
+    startOpenPauseStatusTimer()
   }
+})
+
+watch(isLoginPage, (loginPage) => {
+  if (loginPage) {
+    stopOpenPauseStatusTimer()
+  } else {
+    startOpenPauseStatusTimer()
+  }
+})
+
+onUnmounted(() => {
+  stopOpenPauseStatusTimer()
 })
 
 async function handleLogout() {
@@ -123,6 +185,10 @@ function toggleMenu() {
           <el-icon><Connection /></el-icon>
           <template #title>连接状态</template>
         </el-menu-item>
+        <el-menu-item index="/reconciliation">
+          <el-icon><DataAnalysis /></el-icon>
+          <template #title>持仓对账</template>
+        </el-menu-item>
         <el-sub-menu index="settings">
           <template #title>
             <el-icon><Setting /></el-icon>
@@ -134,6 +200,21 @@ function toggleMenu() {
           </el-menu-item>
         </el-sub-menu>
       </el-menu>
+
+      <el-tooltip
+        :content="openPauseTitle"
+        placement="right"
+        :disabled="!isCollapsed"
+      >
+        <div
+          class="open-pause-control"
+          :class="{ 'is-paused': openPaused, 'is-loading': openPauseLoading }"
+          @click="toggleOpenPause"
+        >
+          <el-icon><component :is="openPauseIcon" /></el-icon>
+          <span v-if="!isCollapsed" class="open-pause-text">{{ openPauseTitle }}</span>
+        </div>
+      </el-tooltip>
       
       <!-- 折叠/展开按钮 -->
       <div class="collapse-btn" @click="toggleMenu">
@@ -258,6 +339,56 @@ function toggleMenu() {
 
 .app-menu :deep(.el-menu-item:hover) {
   background-color: rgba(255, 255, 255, 0.04) !important;
+}
+
+.open-pause-control {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #e6a23c;
+  border-top: 1px solid var(--app-border);
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.3s ease;
+}
+
+.open-pause-control:hover {
+  background-color: rgba(230, 162, 60, 0.12);
+  color: #f3b760;
+}
+
+.open-pause-control.is-paused {
+  color: #67c23a;
+}
+
+.open-pause-control.is-paused:hover {
+  background-color: rgba(103, 194, 58, 0.12);
+  color: #85ce61;
+}
+
+.open-pause-control.is-loading {
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+.open-pause-control.is-loading :deep(.el-icon) {
+  animation: open-pause-spin 0.9s linear infinite;
+}
+
+.open-pause-text {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+@keyframes open-pause-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .app-main {

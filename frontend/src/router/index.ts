@@ -35,6 +35,11 @@ const router = createRouter({
       component: () => import('../views/ConnectionStatus.vue'),
     },
     {
+      path: '/reconciliation',
+      name: 'reconciliation',
+      component: () => import('../views/Reconciliation.vue'),
+    },
+    {
       path: '/settings/threshold',
       name: 'threshold',
       component: () => import('../views/VwapThreshold.vue'),
