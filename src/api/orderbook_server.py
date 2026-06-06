@@ -12,7 +12,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Set
@@ -198,14 +197,14 @@ def _get_merged_rows() -> List[Dict]:
     global _cached_merged_rows, _cached_merged_ts
     now = time.time()
     if _cached_merged_rows and (now - _cached_merged_ts) < BROADCAST_THROTTLE_SEC:
-        return _cached_merged_rows
+        return [dict(row) for row in _cached_merged_rows]
 
     rows = svc.get_merged_rows() if svc else []
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
 
-    _cached_merged_rows = rows
+    _cached_merged_rows = [dict(row) for row in rows]
     _cached_merged_ts = now
-    return rows
+    return [dict(row) for row in _cached_merged_rows]
 
 
 
@@ -929,14 +928,14 @@ def _get_fresh_trading_rows() -> List[Dict]:
     global _cached_trading_rows, _cached_trading_ts
     now = time.time()
     if _cached_trading_rows and (now - _cached_trading_ts) < TRADING_SCAN_CACHE_SEC:
-        return deepcopy(_cached_trading_rows)
+        return [dict(row) for row in _cached_trading_rows]
 
     rows = _get_merged_rows()
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
     enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg)
-    _cached_trading_rows = deepcopy(rows)
+    _cached_trading_rows = [dict(row) for row in rows]
     _cached_trading_ts = now
-    return rows
+    return [dict(row) for row in _cached_trading_rows]
 
 
 def _run_open_position_check_once():
