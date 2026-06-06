@@ -933,7 +933,7 @@ const canStop = computed(
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = getToken()
-  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}`
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}&mode=snapshot`
 }
 
 function connectWs() {

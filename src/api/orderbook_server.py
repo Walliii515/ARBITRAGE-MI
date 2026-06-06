@@ -864,7 +864,7 @@ async def close_all_positions():
 
 
 @app.websocket('/ws/orderbook')
-async def ws_orderbook(websocket: WebSocket, token: str = Query(None), mode: str = Query('snapshot')):
+async def ws_orderbook(websocket: WebSocket, token: str = Query(None), mode: str = Query('events')):
     # 验证 token
     try:
         verify_ws_token(token)
