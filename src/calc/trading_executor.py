@@ -157,6 +157,8 @@ class TradingExecutor:
         self._max_orderbook_lag_ms = float(cfg.max_orderbook_lag_ms)
         # 临时槽位：旁路风控通过时记录的 (gate_lag_ms, spot_lag_ms)，供 _build_open_reason 拼到开仓原因
         self._last_orderbook_lag_ms: Dict[str, tuple] = {}
+        # 临时槽位：盘口恢复确认通过时记录 metrics，供 _build_open_reason 拼到开仓原因
+        self._last_resiliency_metrics: Dict[str, Dict] = {}
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -436,6 +438,7 @@ class TradingExecutor:
             f"coverage={m.get('coverage')}"
         )
         if result.passed:
+            self._last_resiliency_metrics[base_asset] = dict(m)
             logger.info(f"开仓盘口恢复通过 | {base_asset} | {metric_text}")
             return True
         if result.terminal:
@@ -1003,6 +1006,22 @@ class TradingExecutor:
             parts.append(f"鲜度(gate={_fmt(gate_lag_ms)},spot={_fmt(spot_lag_ms)})")
         else:
             parts.append("鲜度(NA)")
+
+        # 5.6 盘口恢复确认（resiliency）通过时的关键指标，便于复盘成功开仓质量
+        resiliency_metrics = self._last_resiliency_metrics.pop(base_asset, None)
+        if resiliency_metrics:
+            recovery = float(resiliency_metrics.get('recovery_ratio', 0) or 0)
+            drop = float(resiliency_metrics.get('shock_drop_ratio', 0) or 0)
+            basis_vol = float(resiliency_metrics.get('basis_volatility_bps', 0) or 0)
+            spread_widen = float(resiliency_metrics.get('max_spread_widen_bps', 0) or 0)
+            coverage = resiliency_metrics.get('coverage')
+            hold_sec = float(resiliency_metrics.get('hold_sec', 0) or 0)
+            cov_text = 'NA' if coverage is None else f'{float(coverage):.2f}'
+            parts.append(
+                f"恢复(recovery={recovery:.2f},drop={drop:.2f},"
+                f"vol={basis_vol:.1f}bps,spread={spread_widen:.1f}bps,"
+                f"cov={cov_text},hold={hold_sec:.1f}s)"
+            )
 
         # 6. 24h成交量（现货/期货）
         vol_parts = []
