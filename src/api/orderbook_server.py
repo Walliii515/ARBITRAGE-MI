@@ -143,6 +143,7 @@ svc: Optional[OrderBookDataClient] = None
 event_loop: Optional[asyncio.AbstractEventLoop] = None
 broadcast_queue: Optional[asyncio.Queue] = None
 ws_clients: Set[WebSocket] = set()
+event_ws_clients: Set[WebSocket] = set()
 last_broadcast_time = 0.0
 pending_broadcast = False
 
@@ -408,19 +409,22 @@ def _delayed_broadcast():
 async def broadcast_worker():
     while True:
         payload = await broadcast_queue.get()
+        payload_type = 'snapshot' if isinstance(payload, str) else payload.get('type')
+        targets = ws_clients if payload_type == 'snapshot' else (ws_clients | event_ws_clients)
         # 预序列化一次，所有客户端共享同一份 JSON 字符串
         if isinstance(payload, str):
             text = payload  # 已经是预序列化的 JSON
         else:
             text = _json_dumps(payload)
         dead_clients = []
-        for ws in list(ws_clients):
+        for ws in list(targets):
             try:
                 await ws.send_text(text)
             except Exception:
                 dead_clients.append(ws)
         for ws in dead_clients:
             ws_clients.discard(ws)
+            event_ws_clients.discard(ws)
 
 
 async def _orderbook_broadcast_loop():
@@ -555,6 +559,7 @@ async def health():
         'contracts': status.get('contracts', []),
         'spot_symbols': status.get('spot_symbols', []),
         'client_count': len(ws_clients),
+        'event_client_count': len(event_ws_clients),
         'service_state': status.get('state', SERVICE_IDLE),
     }
 
@@ -859,7 +864,7 @@ async def close_all_positions():
 
 
 @app.websocket('/ws/orderbook')
-async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
+async def ws_orderbook(websocket: WebSocket, token: str = Query(None), mode: str = Query('snapshot')):
     # 验证 token
     try:
         verify_ws_token(token)
@@ -868,11 +873,15 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
         return
     
     await websocket.accept()
-    ws_clients.add(websocket)
+    snapshot_mode = mode != 'events'
+    if snapshot_mode:
+        ws_clients.add(websocket)
+    event_ws_clients.add(websocket)
 
     try:
         # 初始连接时发送当前快照（复用缓存的 JSON）
-        await websocket.send_text(build_payload_json())
+        if snapshot_mode:
+            await websocket.send_text(build_payload_json())
         if svc and svc.state in (SERVICE_STARTING, SERVICE_STOPPING):
             await websocket.send_text(_json_dumps(svc.get_progress_payload()))
 
@@ -892,6 +901,7 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
         pass
     finally:
         ws_clients.discard(websocket)
+        event_ws_clients.discard(websocket)
 
 
 def _get_fresh_trading_rows() -> List[Dict]:

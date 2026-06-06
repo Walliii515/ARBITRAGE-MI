@@ -150,7 +150,7 @@ let pageVisible = true
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = getToken()
-  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}`
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}&mode=events`
 }
 
 function connectWs() {
@@ -1021,7 +1021,8 @@ onUnmounted(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (pingInterval) clearInterval(pingInterval)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
-  // WebSocket 保持活跃，不主动关闭
+  socket?.close()
+  socket = null
 })
 </script>
 

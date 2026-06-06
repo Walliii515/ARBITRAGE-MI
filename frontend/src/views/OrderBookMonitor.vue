@@ -1191,13 +1191,12 @@ function handleVisibilityChange() {
 }
 
 onUnmounted(() => {
-  // HMR 时不关闭 WebSocket，保持连接
-  // 只有在页面真正关闭/导航时才清理
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (statusInterval) clearInterval(statusInterval)
   if (pingInterval) clearInterval(pingInterval)
-  // 注释掉 socket?.close()，让 HMR 时连接保持活跃
-  // socket?.close()
+  socket?.close()
+  socket = null
+  wsInitialized = false
   
   // 清理事件监听
   document.removeEventListener('click', handleOutsideClick)
