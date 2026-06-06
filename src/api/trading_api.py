@@ -22,6 +22,15 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/trading", tags=["trading"])
 
+_ALLOWED_CLOSE_THRESHOLD_COLS = {
+    'close_basis_p1',
+    'close_basis_p2',
+    'close_basis_p3',
+    'close_basis_p5',
+    'close_basis_p10',
+    'close_basis_p20',
+}
+
 
 def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """将数据库行中的 Decimal/datetime 转换为 JSON 可序列化类型"""
@@ -55,6 +64,14 @@ async def get_orders(
     page_size: int = Query(100, ge=1, le=5000, description="每页持仓数"),
 ):
     """查询持仓列表（直接查 mi_trade_position，按持仓分页）"""
+    close_threshold_col = config.get_str(
+        'trade.vwap.close_threshold_percentile',
+        'close_basis_p20',
+    ).strip()
+    if close_threshold_col not in _ALLOWED_CLOSE_THRESHOLD_COLS:
+        logger.warning(f'无效平仓VWAP阈值字段 {close_threshold_col}，回退 close_basis_p20')
+        close_threshold_col = 'close_basis_p20'
+
     # ─── 构建 WHERE 条件 ───
     where_clauses = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
     params: list = [days]
@@ -99,9 +116,22 @@ async def get_orders(
     query_params = list(params) + [page_size, offset]
     sql = f"""
         SELECT p.*,
+               t.open_basis_p20 AS open_vwap_threshold_bps,
+               t.{close_threshold_col} AS close_vwap_threshold_bps,
                (SELECT o.channel FROM mi_trade_order o WHERE o.position_id = p.id LIMIT 1) AS channel,
                (SELECT COUNT(*) FROM mi_trade_order o WHERE o.position_id = p.id) AS order_count
         FROM mi_trade_position p
+        LEFT JOIN (
+            SELECT v.*
+            FROM mi_vwap_basis_threshold v
+            INNER JOIN (
+                SELECT base_asset, MAX(calc_date) AS calc_date
+                FROM mi_vwap_basis_threshold
+                GROUP BY base_asset
+            ) latest
+                ON latest.base_asset = v.base_asset
+               AND latest.calc_date = v.calc_date
+        ) t ON t.base_asset = p.base_asset
         WHERE {where_sql}
         ORDER BY p.id DESC
         LIMIT %s OFFSET %s

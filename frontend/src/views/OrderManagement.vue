@@ -56,6 +56,8 @@ interface PositionRow {
   future_open_price: number | null
   future_open_contracts: number | null
   open_spread_bps: number | null
+  open_vwap_threshold_bps: number | null
+  close_vwap_threshold_bps: number | null
   open_reason: string | null
   spot_close_price: number | null
   spot_close_amount: number | null
@@ -243,9 +245,27 @@ const columnDefs = computed((): ColDef[] => [
     valueFormatter: bpsFormatter,
   },
   {
+    headerName: '开仓VWAP阈值(bps)',
+    field: 'open_vwap_threshold_bps',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
     headerName: '平仓基差(bps)',
     field: 'close_spread_bps',
     width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '平仓VWAP阈值(bps)',
+    field: 'close_vwap_threshold_bps',
+    width: 150,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
