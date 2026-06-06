@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional, Set
@@ -172,6 +173,9 @@ _connectivity_check_interval: int = 30       # 连通性检查间隔（秒）
 # 合并+对冲指标缓存（避免多个后台循环重复计算）
 _cached_merged_rows: List[Dict] = []
 _cached_merged_ts: float = 0.0
+_cached_trading_rows: List[Dict] = []
+_cached_trading_ts: float = 0.0
+TRADING_SCAN_CACHE_SEC = config.get_float('orderbook.trading_scan_cache_sec', 1.0)
 
 # 完整广播 payload 缓存（预序列化 JSON 字符串，避免多客户端重复序列化）
 _cached_payload_json: str = ''
@@ -896,9 +900,16 @@ def _get_fresh_trading_rows() -> List[Dict]:
     候选扫描复用短期合并缓存，避免 0.2s 开仓循环反复跨进程拉取全量宽表。
     真正下单前仍由 TradingExecutor 的单标的旁路校验读取最新盘口并检查 lag。
     """
+    global _cached_trading_rows, _cached_trading_ts
+    now = time.time()
+    if _cached_trading_rows and (now - _cached_trading_ts) < TRADING_SCAN_CACHE_SEC:
+        return deepcopy(_cached_trading_rows)
+
     rows = _get_merged_rows()
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
     enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg)
+    _cached_trading_rows = deepcopy(rows)
+    _cached_trading_ts = now
     return rows
 
 
