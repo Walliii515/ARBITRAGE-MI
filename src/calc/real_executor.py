@@ -295,7 +295,7 @@ class RealExecutor:
 
     def fetch_binance_account_balances(self) -> List[Dict]:
         """
-        拉取 Binance 现货账户非零资产余额（只读，资金/对账使用）。
+        拉取 Binance 现货账户非零资产余额（只读，资金使用）。
 
         返回字段保持贴近交易所原始口径：
         [{asset, free, locked, total}]
@@ -315,7 +315,7 @@ class RealExecutor:
         result: List[Dict] = []
         for item in data.get('balances', []):
             asset = str(item.get('asset') or '').upper()
-            if not asset or asset == 'USDT':
+            if not asset:
                 continue
             free = float(item.get('free') or 0)
             locked = float(item.get('locked') or 0)
