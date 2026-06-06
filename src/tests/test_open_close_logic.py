@@ -76,7 +76,9 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           asset_tier_meta=None,
                           momentum_enabled=False,
                           momentum_allowed_tiers=None,
-                          momentum_tier_overrides=None):
+                          momentum_tier_overrides=None,
+                          rebound_enabled=True,
+                          rebound_allowed_tiers=None):
     """构造独立的 TradingExecutor 实例（不依赖 DB / API）"""
     from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 
@@ -90,6 +92,8 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         momentum_enabled=momentum_enabled,
         momentum_allowed_tiers=momentum_allowed_tiers or ['A'],
         momentum_tier_overrides=momentum_tier_overrides or {},
+        rebound_enabled=rebound_enabled,
+        rebound_allowed_tiers=rebound_allowed_tiers or ['B'],
     )
     te = TradingExecutor(
         cfg, contract_meta={}, spot_meta={},
@@ -620,6 +624,34 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
 
         self.assertFalse(te._pass_momentum_check('BTC', 34.0, self._row('BTC', 34.0)))
         self.assertNotIn('BTC', te._peak_state)
+
+    def test_b_tier_waits_for_rebound_after_pullback_resiliency(self):
+        te = make_trading_executor(
+            basis_threshold_bps=20,
+            vwap_threshold_meta={'BTC': {'p20': 20}},
+            close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
+            asset_tier_meta={'BTC': 'B'},
+            rebound_enabled=True,
+            rebound_allowed_tiers=['B'],
+        )
+        te.rebound_min_rise_bps = 4.0
+        te.rebound_min_slope_bps = 0.5
+        te.rebound_min_basis_buffer_bps = 2.0
+        te._resolve_signal = MagicMock()
+        te._peak_state['BTC'] = {
+            'peak_bps': 50.0,
+            'start_time': datetime.now(),
+            'trigger': 'pullback',
+            'signal_id': 1001,
+            'signal_basis_bps': 50.0,
+            'resiliency_active': True,
+        }
+
+        self.assertFalse(te._pass_rebound_check('BTC', 42.0, self._row('BTC', 42.0)))
+        self.assertFalse(te._pass_rebound_check('BTC', 44.0, self._row('BTC', 44.0)))
+        self.assertTrue(te._pass_rebound_check('BTC', 46.5, self._row('BTC', 46.5)))
+        self.assertEqual(te._peak_state['BTC']['trigger'], 'rebound')
+        self.assertAlmostEqual(te._peak_state['BTC']['rebound_rise_bps'], 4.5)
 
 
 # ══════════════════════════════════════════════════════════════════

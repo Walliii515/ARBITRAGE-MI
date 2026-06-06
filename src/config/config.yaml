@@ -77,6 +77,25 @@ trade:
         min_basis_buffer_bps: 6             # A 级安全垫略小
         safety_bps: 6                       # A 级盈利性守卫额外安全垫略小
 
+  # ─── 回调后再突破开仓通道 ───
+  # 用于 B 级标的：先等冲击释放和盘口恢复，但不在回调后立刻接单；
+  # 只有基差从回调低点再次上行突破，才进入最终旁路和下单。
+  rebound_open:
+    enabled: true
+    allowed_tiers: [B]
+    min_rise_bps: 4                         # 从回调低点至少回升多少 bps
+    min_slope_bps: 0.5                      # 当前样本相对上一样本仍需向上
+    min_basis_buffer_bps: 4                 # 当前基差需至少高于 p20 的额外安全垫
+    max_wait_sec: 4.0                       # 回调恢复后最多等待二次突破多久
+
+  # ─── 下单前执行质量保护 ───
+  # 过滤 pre_gate 已经缺少安全垫、或相对峰值衰减太多的机会。
+  execution_guard:
+    enabled: true
+    min_profit_buffer_bps: 15               # pre_gate 需高于 平仓阈值+全手续费 的额外安全垫
+    min_p20_buffer_bps: 3                   # pre_gate 需高于 p20 的额外安全垫
+    max_peak_decay_bps: 45                  # pre_gate 相对峰值最多允许衰减
+
   # ─── 开仓盘口恢复确认 ───
   # 当开仓信号已经完成“峰值回落”确认后，系统不会立刻下单，而是进入最多 3.0 秒的盘口恢复观察期；
   # 在这段时间里，至少需要采集到 3 个有效盘口样本；被冲击的开仓侧深度要恢复到监控起点的 65% 以上；

@@ -89,6 +89,20 @@ class TradingExecutorConfig:
     momentum_allowed_tiers: List[str] = field(default_factory=lambda: ['A'])
     momentum_tier_overrides: Dict[str, Dict] = field(default_factory=dict)
 
+    # ─── 回调后二次突破开仓 ───
+    rebound_enabled: bool = True
+    rebound_allowed_tiers: List[str] = field(default_factory=lambda: ['B'])
+    rebound_min_rise_bps: float = 4.0
+    rebound_min_slope_bps: float = 0.5
+    rebound_min_basis_buffer_bps: float = 4.0
+    rebound_max_wait_sec: float = 4.0
+
+    # ─── 下单前执行质量保护 ───
+    execution_guard_enabled: bool = True
+    execution_guard_min_profit_buffer_bps: float = 15.0
+    execution_guard_min_p20_buffer_bps: float = 3.0
+    execution_guard_max_peak_decay_bps: float = 45.0
+
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
     capital_max_age_sec: int = 180
@@ -224,6 +238,22 @@ class TradingExecutor:
             if isinstance(params, dict)
         }
         self._momentum_samples: Dict[str, deque] = {}
+
+        self.rebound_enabled = cfg.rebound_enabled
+        self.rebound_allowed_tiers: Set[str] = {
+            str(t).strip().upper()
+            for t in (cfg.rebound_allowed_tiers or [])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.rebound_min_rise_bps = float(cfg.rebound_min_rise_bps)
+        self.rebound_min_slope_bps = float(cfg.rebound_min_slope_bps)
+        self.rebound_min_basis_buffer_bps = float(cfg.rebound_min_basis_buffer_bps)
+        self.rebound_max_wait_sec = float(cfg.rebound_max_wait_sec)
+
+        self.execution_guard_enabled = cfg.execution_guard_enabled
+        self.execution_guard_min_profit_buffer_bps = float(cfg.execution_guard_min_profit_buffer_bps)
+        self.execution_guard_min_p20_buffer_bps = float(cfg.execution_guard_min_p20_buffer_bps)
+        self.execution_guard_max_peak_decay_bps = float(cfg.execution_guard_max_peak_decay_bps)
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
@@ -372,6 +402,11 @@ class TradingExecutor:
                     # 后续循环持续采样恢复质量，不再反复要求 pullback 条件成立。
                     if not self._pass_open_resiliency_check(base_asset, row, open_vwap_basis):
                         continue
+
+                    # 3.3 B 级回调通道不在盘口恢复后立刻开仓，而是等待基差二次上行突破。
+                    # 这保留“冲击释放后再进”的优点，同时避免接住继续衰减的第一口流动性。
+                    if not self._pass_rebound_check(base_asset, open_vwap_basis, row):
+                        continue
                                 
                 # 3.5 最终风控旁路：单标的最短链路重新校验（拦截信号过期场景）
                 contract = row.get('contract', '')
@@ -404,6 +439,25 @@ class TradingExecutor:
                 signal_basis = peak_state.get('signal_basis_bps')
                 row['signal_basis_bps'] = signal_basis
                 row['pre_gate_basis_bps'] = open_vwap_basis
+
+                guard_passed, guard_reason = self._pass_execution_guard(
+                    base_asset, open_vwap_basis, peak_state
+                )
+                if not guard_passed:
+                    self._resolve_signal(
+                        base_asset, 'gate_rejected', guard_reason,
+                        exit_basis_bps=open_vwap_basis,
+                        trigger_type=peak_state.get('trigger'),
+                        signal_basis_bps=signal_basis,
+                        pre_gate_basis_bps=open_vwap_basis,
+                    )
+                    self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
+                    logger.info(
+                        f"执行质量保护拦截 | {base_asset} | "
+                        f"pre_gate_basis={open_vwap_basis:.2f}bps | 原因: {guard_reason}"
+                    )
+                    continue
                 
                 # 4. 构建开仓原因（用于复盘）
                 open_reason = self._build_open_reason(row, base_asset, open_vwap_basis)
@@ -620,6 +674,147 @@ class TradingExecutor:
             return False
         logger.info(f"开仓盘口恢复等待 | {base_asset} | reason={result.reason} | {metric_text}")
         return False
+
+    def _pass_rebound_check(self, base_asset: str, current_basis_bps: float, row: Dict) -> bool:
+        """
+        回调 + 盘口恢复后，等待基差再次向上突破再入场。
+
+        这只改变 pullback 通道；momentum 通道已经代表“上升期直接入场”，不经过这里。
+        """
+        if not self.rebound_enabled:
+            return True
+
+        tier = self._asset_tier(base_asset)
+        if tier not in self.rebound_allowed_tiers:
+            return True
+
+        state = self._peak_state.get(base_asset)
+        if not state or state.get('trigger') != 'pullback':
+            return True
+
+        now = datetime.now()
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        p20 = float(threshold_data.get('p20', self.basis_threshold_bps))
+        min_basis = p20 + self.rebound_min_basis_buffer_bps
+
+        if current_basis_bps < p20:
+            self._resolve_signal(
+                base_asset,
+                'conditions_lost',
+                f'回弹等待中基差跌回阈值下({current_basis_bps:.1f}<p20={p20:.1f}bps)',
+                exit_basis_bps=current_basis_bps,
+                trigger_type='pullback',
+            )
+            self._peak_state.pop(base_asset, None)
+            self._open_resiliency.clear(base_asset)
+            return False
+
+        if not state.get('rebound_active'):
+            state['rebound_active'] = True
+            state['rebound_start_time'] = now
+            state['rebound_floor_bps'] = current_basis_bps
+            state['rebound_last_basis_bps'] = current_basis_bps
+            logger.info(
+                f"回调后再突破等待开始 | {base_asset} | tier={tier} | "
+                f"floor={current_basis_bps:.2f}bps | "
+                f"需回升{self.rebound_min_rise_bps:.1f}bps且≥p20+buffer={min_basis:.2f}bps"
+            )
+            return False
+
+        floor_bps = float(state.get('rebound_floor_bps', current_basis_bps))
+        last_basis = float(state.get('rebound_last_basis_bps', current_basis_bps))
+        if current_basis_bps < floor_bps:
+            floor_bps = current_basis_bps
+            state['rebound_floor_bps'] = floor_bps
+
+        waited_sec = (now - state.get('rebound_start_time', now)).total_seconds()
+        if waited_sec > self.rebound_max_wait_sec:
+            self._resolve_signal(
+                base_asset,
+                'monitor_timeout',
+                (
+                    f'回弹等待{waited_sec:.1f}s未再突破('
+                    f'floor={floor_bps:.1f},current={current_basis_bps:.1f})'
+                ),
+                exit_basis_bps=current_basis_bps,
+                trigger_type='rebound_timeout',
+            )
+            self._peak_state.pop(base_asset, None)
+            self._open_resiliency.clear(base_asset)
+            logger.info(
+                f"回调后再突破超时放弃 | {base_asset} | "
+                f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | waited={waited_sec:.1f}s"
+            )
+            return False
+
+        rise_from_floor = current_basis_bps - floor_bps
+        slope_bps = current_basis_bps - last_basis
+        state['rebound_last_basis_bps'] = current_basis_bps
+
+        if (
+            rise_from_floor >= self.rebound_min_rise_bps
+            and slope_bps >= self.rebound_min_slope_bps
+            and current_basis_bps >= min_basis
+        ):
+            state['trigger'] = 'rebound'
+            state['rebound_rise_bps'] = rise_from_floor
+            state['rebound_floor_bps'] = floor_bps
+            logger.info(
+                f"回调后再突破确认 | {base_asset} | tier={tier} | "
+                f"floor={floor_bps:.2f}bps -> current={current_basis_bps:.2f}bps | "
+                f"rise={rise_from_floor:.2f}bps | slope={slope_bps:.2f}bps"
+            )
+            return True
+
+        logger.info(
+            f"回调后再突破等待 | {base_asset} | "
+            f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | "
+            f"rise={rise_from_floor:.2f}/{self.rebound_min_rise_bps:.1f}bps | "
+            f"slope={slope_bps:.2f}/{self.rebound_min_slope_bps:.1f}bps | "
+            f"min_basis={min_basis:.2f}"
+        )
+        return False
+
+    def _pass_execution_guard(self, base_asset: str, pre_gate_basis_bps: float, peak_state: Dict) -> tuple:
+        """下单前对 pre-gate 基差加安全垫，过滤回调通道里已经衰减太多的机会。"""
+        if not self.execution_guard_enabled:
+            return True, ''
+
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        p20 = threshold_data.get('p20', self.basis_threshold_bps)
+        if p20 is not None:
+            min_p20_basis = float(p20) + self.execution_guard_min_p20_buffer_bps
+            if pre_gate_basis_bps < min_p20_basis:
+                return False, (
+                    f'执行保护(pregate={pre_gate_basis_bps:.1f}<'
+                    f'p20+buffer={min_p20_basis:.1f})'
+                )
+
+        close_data = self.close_vwap_threshold_meta.get(base_asset)
+        if close_data:
+            close_thr = close_data.get(self.close_threshold_col)
+            if close_thr is not None:
+                min_profit_basis = (
+                    float(close_thr)
+                    + self.fee_cost_bps
+                    + self.execution_guard_min_profit_buffer_bps
+                )
+                if pre_gate_basis_bps <= min_profit_basis:
+                    return False, (
+                        f'执行保护(pregate={pre_gate_basis_bps:.1f}<='
+                        f'close+fee+buffer={min_profit_basis:.1f})'
+                    )
+
+        peak_bps = peak_state.get('peak_bps') if peak_state else None
+        if peak_bps is not None:
+            decay_bps = float(peak_bps) - pre_gate_basis_bps
+            if decay_bps > self.execution_guard_max_peak_decay_bps:
+                return False, (
+                    f'执行保护(峰值衰减{decay_bps:.1f}bps>'
+                    f'{self.execution_guard_max_peak_decay_bps:.1f}bps)'
+                )
+
+        return True, ''
     
     def _pass_risk_check(self, row: Dict) -> bool:
         """
@@ -1204,6 +1399,13 @@ class TradingExecutor:
                 parts.append(
                     f"峰值回落(峰{peak_bps:.1f},持续{elapsed:.1f}s≥{self.sustain_sec}s,"
                     f"回落{self.peak_pullback_pct*100:.0f}%)"
+                )
+            elif trigger == 'rebound':
+                floor_bps = float(peak_state.get('rebound_floor_bps', 0) or 0)
+                rise_bps = float(peak_state.get('rebound_rise_bps', 0) or 0)
+                parts.append(
+                    f"回调再突破(峰{peak_bps:.1f},低{floor_bps:.1f},"
+                    f"回升{rise_bps:.1f}bps)"
                 )
             elif trigger == 'momentum':
                 rise_bps = float(peak_state.get('momentum_rise_bps', 0) or 0)
