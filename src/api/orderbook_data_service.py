@@ -11,6 +11,7 @@
 """
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -28,6 +29,7 @@ logger = get_logger(__name__)
 
 SETTLE = config.get_str('orderbook.settle', 'usdt', env='ORDERBOOK_SETTLE')
 svc: ServiceLifecycleManager = ServiceLifecycleManager(settle=SETTLE)
+_last_raw_snapshot_metrics = {}
 
 
 @asynccontextmanager
@@ -66,6 +68,13 @@ async def health():
 @app.get('/api/service/status')
 async def service_status():
     return svc.get_status()
+
+
+@app.get('/api/service/diagnostics')
+async def service_diagnostics():
+    data = svc.get_diagnostics()
+    data['raw_snapshot'] = _last_raw_snapshot_metrics
+    return data
 
 
 @app.get('/api/service/connections')
@@ -109,9 +118,29 @@ async def retry_snapshot(body: dict):
 
 @app.get('/api/orderbook/raw-snapshot')
 async def raw_snapshot():
+    global _last_raw_snapshot_metrics
+    start = time.perf_counter()
     future_rows = svc.gate_manager.to_records() if svc.gate_manager else []
+    future_ms = (time.perf_counter() - start) * 1000
+    spot_start = time.perf_counter()
     spot_rows = svc.spot_manager.to_records() if svc.spot_manager else []
+    spot_ms = (time.perf_counter() - spot_start) * 1000
+    merge_start = time.perf_counter()
     rows = merge_orderbook_records(future_rows, spot_rows)
+    merge_ms = (time.perf_counter() - merge_start) * 1000
+    total_ms = (time.perf_counter() - start) * 1000
+    _last_raw_snapshot_metrics = {
+        'total_ms': round(total_ms, 2),
+        'future_to_records_ms': round(future_ms, 2),
+        'spot_to_records_ms': round(spot_ms, 2),
+        'merge_ms': round(merge_ms, 2),
+        'future_rows': len(future_rows),
+        'spot_rows': len(spot_rows),
+        'merged_rows': len(rows),
+        'at': time.time(),
+    }
+    if total_ms > 500:
+        logger.warning(f'raw_snapshot 构建偏慢: {_last_raw_snapshot_metrics}')
     return {
         'state': svc.state,
         'gate_ws_connected': svc._gate_ws_connected(),

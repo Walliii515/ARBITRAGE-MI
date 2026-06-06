@@ -165,6 +165,22 @@ class ServiceLifecycleManager:
             'spot_symbols': self.spot_manager.get_all_symbols() if self.spot_manager else [],
         }
 
+    def get_diagnostics(self) -> dict:
+        """获取行情新鲜度与 WS 分片处理指标，用于定位延迟来源。"""
+        return {
+            'state': self._state,
+            'gate_ws_connected': self._gate_ws_connected(),
+            'binance_ws_connected': self._binance_ws_connected(),
+            'freshness': {
+                'gate': self._freshness_summary('gate'),
+                'binance': self._freshness_summary('binance'),
+            },
+            'ws_clients': {
+                'gate': self._ws_client_metrics(self.gate_manager),
+                'binance': self._ws_client_metrics(self.spot_manager),
+            },
+        }
+
     def get_connection_status(self) -> List[Dict]:
         """获取逐标的连接状态列表（供前端展示）"""
         now = time.time()
@@ -630,6 +646,59 @@ class ServiceLifecycleManager:
         ordered = sorted(values)
         index = min(len(ordered) - 1, int((len(ordered) - 1) * 0.9))
         return ordered[index]
+
+    def _freshness_summary(self, side: str) -> dict:
+        now = time.time()
+        if side == 'gate':
+            books = self.gate_manager.orderbooks if self.gate_manager else {}
+            key_name = 'contract'
+            rows = [
+                (getattr(ob, key_name, key), (now - ob.last_update_time) * 1000)
+                for key, ob in books.items()
+                if getattr(ob, 'last_update_time', 0) > 0
+            ]
+        else:
+            books = self.spot_manager.orderbooks if self.spot_manager else {}
+            key_name = 'symbol'
+            rows = []
+            for key, ob in books.items():
+                last_update = getattr(ob, 'last_update_time', 0) or getattr(ob, 'update_time', 0)
+                if last_update > 0:
+                    rows.append((getattr(ob, key_name, key), (now - last_update) * 1000))
+
+        ages = [age for _, age in rows]
+        if not ages:
+            return {'count': 0}
+        ordered = sorted(ages)
+        def pct(q: float) -> int:
+            return int(ordered[min(len(ordered) - 1, int((len(ordered) - 1) * q))])
+        worst = sorted(rows, key=lambda item: item[1], reverse=True)[:10]
+        return {
+            'count': len(ages),
+            'p50_ms': pct(0.5),
+            'p90_ms': pct(0.9),
+            'p99_ms': pct(0.99),
+            'max_ms': int(ordered[-1]),
+            'over_200ms': sum(1 for age in ages if age > 200),
+            'over_1000ms': sum(1 for age in ages if age > 1000),
+            'over_5000ms': sum(1 for age in ages if age > 5000),
+            'worst': [{'key': key, 'age_ms': int(age)} for key, age in worst],
+        }
+
+    @staticmethod
+    def _ws_client_metrics(manager) -> List[dict]:
+        if not manager:
+            return []
+        clients = getattr(manager, 'ws_clients', None) or []
+        metrics = []
+        for index, client in enumerate(clients):
+            if hasattr(client, 'get_metrics'):
+                item = client.get_metrics()
+            else:
+                item = {}
+            item['index'] = index
+            metrics.append(item)
+        return metrics
 
     def _push_progress(self):
         """WS 广播进度更新"""

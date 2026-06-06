@@ -55,6 +55,16 @@ class BinanceSpotOrderBookWS:
         self._should_reconnect = False  # 区分主动断开 vs 意外断连
         self._reconnect_thread: Optional[threading.Thread] = None
         self._init_symbols: Optional[List[str]] = None  # 重连时用于重建组合流 URL
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            'message_count': 0,
+            'last_message_at': 0.0,
+            'json_ms_total': 0.0,
+            'json_ms_max': 0.0,
+            'callback_ms_total': 0.0,
+            'callback_ms_max': 0.0,
+            'slow_callback_count': 0,
+        }
 
     def connect(self, symbols: Optional[List[str]] = None):
         """
@@ -208,10 +218,15 @@ class BinanceSpotOrderBookWS:
             }
         }
         """
+        start = time.perf_counter()
+        json_done = start
+        callback_ms = 0.0
         try:
             msg = json.loads(message)
+            json_done = time.perf_counter()
 
             if 'result' in msg and 'id' in msg:
+                self._record_metrics(json_done - start, callback_ms)
                 return
 
             if 'stream' in msg and 'data' in msg:
@@ -220,17 +235,53 @@ class BinanceSpotOrderBookWS:
                 symbol = stream.split('@')[0].upper()
 
                 if self.on_update_callback:
+                    cb_start = time.perf_counter()
                     self.on_update_callback(symbol, data)
+                    callback_ms = (time.perf_counter() - cb_start) * 1000
+                self._record_metrics(json_done - start, callback_ms)
                 return
 
             if 'lastUpdateId' in msg:
                 if self.on_update_callback and len(self.subscriptions) == 1:
+                    cb_start = time.perf_counter()
                     self.on_update_callback(self.subscriptions[0], msg)
+                    callback_ms = (time.perf_counter() - cb_start) * 1000
+                self._record_metrics(json_done - start, callback_ms)
 
         except json.JSONDecodeError as e:
             logger.exception(f"JSON 解析错误: {e}")
         except Exception as e:
             logger.exception(f"处理消息错误: {e}")
+
+    def _record_metrics(self, json_sec: float, callback_ms: float):
+        json_ms = json_sec * 1000
+        with self._metrics_lock:
+            self._metrics['message_count'] += 1
+            self._metrics['last_message_at'] = time.time()
+            self._metrics['json_ms_total'] += json_ms
+            self._metrics['json_ms_max'] = max(self._metrics['json_ms_max'], json_ms)
+            self._metrics['callback_ms_total'] += callback_ms
+            self._metrics['callback_ms_max'] = max(self._metrics['callback_ms_max'], callback_ms)
+            if callback_ms > 50:
+                self._metrics['slow_callback_count'] += 1
+
+    def get_metrics(self) -> dict:
+        with self._metrics_lock:
+            metrics = dict(self._metrics)
+        count = metrics['message_count'] or 1
+        return {
+            'subscriptions': len(self.subscriptions),
+            'is_running': self.is_running,
+            'connected': self._connected_event.is_set(),
+            'message_count': metrics['message_count'],
+            'last_message_at': metrics['last_message_at'],
+            'message_age_ms': int((time.time() - metrics['last_message_at']) * 1000) if metrics['last_message_at'] else None,
+            'json_ms_avg': round(metrics['json_ms_total'] / count, 3),
+            'json_ms_max': round(metrics['json_ms_max'], 3),
+            'callback_ms_avg': round(metrics['callback_ms_total'] / count, 3),
+            'callback_ms_max': round(metrics['callback_ms_max'], 3),
+            'slow_callback_count': metrics['slow_callback_count'],
+        }
 
     def _on_error(self, ws, error):
         """错误回调"""

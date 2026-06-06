@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from copy import deepcopy
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from calc.service_lifecycle import SERVICE_IDLE
@@ -89,6 +90,14 @@ class OrderBookDataClient:
         self._raw_ttl = 0.05
         self.gate_manager = RemoteGateManager(self)
         self.spot_manager = RemoteSpotManager(self)
+        self._request_metrics: Dict[str, Dict] = defaultdict(lambda: {
+            'count': 0,
+            'total_ms': 0.0,
+            'max_ms': 0.0,
+            'slow_count': 0,
+            'last_ms': 0.0,
+            'last_at': 0.0,
+        })
 
     def _request(self, method: str, path: str, body: Optional[Dict] = None) -> Dict:
         data = None if body is None else json.dumps(body).encode('utf-8')
@@ -99,11 +108,25 @@ class OrderBookDataClient:
             headers={'Content-Type': 'application/json'},
         )
         try:
+            start = time.perf_counter()
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode('utf-8'))
+                payload = resp.read()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            self._record_request_metric(path, elapsed_ms)
+            return json.loads(payload.decode('utf-8'))
         except urllib.error.HTTPError as e:
             detail = e.read().decode('utf-8', errors='ignore')
             raise RuntimeError(f'盘口服务请求失败 {method} {path}: HTTP {e.code} {detail}') from e
+
+    def _record_request_metric(self, path: str, elapsed_ms: float) -> None:
+        metric = self._request_metrics[path]
+        metric['count'] += 1
+        metric['total_ms'] += elapsed_ms
+        metric['max_ms'] = max(metric['max_ms'], elapsed_ms)
+        metric['last_ms'] = elapsed_ms
+        metric['last_at'] = time.time()
+        if elapsed_ms > 500:
+            metric['slow_count'] += 1
 
     @property
     def state(self) -> str:
@@ -126,6 +149,25 @@ class OrderBookDataClient:
 
     def get_connection_status(self) -> List[Dict]:
         return self._request('GET', '/api/service/connections').get('items', [])
+
+    def get_diagnostics(self) -> Dict:
+        data = self._request('GET', '/api/service/diagnostics')
+        data['client_request_metrics'] = self.get_request_metrics()
+        return data
+
+    def get_request_metrics(self) -> Dict:
+        result = {}
+        for path, metric in self._request_metrics.items():
+            count = metric['count'] or 1
+            result[path] = {
+                'count': metric['count'],
+                'avg_ms': round(metric['total_ms'] / count, 2),
+                'max_ms': round(metric['max_ms'], 2),
+                'last_ms': round(metric['last_ms'], 2),
+                'last_at': metric['last_at'],
+                'slow_count': metric['slow_count'],
+            }
+        return result
 
     def get_raw_snapshot(self, force: bool = False) -> Dict:
         now = time.time()

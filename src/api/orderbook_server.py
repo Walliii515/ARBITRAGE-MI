@@ -576,6 +576,16 @@ async def service_connections():
     }
 
 
+@app.get('/api/service/diagnostics')
+async def service_diagnostics():
+    """透传盘口数据服务诊断指标，并附带主服务 HTTP 客户端耗时。"""
+    if not svc:
+        return {'state': SERVICE_IDLE}
+    if hasattr(svc, 'get_diagnostics'):
+        return svc.get_diagnostics()
+    return {'state': svc.state}
+
+
 @app.get('/api/service/exchange-connectivity')
 async def exchange_connectivity():
     """获取交易链路连通性状态（无需认证，用于前端监控展示）

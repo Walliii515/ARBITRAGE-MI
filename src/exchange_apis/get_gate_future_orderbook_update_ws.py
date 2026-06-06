@@ -47,6 +47,16 @@ class GateFuturesOrderBookWS:
         self._reconnect_thread: Optional[threading.Thread] = None
         self._send_lock = threading.Lock()
         self._last_control_send_at = 0.0
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            'message_count': 0,
+            'last_message_at': 0.0,
+            'json_ms_total': 0.0,
+            'json_ms_max': 0.0,
+            'callback_ms_total': 0.0,
+            'callback_ms_max': 0.0,
+            'slow_callback_count': 0,
+        }
 
     def connect(self):
         """建立 WebSocket 连接"""
@@ -183,25 +193,33 @@ class GateFuturesOrderBookWS:
             self._send_subscribe(sub)
 
     def _on_message(self, ws, message):
+        start = time.perf_counter()
+        json_done = start
+        callback_ms = 0.0
         try:
             data = json.loads(message)
+            json_done = time.perf_counter()
             if data.get('event') == 'subscribe':
                 result = data.get('result', {})
                 status = result.get('status', '')
                 log_print(f"Gate OBU 订阅确认: status={status}")
                 if status == 'fail':
                     logger.error(f"Gate OBU 订阅失败: {json.dumps(data, ensure_ascii=False)}")
+                self._record_metrics(json_done - start, callback_ms)
                 return
 
             if data.get('channel') != 'futures.obu':
+                self._record_metrics(json_done - start, callback_ms)
                 return
             result = data.get('result', {})
             if not isinstance(result, dict):
+                self._record_metrics(json_done - start, callback_ms)
                 return
 
             stream = result.get('s') or data.get('payload', [None])[0]
             contract = self._contract_from_stream(stream)
             if not contract:
+                self._record_metrics(json_done - start, callback_ms)
                 return
 
             update_data = {
@@ -214,11 +232,44 @@ class GateFuturesOrderBookWS:
                 'asks': result.get('a', []),
             }
             if self.on_update_callback:
+                cb_start = time.perf_counter()
                 self.on_update_callback(contract, update_data)
+                callback_ms = (time.perf_counter() - cb_start) * 1000
+            self._record_metrics(json_done - start, callback_ms)
         except json.JSONDecodeError as e:
             logger.exception(f"Gate OBU JSON 解析错误: {e}")
         except Exception as e:
             logger.exception(f"Gate OBU 处理消息错误: {e}")
+
+    def _record_metrics(self, json_sec: float, callback_ms: float):
+        json_ms = json_sec * 1000
+        with self._metrics_lock:
+            self._metrics['message_count'] += 1
+            self._metrics['last_message_at'] = time.time()
+            self._metrics['json_ms_total'] += json_ms
+            self._metrics['json_ms_max'] = max(self._metrics['json_ms_max'], json_ms)
+            self._metrics['callback_ms_total'] += callback_ms
+            self._metrics['callback_ms_max'] = max(self._metrics['callback_ms_max'], callback_ms)
+            if callback_ms > 50:
+                self._metrics['slow_callback_count'] += 1
+
+    def get_metrics(self) -> dict:
+        with self._metrics_lock:
+            metrics = dict(self._metrics)
+        count = metrics['message_count'] or 1
+        return {
+            'subscriptions': len(self.subscriptions),
+            'is_running': self.is_running,
+            'connected': self._connected_event.is_set(),
+            'message_count': metrics['message_count'],
+            'last_message_at': metrics['last_message_at'],
+            'message_age_ms': int((time.time() - metrics['last_message_at']) * 1000) if metrics['last_message_at'] else None,
+            'json_ms_avg': round(metrics['json_ms_total'] / count, 3),
+            'json_ms_max': round(metrics['json_ms_max'], 3),
+            'callback_ms_avg': round(metrics['callback_ms_total'] / count, 3),
+            'callback_ms_max': round(metrics['callback_ms_max'], 3),
+            'slow_callback_count': metrics['slow_callback_count'],
+        }
 
     @staticmethod
     def _contract_from_stream(stream: Optional[str]) -> str:
