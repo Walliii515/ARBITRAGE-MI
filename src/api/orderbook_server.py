@@ -998,7 +998,7 @@ def _run_open_position_check_once():
                 momentum_allowed_tiers=config.get('trade.momentum_open.allowed_tiers', ['A']),
                 momentum_tier_overrides=config.get('trade.momentum_open.tier_overrides', {}),
                 rebound_enabled=config.get_bool('trade.rebound_open.enabled', True),
-                rebound_allowed_tiers=config.get('trade.rebound_open.allowed_tiers', ['B']),
+                rebound_allowed_tiers=config.get('trade.rebound_open.allowed_tiers', ['A', 'B']),
                 rebound_min_rise_bps=config.get_float('trade.rebound_open.min_rise_bps', 4.0),
                 rebound_min_slope_bps=config.get_float('trade.rebound_open.min_slope_bps', 0.5),
                 rebound_min_basis_buffer_bps=config.get_float('trade.rebound_open.min_basis_buffer_bps', 4.0),

@@ -93,7 +93,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         momentum_allowed_tiers=momentum_allowed_tiers or ['A'],
         momentum_tier_overrides=momentum_tier_overrides or {},
         rebound_enabled=rebound_enabled,
-        rebound_allowed_tiers=rebound_allowed_tiers or ['B'],
+        rebound_allowed_tiers=rebound_allowed_tiers or ['A', 'B'],
     )
     te = TradingExecutor(
         cfg, contract_meta={}, spot_meta={},
@@ -572,7 +572,7 @@ class TestTradingExecutorOpenFlowResiliency(unittest.TestCase):
 
 
 class TestTradingExecutorTierMomentum(unittest.TestCase):
-    """A 级允许 momentum，B 级只走回落+恢复。"""
+    """A 级允许 momentum；A 未命中 momentum 和 B 级都必须走 rebound。"""
 
     def _row(self, base_asset, basis):
         return {
@@ -625,14 +625,14 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
         self.assertFalse(te._pass_momentum_check('BTC', 34.0, self._row('BTC', 34.0)))
         self.assertNotIn('BTC', te._peak_state)
 
-    def test_b_tier_waits_for_rebound_after_pullback_resiliency(self):
+    def _assert_waits_for_rebound_after_pullback_resiliency(self, tier):
         te = make_trading_executor(
             basis_threshold_bps=20,
             vwap_threshold_meta={'BTC': {'p20': 20}},
             close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
-            asset_tier_meta={'BTC': 'B'},
+            asset_tier_meta={'BTC': tier},
             rebound_enabled=True,
-            rebound_allowed_tiers=['B'],
+            rebound_allowed_tiers=['A', 'B'],
         )
         te.rebound_min_rise_bps = 4.0
         te.rebound_min_slope_bps = 0.5
@@ -652,6 +652,35 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
         self.assertTrue(te._pass_rebound_check('BTC', 46.5, self._row('BTC', 46.5)))
         self.assertEqual(te._peak_state['BTC']['trigger'], 'rebound')
         self.assertAlmostEqual(te._peak_state['BTC']['rebound_rise_bps'], 4.5)
+
+    def test_a_tier_waits_for_rebound_when_momentum_not_used(self):
+        self._assert_waits_for_rebound_after_pullback_resiliency('A')
+
+    def test_b_tier_waits_for_rebound_after_pullback_resiliency(self):
+        self._assert_waits_for_rebound_after_pullback_resiliency('B')
+
+    def test_pullback_direct_open_is_blocked_for_non_rebound_tier(self):
+        te = make_trading_executor(
+            basis_threshold_bps=20,
+            vwap_threshold_meta={'BTC': {'p20': 20}},
+            close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
+            asset_tier_meta={'BTC': 'C'},
+            rebound_enabled=True,
+            rebound_allowed_tiers=['A', 'B'],
+        )
+        te._resolve_signal = MagicMock()
+        te._peak_state['BTC'] = {
+            'peak_bps': 50.0,
+            'start_time': datetime.now(),
+            'trigger': 'pullback',
+            'signal_id': 1001,
+            'signal_basis_bps': 50.0,
+            'resiliency_active': True,
+        }
+
+        self.assertFalse(te._pass_rebound_check('BTC', 42.0, self._row('BTC', 42.0)))
+        te._resolve_signal.assert_called_once()
+        self.assertNotIn('BTC', te._peak_state)
 
 
 # ══════════════════════════════════════════════════════════════════

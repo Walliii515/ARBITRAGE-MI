@@ -91,7 +91,7 @@ class TradingExecutorConfig:
 
     # ─── 回调后二次突破开仓 ───
     rebound_enabled: bool = True
-    rebound_allowed_tiers: List[str] = field(default_factory=lambda: ['B'])
+    rebound_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
     rebound_min_rise_bps: float = 4.0
     rebound_min_slope_bps: float = 0.5
     rebound_min_basis_buffer_bps: float = 4.0
@@ -403,8 +403,8 @@ class TradingExecutor:
                     if not self._pass_open_resiliency_check(base_asset, row, open_vwap_basis):
                         continue
 
-                    # 3.3 B 级回调通道不在盘口恢复后立刻开仓，而是等待基差二次上行突破。
-                    # 这保留“冲击释放后再进”的优点，同时避免接住继续衰减的第一口流动性。
+                    # 3.3 回调通道不在盘口恢复后立刻开仓，而是等待基差二次上行突破。
+                    # A 级若没命中 momentum，也必须走 rebound；B 级只走 rebound。
                     if not self._pass_rebound_check(base_asset, open_vwap_basis, row):
                         continue
                                 
@@ -685,12 +685,25 @@ class TradingExecutor:
             return True
 
         tier = self._asset_tier(base_asset)
-        if tier not in self.rebound_allowed_tiers:
-            return True
-
         state = self._peak_state.get(base_asset)
         if not state or state.get('trigger') != 'pullback':
             return True
+
+        if tier not in self.rebound_allowed_tiers:
+            self._resolve_signal(
+                base_asset,
+                'gate_rejected',
+                f'分层不允许pullback直开(tier={tier}, allowed_rebound={sorted(self.rebound_allowed_tiers)})',
+                exit_basis_bps=current_basis_bps,
+                trigger_type='pullback',
+            )
+            self._peak_state.pop(base_asset, None)
+            self._open_resiliency.clear(base_asset)
+            logger.info(
+                f"回调通道分层拦截 | {base_asset} | tier={tier} | "
+                f"allowed_rebound={sorted(self.rebound_allowed_tiers)}"
+            )
+            return False
 
         now = datetime.now()
         threshold_data = self.vwap_threshold_meta.get(base_asset, {})
