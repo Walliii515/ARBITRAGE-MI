@@ -155,8 +155,10 @@ class AccountCapitalSnapshotter:
         total = _float(account.get('total'))
         unrealized = _float(account.get('unrealised_pnl') or account.get('unrealized_pnl'))
         position_margin = _float(account.get('position_margin'))
+        isolated_position_margin = _float(account.get('isolated_position_margin'))
+        position_initial_margin = _float(account.get('position_initial_margin'))
         order_margin = _float(account.get('order_margin'))
-        margin_used = position_margin + order_margin
+        margin_used = max(position_margin, isolated_position_margin, position_initial_margin) + order_margin
         equity = total if total else available + margin_used + unrealized
         return {
             'snapshot_at': snapshot_at,
