@@ -40,9 +40,9 @@ from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
-from calc.capital_tracker import CapitalConfig, calculate_account_summary
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
+from calc.account_capital import build_default_capital_snapshotter
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
 
@@ -125,17 +125,6 @@ _pnl_cfg = PnlConfig(
     margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
 )
 
-# 资金跟踪配置实例
-_capital_cfg = CapitalConfig(
-    leverage=config.get_float('margin.leverage', 2.0),
-    binance_initial=config.get_float('capital.binance_initial', 100000.0),
-    gate_initial=config.get_float('capital.gate_initial', 100000.0),
-    fee_spot_open=SPOT_OPEN_FEE,
-    fee_spot_close=SPOT_CLOSE_FEE,
-    fee_future_open=FUTURE_OPEN_FEE,
-    fee_future_close=FUTURE_CLOSE_FEE,
-)
-
 # 服务生命周期管理器（在 lifespan 中初始化）
 svc: Optional[OrderBookDataClient] = None
 
@@ -155,6 +144,8 @@ _vwap_threshold_meta: Dict[str, float] = {}  # base_asset -> threshold_bps
 _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p10..p40}
 _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费率(止盈用)
 _asset_tier_meta: Dict[str, str] = {}  # base_asset -> strategy_tier
+_latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇总
+_latest_account_summary_ts: float = 0.0
 
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
@@ -524,6 +515,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_margin_status_loop())
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
+    asyncio.create_task(_account_capital_snapshot_loop())
     asyncio.create_task(_position_realtime_push())
     asyncio.create_task(_reconciliation_loop())
     asyncio.create_task(_vwap_snapshot_loop())
@@ -1005,6 +997,9 @@ def _run_open_position_check_once():
                 momentum_safety_bps=config.get_float('trade.momentum_open.safety_bps', 8.0),
                 momentum_allowed_tiers=config.get('trade.momentum_open.allowed_tiers', ['A']),
                 momentum_tier_overrides=config.get('trade.momentum_open.tier_overrides', {}),
+                capital_required=config.get_trade_mode() != 'virtual',
+                capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
+                capital_gate_leverage=config.get_float('margin.leverage', 2.0),
             )
             _trading_executor = TradingExecutor(
                 _trading_cfg, _contract_meta, _spot_meta,
@@ -1012,6 +1007,7 @@ def _run_open_position_check_once():
             )
             _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
 
+        _trading_executor.update_account_capital_status(_latest_account_summary, _latest_account_summary_ts)
         results = _trading_executor.check_and_open(merged_rows)
 
         if results and event_loop and broadcast_queue:
@@ -1243,8 +1239,8 @@ async def _position_realtime_push():
             # 计算实时盈亏（已平仓持仓用DB存储的价格，不依赖 close_vwaps）
             calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
             
-            # 计算资金汇总
-            account_summary = calculate_account_summary(positions, _capital_cfg)
+            # 资金汇总来自交易所真实资金快照（分钟级刷新）
+            account_summary = _latest_account_summary
             
             # 推送（不含 funding_history，保持消息精简）
             payload = {
@@ -1259,6 +1255,28 @@ async def _position_realtime_push():
 
         except Exception as e:
             logger.error(f"持仓实时推送失败: {e}")
+
+
+async def _account_capital_snapshot_loop():
+    """分钟级采集交易所真实资金并落库，同时刷新开仓风控缓存。"""
+    global _latest_account_summary, _latest_account_summary_ts
+    if config.get_trade_mode() == 'virtual':
+        logger.info('virtual 模式跳过交易所真实资金采集')
+        return
+    if not config.get_bool('account_capital.enabled', True):
+        logger.info('交易所资金采集已关闭')
+        return
+
+    interval = max(30, config.get_int('account_capital.snapshot_interval_sec', 60))
+    while True:
+        try:
+            result = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
+            _latest_account_summary = result.get('summary')
+            _latest_account_summary_ts = time.time()
+            logger.info(f"交易所资金快照完成: snapshot_at={result.get('snapshot_at')}")
+        except Exception as e:
+            logger.error(f"交易所资金快照失败: {e}", exc_info=True)
+        await asyncio.sleep(interval)
 
 
 async def _reconciliation_loop():

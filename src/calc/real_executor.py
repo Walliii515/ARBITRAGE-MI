@@ -17,7 +17,7 @@ import hmac
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -293,9 +293,9 @@ class RealExecutor:
             hashlib.sha256
         ).hexdigest()
 
-    def fetch_binance_spot_balances(self) -> List[Dict]:
+    def fetch_binance_account_balances(self) -> List[Dict]:
         """
-        拉取 Binance 现货账户非零资产余额（只读，对账使用）。
+        拉取 Binance 现货账户非零资产余额（只读，资金/对账使用）。
 
         返回字段保持贴近交易所原始口径：
         [{asset, free, locked, total}]
@@ -328,6 +328,41 @@ class RealExecutor:
                 'locked': locked,
                 'total': total,
             })
+        return result
+
+    def fetch_binance_spot_balances(self) -> List[Dict]:
+        """拉取 Binance 非 USDT 现货余额（对账使用）。"""
+        return [b for b in self.fetch_binance_account_balances() if b.get('asset') != 'USDT']
+
+    def fetch_binance_ticker_prices(self, assets: Iterable[str]) -> Dict[str, float]:
+        """批量拉取 Binance 现货 USDT 价格（公开接口，资金估值使用）。"""
+        symbols = [f"{str(asset).upper()}USDT" for asset in assets if str(asset).upper() != 'USDT']
+        if not symbols:
+            return {}
+        params = {'symbols': json.dumps(symbols)}
+        url = f"{self.config.binance_base_url}/api/v3/ticker/price"
+        resp = self._session.get(url, params=params, timeout=self.config.timeout_sec)
+        if resp.status_code != 200:
+            result: Dict[str, float] = {}
+            for symbol in symbols:
+                single = self._session.get(
+                    url,
+                    params={'symbol': symbol},
+                    timeout=self.config.timeout_sec,
+                )
+                if single.status_code != 200:
+                    logger.debug(f"Binance ticker 跳过 | {symbol} | HTTP {single.status_code}")
+                    continue
+                item = single.json()
+                if symbol.endswith('USDT'):
+                    result[symbol[:-4]] = float(item.get('price') or 0)
+            return result
+        data = resp.json()
+        result: Dict[str, float] = {}
+        for item in data if isinstance(data, list) else []:
+            symbol = str(item.get('symbol') or '').upper()
+            if symbol.endswith('USDT'):
+                result[symbol[:-4]] = float(item.get('price') or 0)
         return result
 
     # ──────────────────────────────────────────────────────────────────
@@ -538,6 +573,18 @@ class RealExecutor:
                 'mode': item.get('mode'),
             })
         return result
+
+    def fetch_gate_futures_account(self) -> Dict:
+        """拉取 Gate USDT 永续账户资金（只读，资金快照使用）。"""
+        method = 'GET'
+        api_path = '/api/v4/futures/usdt/accounts'
+        headers = self._gate_sign(method, api_path, '', '')
+        url = f"{self.config.gate_base_url}{api_path}"
+        resp = self._session.get(url, headers=headers, timeout=self.config.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gate futures account HTTP {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
 
     # ──────────────────────────────────────────────────────────────────
     # 辅助方法

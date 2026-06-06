@@ -30,6 +30,11 @@ const router = createRouter({
       component: () => import('../views/PositionMonitor.vue'),
     },
     {
+      path: '/capital',
+      name: 'capital',
+      component: () => import('../views/CapitalMonitor.vue'),
+    },
+    {
       path: '/connections',
       name: 'connections',
       component: () => import('../views/ConnectionStatus.vue'),

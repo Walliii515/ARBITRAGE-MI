@@ -80,7 +80,7 @@ interface WsPositionMessage {
 }
 
 interface AccountExchange {
-  initial: number
+  initial?: number
   capital_used?: number
   margin_used?: number
   floating_value: number
@@ -91,7 +91,7 @@ interface AccountExchange {
 }
 
 interface AccountTotal {
-  initial: number
+  initial?: number
   used: number
   floating_pnl: number
   realized_pnl: number
@@ -1124,7 +1124,7 @@ onUnmounted(() => {
         </span>
         <span class="capital-item">
           <span class="capital-label">总净值</span>
-          <span class="capital-value" :class="accountSummary.total.net_value >= accountSummary.total.initial ? 'pnl-positive' : 'pnl-negative'">{{ formatAmount(accountSummary.total.net_value) }}</span>
+          <span class="capital-value" :class="accountSummary.total.total_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatAmount(accountSummary.total.net_value) }}</span>
         </span>
       </div>
     </div>

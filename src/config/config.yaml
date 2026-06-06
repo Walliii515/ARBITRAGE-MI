@@ -34,7 +34,7 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
-    max_positions_per_asset: 1              # 同标的最大持仓数
+    max_positions_per_asset: 3              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
@@ -148,19 +148,19 @@ margin:
   # 距爆仓平仓阈值(%)：低于此值时触发两端同时平仓
   close_threshold_pct: 5
 
-# 资金管理配置
-capital:
-  # Binance 初始入金 (USDT)
-  binance_initial: 500
-  # Gate 初始入金 (USDT)
-  gate_initial: 250
-
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数
 # 注：交易所环境（mainnet/testnet）由顶层 trade.mode 统一控制，不再在此重复配置
 real_executor:
   # HTTP 请求超时（秒）
   timeout_sec: 10
+
+# 真实资金快照配置（Binance 现货 + Gate 期货）
+account_capital:
+  enabled: true
+  snapshot_interval_sec: 60
+  retention_days: 30
+  max_age_sec: 180
 
 # 基础持仓对账配置（Binance 现货 + Gate 期货，只记录差异，不自动修复）
 reconciliation:

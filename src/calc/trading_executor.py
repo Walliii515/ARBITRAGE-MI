@@ -89,6 +89,11 @@ class TradingExecutorConfig:
     momentum_allowed_tiers: List[str] = field(default_factory=lambda: ['A'])
     momentum_tier_overrides: Dict[str, Dict] = field(default_factory=dict)
 
+    # ─── 交易所真实资金风控 ───
+    capital_required: bool = False
+    capital_max_age_sec: int = 180
+    capital_gate_leverage: float = 2.0
+
 
 class TradingExecutor:
     """交易执行器(开仓判断 + 订单生成 + 持久化，通过 ExecutorClient 调用成交引擎服务)"""
@@ -219,6 +224,12 @@ class TradingExecutor:
             if isinstance(params, dict)
         }
         self._momentum_samples: Dict[str, deque] = {}
+
+        self.capital_required = cfg.capital_required
+        self.capital_max_age_sec = cfg.capital_max_age_sec
+        self.capital_gate_leverage = max(float(cfg.capital_gate_leverage or 1.0), 1.0)
+        self._account_summary: Optional[Dict] = None
+        self._account_summary_ts: float = 0.0
     
     def set_orderbook_managers(self, gate_manager, spot_manager):
         """
@@ -231,6 +242,11 @@ class TradingExecutor:
         self._gate_manager = gate_manager
         self._spot_manager = spot_manager
         logger.info('OrderBookManager 已注入 TradingExecutor（最终风控旁路就绪）')
+
+    def update_account_capital_status(self, account_summary: Optional[Dict], snapshot_ts: float):
+        """更新交易所真实资金缓存，供开仓热路径只读。"""
+        self._account_summary = account_summary
+        self._account_summary_ts = float(snapshot_ts or 0)
 
     def update_holding_margin_status(self, positions: List[Dict]):
         """
@@ -625,6 +641,9 @@ class TradingExecutor:
             if self._holding_liq_distance[base_asset] < self.margin_warning_pct:
                 return False
 
+        if not self._pass_account_capital_check():
+            return False
+
         # 最小名义价值检查：开仓金额低于交易所最低要求时直接过滤
         if base_asset in self.spot_meta:
             min_notional = self.spot_meta[base_asset].get('min_notional')
@@ -683,6 +702,24 @@ class TradingExecutor:
                 return False
         
         return True
+
+    def _pass_account_capital_check(self) -> bool:
+        """真实资金检查：开仓前确认 Binance/Gate 可用资金足够且快照新鲜。"""
+        if not self.capital_required:
+            return True
+        if not self._account_summary or not self._account_summary_ts:
+            return False
+        if time.time() - self._account_summary_ts > self.capital_max_age_sec:
+            return False
+
+        binance_available = float((self._account_summary.get('binance') or {}).get('available') or 0)
+        gate_available = float((self._account_summary.get('gate') or {}).get('available') or 0)
+        spot_required = self.open_amount_usdt * (1 + self._fee_spot_open)
+        gate_required = (
+            self.open_amount_usdt / self.capital_gate_leverage
+            + self.open_amount_usdt * self._fee_future_open
+        )
+        return binance_available >= spot_required and gate_available >= gate_required
     
     def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
         """
@@ -1067,6 +1104,24 @@ class TradingExecutor:
             liq_dist = self._holding_liq_distance[base_asset]
             if liq_dist < self.margin_warning_pct:
                 return f"保证金风控(距爆仓{liq_dist:.1f}%<{self.margin_warning_pct:.1f}%)"
+
+        if self.capital_required:
+            if not self._account_summary or not self._account_summary_ts:
+                return '资金风控(无交易所资金快照)'
+            age = time.time() - self._account_summary_ts
+            if age > self.capital_max_age_sec:
+                return f"资金风控(资金快照过期{age:.0f}s>{self.capital_max_age_sec}s)"
+            binance_available = float((self._account_summary.get('binance') or {}).get('available') or 0)
+            gate_available = float((self._account_summary.get('gate') or {}).get('available') or 0)
+            spot_required = self.open_amount_usdt * (1 + self._fee_spot_open)
+            gate_required = (
+                self.open_amount_usdt / self.capital_gate_leverage
+                + self.open_amount_usdt * self._fee_future_open
+            )
+            if binance_available < spot_required:
+                return f"资金风控(Binance可用{binance_available:.2f}<需{spot_required:.2f}USDT)"
+            if gate_available < gate_required:
+                return f"资金风控(Gate可用{gate_available:.2f}<需{gate_required:.2f}USDT)"
 
         # 最小名义价值检查
         if base_asset in self.spot_meta:

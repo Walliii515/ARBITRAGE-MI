@@ -181,6 +181,10 @@ function toggleMenu() {
           <el-icon><TrendCharts /></el-icon>
           <template #title>持仓监控</template>
         </el-menu-item>
+        <el-menu-item index="/capital">
+          <el-icon><TrendCharts /></el-icon>
+          <template #title>资金监控</template>
+        </el-menu-item>
         <el-menu-item index="/connections">
           <el-icon><Connection /></el-icon>
           <template #title>连接状态</template>

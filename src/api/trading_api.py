@@ -19,6 +19,7 @@ from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
 from calc.reconciliation import build_default_reconciler
+from calc.account_capital import build_default_capital_snapshotter
 
 logger = get_logger(__name__)
 
@@ -351,6 +352,8 @@ async def get_positions_summary():
 
 _recon_running = False
 _recon_lock = threading.Lock()
+_capital_running = False
+_capital_lock = threading.Lock()
 
 
 @router.get('/reconciliation/latest')
@@ -432,6 +435,73 @@ async def run_reconciliation_now():
     finally:
         with _recon_lock:
             _recon_running = False
+
+
+# ─── 真实资金快照 ────────────────────────────────────────────────────────────
+
+@router.get('/capital/latest')
+async def get_capital_latest():
+    """返回最新资金快照汇总。"""
+    sql = """
+        SELECT *
+        FROM mi_capital_snapshot
+        WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM mi_capital_snapshot)
+        ORDER BY FIELD(exchange, 'binance', 'gate', 'total')
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+    return {'rows': _serialize_rows(rows)}
+
+
+@router.get('/capital/history')
+async def get_capital_history(
+    days: int = Query(7, ge=1, le=90, description="最近N天"),
+    exchange: Optional[str] = Query(None, description="交易所过滤(binance/gate/total)"),
+):
+    """返回资金历史曲线数据。"""
+    where = ["snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    params: List[Any] = [days]
+    if exchange in ('binance', 'gate', 'total'):
+        where.append("exchange = %s")
+        params.append(exchange)
+    where_sql = " AND ".join(where)
+    sql = f"""
+        SELECT *
+        FROM mi_capital_snapshot
+        WHERE {where_sql}
+        ORDER BY snapshot_at ASC, FIELD(exchange, 'binance', 'gate', 'total')
+        LIMIT 20000
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    return {'rows': _serialize_rows(rows)}
+
+
+@router.post('/capital/run')
+async def run_capital_snapshot_now():
+    """手动采集一次真实资金快照。"""
+    global _capital_running
+    if config.get_trade_mode() == 'virtual':
+        return {'success': False, 'message': 'virtual 模式不采集交易所真实资金'}
+    if not config.get_bool('account_capital.enabled', True):
+        return {'success': False, 'message': '真实资金采集已关闭'}
+
+    with _capital_lock:
+        if _capital_running:
+            return {'success': False, 'message': '资金采集正在执行中'}
+        _capital_running = True
+
+    try:
+        result = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
+        return {'success': True, 'message': '资金采集完成', **result}
+    except Exception as e:
+        logger.error(f'手动资金采集失败: {e}', exc_info=True)
+        return {'success': False, 'message': f'资金采集失败: {e}'}
+    finally:
+        with _capital_lock:
+            _capital_running = False
 
 
 # ─── VWAP 基差阈值 ────────────────────────────────────────────────────────────
