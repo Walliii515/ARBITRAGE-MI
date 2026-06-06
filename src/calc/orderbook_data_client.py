@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from copy import deepcopy
 from collections import defaultdict
+from urllib.parse import urlencode
 from typing import Dict, List, Optional, Tuple
 
 from calc.service_lifecycle import SERVICE_IDLE
@@ -45,10 +46,8 @@ class RemoteGateManager:
         return self._client.get_future_rows()
 
     def get_orderbook(self, contract: str) -> Optional[RemoteOrderBook]:
-        for row in self.to_records():
-            if row.get('contract') == contract:
-                return RemoteOrderBook(row, 'future_ready')
-        return None
+        row = self._client.get_future_orderbook(contract)
+        return RemoteOrderBook(row, 'future_ready') if row else None
 
     def get_all_contracts(self) -> List[str]:
         status = self._client.get_status()
@@ -63,11 +62,8 @@ class RemoteSpotManager:
         return self._client.get_spot_rows()
 
     def get_orderbook(self, symbol: str) -> Optional[RemoteOrderBook]:
-        symbol = symbol.upper()
-        for row in self.to_records():
-            if str(row.get('symbol', '')).upper() == symbol:
-                return RemoteOrderBook(row, 'spot_ready')
-        return None
+        row = self._client.get_spot_orderbook(symbol)
+        return RemoteOrderBook(row, 'spot_ready') if row else None
 
     def get_all_symbols(self) -> List[str]:
         status = self._client.get_status()
@@ -88,8 +84,12 @@ class OrderBookDataClient:
         self._raw_cache: Tuple[float, Dict] = (0.0, {'future_rows': [], 'spot_rows': [], 'rows': []})
         self._status_ttl = 0.5
         self._raw_ttl = 0.05
+        self._merged_ttl = 0.05
+        self._book_ttl = 0.05
         self.gate_manager = RemoteGateManager(self)
         self.spot_manager = RemoteSpotManager(self)
+        self._merged_cache: Tuple[float, Dict] = (0.0, {'rows': []})
+        self._book_cache: Dict[str, Tuple[float, Dict]] = {}
         self._request_metrics: Dict[str, Dict] = defaultdict(lambda: {
             'count': 0,
             'total_ms': 0.0,
@@ -155,6 +155,22 @@ class OrderBookDataClient:
         data['client_request_metrics'] = self.get_request_metrics()
         return data
 
+    def get_progress_payload(self) -> Dict:
+        status = self.get_status()
+        return {
+            'type': 'service_progress',
+            'state': status.get('state', SERVICE_IDLE),
+            'error': status.get('error'),
+            'gate_ws_connected': status.get('gate_ws_connected', False),
+            'binance_ws_connected': status.get('binance_ws_connected', False),
+            'gate_ws_latency_ms': status.get('gate_ws_latency_ms'),
+            'binance_ws_latency_ms': status.get('binance_ws_latency_ms'),
+            'gate_snapshot': status.get('gate_snapshot'),
+            'gate_ws': status.get('gate_ws'),
+            'binance_ws': status.get('binance_ws'),
+            'binance_data': status.get('binance_data'),
+        }
+
     def get_request_metrics(self) -> Dict:
         result = {}
         for path, metric in self._request_metrics.items():
@@ -189,7 +205,44 @@ class OrderBookDataClient:
         return self.get_raw_snapshot().get('spot_rows', [])
 
     def get_merged_rows(self, force: bool = False) -> List[Dict]:
-        return self.get_raw_snapshot(force=force).get('rows', [])
+        now = time.time()
+        ts, cached = self._merged_cache
+        if not force and now - ts < self._merged_ttl:
+            return deepcopy(cached).get('rows', [])
+        try:
+            payload = self._request('GET', '/api/orderbook/merged-snapshot')
+            self._merged_cache = (now, payload)
+            return deepcopy(payload).get('rows', [])
+        except Exception as e:
+            logger.warning(f'读取合并盘口快照失败: {e}')
+            return deepcopy(cached).get('rows', [])
+
+    def _get_single_book(self, *, contract: Optional[str] = None, symbol: Optional[str] = None) -> Dict:
+        params = {}
+        if contract:
+            params['contract'] = contract
+        if symbol:
+            params['symbol'] = symbol.upper()
+        if not params:
+            return {}
+        path = f"/api/orderbook/book?{urlencode(params)}"
+        now = time.time()
+        ts, cached = self._book_cache.get(path, (0.0, {}))
+        if now - ts < self._book_ttl:
+            return deepcopy(cached)
+        try:
+            payload = self._request('GET', path)
+            self._book_cache[path] = (now, payload)
+            return deepcopy(payload)
+        except Exception as e:
+            logger.warning(f'读取单标的盘口失败: {e}')
+            return deepcopy(cached)
+
+    def get_future_orderbook(self, contract: str) -> Optional[Dict]:
+        return self._get_single_book(contract=contract).get('future_row')
+
+    def get_spot_orderbook(self, symbol: str) -> Optional[Dict]:
+        return self._get_single_book(symbol=symbol).get('spot_row')
 
     def start(self) -> Tuple[bool, str]:
         res = self._request('POST', '/api/service/start')

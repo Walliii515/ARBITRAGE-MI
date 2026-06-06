@@ -13,8 +13,9 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -30,6 +31,8 @@ logger = get_logger(__name__)
 SETTLE = config.get_str('orderbook.settle', 'usdt', env='ORDERBOOK_SETTLE')
 svc: ServiceLifecycleManager = ServiceLifecycleManager(settle=SETTLE)
 _last_raw_snapshot_metrics = {}
+_last_merged_snapshot_metrics = {}
+_last_book_metrics = {}
 
 
 @asynccontextmanager
@@ -74,6 +77,8 @@ async def service_status():
 async def service_diagnostics():
     data = svc.get_diagnostics()
     data['raw_snapshot'] = _last_raw_snapshot_metrics
+    data['merged_snapshot'] = _last_merged_snapshot_metrics
+    data['single_book'] = _last_book_metrics
     return data
 
 
@@ -150,6 +155,82 @@ async def raw_snapshot():
         'future_rows': future_rows,
         'spot_rows': spot_rows,
         'rows': rows,
+    }
+
+
+@app.get('/api/orderbook/merged-snapshot')
+async def merged_snapshot():
+    """返回交易业务最常用的合并行，避免传输 future/spot/merged 三份全量数据。"""
+    global _last_merged_snapshot_metrics
+    start = time.perf_counter()
+    future_rows = svc.gate_manager.to_records() if svc.gate_manager else []
+    future_ms = (time.perf_counter() - start) * 1000
+    spot_start = time.perf_counter()
+    spot_rows = svc.spot_manager.to_records() if svc.spot_manager else []
+    spot_ms = (time.perf_counter() - spot_start) * 1000
+    merge_start = time.perf_counter()
+    rows = merge_orderbook_records(future_rows, spot_rows)
+    merge_ms = (time.perf_counter() - merge_start) * 1000
+    total_ms = (time.perf_counter() - start) * 1000
+    _last_merged_snapshot_metrics = {
+        'total_ms': round(total_ms, 2),
+        'future_to_records_ms': round(future_ms, 2),
+        'spot_to_records_ms': round(spot_ms, 2),
+        'merge_ms': round(merge_ms, 2),
+        'future_rows': len(future_rows),
+        'spot_rows': len(spot_rows),
+        'merged_rows': len(rows),
+        'at': time.time(),
+    }
+    if total_ms > 500:
+        logger.warning(f'merged_snapshot 构建偏慢: {_last_merged_snapshot_metrics}')
+    return {
+        'state': svc.state,
+        'gate_ws_connected': svc._gate_ws_connected(),
+        'binance_ws_connected': svc._binance_ws_connected(),
+        'gate_ws_latency_ms': svc._calc_gate_data_age_ms(),
+        'binance_ws_latency_ms': svc._calc_binance_data_age_ms(),
+        'rows': rows,
+    }
+
+
+@app.get('/api/orderbook/book')
+async def single_book(
+    contract: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+):
+    """返回单标的盘口，供开/平仓最终旁路校验使用。"""
+    global _last_book_metrics
+    start = time.perf_counter()
+    contract_key = (contract or '').strip()
+    symbol_key = (symbol or '').strip().upper()
+
+    future_row = None
+    spot_row = None
+    if contract_key and svc.gate_manager:
+        gate_ob = svc.gate_manager.get_orderbook(contract_key)
+        future_row = gate_ob.to_dict_row() if gate_ob else None
+    if symbol_key and svc.spot_manager:
+        spot_ob = svc.spot_manager.get_orderbook(symbol_key)
+        spot_row = spot_ob.to_dict_row() if spot_ob else None
+
+    rows = merge_orderbook_records([future_row], [spot_row] if spot_row else []) if future_row else []
+    total_ms = (time.perf_counter() - start) * 1000
+    _last_book_metrics = {
+        'total_ms': round(total_ms, 2),
+        'contract': contract_key,
+        'symbol': symbol_key,
+        'has_future': future_row is not None,
+        'has_spot': spot_row is not None,
+        'at': time.time(),
+    }
+    if total_ms > 100:
+        logger.warning(f'single_book 构建偏慢: {_last_book_metrics}')
+    return {
+        'state': svc.state,
+        'future_row': future_row,
+        'spot_row': spot_row,
+        'row': rows[0] if rows else None,
     }
 
 
