@@ -133,6 +133,7 @@ const exitReasonOptions = [
   { label: '盈利性守卫', value: '盈利性守卫' },
   { label: 'resiliency', value: 'resiliency' },
   { label: '基差跌回阈值下', value: '基差跌回阈值下' },
+  { label: '行情滞后', value: '行情滞后' },
   { label: '旁路风控', value: '旁路' },
   { label: '保证金风控', value: '保证金风控' },
   { label: '盘口覆盖超限', value: '盘口覆盖超限' },

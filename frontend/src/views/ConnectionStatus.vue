@@ -164,7 +164,7 @@ const columnDefs: ColDef[] = [
     },
   },
   {
-    headerName: 'Gate延迟(s)',
+    headerName: 'Gate新鲜度(s)',
     field: 'gate_stale_sec',
     width: 110,
     valueFormatter: (params: ValueFormatterParams) => {
@@ -198,7 +198,7 @@ const columnDefs: ColDef[] = [
     },
   },
   {
-    headerName: 'Binance延迟(s)',
+    headerName: 'Binance新鲜度(s)',
     field: 'binance_stale_sec',
     width: 120,
     valueFormatter: (params: ValueFormatterParams) => {
@@ -325,10 +325,10 @@ onUnmounted(() => {
           服务: {{ serviceState === 'running' ? '运行中' : serviceState === 'idle' ? '未启动' : serviceState }}
         </span>
         <span class="ws-badge" :class="{ connected: gateWsConnected }">
-          Gate WS: {{ gateWsConnected ? (gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接') : '未连接' }}
+          Gate WS p90: {{ gateWsConnected ? (gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接') : '未连接' }}
         </span>
         <span class="ws-badge" :class="{ connected: binanceWsConnected }">
-          Binance WS: {{ binanceWsConnected ? (binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接') : '未连接' }}
+          Binance WS p90: {{ binanceWsConnected ? (binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接') : '未连接' }}
         </span>
       </div>
 
