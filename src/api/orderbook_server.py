@@ -891,8 +891,12 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None)):
 
 
 def _get_fresh_trading_rows() -> List[Dict]:
-    """无缓存获取最新盘口+富化数据（用于开仓决策链路，确保数据最新鲜）"""
-    rows = svc.get_merged_rows(force=True) if svc else []
+    """获取候选扫描用盘口+富化数据。
+
+    候选扫描复用短期合并缓存，避免 0.2s 开仓循环反复跨进程拉取全量宽表。
+    真正下单前仍由 TradingExecutor 的单标的旁路校验读取最新盘口并检查 lag。
+    """
+    rows = _get_merged_rows()
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
     enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg)
     return rows
