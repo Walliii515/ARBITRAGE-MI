@@ -197,7 +197,7 @@ class TestGateOrderBookManagerObu(unittest.TestCase):
 
 
 class TestTradingExecutorPeakCheck(unittest.TestCase):
-    """峰值回落 + sustain 确认（开仓唯一通道）"""
+    """峰值回落 + sustain 确认（开仓回落通道）"""
 
     def setUp(self):
         self.te = make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,

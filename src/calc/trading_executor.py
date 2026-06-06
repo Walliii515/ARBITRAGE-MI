@@ -5,6 +5,7 @@
 """
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -56,7 +57,7 @@ class TradingExecutorConfig:
     min_spot_volume_24h_usdt: float = 0
     min_future_volume_24h_usdt: float = 0
 
-    # ─── 峰值回落 + sustain 确认（开仓唯一通道） ───
+    # ─── 峰值回落 + sustain 确认（开仓回落通道） ───
     peak_pullback_pct: float = 0.10
     peak_monitor_timeout_sec: int = 60
     peak_timeout_cooldown_sec: int = 300
@@ -77,6 +78,14 @@ class TradingExecutorConfig:
     resiliency_max_basis_volatility_bps: float = 6.0
     resiliency_min_hold_sec: float = 0.8
     resiliency_max_wait_sec: float = 3.0
+
+    # ─── 动量开仓通道 ───
+    momentum_enabled: bool = False
+    momentum_window_sec: float = 1.2
+    momentum_min_samples: int = 3
+    momentum_min_rise_bps: float = 3.0
+    momentum_min_basis_buffer_bps: float = 8.0
+    momentum_safety_bps: float = 8.0
 
 
 class TradingExecutor:
@@ -182,6 +191,15 @@ class TradingExecutor:
             ['spot_open_coverage', 'future_open_coverage'],
             'open',
         )
+
+        # 动量通道：适合高流动性标的在“超阈值 + 上升期 + 盘口好”时直接进入旁路。
+        self.momentum_enabled = cfg.momentum_enabled
+        self.momentum_window_sec = cfg.momentum_window_sec
+        self.momentum_min_samples = cfg.momentum_min_samples
+        self.momentum_min_rise_bps = cfg.momentum_min_rise_bps
+        self.momentum_min_basis_buffer_bps = cfg.momentum_min_basis_buffer_bps
+        self.momentum_safety_bps = cfg.momentum_safety_bps
+        self._momentum_samples: Dict[str, deque] = {}
     
     def set_orderbook_managers(self, gate_manager, spot_manager):
         """
@@ -305,16 +323,20 @@ class TradingExecutor:
                 # 3. 峰值回落 + sustain 确认（单通道）
                 self._annotate_resiliency_row(row)
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
-                self._open_resiliency.observe_shock(base_asset, row)
-                if not self._pass_peak_check(base_asset, open_vwap_basis, row):
-                    if base_asset not in self._peak_state:
-                        self._open_resiliency.clear(base_asset)
-                    continue
+                self._record_momentum_sample(base_asset, open_vwap_basis)
+                momentum_ready = self._pass_momentum_check(base_asset, open_vwap_basis, row)
 
-                # 3.2 盘口恢复确认：pullback 通过后进入 RESILIENCY_WAIT，
-                # 后续循环持续采样恢复质量，不再反复要求 pullback 条件成立。
-                if not self._pass_open_resiliency_check(base_asset, row, open_vwap_basis):
-                    continue
+                if not momentum_ready:
+                    self._open_resiliency.observe_shock(base_asset, row)
+                    if not self._pass_peak_check(base_asset, open_vwap_basis, row):
+                        if base_asset not in self._peak_state:
+                            self._open_resiliency.clear(base_asset)
+                        continue
+
+                    # 3.2 盘口恢复确认：pullback 通过后进入 RESILIENCY_WAIT，
+                    # 后续循环持续采样恢复质量，不再反复要求 pullback 条件成立。
+                    if not self._pass_open_resiliency_check(base_asset, row, open_vwap_basis):
+                        continue
                                 
                 # 3.5 最终风控旁路：单标的最短链路重新校验（拦截信号过期场景）
                 contract = row.get('contract', '')
@@ -343,6 +365,10 @@ class TradingExecutor:
                     row = gate_row
                 if gate_basis is not None:
                     open_vwap_basis = gate_basis
+                peak_state = self._peak_state.get(base_asset, {})
+                signal_basis = peak_state.get('signal_basis_bps')
+                row['signal_basis_bps'] = signal_basis
+                row['pre_gate_basis_bps'] = open_vwap_basis
                 
                 # 4. 构建开仓原因（用于复盘）
                 open_reason = self._build_open_reason(row, base_asset, open_vwap_basis)
@@ -365,13 +391,18 @@ class TradingExecutor:
                         base_asset, 'opened', None,
                         exit_basis_bps=open_vwap_basis,
                         trigger_type=trigger_type,
-                        order_uuid=order_group['order_uuid']
+                        order_uuid=order_group['order_uuid'],
+                        signal_basis_bps=order_group.get('signal_basis_bps'),
+                        pre_gate_basis_bps=order_group.get('pre_gate_basis_bps'),
+                        actual_basis_bps=order_group.get('actual_basis_bps'),
                     )
                 else:
                     self._resolve_signal(
                         base_asset, 'rejected', exec_result.get('message'),
                         exit_basis_bps=open_vwap_basis,
-                        trigger_type=trigger_type
+                        trigger_type=trigger_type,
+                        signal_basis_bps=order_group.get('signal_basis_bps'),
+                        pre_gate_basis_bps=order_group.get('pre_gate_basis_bps'),
                     )
                     # 被交易所拒单后启动冷却，避免重复提交失败订单
                     self._reject_cooldown_until[base_asset] = datetime.now() + timedelta(seconds=self.reject_cooldown_sec)
@@ -418,6 +449,79 @@ class TradingExecutor:
         """Attach per-asset contract multiplier for shared depth calculations."""
         base_asset = row.get('base_asset', '')
         row['_future_qty_multiplier'] = self._get_quanto_multiplier(base_asset)
+
+    def _record_momentum_sample(self, base_asset: str, basis_bps: float) -> None:
+        now = datetime.now()
+        samples = self._momentum_samples.setdefault(base_asset, deque())
+        samples.append((now, basis_bps))
+        cutoff = now - timedelta(seconds=self.momentum_window_sec)
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+
+    def _pass_momentum_check(self, base_asset: str, current_basis_bps: float, row: Dict) -> bool:
+        """
+        动量开仓通道：当基差已经明显超过阈值，并且短窗口内继续上行，
+        且盘口覆盖和盈利性守卫仍然健康时，直接进入最终旁路，不等待回调。
+        """
+        if not self.momentum_enabled:
+            return False
+        if base_asset in self._peak_state:
+            return False
+
+        samples = self._momentum_samples.get(base_asset)
+        if not samples or len(samples) < self.momentum_min_samples:
+            return False
+
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        p20 = threshold_data.get('p20', self.basis_threshold_bps)
+        min_entry_basis = float(p20) + self.momentum_min_basis_buffer_bps
+        if current_basis_bps < min_entry_basis:
+            return False
+
+        first_basis = float(samples[0][1])
+        rise_bps = current_basis_bps - first_basis
+        if rise_bps < self.momentum_min_rise_bps:
+            return False
+
+        recent_values = [float(v) for _, v in samples]
+        if current_basis_bps < max(recent_values) - 0.5:
+            return False
+
+        open_coverage = row.get('open_coverage')
+        if open_coverage is not None and float(open_coverage) > self.coverage_threshold:
+            return False
+
+        close_data = self.close_vwap_threshold_meta.get(base_asset)
+        if not close_data:
+            return False
+        close_thr = close_data.get(self.close_threshold_col)
+        if close_thr is None:
+            return False
+        min_profit_basis = float(close_thr) + self.fee_cost_bps + self.momentum_safety_bps
+        if current_basis_bps <= min_profit_basis:
+            return False
+
+        contract = row.get('contract', '')
+        if not self._verify_realtime_funding_rate(base_asset, contract):
+            return False
+
+        now = datetime.now()
+        signal_id = self._create_signal(base_asset, current_basis_bps)
+        self._peak_state[base_asset] = {
+            'peak_bps': current_basis_bps,
+            'start_time': now,
+            'trigger': 'momentum',
+            'signal_id': signal_id,
+            'signal_basis_bps': current_basis_bps,
+            'momentum_rise_bps': rise_bps,
+        }
+        logger.info(
+            f"动量开仓确认 | {base_asset} | "
+            f"basis={current_basis_bps:.2f}bps≥p20+buffer={min_entry_basis:.2f} | "
+            f"rise={rise_bps:.2f}bps/{self.momentum_window_sec:.1f}s | "
+            f"coverage={open_coverage} | guard>{min_profit_basis:.2f}"
+        )
+        return True
 
     def _pass_open_resiliency_check(self, base_asset: str, row: Dict, open_vwap_basis: float) -> bool:
         threshold_data = self.vwap_threshold_meta.get(base_asset, {})
@@ -761,6 +865,7 @@ class TradingExecutor:
                 'start_time': now,
                 'trigger': None,
                 'signal_id': signal_id,
+                'signal_basis_bps': current_basis_bps,
             }
             logger.info(
                 f"峰值监控开始 | {base_asset} | "
@@ -827,15 +932,22 @@ class TradingExecutor:
         """创建信号记录（进入峰值监控时）"""
         try:
             sql = """
-                INSERT INTO mi_trade_signal (base_asset, signal_time, status, entry_basis_bps, peak_basis_bps)
-                VALUES (%(base_asset)s, %(signal_time)s, 'monitoring', %(entry_basis_bps)s, %(peak_basis_bps)s)
+                INSERT INTO mi_trade_signal (
+                    base_asset, signal_time, status,
+                    entry_basis_bps, signal_basis_bps, peak_basis_bps
+                ) VALUES (
+                    %(base_asset)s, %(signal_time)s, 'monitoring',
+                    %(entry_basis_bps)s, %(signal_basis_bps)s, %(peak_basis_bps)s
+                )
             """
+            basis = round(entry_basis_bps, 2)
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, {
                     'base_asset': base_asset,
                     'signal_time': datetime.now(),
-                    'entry_basis_bps': round(entry_basis_bps, 2),
-                    'peak_basis_bps': round(entry_basis_bps, 2),
+                    'entry_basis_bps': basis,
+                    'signal_basis_bps': basis,
+                    'peak_basis_bps': basis,
                 })
                 return cursor.lastrowid
         except Exception as e:
@@ -847,6 +959,9 @@ class TradingExecutor:
         exit_basis_bps: Optional[float] = None,
         trigger_type: Optional[str] = None,
         order_uuid: Optional[str] = None,
+        signal_basis_bps: Optional[float] = None,
+        pre_gate_basis_bps: Optional[float] = None,
+        actual_basis_bps: Optional[float] = None,
     ):
         """结束信号记录（状态转为终态）"""
         state = self._peak_state.get(base_asset)
@@ -860,13 +975,19 @@ class TradingExecutor:
         now = datetime.now()
         duration_sec = int((now - state['start_time']).total_seconds())
         peak_bps = state.get('peak_bps')
+        signal_basis = signal_basis_bps
+        if signal_basis is None:
+            signal_basis = state.get('signal_basis_bps')
 
         try:
             sql = """
                 UPDATE mi_trade_signal SET
                     status = %(status)s,
                     resolved_time = %(resolved_time)s,
+                    signal_basis_bps = %(signal_basis_bps)s,
                     peak_basis_bps = %(peak_basis_bps)s,
+                    pre_gate_basis_bps = %(pre_gate_basis_bps)s,
+                    actual_basis_bps = %(actual_basis_bps)s,
                     exit_basis_bps = %(exit_basis_bps)s,
                     exit_reason = %(exit_reason)s,
                     duration_sec = %(duration_sec)s,
@@ -878,7 +999,10 @@ class TradingExecutor:
                 cursor.execute(sql, {
                     'status': status,
                     'resolved_time': now,
+                    'signal_basis_bps': round(signal_basis, 2) if signal_basis is not None else None,
                     'peak_basis_bps': round(peak_bps, 2) if peak_bps is not None else None,
+                    'pre_gate_basis_bps': round(pre_gate_basis_bps, 2) if pre_gate_basis_bps is not None else None,
+                    'actual_basis_bps': round(actual_basis_bps, 2) if actual_basis_bps is not None else None,
                     'exit_basis_bps': round(exit_basis_bps, 2) if exit_basis_bps is not None else None,
                     'exit_reason': exit_reason[:200] if exit_reason else None,
                     'duration_sec': duration_sec,
@@ -980,6 +1104,12 @@ class TradingExecutor:
                 parts.append(
                     f"峰值回落(峰{peak_bps:.1f},持续{elapsed:.1f}s≥{self.sustain_sec}s,"
                     f"回落{self.peak_pullback_pct*100:.0f}%)"
+                )
+            elif trigger == 'momentum':
+                rise_bps = float(peak_state.get('momentum_rise_bps', 0) or 0)
+                parts.append(
+                    f"动量开仓(升{rise_bps:.1f}bps/{self.momentum_window_sec:.1f}s,"
+                    f"buffer={self.momentum_min_basis_buffer_bps:.1f}bps)"
                 )
             else:
                 parts.append(f"峰值{peak_bps:.1f}")
@@ -1152,49 +1282,75 @@ class TradingExecutor:
             'spot_open_coverage': row.get('spot_open_coverage'),
             'future_open_coverage': row.get('future_open_coverage'),
             'open_vwap_basis_bps': row.get('open_vwap_basis_bps'),
+            'signal_basis_bps': row.get('signal_basis_bps'),
+            'pre_gate_basis_bps': row.get('pre_gate_basis_bps'),
+            'actual_basis_bps': row.get('actual_basis_bps'),
             'risk_relief_bps': row.get('risk_relief_bps'),
             'open_marginal_basis_bps': row.get('open_marginal_basis_bps'),
             'funding_rate_24h': row.get('funding_rate_24h')
         }
     
+    def _format_basis_audit(self, order_group: Dict) -> str:
+        def _fmt(value):
+            return 'NA' if value is None else f'{float(value):.1f}bps'
+
+        return (
+            f"基差对比(signal={_fmt(order_group.get('signal_basis_bps'))},"
+            f"pre_gate={_fmt(order_group.get('pre_gate_basis_bps'))},"
+            f"actual={_fmt(order_group.get('actual_basis_bps'))})"
+        )
+
+    def _attach_actual_basis_audit(self, order_group: Dict, exec_result: Dict) -> None:
+        if not exec_result['success']:
+            return
+
+        spot_exec_price = float(exec_result['spot_order']['exec_price'])
+        future_exec_price = float(exec_result['future_order']['exec_price'])
+        actual_basis_bps = calc_vwap_basis_bps(spot_exec_price, future_exec_price)
+        if actual_basis_bps is not None:
+            actual_basis_bps = round(actual_basis_bps, 2)
+        else:
+            actual_basis_bps = order_group.get('pre_gate_basis_bps') or order_group.get('open_vwap_basis_bps')
+
+        order_group['actual_basis_bps'] = actual_basis_bps
+        order_group['open_vwap_basis_bps'] = actual_basis_bps
+
+        open_fee_bps = calc_open_fee_bps(
+            self._fee_spot_open,
+            self._fee_future_open
+        )
+        if actual_basis_bps is not None:
+            order_group['open_marginal_basis_bps'] = round(
+                actual_basis_bps + open_fee_bps + self._risk_relief_bps, 2
+            )
+
+        reason = order_group.get('open_reason') or ''
+        audit_text = self._format_basis_audit(order_group)
+        order_group['open_reason'] = f"{reason}|{audit_text}" if reason else audit_text
+
     def _save_orders(self, order_group: Dict, exec_result: Dict):
         """持久化订单到数据库"""
+        self._attach_actual_basis_audit(order_group, exec_result)
+
         # 开仓成功时，先创建持仓记录，获取 position_id
         position_id = None
         if exec_result['success'] and order_group['spot_order']['order_side'] == 'open':
             position_id = self._create_position(order_group, exec_result)
-        
-        # --- 统一为实际成交口径：用格式化后的 exec_price 重新计算 VWAP 基差 ---
-        if exec_result['success']:
-            spot_exec_price = float(exec_result['spot_order']['exec_price'])
-            future_exec_price = float(exec_result['future_order']['exec_price'])
-            actual_basis_bps = calc_vwap_basis_bps(spot_exec_price, future_exec_price)
-            if actual_basis_bps is not None:
-                actual_basis_bps = round(actual_basis_bps, 2)
-            else:
-                actual_basis_bps = order_group.get('open_vwap_basis_bps')
-            order_group['open_vwap_basis_bps'] = actual_basis_bps
-            # 重算开仓边际基差
-            open_fee_bps = calc_open_fee_bps(
-                self._fee_spot_open,
-                self._fee_future_open
-            )
-            risk_relief_bps = self._risk_relief_bps
-            if actual_basis_bps is not None:
-                order_group['open_marginal_basis_bps'] = round(actual_basis_bps + open_fee_bps + risk_relief_bps, 2)
         
         sql = """
             INSERT INTO mi_trade_order (
                 order_uuid, position_id, base_asset, spot_symbol, future_contract, order_side, market_type,
                 trade_direction, status, channel, reject_reason, target_qty, target_amount,
                 exec_price, exec_qty, exec_amount, coverage_ratio,
-                open_coverage, open_vwap_basis_bps, risk_relief_bps, open_marginal_basis_bps, funding_rate_24h, executed_at
+                open_coverage, open_vwap_basis_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps,
+                risk_relief_bps, open_marginal_basis_bps, funding_rate_24h, executed_at
             ) VALUES (
                 %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 %(order_side)s, %(market_type)s, %(trade_direction)s, %(status)s, %(channel)s,
                 %(reject_reason)s, %(target_qty)s, %(target_amount)s,
                 %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
-                %(open_coverage)s, %(open_vwap_basis_bps)s, %(risk_relief_bps)s, %(open_marginal_basis_bps)s, %(funding_rate_24h)s, %(executed_at)s
+                %(open_coverage)s, %(open_vwap_basis_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s,
+                %(risk_relief_bps)s, %(open_marginal_basis_bps)s, %(funding_rate_24h)s, %(executed_at)s
             )
         """
         
@@ -1208,6 +1364,9 @@ class TradingExecutor:
             else:
                 order['open_coverage'] = order_group.get('future_open_coverage')
             order['open_vwap_basis_bps'] = order_group.get('open_vwap_basis_bps')
+            order['signal_basis_bps'] = order_group.get('signal_basis_bps')
+            order['pre_gate_basis_bps'] = order_group.get('pre_gate_basis_bps')
+            order['actual_basis_bps'] = order_group.get('actual_basis_bps')
             order['risk_relief_bps'] = order_group.get('risk_relief_bps')
             order['open_marginal_basis_bps'] = order_group.get('open_marginal_basis_bps')
             order['funding_rate_24h'] = order_group.get('funding_rate_24h')
@@ -1257,14 +1416,14 @@ class TradingExecutor:
                 status, opened_at,
                 spot_open_qty, spot_open_price, spot_open_amount,
                 future_open_qty, future_open_price, future_open_contracts,
-                open_spread_bps, open_reason,
+                open_spread_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps, open_reason,
                 funding_rate_sum_bps, funding_payments_count, funding_total_pnl
             ) VALUES (
                 %(order_uuid)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 'holding', %(opened_at)s,
                 %(spot_open_qty)s, %(spot_open_price)s, %(spot_open_amount)s,
                 %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s,
-                %(open_spread_bps)s, %(open_reason)s,
+                %(open_spread_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s, %(open_reason)s,
                 0, 0, 0
             )
         """
@@ -1286,6 +1445,9 @@ class TradingExecutor:
             'future_open_price': future_exec['exec_price'],
             'future_open_contracts': future_contracts,
             'open_spread_bps': open_spread_bps,
+            'signal_basis_bps': order_group.get('signal_basis_bps'),
+            'pre_gate_basis_bps': order_group.get('pre_gate_basis_bps'),
+            'actual_basis_bps': order_group.get('actual_basis_bps'),
             'open_reason': order_group.get('open_reason'),
         }
         
