@@ -68,6 +68,11 @@ interface PositionRow {
   total_pnl_bps: number | null
   total_pnl: number | null
   fee_cost: number | null
+  margin_topup_count: number | null
+  margin_topup_total: number | null
+  margin_topup_last_at: string | null
+  margin_initial: number | null
+  current_margin: number | null
   liq_price: number | null
   liq_distance_pct: number | null
 }
@@ -626,6 +631,39 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellStyle: pnlCellStyle,
   },
   {
+    headerName: '追加次数',
+    field: 'margin_topup_count',
+    width: 100,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (params: ValueFormatterParams) => {
+      if (params.value == null) return '0'
+      return String(params.value)
+    },
+  },
+  {
+    headerName: '追加金额',
+    field: 'margin_topup_total',
+    width: 110,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: pnlFormatter,
+  },
+  {
+    headerName: '当前保证金',
+    field: 'current_margin',
+    width: 120,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: pnlFormatter,
+  },
+  {
     headerName: '平仓基差(bps)',
     field: 'close_spread_bps',
     width: 120,
@@ -712,6 +750,11 @@ const localeText = {
 
 const getRowId = (params: GetRowIdParams<PositionRow>) =>
   String(params.data?.id ?? '')
+
+const getRowClass = (params: any) => {
+  const count = Number(params.data?.margin_topup_count || 0)
+  return count > 0 ? 'position-row-topup' : ''
+}
 
 /* ───── 外部过滤 ───── */
 function isExternalFilterPresent(): boolean {
@@ -831,6 +874,11 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     realized_pnl: sumField('realized_pnl'),
     total_pnl_bps: null,
     total_pnl: sumField('total_pnl'),
+    margin_topup_count: null,
+    margin_topup_total: sumField('margin_topup_total'),
+    margin_topup_last_at: null,
+    margin_initial: sumField('margin_initial'),
+    current_margin: sumField('current_margin'),
     liq_price: null,
     liq_distance_pct: null,
   }]
@@ -1230,6 +1278,7 @@ onUnmounted(() => {
         :defaultColDef="defaultColDef"
         :initialState="{ sort: { sortModel: initialSortModel } }"
         :getRowId="getRowId"
+        :getRowClass="getRowClass"
         :header-height="32"
         :row-height="32"
         :tooltipShowDelay="300"
@@ -1382,6 +1431,10 @@ onUnmounted(() => {
   width: 100%;
   height: calc(100vh - 340px);
   min-height: 420px;
+}
+
+.orderbook-grid :deep(.position-row-topup) {
+  background-color: rgba(230, 162, 60, 0.08);
 }
 
 /* 列选择面板 */

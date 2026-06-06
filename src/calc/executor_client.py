@@ -135,6 +135,28 @@ class ExecutorClient:
         except Exception as e:
             return {'status': 'error', 'error': str(e)}
 
+    def topup_margin(self, contract: str, amount: float) -> Dict:
+        """
+        调用成交引擎服务追加 Gate 逐仓保证金。
+
+        虚拟成交引擎会模拟成功；真实成交引擎会调用 Gate API。
+        """
+        url = f'{self.base_url}/api/margin/topup'
+        payload = {'contract': contract, 'amount': amount}
+        try:
+            resp = requests.post(url, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.ConnectionError as e:
+            return {'success': False, 'message': f'成交引擎服务连接失败({self.base_url}): {e}'}
+        except requests.exceptions.Timeout as e:
+            return {'success': False, 'message': f'追加保证金请求超时({self.timeout}s): {e}'}
+        except requests.exceptions.HTTPError:
+            return {'success': False, 'message': f'追加保证金服务返回错误: {resp.status_code} {resp.text[:200]}'}
+        except Exception as e:
+            logger.error(f'追加保证金调用异常: {e}', exc_info=True)
+            return {'success': False, 'message': f'追加保证金调用异常: {e}'}
+
     @staticmethod
     def _error_result(message: str) -> Dict:
         """构造错误返回（与 VirtualExecutor.execute 返回格式一致）"""

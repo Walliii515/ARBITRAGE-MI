@@ -586,6 +586,41 @@ class RealExecutor:
         data = resp.json()
         return data if isinstance(data, dict) else {}
 
+    def topup_gate_margin(self, contract: str, amount: float) -> Dict:
+        """
+        追加 Gate 逐仓保证金。
+
+        API: POST /api/v4/futures/usdt/positions/{contract}/margin?change=...
+        """
+        contract = str(contract or '').upper()
+        change = round(float(amount or 0), 6)
+        if not contract or change <= 0:
+            return {'success': False, 'message': f'追加金额无效: contract={contract}, amount={amount}'}
+
+        method = 'POST'
+        api_path = f'/api/v4/futures/usdt/positions/{contract}/margin'
+        query_string = urlencode({'change': f'{change:.6f}'})
+        headers = self._gate_sign(method, api_path, query_string, '')
+        url = f"{self.config.gate_base_url}{api_path}?{query_string}"
+
+        try:
+            resp = self._session.post(url, headers=headers, timeout=self.config.timeout_sec)
+            if resp.status_code not in (200, 201):
+                return {
+                    'success': False,
+                    'message': f'Gate追保失败 HTTP {resp.status_code}: {resp.text[:200]}',
+                }
+            data = resp.json() if resp.text else {}
+            logger.info(f"Gate 追加保证金成功 | {contract} | amount={change:.6f}")
+            return {'success': True, 'message': 'Gate追保成功', 'data': data, 'amount': change}
+        except requests.exceptions.Timeout:
+            return {'success': False, 'message': f'Gate追保请求超时({self.config.timeout_sec}s)'}
+        except requests.exceptions.ConnectionError as e:
+            return {'success': False, 'message': f'Gate追保连接失败: {str(e)[:100]}'}
+        except Exception as e:
+            logger.error(f"Gate 追加保证金异常 | {contract} | {e}", exc_info=True)
+            return {'success': False, 'message': f'Gate追保异常: {str(e)[:100]}'}
+
     # ──────────────────────────────────────────────────────────────────
     # 辅助方法
     # ──────────────────────────────────────────────────────────────────

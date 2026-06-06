@@ -14,7 +14,7 @@
 import time
 import uuid
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from common.database import db_manager
 from common.config import config
@@ -70,6 +70,7 @@ class ClosingExecutor:
         # 平仓失败冷却机制
         self.close_cooldown_sec = config.get_int('trade.close.cooldown_sec', 60)
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
+        self._margin_topup_attempt_cooldown: Dict[int, datetime] = {}
 
         # 累计资金费支出阈值配置
         self.funding_cost_tolerance_ratio = config.get_float('trade.close.funding_cost_tolerance_ratio', 0.5)
@@ -77,6 +78,18 @@ class ClosingExecutor:
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
+        self.margin_topup_pct = config.get_float('margin.topup_pct', 12.0)
+        self.margin_topup_enabled = config.get_bool('margin.topup.enabled', True)
+        self.margin_topup_target_ratio = config.get_float('margin.topup.target_margin_ratio', 0.5)
+        self.margin_topup_max_count = config.get_int('margin.topup.max_topup_per_position', 3)
+        self.margin_topup_max_ratio = config.get_float('margin.topup.max_topup_ratio', 1.0)
+        self.margin_topup_min_gate_available = config.get_float('margin.topup.min_gate_available', 50.0)
+        self.margin_topup_cooldown_sec = config.get_int('margin.topup.cooldown_sec', 300)
+        self.margin_topup_min_amount = config.get_float('margin.topup.min_amount_usdt', 0.1)
+        self.margin_topup_snapshot_max_age_sec = config.get_int('margin.topup.snapshot_max_age_sec', 180)
+        self.margin_topup_balance_tolerance_pct = config.get_float(
+            'margin.topup.hedge_balance_tolerance_pct', 5.0
+        )
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -168,6 +181,12 @@ class ClosingExecutor:
             # ── 按优先级检查平仓条件 ──
             close_reason = None
             close_reason_detail = None
+
+            topup_result = self._check_and_topup_margin(pos)
+            if topup_result:
+                results.append(topup_result)
+                if topup_result.get('success'):
+                    continue
 
             # 优先级 0：保证金爆仓风控（最高优先级，距爆仓距离低于阈值时立即平仓）
             if self._check_margin_liquidation(pos):
@@ -333,6 +352,232 @@ class ClosingExecutor:
         if liq_distance is None:
             return False
         return liq_distance < self.margin_close_threshold_pct
+
+    def _check_and_topup_margin(self, pos: Dict) -> Optional[Dict]:
+        """在紧急平仓前尝试自动追加 Gate 逐仓保证金。"""
+        if not self.margin_topup_enabled:
+            return None
+
+        liq_distance = pos.get('liq_distance_pct')
+        if liq_distance is None:
+            return None
+        liq_distance = float(liq_distance)
+        if liq_distance >= self.margin_topup_pct:
+            return None
+        if liq_distance < self.margin_close_threshold_pct:
+            return None
+
+        ba = pos.get('base_asset', '')
+        position_id = int(pos.get('id') or 0)
+        contract = pos.get('future_contract') or f"{ba}_USDT"
+        if self._in_margin_topup_cooldown(position_id):
+            return None
+
+        hedge_balanced = self._is_hedge_balanced(pos)
+        if not hedge_balanced:
+            message = '现货/期货数量不平衡，跳过自动追保'
+            self._insert_margin_topup_log(pos, 0, 0, 0, liq_distance, None, None, False, False, message)
+            self._set_margin_topup_cooldown(position_id)
+            logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
+            return None
+
+        topup_count = int(pos.get('margin_topup_count') or 0)
+        if topup_count >= self.margin_topup_max_count:
+            return None
+
+        last_at = pos.get('margin_topup_last_at')
+        if last_at and isinstance(last_at, str):
+            try:
+                last_at = datetime.strptime(last_at, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                last_at = None
+        if last_at and (datetime.now() - last_at).total_seconds() < self.margin_topup_cooldown_sec:
+            return None
+
+        calc = self._calculate_margin_topup_amount(pos)
+        if not calc:
+            return None
+        topup_amount = calc['topup_amount']
+        if topup_amount < self.margin_topup_min_amount:
+            return None
+
+        initial_margin = calc['initial_margin']
+        topup_total = float(pos.get('margin_topup_total') or 0)
+        max_total = initial_margin * self.margin_topup_max_ratio
+        if max_total > 0 and topup_total + topup_amount > max_total:
+            topup_amount = max(0.0, max_total - topup_total)
+            if topup_amount < self.margin_topup_min_amount:
+                return None
+
+        gate_available = self._get_latest_gate_available()
+        if gate_available is None:
+            message = '无有效Gate资金快照，跳过自动追保'
+            self._insert_margin_topup_log(
+                pos, topup_amount, calc['target_margin'], calc['margin_before'],
+                liq_distance, calc['liq_distance_after'], None, True, False, message
+            )
+            self._set_margin_topup_cooldown(position_id)
+            logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
+            return None
+        if gate_available - topup_amount < self.margin_topup_min_gate_available:
+            message = (
+                f"Gate可用余额不足: available={gate_available:.4f}, "
+                f"topup={topup_amount:.4f}, reserve={self.margin_topup_min_gate_available:.4f}"
+            )
+            self._insert_margin_topup_log(
+                pos, topup_amount, calc['target_margin'], calc['margin_before'],
+                liq_distance, calc['liq_distance_after'], gate_available, True, False, message
+            )
+            self._set_margin_topup_cooldown(position_id)
+            logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
+            return None
+
+        exec_result = self.executor_client.topup_margin(contract, topup_amount)
+        success = bool(exec_result.get('success'))
+        message = exec_result.get('message') or ('追保成功' if success else '追保失败')
+        self._insert_margin_topup_log(
+            pos, topup_amount, calc['target_margin'], calc['margin_before'],
+            liq_distance, calc['liq_distance_after'], gate_available, True, success, message
+        )
+        if not success:
+            self._set_margin_topup_cooldown(position_id)
+            logger.warning(
+                f"自动追保失败 | {ba} | position_id={position_id} | "
+                f"amount={topup_amount:.6f} | {message}"
+            )
+            return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
+
+        self._mark_margin_topup_success(position_id, topup_amount)
+        logger.info(
+            f"自动追保成功 | {ba} | position_id={position_id} | amount={topup_amount:.6f} | "
+            f"margin={calc['margin_before']:.6f}->{calc['margin_before'] + topup_amount:.6f} | "
+            f"target={calc['target_margin']:.6f} | liq_distance={liq_distance:.2f}%"
+        )
+        return {
+            'base_asset': ba,
+            'success': True,
+            'action': 'margin_topup',
+            'topup_amount': round(topup_amount, 6),
+            'message': message,
+        }
+
+    def _in_margin_topup_cooldown(self, position_id: int) -> bool:
+        if not position_id:
+            return False
+        last_attempt = self._margin_topup_attempt_cooldown.get(position_id)
+        if not last_attempt:
+            return False
+        return (datetime.now() - last_attempt).total_seconds() < self.margin_topup_cooldown_sec
+
+    def _set_margin_topup_cooldown(self, position_id: int):
+        if position_id:
+            self._margin_topup_attempt_cooldown[position_id] = datetime.now()
+
+    def _calculate_margin_topup_amount(self, pos: Dict) -> Optional[Dict]:
+        """计算补到当前期货名义价值 50% 保证金水平所需金额。"""
+        future_qty = float(pos.get('future_open_qty') or 0)
+        open_price = float(pos.get('future_open_price') or 0)
+        current_price = float(pos.get('current_future_price') or 0)
+        if future_qty <= 0 or open_price <= 0 or current_price <= 0:
+            return None
+
+        initial_margin = future_qty * open_price / max(config.get_float('margin.leverage', 2.0), 1.0)
+        topup_total = float(pos.get('margin_topup_total') or 0)
+        margin_before = initial_margin + topup_total
+        target_margin = future_qty * current_price * self.margin_topup_target_ratio
+        topup_amount = max(0.0, target_margin - margin_before)
+        maintenance_rate = self._get_maintenance_rate(pos.get('base_asset'))
+        liq_price_after = open_price + (margin_before + topup_amount) / future_qty - maintenance_rate * open_price
+        liq_distance_after = (
+            (liq_price_after - current_price) / current_price * 100
+            if current_price > 0 else None
+        )
+        return {
+            'initial_margin': initial_margin,
+            'margin_before': margin_before,
+            'target_margin': target_margin,
+            'topup_amount': topup_amount,
+            'liq_distance_after': liq_distance_after,
+        }
+
+    def _is_hedge_balanced(self, pos: Dict) -> bool:
+        """追保前确认现货腿和期货腿仍大致平衡；追保不改变对冲数量。"""
+        spot_qty = float(pos.get('spot_open_qty') or 0)
+        future_qty = float(pos.get('future_open_qty') or 0)
+        if spot_qty <= 0 or future_qty <= 0:
+            return False
+        tolerance = max(self.margin_topup_balance_tolerance_pct, 0) / 100
+        return abs(spot_qty - future_qty) / max(spot_qty, future_qty) <= tolerance
+
+    def _get_maintenance_rate(self, base_asset) -> float:
+        meta = self.contract_meta.get(str(base_asset or '').upper(), {})
+        return float(meta.get('maintenance_rate') or config.get_float('margin.default_maintenance_rate', 0.005))
+
+    def _get_latest_gate_available(self) -> Optional[float]:
+        sql = """
+            SELECT available_usdt, snapshot_at
+            FROM mi_capital_snapshot
+            WHERE exchange = 'gate'
+            ORDER BY snapshot_at DESC
+            LIMIT 1
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+        if not row:
+            return None
+        snapshot_at = row.get('snapshot_at')
+        if snapshot_at and isinstance(snapshot_at, str):
+            try:
+                snapshot_at = datetime.strptime(snapshot_at, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                snapshot_at = None
+        if snapshot_at and (datetime.now() - snapshot_at).total_seconds() > self.margin_topup_snapshot_max_age_sec:
+            return None
+        return float(row.get('available_usdt') or 0)
+
+    def _mark_margin_topup_success(self, position_id: int, amount: float):
+        sql = """
+            UPDATE mi_trade_position SET
+                margin_topup_count = margin_topup_count + 1,
+                margin_topup_total = margin_topup_total + %s,
+                margin_topup_last_at = NOW()
+            WHERE id = %s AND status = 'holding'
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (amount, position_id))
+
+    def _insert_margin_topup_log(
+        self, pos: Dict, amount: float, target_margin: float, margin_before: float,
+        liq_before: Optional[float], liq_after: Optional[float], gate_available: Optional[float],
+        hedge_balanced: bool, success: bool, message: str
+    ):
+        sql = """
+            INSERT INTO mi_margin_topup_log (
+                base_asset, position_id, contract, topup_amount, target_margin_usdt,
+                margin_before_usdt, liq_distance_before, liq_distance_after,
+                gate_available_before, hedge_balanced, success, error_msg
+            ) VALUES (
+                %(base_asset)s, %(position_id)s, %(contract)s, %(topup_amount)s, %(target_margin)s,
+                %(margin_before)s, %(liq_before)s, %(liq_after)s,
+                %(gate_available)s, %(hedge_balanced)s, %(success)s, %(error_msg)s
+            )
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'base_asset': pos.get('base_asset'),
+                'position_id': pos.get('id'),
+                'contract': pos.get('future_contract') or f"{pos.get('base_asset')}_USDT",
+                'topup_amount': round(float(amount or 0), 6),
+                'target_margin': round(float(target_margin or 0), 6),
+                'margin_before': round(float(margin_before or 0), 6),
+                'liq_before': liq_before,
+                'liq_after': round(float(liq_after), 2) if liq_after is not None else None,
+                'gate_available': gate_available,
+                'hedge_balanced': 1 if hedge_balanced else 0,
+                'success': 1 if success else 0,
+                'error_msg': (message or '')[:200],
+            })
 
     def _check_funding_count(self, pos: Dict) -> bool:
         """检查资金费次数是否达到上限"""

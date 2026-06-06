@@ -175,7 +175,12 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
 
             # ── 保证金风控指标注入（逐仓模式空头爆仓价 + 距爆仓距离）──
             maintenance_rate = c_meta.get('maintenance_rate') or margin_default_mmr
-            liq_price = future_open_price * (1 + 1 / margin_leverage - maintenance_rate)
+            initial_margin = future_open_price * future_qty / margin_leverage
+            topup_total = float(pos.get('margin_topup_total') or 0)
+            total_margin = initial_margin + topup_total
+            pos['margin_initial'] = round(initial_margin, 6)
+            pos['current_margin'] = round(total_margin, 6)
+            liq_price = future_open_price + total_margin / future_qty - maintenance_rate * future_open_price
             pos['liq_price'] = round(liq_price, 6)
             if current_future > 0:
                 liq_distance_pct = (liq_price - current_future) / current_future * 100
@@ -194,6 +199,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['realized_pnl'] = None
             pos['total_pnl_bps'] = None
             pos['total_pnl'] = None
+            pos['margin_initial'] = None
+            pos['current_margin'] = None
             pos['liq_price'] = None
             pos['liq_distance_pct'] = None
 

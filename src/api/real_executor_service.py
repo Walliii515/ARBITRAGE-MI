@@ -129,6 +129,12 @@ class ExecuteRequest(BaseModel):
     orderbook_row: dict
 
 
+class MarginTopupRequest(BaseModel):
+    """追加保证金请求体"""
+    contract: str
+    amount: float
+
+
 # ───── API 端点 ─────
 @app.post('/api/execute')
 async def execute(req: ExecuteRequest):
@@ -151,6 +157,19 @@ async def execute(req: ExecuteRequest):
             'spot_order': None,
             'future_order': None
         }
+
+
+@app.post('/api/margin/topup')
+async def margin_topup(req: MarginTopupRequest):
+    """向 Gate 逐仓仓位追加保证金。"""
+    if _executor is None:
+        raise HTTPException(status_code=503, detail='成交引擎未初始化')
+
+    try:
+        return _executor.topup_gate_margin(req.contract, req.amount)
+    except Exception as e:
+        logger.error(f'追加保证金异常: {e}', exc_info=True)
+        return {'success': False, 'message': f'追加保证金异常: {str(e)}'}
 
 
 @app.post('/api/reload')
