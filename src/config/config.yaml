@@ -60,14 +60,22 @@ trade:
 
   # ─── 动量开仓通道 ───
   # 用于高流动性标的在“超阈值 + 上升期 + 盘口好”时直接进入最终旁路，不等待回调。
-  # 默认关闭；建议先在 virtual 跑日志，对比 signal/pre_gate/actual 后再开启 live。
+  # 只对 A 级标的启用；B 级仍走 pullback + resiliency，C 级不订阅 WS。
   momentum_open:
-    enabled: false
-    window_sec: 1.2                         # 短窗口内观察基差是否继续上升
-    min_samples: 3                          # 动量判断最少样本数
-    min_rise_bps: 3                         # 窗口内基差最小上升幅度
-    min_basis_buffer_bps: 8                 # 当前基差需高于 p20 的额外安全垫
-    safety_bps: 8                           # 盈利性守卫的额外安全垫
+    enabled: true
+    allowed_tiers: [A]                      # 只有 A 级主交易池允许动量直开
+    window_sec: 1.2                         # 默认短窗口；可被 tier_overrides 覆盖
+    min_samples: 3                          # 默认动量判断最少样本数
+    min_rise_bps: 3                         # 默认窗口内基差最小上升幅度
+    min_basis_buffer_bps: 8                 # 默认当前基差需高于 p20 的额外安全垫
+    safety_bps: 8                           # 默认盈利性守卫的额外安全垫
+    tier_overrides:
+      A:
+        window_sec: 1.0                     # A 级流动性好，动量确认窗口更短
+        min_samples: 3
+        min_rise_bps: 3
+        min_basis_buffer_bps: 6             # A 级安全垫略小
+        safety_bps: 6                       # A 级盈利性守卫额外安全垫略小
 
   # ─── 开仓盘口恢复确认 ───
   # 当开仓信号已经完成“峰值回落”确认后，系统不会立刻下单，而是进入最多 3.0 秒的盘口恢复观察期；
@@ -157,6 +165,8 @@ real_executor:
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
   settle: usdt
+  # WS 订阅标的分层白名单；默认只订阅 A/B，C 不进入 Gate/Binance WS，降低服务器压力
+  strategy_tiers: [A, B]
   # 最大订阅合约数（从 mi_base_asset 加载的上限）
   max_contracts: 999
   # Gate OBU WS 连接分片数；若 max_contracts=250 且 level=50，建议设为 5

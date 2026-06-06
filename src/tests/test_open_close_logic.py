@@ -72,7 +72,11 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           coverage_threshold=0.8,
                           max_orderbook_lag_ms=200.0,
                           vwap_threshold_meta=None,
-                          close_vwap_threshold_meta=None):
+                          close_vwap_threshold_meta=None,
+                          asset_tier_meta=None,
+                          momentum_enabled=False,
+                          momentum_allowed_tiers=None,
+                          momentum_tier_overrides=None):
     """构造独立的 TradingExecutor 实例（不依赖 DB / API）"""
     from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 
@@ -83,11 +87,15 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         basis_threshold_bps=basis_threshold_bps,
         coverage_threshold=coverage_threshold,
         max_orderbook_lag_ms=max_orderbook_lag_ms,
+        momentum_enabled=momentum_enabled,
+        momentum_allowed_tiers=momentum_allowed_tiers or ['A'],
+        momentum_tier_overrides=momentum_tier_overrides or {},
     )
     te = TradingExecutor(
         cfg, contract_meta={}, spot_meta={},
         vwap_threshold_meta=vwap_threshold_meta,
         close_vwap_threshold_meta=close_vwap_threshold_meta,
+        asset_tier_meta=asset_tier_meta,
     )
     return te
 
@@ -557,6 +565,61 @@ class TestTradingExecutorOpenFlowResiliency(unittest.TestCase):
         # basis 反弹到 pullback 阈值上方；仍应继续跑 resiliency，而不是回到 peak 等待。
         te.check_and_open([self._row(99.0)])
         self.assertEqual(te._pass_open_resiliency_check.call_count, 2)
+
+
+class TestTradingExecutorTierMomentum(unittest.TestCase):
+    """A 级允许 momentum，B 级只走回落+恢复。"""
+
+    def _row(self, base_asset, basis):
+        return {
+            'base_asset': base_asset,
+            'contract': f'{base_asset}_USDT',
+            'symbol': f'{base_asset}USDT',
+            'open_vwap_basis_bps': basis,
+            'open_coverage': 0.1,
+            'funding_rate_24h': 0.001,
+        }
+
+    def _executor(self, tier):
+        base_asset = 'BTC'
+        te = make_trading_executor(
+            basis_threshold_bps=20,
+            coverage_threshold=0.8,
+            vwap_threshold_meta={base_asset: {'p20': 20}},
+            close_vwap_threshold_meta={base_asset: {'close_basis_p20': -100}},
+            asset_tier_meta={base_asset: tier},
+            momentum_enabled=True,
+            momentum_allowed_tiers=['A'],
+            momentum_tier_overrides={
+                'A': {
+                    'window_sec': 1.0,
+                    'min_samples': 3,
+                    'min_rise_bps': 3,
+                    'min_basis_buffer_bps': 6,
+                    'safety_bps': 6,
+                }
+            },
+        )
+        te._verify_realtime_funding_rate = MagicMock(return_value=True)
+        te._create_signal = MagicMock(return_value=1001)
+        return te
+
+    def test_a_tier_can_enter_momentum_channel(self):
+        te = self._executor('A')
+        for basis in [30.0, 32.0, 34.0]:
+            te._record_momentum_sample('BTC', basis)
+
+        self.assertTrue(te._pass_momentum_check('BTC', 34.0, self._row('BTC', 34.0)))
+        self.assertEqual(te._peak_state['BTC']['trigger'], 'momentum')
+        self.assertEqual(te._peak_state['BTC']['strategy_tier'], 'A')
+
+    def test_b_tier_does_not_enter_momentum_channel(self):
+        te = self._executor('B')
+        for basis in [30.0, 32.0, 34.0]:
+            te._record_momentum_sample('BTC', basis)
+
+        self.assertFalse(te._pass_momentum_check('BTC', 34.0, self._row('BTC', 34.0)))
+        self.assertNotIn('BTC', te._peak_state)
 
 
 # ══════════════════════════════════════════════════════════════════

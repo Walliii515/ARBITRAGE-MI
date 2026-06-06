@@ -308,19 +308,34 @@ class ServiceLifecycleManager:
 
     # ───── 合约加载 ─────
 
+    def _allowed_strategy_tiers(self) -> List[str]:
+        raw = config.get('orderbook.strategy_tiers', ['A', 'B'])
+        if isinstance(raw, str):
+            tiers = [part.strip().upper() for part in raw.split(',')]
+        elif isinstance(raw, (list, tuple, set)):
+            tiers = [str(part).strip().upper() for part in raw]
+        else:
+            tiers = ['A', 'B']
+        tiers = [tier for tier in tiers if tier in ('A', 'B', 'C')]
+        return tiers or ['A', 'B']
+
     def fetch_contracts_from_db(self) -> List[str]:
         """从 mi_base_asset 查询有效 base_asset，拼接为 Gate 合约名。
 
-        启动订阅前只按可交易性和成交量做基础过滤。
+        启动订阅前按策略分层、可交易性和成交量做基础过滤。
+        默认只订阅 A/B 分层，C 分层不进入 WS，以减少订阅、合并、广播和策略扫描压力。
         资金费率是动态信号，保留到运行时开仓判断，避免启动时为负而漏掉后续转正机会。
         """
         max_contracts = config.get_int('orderbook.max_contracts', 999)
         settle_suffix = self._settle.upper()
         min_spot_volume = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
         min_future_volume = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
+        allowed_tiers = self._allowed_strategy_tiers()
+        tier_placeholders = ', '.join(['%s'] * len(allowed_tiers))
         sql = """
             SELECT
                 b.base_asset,
+                COALESCE(b.strategy_tier, 'C') AS strategy_tier,
                 g.funding_rate_24h,
                 g.volume_24h_settle,
                 s.quote_volume
@@ -332,6 +347,7 @@ class ServiceLifecycleManager:
                 ON s.base_asset = UPPER(TRIM(b.base_asset))
                AND s.symbol = CONCAT(UPPER(TRIM(b.base_asset)), %s)
             WHERE b.is_valid = 'Y'
+              AND COALESCE(b.strategy_tier, 'C') IN ({tier_placeholders})
               AND g.status = 'trading'
               AND s.status = 'TRADING'
               AND s.is_spot_trading_allowed = 1
@@ -339,7 +355,7 @@ class ServiceLifecycleManager:
               AND COALESCE(s.quote_volume, 0) >= %s
             ORDER BY g.funding_rate_24h DESC, g.volume_24h_settle DESC, s.quote_volume DESC
             LIMIT %s
-        """
+        """.format(tier_placeholders=tier_placeholders)
         try:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(
@@ -347,6 +363,7 @@ class ServiceLifecycleManager:
                     (
                         f"_{settle_suffix}",
                         settle_suffix,
+                        *allowed_tiers,
                         min_future_volume,
                         min_spot_volume,
                         max_contracts,
@@ -358,15 +375,36 @@ class ServiceLifecycleManager:
                     for row in rows
                     if row.get('base_asset') and row['base_asset'].strip()
                 ]
+                tier_counts: Dict[str, int] = {}
+                for row in rows:
+                    tier = row.get('strategy_tier') or 'C'
+                    tier_counts[tier] = tier_counts.get(tier, 0) + 1
                 log_print(
                     f"从数据库筛选到 {len(contracts)} 个订阅合约"
-                    f"（max={max_contracts}, min_spot_vol={min_spot_volume}, "
+                    f"（tiers={allowed_tiers}, tier_counts={tier_counts}, "
+                    f"max={max_contracts}, min_spot_vol={min_spot_volume}, "
                     f"min_future_vol={min_future_volume}, funding_filter=runtime）: {contracts}"
                 )
                 return contracts
         except Exception as e:
             logger.error(f"从数据库获取合约列表失败: {e}，使用默认合约", exc_info=True)
             return ['BTC_USDT', 'ETH_USDT']
+
+    def _get_asset_strategy_tier(self, base_asset: str) -> Optional[str]:
+        sql = """
+            SELECT COALESCE(strategy_tier, 'C') AS strategy_tier
+            FROM mi_base_asset
+            WHERE UPPER(TRIM(base_asset)) = %s
+            LIMIT 1
+        """
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, (base_asset.strip().upper(),))
+                row = cursor.fetchone()
+            return row.get('strategy_tier') if row else None
+        except Exception as e:
+            logger.warning(f"查询 {base_asset} strategy_tier 失败: {e}")
+            return None
 
     # ───── 手动重试 ─────
 
@@ -389,6 +427,10 @@ class ServiceLifecycleManager:
         ba = base_asset.strip().upper()
         contract = f"{ba}_{self._settle.upper()}"
         symbol = f"{ba}USDT"
+        tier = self._get_asset_strategy_tier(ba)
+        allowed_tiers = self._allowed_strategy_tiers()
+        if tier not in allowed_tiers:
+            return False, f'{ba} strategy_tier={tier or "NA"} 不在订阅白名单 {allowed_tiers}，不订阅'
 
         # 1. Gate OBU 订阅
         with self._conn_lock:

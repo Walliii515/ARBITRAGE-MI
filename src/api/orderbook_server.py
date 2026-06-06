@@ -33,7 +33,7 @@ from calc.etl_pipeline import start_daily_schedulers, stop_daily_schedulers, ETL
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger, log_print, setup_logging
-from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+from common.meta_loader import fetch_asset_tier_meta, fetch_contract_meta, fetch_spot_meta
 
 from api.trading_api import router as trading_router
 from api.auth import router as auth_router, verify_token_dependency, verify_ws_token
@@ -154,6 +154,7 @@ _threshold_meta: Dict[str, float] = {}
 _vwap_threshold_meta: Dict[str, float] = {}  # base_asset -> threshold_bps
 _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p10..p40}
 _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费率(止盈用)
+_asset_tier_meta: Dict[str, str] = {}  # base_asset -> strategy_tier
 
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
@@ -460,14 +461,21 @@ async def lifespan(app: FastAPI):
     broadcast_queue = asyncio.Queue()
     worker_task = asyncio.create_task(broadcast_worker())
 
-    global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _funding_rate_p40_meta, _meta_update_time
+    global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
+    global _close_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
     _contract_meta = fetch_contract_meta()
     _spot_meta = fetch_spot_meta()
+    _asset_tier_meta = fetch_asset_tier_meta()
     _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_print(f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条，费率p40 {len(_funding_rate_p40_meta)} 条')
+    log_print(
+        f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，'
+        f'标的分层 {len(_asset_tier_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，'
+        f'VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条，'
+        f'费率p40 {len(_funding_rate_p40_meta)} 条'
+    )
 
     async def _refresh_meta_cache_loop():
         """定时刷新内存缓存（ETL由各任务的IntervalScheduler独立执行）"""
@@ -485,9 +493,11 @@ async def lifespan(app: FastAPI):
             try:
                 logger.info(f'开始定时刷新内存缓存 (间隔: {min_interval} 分钟)...')
                 # 刷新内存缓存
-                global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta, _close_vwap_threshold_meta, _funding_rate_p40_meta, _meta_update_time
+                global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
+                global _close_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
                 _contract_meta = fetch_contract_meta()
                 _spot_meta = fetch_spot_meta()
+                _asset_tier_meta = fetch_asset_tier_meta()
                 _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
                 new_close_meta = fetch_close_vwap_threshold_meta()
@@ -496,7 +506,12 @@ async def lifespan(app: FastAPI):
                 else:
                     logger.warning(f'平仓VWAP基差阈值刷新结果为空，保留旧缓存（{len(_close_vwap_threshold_meta)} 条）')
                 _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                logger.info(f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, 阈値 {len(_threshold_meta)} 条, VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, 费率p40 {len(_funding_rate_p40_meta)} 条')
+                logger.info(
+                    f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, '
+                    f'标的分层 {len(_asset_tier_meta)} 条, 阈値 {len(_threshold_meta)} 条, '
+                    f'VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, '
+                    f'费率p40 {len(_funding_rate_p40_meta)} 条'
+                )
                 # 重置执行器单例，下次循环用新元数据重建
                 global _trading_executor, _closing_executor
                 _trading_executor = None
@@ -987,10 +1002,12 @@ def _run_open_position_check_once():
                 momentum_min_rise_bps=config.get_float('trade.momentum_open.min_rise_bps', 3.0),
                 momentum_min_basis_buffer_bps=config.get_float('trade.momentum_open.min_basis_buffer_bps', 8.0),
                 momentum_safety_bps=config.get_float('trade.momentum_open.safety_bps', 8.0),
+                momentum_allowed_tiers=config.get('trade.momentum_open.allowed_tiers', ['A']),
+                momentum_tier_overrides=config.get('trade.momentum_open.tier_overrides', {}),
             )
             _trading_executor = TradingExecutor(
                 _trading_cfg, _contract_meta, _spot_meta,
-                _vwap_threshold_meta, _close_vwap_threshold_meta
+                _vwap_threshold_meta, _close_vwap_threshold_meta, _asset_tier_meta
             )
             _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
 

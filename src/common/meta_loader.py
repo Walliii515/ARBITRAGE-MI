@@ -65,3 +65,25 @@ def fetch_spot_meta() -> Dict[str, Dict]:
     except Exception as e:
         logger.error(f'加载现货元数据失败: {e}', exc_info=True)
     return result
+
+
+def fetch_asset_tier_meta() -> Dict[str, str]:
+    """
+    从 mi_base_asset 加载策略分层，按 base_asset 索引。
+
+    Returns:
+        base_asset -> strategy_tier ('A'/'B'/'C')
+    """
+    sql = "SELECT base_asset, COALESCE(strategy_tier, 'C') AS strategy_tier FROM mi_base_asset"
+    result = {}
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            for row in rows:
+                base_asset = row.get('base_asset')
+                if base_asset:
+                    result[base_asset.strip().upper()] = (row.get('strategy_tier') or 'C').strip().upper()
+    except Exception as e:
+        logger.error(f'加载标的策略分层失败: {e}', exc_info=True)
+    return result

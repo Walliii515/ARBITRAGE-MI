@@ -6,9 +6,9 @@
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 from common.database import db_manager
 from common.logger import get_logger
@@ -86,6 +86,8 @@ class TradingExecutorConfig:
     momentum_min_rise_bps: float = 3.0
     momentum_min_basis_buffer_bps: float = 8.0
     momentum_safety_bps: float = 8.0
+    momentum_allowed_tiers: List[str] = field(default_factory=lambda: ['A'])
+    momentum_tier_overrides: Dict[str, Dict] = field(default_factory=dict)
 
 
 class TradingExecutor:
@@ -93,7 +95,8 @@ class TradingExecutor:
     
     def __init__(self, cfg: TradingExecutorConfig, contract_meta: Dict, spot_meta: Dict,
                  vwap_threshold_meta: Optional[Dict[str, float]] = None,
-                 close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None):
+                 close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None,
+                 asset_tier_meta: Optional[Dict[str, str]] = None):
         """
         Args:
             cfg: 配置 dataclass（由 api/ 层构造后注入）
@@ -101,11 +104,17 @@ class TradingExecutor:
             spot_meta: base_asset -> {step_size, min_qty, ...}
             vwap_threshold_meta: base_asset -> threshold_bps (按标的VWAP基差阈值)
             close_vwap_threshold_meta: base_asset -> {close_basis_p10..p40} (平仓基差阈值，用于盈利性守卫)
+            asset_tier_meta: base_asset -> strategy_tier ('A'/'B'/'C')
         """
         self.contract_meta = contract_meta
         self.spot_meta = spot_meta
         self.vwap_threshold_meta = vwap_threshold_meta or {}
         self.close_vwap_threshold_meta = close_vwap_threshold_meta or {}
+        self.asset_tier_meta = {
+            str(k).strip().upper(): str(v).strip().upper()
+            for k, v in (asset_tier_meta or {}).items()
+            if k
+        }
         
         # 通过 HTTP 客户端调用独立的成交引擎服务（虚拟/实盘），实现虚实分离
         self.executor_client = ExecutorClient(cfg.executor_url, timeout=cfg.executor_timeout)
@@ -199,6 +208,16 @@ class TradingExecutor:
         self.momentum_min_rise_bps = cfg.momentum_min_rise_bps
         self.momentum_min_basis_buffer_bps = cfg.momentum_min_basis_buffer_bps
         self.momentum_safety_bps = cfg.momentum_safety_bps
+        self.momentum_allowed_tiers: Set[str] = {
+            str(t).strip().upper()
+            for t in (cfg.momentum_allowed_tiers or [])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.momentum_tier_overrides = {
+            str(tier).strip().upper(): params
+            for tier, params in (cfg.momentum_tier_overrides or {}).items()
+            if isinstance(params, dict)
+        }
         self._momentum_samples: Dict[str, deque] = {}
     
     def set_orderbook_managers(self, gate_manager, spot_manager):
@@ -458,6 +477,21 @@ class TradingExecutor:
         while samples and samples[0][0] < cutoff:
             samples.popleft()
 
+    def _asset_tier(self, base_asset: str) -> str:
+        return self.asset_tier_meta.get((base_asset or '').strip().upper(), 'C')
+
+    def _momentum_params_for_tier(self, tier: str) -> Dict[str, float]:
+        override = self.momentum_tier_overrides.get((tier or '').strip().upper(), {})
+        return {
+            'window_sec': float(override.get('window_sec', self.momentum_window_sec)),
+            'min_samples': int(override.get('min_samples', self.momentum_min_samples)),
+            'min_rise_bps': float(override.get('min_rise_bps', self.momentum_min_rise_bps)),
+            'min_basis_buffer_bps': float(
+                override.get('min_basis_buffer_bps', self.momentum_min_basis_buffer_bps)
+            ),
+            'safety_bps': float(override.get('safety_bps', self.momentum_safety_bps)),
+        }
+
     def _pass_momentum_check(self, base_asset: str, current_basis_bps: float, row: Dict) -> bool:
         """
         动量开仓通道：当基差已经明显超过阈值，并且短窗口内继续上行，
@@ -465,25 +499,32 @@ class TradingExecutor:
         """
         if not self.momentum_enabled:
             return False
+        tier = self._asset_tier(base_asset)
+        if tier not in self.momentum_allowed_tiers:
+            return False
         if base_asset in self._peak_state:
             return False
 
         samples = self._momentum_samples.get(base_asset)
-        if not samples or len(samples) < self.momentum_min_samples:
+        params = self._momentum_params_for_tier(tier)
+        now = datetime.now()
+        cutoff = now - timedelta(seconds=params['window_sec'])
+        recent_samples = [(t, b) for t, b in (samples or []) if t >= cutoff]
+        if len(recent_samples) < params['min_samples']:
             return False
 
         threshold_data = self.vwap_threshold_meta.get(base_asset, {})
         p20 = threshold_data.get('p20', self.basis_threshold_bps)
-        min_entry_basis = float(p20) + self.momentum_min_basis_buffer_bps
+        min_entry_basis = float(p20) + params['min_basis_buffer_bps']
         if current_basis_bps < min_entry_basis:
             return False
 
-        first_basis = float(samples[0][1])
+        first_basis = float(recent_samples[0][1])
         rise_bps = current_basis_bps - first_basis
-        if rise_bps < self.momentum_min_rise_bps:
+        if rise_bps < params['min_rise_bps']:
             return False
 
-        recent_values = [float(v) for _, v in samples]
+        recent_values = [float(v) for _, v in recent_samples]
         if current_basis_bps < max(recent_values) - 0.5:
             return False
 
@@ -497,7 +538,7 @@ class TradingExecutor:
         close_thr = close_data.get(self.close_threshold_col)
         if close_thr is None:
             return False
-        min_profit_basis = float(close_thr) + self.fee_cost_bps + self.momentum_safety_bps
+        min_profit_basis = float(close_thr) + self.fee_cost_bps + params['safety_bps']
         if current_basis_bps <= min_profit_basis:
             return False
 
@@ -514,11 +555,15 @@ class TradingExecutor:
             'signal_id': signal_id,
             'signal_basis_bps': current_basis_bps,
             'momentum_rise_bps': rise_bps,
+            'strategy_tier': tier,
+            'momentum_window_sec': params['window_sec'],
+            'momentum_min_basis_buffer_bps': params['min_basis_buffer_bps'],
         }
         logger.info(
             f"动量开仓确认 | {base_asset} | "
+            f"tier={tier} | "
             f"basis={current_basis_bps:.2f}bps≥p20+buffer={min_entry_basis:.2f} | "
-            f"rise={rise_bps:.2f}bps/{self.momentum_window_sec:.1f}s | "
+            f"rise={rise_bps:.2f}bps/{params['window_sec']:.1f}s | "
             f"coverage={open_coverage} | guard>{min_profit_basis:.2f}"
         )
         return True
@@ -1107,9 +1152,14 @@ class TradingExecutor:
                 )
             elif trigger == 'momentum':
                 rise_bps = float(peak_state.get('momentum_rise_bps', 0) or 0)
+                tier = peak_state.get('strategy_tier', self._asset_tier(base_asset))
+                window_sec = float(peak_state.get('momentum_window_sec', self.momentum_window_sec) or 0)
+                buffer_bps = float(
+                    peak_state.get('momentum_min_basis_buffer_bps', self.momentum_min_basis_buffer_bps) or 0
+                )
                 parts.append(
-                    f"动量开仓(升{rise_bps:.1f}bps/{self.momentum_window_sec:.1f}s,"
-                    f"buffer={self.momentum_min_basis_buffer_bps:.1f}bps)"
+                    f"动量开仓(tier={tier},升{rise_bps:.1f}bps/{window_sec:.1f}s,"
+                    f"buffer={buffer_bps:.1f}bps)"
                 )
             else:
                 parts.append(f"峰值{peak_bps:.1f}")
