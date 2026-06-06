@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS mi_trade_signal (
     entry_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '进入监控时基差(bps)',
     peak_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '监控期间峰值基差(bps)',
     exit_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '结束时基差(bps)',
-    exit_reason VARCHAR(200) DEFAULT NULL COMMENT '结束原因(条件消失原因/拒单原因)',
+    exit_reason TEXT DEFAULT NULL COMMENT '结束原因(条件消失原因/拒单原因/开仓原因)',
     duration_sec INT DEFAULT NULL COMMENT '监控持续时长(秒)',
     trigger_type VARCHAR(20) DEFAULT NULL COMMENT '触发方式: pullback/timeout (仅opened/rejected)',
     order_uuid VARCHAR(50) DEFAULT NULL COMMENT '关联订单UUID(仅opened)',

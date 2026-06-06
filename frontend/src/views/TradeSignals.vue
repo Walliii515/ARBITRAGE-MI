@@ -16,6 +16,9 @@ interface SignalRow {
   resolved_time: string | null
   status: 'monitoring' | 'opened' | 'conditions_lost' | 'rejected' | 'gate_rejected'
   entry_basis_bps: number | null
+  actual_basis_bps: number | null
+  signal_basis_bps: number | null
+  pre_gate_basis_bps: number | null
   peak_basis_bps: number | null
   exit_basis_bps: number | null
   exit_reason: string | null
@@ -129,6 +132,12 @@ const statusMap: Record<string, { label: string; color: string }> = {
   gate_rejected: { label: '被拒', color: '#f56c6c' },
 }
 
+function formatBps(value: unknown): string {
+  if (value == null || value === '') return ''
+  const n = Number(value)
+  return Number.isFinite(n) ? n.toFixed(1) : ''
+}
+
 const exitReasonOptions = [
   { label: '盈利性守卫', value: '盈利性守卫' },
   { label: 'resiliency', value: 'resiliency' },
@@ -156,22 +165,36 @@ const columnDefs = ref<ColDef[]>([
     },
   },
   {
+    headerName: '实际基差',
+    field: 'actual_basis_bps',
+    width: 105,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p: any) => formatBps(p.value),
+  },
+  {
     headerName: '入场基差',
     field: 'entry_basis_bps',
     width: 105,
-    valueFormatter: (p: any) => p.value != null ? `${p.value.toFixed(1)}` : '',
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p: any) => formatBps(p.value),
   },
   {
     headerName: '峰值基差',
     field: 'peak_basis_bps',
     width: 105,
-    valueFormatter: (p: any) => p.value != null ? `${p.value.toFixed(1)}` : '',
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p: any) => formatBps(p.value),
   },
   {
     headerName: '退出基差',
     field: 'exit_basis_bps',
     width: 105,
-    valueFormatter: (p: any) => p.value != null ? `${p.value.toFixed(1)}` : '',
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p: any) => formatBps(p.value),
   },
   {
     headerName: '持续时长',

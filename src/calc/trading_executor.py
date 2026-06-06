@@ -477,7 +477,7 @@ class TradingExecutor:
                 trigger_type = peak_state.get('trigger')
                 if exec_result['success']:
                     self._resolve_signal(
-                        base_asset, 'opened', None,
+                        base_asset, 'opened', order_group.get('open_reason'),
                         exit_basis_bps=open_vwap_basis,
                         trigger_type=trigger_type,
                         order_uuid=order_group['order_uuid'],
@@ -1281,7 +1281,7 @@ class TradingExecutor:
                     'pre_gate_basis_bps': round(pre_gate_basis_bps, 2) if pre_gate_basis_bps is not None else None,
                     'actual_basis_bps': round(actual_basis_bps, 2) if actual_basis_bps is not None else None,
                     'exit_basis_bps': round(exit_basis_bps, 2) if exit_basis_bps is not None else None,
-                    'exit_reason': exit_reason[:200] if exit_reason else None,
+                    'exit_reason': exit_reason if exit_reason else None,
                     'duration_sec': duration_sec,
                     'trigger_type': trigger_type,
                     'order_uuid': order_uuid,
