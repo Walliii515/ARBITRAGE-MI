@@ -52,6 +52,7 @@ interface PositionRow {
   current_spot_price: number | null
   current_future_price: number | null
   current_spread_bps: number | null
+  spot_open_amount: number | null
   floating_pnl_total: number | null
   floating_pnl_bps: number | null
   fee_bps: number | null
@@ -872,6 +873,18 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
   const sumField = (field: keyof PositionRow): number =>
     rows.reduce((acc, r) => acc + ((r[field] as number | null | undefined) ?? 0), 0)
 
+  const totalOpenAmount = rows.reduce((acc, r) => {
+    const amount = Number(r.spot_open_amount)
+    return acc + (Number.isFinite(amount) && amount > 0 ? amount : openAmountUsdt.value)
+  }, 0)
+  const toPortfolioBps = (amount: number): number | null =>
+    totalOpenAmount > 0 ? Math.round((amount / totalOpenAmount) * 10000 * 100) / 100 : null
+
+  const floatingPnlTotal = sumField('floating_pnl_total')
+  const realizedPnl = sumField('realized_pnl')
+  const fundingTotalPnl = sumField('funding_total_pnl')
+  const totalPnl = sumField('total_pnl')
+
   return [{
     id: -1,
     base_asset: '汇总',
@@ -889,25 +902,26 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     current_spot_price: null,
     current_future_price: null,
     current_spread_bps: null,
-    floating_pnl_bps: null,
-    floating_pnl_total: sumField('floating_pnl_total'),
+    spot_open_amount: totalOpenAmount,
+    floating_pnl_bps: toPortfolioBps(floatingPnlTotal),
+    floating_pnl_total: floatingPnlTotal,
     fee_bps: null,
     fee_cost: sumField('fee_cost'),
     risk_relief_bps: null,
-    funding_pnl_bps: null,
+    funding_pnl_bps: toPortfolioBps(fundingTotalPnl),
     funding_rate: null,
     funding_rate_24h: null,
     funding_interval: null,
     funding_interval_hours: null,
     funding_last_apply: null,
     funding_next_apply: null,
-    funding_total_pnl: sumField('funding_total_pnl'),
+    funding_total_pnl: fundingTotalPnl,
     funding_payments_count: null,
     funding_history: null,
-    realized_pnl_bps: null,
-    realized_pnl: sumField('realized_pnl'),
-    total_pnl_bps: null,
-    total_pnl: sumField('total_pnl'),
+    realized_pnl_bps: toPortfolioBps(realizedPnl),
+    realized_pnl: realizedPnl,
+    total_pnl_bps: toPortfolioBps(totalPnl),
+    total_pnl: totalPnl,
     margin_topup_count: null,
     margin_topup_total: sumField('margin_topup_total'),
     margin_topup_last_at: null,
