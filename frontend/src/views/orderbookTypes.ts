@@ -62,7 +62,16 @@ export interface OrderBookRow {
   risk_relief_bps?: number | null
   /** 按标的VWAP基差阈值(bps)，后端按标的下发 */
   vwap_threshold_bps?: number | null
-  /** 盈利性守卫: 平仓基差阈值(bps)，后端按标的下发 */
+  /** Funding-adjusted 统一入场门槛(bps)，与后端开仓状态机一致 */
+  entry_floor_bps?: number | null
+  entry_p20_bps?: number | null
+  entry_funding_24h_bps?: number | null
+  entry_expected_funding_bps?: number | null
+  entry_carry_floor_bps?: number | null
+  entry_timing_floor_bps?: number | null
+  entry_funding_discount_bps?: number | null
+  entry_expected_edge_bps?: number | null
+  /** 平仓基差阈值参考(bps)，后端按标的下发 */
   close_vwap_threshold_bps?: number | null
   [key: string]: string | number | boolean | null | undefined
 }

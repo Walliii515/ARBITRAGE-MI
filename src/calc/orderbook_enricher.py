@@ -67,6 +67,14 @@ class EnrichConfig:
     future_open_fee: float
     future_close_fee: float
     close_threshold_col: str = 'close_basis_p20'
+    open_vwap_basis_threshold_bps: float = 0.0
+    funding_entry_enabled: bool = True
+    funding_entry_capture_ratio: float = 0.5
+    funding_entry_slippage_buffer_bps: float = 10.0
+    funding_entry_min_expected_edge_bps: float = 0.0
+    funding_entry_strong_funding_24h_bps: float = 50.0
+    funding_entry_discount_ratio: float = 0.2
+    funding_entry_max_discount_bps: float = 10.0
 
 
 def calc_vwap_basis_bps(spot_vwap, future_vwap) -> Optional[float]:
@@ -97,6 +105,63 @@ def calc_full_fee_bps(spot_open_fee: float, spot_close_fee: float,
     """全部手续费 BPS（开+平，负数）"""
     return round(-(spot_open_fee + spot_close_fee +
                    future_open_fee + future_close_fee) * 10000, 2)
+
+
+def calc_entry_snapshot_bps(base_asset: str, basis_bps: Optional[float],
+                            funding_rate_24h: Optional[float],
+                            vwap_threshold_meta: Dict[str, Dict],
+                            cfg: EnrichConfig) -> Dict[str, Optional[float]]:
+    """计算与 TradingExecutor 一致的 funding-adjusted 入场门槛，供监控页展示/过滤。"""
+    threshold_data = vwap_threshold_meta.get(base_asset, {})
+    p20 = float(threshold_data.get('p20', cfg.open_vwap_basis_threshold_bps))
+    funding_24h_bps = float(funding_rate_24h or 0.0) * 10000.0
+    fee_full_bps = -calc_full_fee_bps(
+        cfg.spot_open_fee, cfg.spot_close_fee,
+        cfg.future_open_fee, cfg.future_close_fee,
+    )
+
+    if not cfg.funding_entry_enabled:
+        entry_floor = p20
+        expected_funding_bps = 0.0
+        carry_floor = p20
+        timing_floor = p20
+        discount_bps = 0.0
+    else:
+        expected_funding_bps = funding_24h_bps * cfg.funding_entry_capture_ratio
+        carry_floor = (
+            cfg.funding_entry_min_expected_edge_bps
+            + fee_full_bps
+            + cfg.funding_entry_slippage_buffer_bps
+            - expected_funding_bps
+        )
+        discount_bps = min(
+            cfg.funding_entry_max_discount_bps,
+            max(0.0, funding_24h_bps) * cfg.funding_entry_discount_ratio,
+        )
+        timing_floor = p20 - discount_bps
+        entry_floor = max(carry_floor, timing_floor)
+        if funding_24h_bps < cfg.funding_entry_strong_funding_24h_bps:
+            entry_floor = max(entry_floor, p20)
+
+    expected_edge_bps = None
+    if basis_bps is not None:
+        expected_edge_bps = (
+            float(basis_bps)
+            + expected_funding_bps
+            - fee_full_bps
+            - cfg.funding_entry_slippage_buffer_bps
+        )
+
+    return {
+        'entry_floor_bps': round(entry_floor, 4),
+        'entry_p20_bps': round(p20, 4),
+        'entry_funding_24h_bps': round(funding_24h_bps, 4),
+        'entry_expected_funding_bps': round(expected_funding_bps, 4),
+        'entry_carry_floor_bps': round(carry_floor, 4),
+        'entry_timing_floor_bps': round(timing_floor, 4),
+        'entry_funding_discount_bps': round(discount_bps, 4),
+        'entry_expected_edge_bps': round(expected_edge_bps, 4) if expected_edge_bps is not None else None,
+    }
 
 
 def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
@@ -265,7 +330,16 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         threshold_entry = vwap_threshold_meta.get(base_asset)
         row['vwap_threshold_bps'] = threshold_entry.get('p20') if threshold_entry else None
 
-        # --- 盈利性守卫: 平仓基差阈值 ---
+        # --- Funding-adjusted 统一入场门槛（与 TradingExecutor 口径一致） ---
+        row.update(calc_entry_snapshot_bps(
+            base_asset,
+            row.get('open_vwap_basis_bps'),
+            row.get('funding_rate_24h'),
+            vwap_threshold_meta,
+            cfg,
+        ))
+
+        # --- 平仓基差阈值参考 ---
         if close_vwap_threshold_meta and base_asset in close_vwap_threshold_meta:
             close_data = close_vwap_threshold_meta[base_asset]
             row['close_vwap_threshold_bps'] = close_data.get(cfg.close_threshold_col)

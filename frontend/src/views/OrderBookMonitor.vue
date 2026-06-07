@@ -32,11 +32,9 @@ interface WsMessage {
   funding_threshold_percentile?: string
   min_funding_rate_bps?: number
   orderbook_coverage_threshold?: number
-  risk_relief_bps?: number
   open_vwap_basis_threshold_bps?: number
   min_spot_volume_24h_usdt?: number
   min_future_volume_24h_usdt?: number
-  ts?: number  // pong 回复的时间戳
 }
 
 interface ServiceStatus {
@@ -51,13 +49,13 @@ const rowData = shallowRef<OrderBookRow[]>([])
 /** 上一帧快照索引，供 diff → applyTransaction */
 const rowsByContract = new Map<string, OrderBookRow>()
 let gridApi: GridApi<OrderBookRow> | null = null
-const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
 const lastUpdate = ref('--')
 const gateWsConnected = ref(false)
 const binanceWsConnected = ref(false)
-const wsLatencyMs = ref<number | null>(null)
 const gateWsLatencyMs = ref<number | null>(null)
 const binanceWsLatencyMs = ref<number | null>(null)
+/** 版本号：每次 rowsByContract 变更后递增，供 computed 感知更新 */
+const rowVersion = ref(0)
 const {
   connectionStats,
   fetchConnectionStatus,
@@ -139,6 +137,7 @@ async function loadColumnState() {
 const serviceState = ref<ServiceStatus['state']>('idle')
 const serviceError = ref<string | null>(null)
 const serviceBusy = ref(false)
+const displayedRowCount = ref(0)
 /** 资金费率下限(bps)，从后端动态获取 */
 const minFundingRateBps = ref<number>(-6)
 /** 资金费率过滤开关（默认开启） */
@@ -147,16 +146,12 @@ const filterByFundingRate = ref<boolean>(true)
 const orderbookCoverageThreshold = ref<number>(0.8)
 /** 盘口覆盖过滤开关（默认开启） */
 const filterByCoverage = ref<boolean>(true)
-/** 风险缓释 bps，从后端动态获取 */
-const riskReliefBps = ref<number>(10)
 /** 开仓边际基差阈值 bps，从后端动态获取 */
 const openVwapBasisThresholdBps = ref<number>(0)
-/** 开仓边际基差过滤开关（默认开启） */
+/** 入场门槛过滤开关（默认开启）：使用后端下发的 funding-adjusted entry_floor */
 const filterByMarginalBasis = ref<boolean>(true)
 /** 成交量过滤开关（默认开启） */
 const filterByVolume = ref<boolean>(true)
-/** 盈利性守卫过滤开关（默认开启） */
-const filterByProfitability = ref<boolean>(true)
 /** 现货24h成交量阈值（USDT） */
 const minSpotVolume24h = ref<number>(5000000)
 /** 期货24h成交量阈值（USDT） */
@@ -187,6 +182,15 @@ const filteredAssetOptions = computed(() => {
     asset.toLowerCase().includes(keyword)
   )
 })
+
+const totalRowCount = computed(() => {
+  void rowVersion.value
+  return rowsByContract.size
+})
+
+function refreshDisplayedRowCount() {
+  displayedRowCount.value = gridApi?.getDisplayedRowCount() ?? rowData.value.length
+}
 
 /** 选择标的资产 */
 function selectAsset(asset: string) {
@@ -246,7 +250,7 @@ function coverageFilterFunc(params: any): boolean {
   return openCoverage <= orderbookCoverageThreshold.value
 }
 
-/** AG Grid 外部过滤函数：开仓VWAP基差过滤（按标的阈值） */
+/** AG Grid 外部过滤函数：后端统一入场门槛过滤 */
 function marginalBasisFilterFunc(params: any): boolean {
   if (!filterByMarginalBasis.value) {
     return true // 不过滤，显示所有
@@ -256,14 +260,14 @@ function marginalBasisFilterFunc(params: any): boolean {
   if (!data) return true
   
   const openVwapBasis = data.open_vwap_basis_bps as number | null | undefined
-  const vwapThreshold = data.vwap_threshold_bps as number | null | undefined
+  const entryFloor = data.entry_floor_bps as number | null | undefined
   
-  // 有按标的阈值时：基差必须 >= 阈值
-  if (openVwapBasis != null && vwapThreshold != null) {
-    return openVwapBasis >= vwapThreshold
+  // 新逻辑：基差必须 >= 后端下发的 funding-adjusted entry_floor
+  if (openVwapBasis != null && entryFloor != null) {
+    return openVwapBasis >= entryFloor
   }
   
-  // 无按标的阈值时回退全局VWAP基差阈值（统一口径，不用边际基差）
+  // 兼容旧快照：无 entry_floor 时回退全局VWAP基差阈值
   if (openVwapBasis == null) {
     return false
   }
@@ -294,32 +298,6 @@ function volumeFilterFunc(params: any): boolean {
   return true
 }
 
-/** AG Grid 外部过滤函数：盈利性守卫过滤 */
-function profitabilityGuardFilterFunc(params: any): boolean {
-  if (!filterByProfitability.value) {
-    return true // 不过滤，显示所有
-  }
-  
-  const data = params.data as OrderBookRow
-  if (!data) return true
-  
-  const openVwapBasis = data.open_vwap_basis_bps as number | null | undefined
-  const closeThreshold = data.close_vwap_threshold_bps as number | null | undefined
-  
-  // 没有平仓阈值数据时不过滤（新标的可能无历史数据）
-  if (closeThreshold == null || openVwapBasis == null) {
-    return true
-  }
-  
-  // 盈利性守卫: 开仓基差 > 平仓基差阈值 + 全程手续费
-  // fee_cost_bps = -(open_fee_bps + close_fee_bps)
-  const openFeeBps = data.open_fee_bps ?? 0
-  const closeFeeBps = data.close_fee_bps ?? 0
-  const feeCostBps = -(openFeeBps + closeFeeBps)
-  
-  return openVwapBasis > closeThreshold + feeCostBps
-}
-
 /** 标的资产过滤函数 */
 function assetFilterFunc(params: any): boolean {
   if (!assetFilterKeyword.value) return true
@@ -332,17 +310,16 @@ function assetFilterFunc(params: any): boolean {
 
 /** 组合过滤函数 */
 function combinedFilterFunc(params: any): boolean {
-  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && volumeFilterFunc(params) && profitabilityGuardFilterFunc(params) && assetFilterFunc(params)
+  return fundingRateFilterFunc(params) && coverageFilterFunc(params) && marginalBasisFilterFunc(params) && volumeFilterFunc(params) && assetFilterFunc(params)
 }
 
 /** WebSocket 实例提升到模块级，避免 HMR 时断开 */
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let statusInterval: ReturnType<typeof setInterval> | null = null
-let pingInterval: ReturnType<typeof setInterval> | null = null
 /** 标记是否已初始化过，HMR 时复用连接 */
 let wsInitialized = false
-/** 页面可见性：页面隐藏时跳过 WS 消息处理和 ping，降低 CPU 开销 */
+/** 页面可见性：页面隐藏时跳过 WS 消息处理，降低 CPU 开销 */
 let pageVisible = true
 
 /** 按实际精度展示数值，去掉多余尾随 0（不固定 2 位小数） */
@@ -372,8 +349,6 @@ const percentFormatter = (params: ValueFormatterParams) => {
 // 五档盘口抽屉状态
 const drawerVisible = ref(false)
 const drawerContract = ref<string>('')
-/** 版本号：每次 rowsByContract 变更后递增，供 drawerRow computed 感知更新 */
-const rowVersion = ref(0)
 const drawerRow = computed(() => {
   void rowVersion.value // 建立响应式依赖
   return rowsByContract.get(drawerContract.value) ?? null
@@ -631,10 +606,9 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       const row = params.data
       if (!row) return { color: '#909399' }
       
-      const threshold = row.vwap_threshold_bps as number | null | undefined
-      if (threshold != null) {
-        // 有按标的阈值：>= 阈值绿色，否则红色
-        return value >= threshold
+      const entryFloor = row.entry_floor_bps as number | null | undefined
+      if (entryFloor != null) {
+        return value >= entryFloor
           ? { color: '#67c23a' }
           : { color: '#f56c6c' }
       }
@@ -642,6 +616,35 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       return value >= openVwapBasisThresholdBps.value
         ? { color: '#67c23a' }
         : { color: '#f56c6c' }
+    },
+  },
+  {
+    headerName: '入场门槛(entry_floor)',
+    field: 'entry_floor_bps',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => {
+      if (p.value != null) return Number(p.value).toFixed(2)
+      return openVwapBasisThresholdBps.value.toFixed(2) + ' *'
+    },
+    cellStyle: (params) => {
+      return params.value == null ? { color: '#909399', fontStyle: 'italic' } : null
+    },
+  },
+  {
+    headerName: '预期Carry Edge(bps)',
+    field: 'entry_expected_edge_bps',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toFixed(2),
+    cellStyle: (params) => {
+      const value = params.value as number | null
+      if (value == null) return { color: '#909399' }
+      return value >= 0 ? { color: '#67c23a' } : { color: '#f56c6c' }
     },
   },
   {
@@ -741,9 +744,10 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       const row = params.data
       if (!row) return { color: '#909399' }
       
-      // 有按标的VWAP阈值时，用open_vwap_basis_bps与vwap_threshold_bps比较
+      // 新模式优先用 entry_floor，与开仓状态机一致；无 entry_floor 时兼容旧 p20 阈值。
       const vwapBasis = row.open_vwap_basis_bps as number | null | undefined
-      const vwapThreshold = row.vwap_threshold_bps as number | null | undefined
+      const entryFloor = row.entry_floor_bps as number | null | undefined
+      const vwapThreshold = entryFloor ?? (row.vwap_threshold_bps as number | null | undefined)
       if (vwapBasis != null && vwapThreshold != null) {
         return vwapBasis >= vwapThreshold
           ? { color: '#67c23a' }
@@ -854,6 +858,7 @@ function diffSnapshotRows(
 
 function syncRowDataFromIndex() {
   rowData.value = Array.from(rowsByContract.values())
+  refreshDisplayedRowCount()
 }
 
 function clearGridData() {
@@ -867,6 +872,7 @@ function clearGridData() {
   } else {
     gridApi.setGridOption('rowData', [])
   }
+  refreshDisplayedRowCount()
 }
 
 /** 全量快照 → diff 后 applyTransaction，保留滚动位置；仅清空/首次加载时整表重置 */
@@ -893,6 +899,7 @@ function applySnapshotRows(rows: unknown, serverTime?: string, forceFull = false
     if (remove.length > 0 || normalized.length > 0) {
       gridApi.applyTransaction({ remove, add: normalized })
     }
+    requestAnimationFrame(refreshDisplayedRowCount)
     return
   }
 
@@ -904,6 +911,7 @@ function applySnapshotRows(rows: unknown, serverTime?: string, forceFull = false
   rowVersion.value++
   // 增量路径不更新 rowData，避免 Vue :rowData 绑定触发整表重绘导致滚动回顶
   gridApi.applyTransaction({ add, update, remove })
+  requestAnimationFrame(refreshDisplayedRowCount)
 }
 
 async function fetchOrderbookSnapshot(forceFull = false) {
@@ -911,7 +919,7 @@ async function fetchOrderbookSnapshot(forceFull = false) {
     const res = await get('/api/orderbook/snapshot')
     if (!res.ok) return
     const data = await res.json()
-    if (data.rows?.length) {
+    if (Array.isArray(data.rows)) {
       applySnapshotRows(data.rows, data.server_time, forceFull)
     }
   } catch {
@@ -941,23 +949,9 @@ function connectWs() {
     return
   }
 
-  wsStatus.value = 'connecting'
   socket = new WebSocket(getWsUrl())
 
   socket.onopen = () => {
-    wsStatus.value = 'connected'
-    wsLatencyMs.value = null
-    // 每 10 秒发送一次 ping 测量延迟（仅页面可见时）
-    if (pingInterval) clearInterval(pingInterval)
-    if (pageVisible) {
-      pingInterval = setInterval(() => {
-        if (socket?.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
-        }
-      }, 10000)
-      // 立即发一次 ping
-      socket!.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
-    }
     fetchServiceStatus().then(() => {
       if (serviceState.value === 'running' || serviceState.value === 'starting') {
         fetchOrderbookSnapshot()
@@ -970,10 +964,6 @@ function connectWs() {
     if (!pageVisible) return
     const msg: WsMessage = JSON.parse(ev.data)
     if (msg.type === 'ping') return
-    if (msg.type === 'pong' && msg.ts) {
-      wsLatencyMs.value = Date.now() - msg.ts
-      return
-    }
     if (msg.type === 'service_progress') {
       if (msg.state) serviceState.value = msg.state
       if (msg.error !== undefined) serviceError.value = msg.error
@@ -996,10 +986,6 @@ function connectWs() {
       if (msg.orderbook_coverage_threshold != null) {
         orderbookCoverageThreshold.value = msg.orderbook_coverage_threshold
       }
-      // 更新风险缓释配置
-      if (msg.risk_relief_bps != null) {
-        riskReliefBps.value = msg.risk_relief_bps
-      }
       // 更新开仓边际基差阈值配置
       if (msg.open_vwap_basis_threshold_bps != null) {
         openVwapBasisThresholdBps.value = msg.open_vwap_basis_threshold_bps
@@ -1016,16 +1002,10 @@ function connectWs() {
   }
 
   socket.onclose = () => {
-    wsStatus.value = 'disconnected'
-    wsLatencyMs.value = null
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
     scheduleReconnect()
   }
 
-  socket.onerror = () => {
-    wsStatus.value = 'disconnected'
-    wsLatencyMs.value = null
-  }
+  socket.onerror = () => {}
 }
 
 function scheduleReconnect() {
@@ -1120,30 +1100,35 @@ watch(serviceBusy, () => {
 watch(filterByFundingRate, () => {
   if (gridApi) {
     gridApi.onFilterChanged()
+    refreshDisplayedRowCount()
   }
 })
 
 watch(filterByCoverage, () => {
   if (gridApi) {
     gridApi.onFilterChanged()
+    refreshDisplayedRowCount()
   }
 })
 
 watch(filterByMarginalBasis, () => {
   if (gridApi) {
     gridApi.onFilterChanged()
+    refreshDisplayedRowCount()
   }
 })
 
 watch(filterByVolume, () => {
   if (gridApi) {
     gridApi.onFilterChanged()
+    refreshDisplayedRowCount()
   }
 })
 
-watch(filterByProfitability, () => {
+watch(assetFilterKeyword, () => {
   if (gridApi) {
     gridApi.onFilterChanged()
+    refreshDisplayedRowCount()
   }
 })
 
@@ -1152,15 +1137,12 @@ onMounted(() => {
   if (!wsInitialized || socket?.readyState === WebSocket.CLOSED) {
     connectWs()
     wsInitialized = true
-  } else if (socket?.readyState === WebSocket.OPEN) {
-    // 复用已有连接，直接更新状态
-    wsStatus.value = 'connected'
   }
   
   // 点击外部关闭资产下拉框
   document.addEventListener('click', handleOutsideClick)
   
-  // 页面可见性监听：隐藏时停止 ping，可见时恢复
+  // 页面可见性监听：隐藏时跳过快照消息处理，降低 CPU 开销
   document.addEventListener('visibilitychange', handleVisibilityChange)
   
   fetchServiceStatus().then(() => {
@@ -1173,27 +1155,11 @@ onMounted(() => {
 
 function handleVisibilityChange() {
   pageVisible = !document.hidden
-  if (pageVisible) {
-    // 恢复可见时重启 ping
-    if (pingInterval) clearInterval(pingInterval)
-    pingInterval = setInterval(() => {
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
-      }
-    }, 10000)
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
-    }
-  } else {
-    // 隐藏时停止 ping
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
-  }
 }
 
 onUnmounted(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (statusInterval) clearInterval(statusInterval)
-  if (pingInterval) clearInterval(pingInterval)
   socket?.close()
   socket = null
   wsInitialized = false
@@ -1212,6 +1178,7 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   loadColumnState()
   // 绑定 Cmd+C 复制 & 右键菜单
   setupGridCopy(params.api)
+  refreshDisplayedRowCount()
 }
 </script>
 
@@ -1227,15 +1194,6 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
             终止 WS 服务
           </el-button>
         </div>
-        <span class="status-item">
-          前端 WS：
-          <el-tag v-if="wsStatus === 'connected'" type="success" size="small">
-            {{ wsLatencyMs != null ? `${wsLatencyMs}ms` : '已连接' }}
-          </el-tag>
-          <el-tag v-else :type="wsStatus === 'connecting' ? 'warning' : 'danger'" size="small">
-            {{ wsStatus === 'connecting' ? '连接中' : '已断开' }}
-          </el-tag>
-        </span>
         <span class="status-item">
           Gate WS p50：
           <el-tag v-if="gateWsConnected" type="success" size="small">
@@ -1291,6 +1249,11 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
             </div>
           </div>
           <div class="header-actions">
+            <div class="row-count">
+              <span>显示 {{ displayedRowCount }}</span>
+              <span class="row-count-separator">/</span>
+              <span>总计 {{ totalRowCount }}</span>
+            </div>
             <div class="filter-group">
               <el-switch
                 v-model="filterByFundingRate"
@@ -1312,8 +1275,8 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
                 v-model="filterByMarginalBasis"
                 class="filter-switch"
                 inline-prompt
-                active-text="VWAP基差阈值过滤"
-                inactive-text="VWAP基差阈值过滤"
+                active-text="入场门槛过滤"
+                inactive-text="入场门槛过滤"
                 style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
               />
               <el-switch
@@ -1322,14 +1285,6 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
                 inline-prompt
                 active-text="成交量过滤"
                 inactive-text="成交量过滤"
-                style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
-              />
-              <el-switch
-                v-model="filterByProfitability"
-                class="filter-switch"
-                inline-prompt
-                active-text="盈利性守卫"
-                inactive-text="盈利性守卫"
                 style="--el-switch-on-color: #13ce66; --el-switch-off-color: #dcdfe6"
               />
             </div>
@@ -1377,9 +1332,10 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
         :locale-text="localeText"
         :header-height="32"
         :row-height="32"
-        :isExternalFilterPresent="() => filterByFundingRate || filterByCoverage || filterByMarginalBasis || filterByVolume"
+        :isExternalFilterPresent="() => filterByFundingRate || filterByCoverage || filterByMarginalBasis || filterByVolume || !!assetFilterKeyword"
         :doesExternalFilterPass="combinedFilterFunc"
         @grid-ready="onGridReady"
+        @model-updated="refreshDisplayedRowCount"
       />
       </div>
     </el-card>
@@ -1559,6 +1515,7 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
 }
 
 .asset-filter-container {
@@ -1598,12 +1555,30 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   display: flex;
   align-items: center;
   gap: 16px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.row-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--app-text-muted);
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.row-count-separator {
+  color: var(--app-border-strong);
 }
 
 .filter-group {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .column-actions {

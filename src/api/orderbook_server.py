@@ -111,6 +111,14 @@ _enrich_cfg = EnrichConfig(
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
     close_threshold_col=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20').strip(),
+    open_vwap_basis_threshold_bps=OPEN_VWAP_BASIS_THRESHOLD_BPS,
+    funding_entry_enabled=config.get_bool('trade.funding_adjusted_entry.enabled', True),
+    funding_entry_capture_ratio=config.get_float('trade.funding_adjusted_entry.funding_capture_ratio', 0.5),
+    funding_entry_slippage_buffer_bps=config.get_float('trade.funding_adjusted_entry.slippage_buffer_bps', 10.0),
+    funding_entry_min_expected_edge_bps=config.get_float('trade.funding_adjusted_entry.min_expected_edge_bps', 0.0),
+    funding_entry_strong_funding_24h_bps=config.get_float('trade.funding_adjusted_entry.strong_funding_24h_bps', 50.0),
+    funding_entry_discount_ratio=config.get_float('trade.funding_adjusted_entry.discount_ratio', 0.2),
+    funding_entry_max_discount_bps=config.get_float('trade.funding_adjusted_entry.max_funding_discount_bps', 10.0),
 )
 
 # 盈亏计算配置实例（持仓实时推送用）
