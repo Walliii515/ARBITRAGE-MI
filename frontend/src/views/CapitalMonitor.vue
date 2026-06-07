@@ -28,7 +28,6 @@ type ChartMetric =
   | 'unrealized_pnl_usdt'
   | 'realized_pnl_usdt'
   | 'funding_pnl_usdt'
-  | 'fee_cost_usdt'
   | 'total_pnl_usdt'
 
 const latestRows = ref<CapitalRow[]>([])
@@ -36,8 +35,8 @@ const historyRows = ref<CapitalRow[]>([])
 const loading = ref(false)
 const running = ref(false)
 const filterDays = ref(7)
-const selectedMetrics = ref<ChartMetric[]>(['equity_usdt', 'total_pnl_usdt', 'funding_pnl_usdt', 'fee_cost_usdt'])
-const selectedExchanges = ref<ExchangeKey[]>(['total'])
+const selectedMetric = ref<ChartMetric>('equity_usdt')
+const selectedExchange = ref<ExchangeKey>('total')
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -48,7 +47,6 @@ const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | '
   { key: 'unrealized_pnl_usdt', label: '未实现盈亏', group: 'pnl', color: '#e6a23c' },
   { key: 'realized_pnl_usdt', label: '平仓盈亏', group: 'pnl', color: '#9b59b6' },
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
-  { key: 'fee_cost_usdt', label: '手续费成本', group: 'pnl', color: '#f56c6c' },
   { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#303133' },
 ]
 
@@ -59,31 +57,21 @@ const latestByExchange = computed(() => {
 })
 
 const chartSeries = computed(() => {
-  const exchangeLineType: Record<ExchangeKey, 'solid' | 'dashed' | 'dotted'> = {
-    total: 'solid',
-    gate: 'dashed',
-    binance: 'dotted',
-  }
-  return selectedExchanges.value.flatMap((exchange) =>
-    selectedMetrics.value.map((metric) => {
-      const option = metricOptions.find((item) => item.key === metric)!
-      const points = historyRows.value
-        .filter((row) => row.exchange === exchange)
-        .map((row) => ({
-          time: row.snapshot_at,
-          value: Number(row[metric] ?? 0),
-        }))
-      return {
-        exchange,
-        metric,
-        label: `${exchangeLabel(exchange)} ${option.label}`,
-        color: option.color,
-        group: option.group,
-        lineType: exchangeLineType[exchange],
-        points,
-      }
-    })
-  )
+  const option = metricOptions.find((item) => item.key === selectedMetric.value)!
+  const points = historyRows.value
+    .filter((row) => row.exchange === selectedExchange.value)
+    .map((row) => ({
+      time: row.snapshot_at,
+      value: Number(row[selectedMetric.value] ?? 0),
+    }))
+  return [{
+    exchange: selectedExchange.value,
+    metric: selectedMetric.value,
+    label: `${exchangeLabel(selectedExchange.value)} ${option.label}`,
+    color: option.color,
+    group: option.group,
+    points,
+  }]
 })
 
 function formatAmount(value: number | null | undefined): string {
@@ -93,14 +81,6 @@ function formatAmount(value: number | null | undefined): string {
 
 function exchangeLabel(exchange: string): string {
   return exchange === 'total' ? '合计' : exchange
-}
-
-function onExchangeChange(value: ExchangeKey[]) {
-  if (!value.length) selectedExchanges.value = ['total']
-}
-
-function onMetricChange(value: ChartMetric[]) {
-  if (!value.length) selectedMetrics.value = ['equity_usdt']
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -195,7 +175,7 @@ function buildChartOption(): EChartsOption {
       yAxisIndex: series.group === 'asset' ? 0 : 1,
       emphasis: { focus: 'series' },
       data: series.points.map((point) => [point.time, point.value]),
-      lineStyle: { width: 2.2, type: series.lineType },
+      lineStyle: { width: 2.2 },
     })),
   }
 }
@@ -261,7 +241,7 @@ onMounted(async () => {
   await initChart()
 })
 
-watch([historyRows, selectedMetrics, selectedExchanges], () => {
+watch([historyRows, selectedMetric, selectedExchange], () => {
   updateChart()
 })
 
@@ -343,32 +323,30 @@ onBeforeUnmount(() => {
     <div class="chart-panel">
       <div class="chart-header">
         <span>资金趋势</span>
-        <el-checkbox-group
-          v-model="selectedExchanges"
+        <el-radio-group
+          v-model="selectedExchange"
           size="small"
           class="exchange-selector"
-          @change="onExchangeChange"
         >
-          <el-checkbox-button label="binance">binance</el-checkbox-button>
-          <el-checkbox-button label="gate">gate</el-checkbox-button>
-          <el-checkbox-button label="total">合计</el-checkbox-button>
-        </el-checkbox-group>
+          <el-radio-button label="binance">binance</el-radio-button>
+          <el-radio-button label="gate">gate</el-radio-button>
+          <el-radio-button label="total">合计</el-radio-button>
+        </el-radio-group>
       </div>
       <div class="metric-selector-row">
-        <el-checkbox-group
-          v-model="selectedMetrics"
+        <el-radio-group
+          v-model="selectedMetric"
           size="small"
           class="metric-selector"
-          @change="onMetricChange"
         >
-          <el-checkbox-button
+          <el-radio-button
             v-for="metric in metricOptions"
             :key="metric.key"
             :label="metric.key"
           >
             {{ metric.label }}
-          </el-checkbox-button>
-        </el-checkbox-group>
+          </el-radio-button>
+        </el-radio-group>
       </div>
       <div class="chart-wrap">
         <div ref="chartRef" class="echarts-chart"></div>
