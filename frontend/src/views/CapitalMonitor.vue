@@ -21,12 +21,16 @@ interface CapitalRow {
   total_pnl_usdt: number | null
 }
 
+type ExchangeKey = 'binance' | 'gate' | 'total'
+type ChartMetric = 'equity_usdt' | 'available_usdt' | 'realized_pnl_usdt' | 'total_pnl_usdt'
+
 const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
 const loading = ref(false)
 const running = ref(false)
 const filterDays = ref(7)
-const selectedMetric = ref<'equity_usdt' | 'available_usdt' | 'total_pnl_usdt'>('equity_usdt')
+const selectedMetric = ref<ChartMetric>('equity_usdt')
+const selectedExchanges = ref<ExchangeKey[]>(['total'])
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -38,18 +42,20 @@ const latestByExchange = computed(() => {
 })
 
 const metricLabel = computed(() => {
+  if (selectedMetric.value === 'equity_usdt') return '总资产'
   if (selectedMetric.value === 'available_usdt') return '可用资金'
+  if (selectedMetric.value === 'realized_pnl_usdt') return '已实现盈亏'
   if (selectedMetric.value === 'total_pnl_usdt') return '综合盈亏'
-  return '账户权益'
+  return '资金'
 })
 
 const chartSeries = computed(() => {
-  const colors: Record<string, string> = {
+  const colors: Record<ExchangeKey, string> = {
     binance: '#f0b90b',
     gate: '#409eff',
     total: '#67c23a',
   }
-  return ['binance', 'gate', 'total'].map((exchange) => {
+  return selectedExchanges.value.map((exchange) => {
     const points = historyRows.value
       .filter((row) => row.exchange === exchange)
       .map((row) => ({
@@ -67,6 +73,10 @@ function formatAmount(value: number | null | undefined): string {
 
 function exchangeLabel(exchange: string): string {
   return exchange === 'total' ? '合计' : exchange
+}
+
+function onExchangeChange(value: ExchangeKey[]) {
+  if (!value.length) selectedExchanges.value = ['total']
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -206,7 +216,7 @@ onMounted(async () => {
   await initChart()
 })
 
-watch([historyRows, selectedMetric], () => {
+watch([historyRows, selectedMetric, selectedExchanges], () => {
   updateChart()
 })
 
@@ -231,8 +241,9 @@ onBeforeUnmount(() => {
         <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDays(90)">90天</el-button>
       </el-button-group>
       <el-select v-model="selectedMetric" size="small" style="width: 140px">
-        <el-option label="账户权益" value="equity_usdt" />
+        <el-option label="总资产" value="equity_usdt" />
         <el-option label="可用资金" value="available_usdt" />
+        <el-option label="已实现盈亏" value="realized_pnl_usdt" />
         <el-option label="综合盈亏" value="total_pnl_usdt" />
       </el-select>
       <el-button size="small" :loading="loading" @click="fetchCapital">刷新</el-button>
@@ -246,7 +257,7 @@ onBeforeUnmount(() => {
       >
         <div class="card-title">{{ exchange === 'total' ? '合计' : exchange }}</div>
         <div class="metric-row">
-          <span>账户权益</span>
+          <span>总资产</span>
           <strong>{{ formatAmount(latestByExchange[exchange]?.equity_usdt) }}</strong>
         </div>
         <div class="metric-row">
@@ -281,11 +292,16 @@ onBeforeUnmount(() => {
     <div class="chart-panel">
       <div class="chart-header">
         <span>{{ metricLabel }}趋势</span>
-        <div class="legend">
-          <span v-for="series in chartSeries" :key="series.exchange" class="legend-item">
-            <i :style="{ backgroundColor: series.color }"></i>{{ exchangeLabel(series.exchange) }}
-          </span>
-        </div>
+        <el-checkbox-group
+          v-model="selectedExchanges"
+          size="small"
+          class="exchange-selector"
+          @change="onExchangeChange"
+        >
+          <el-checkbox-button label="binance">binance</el-checkbox-button>
+          <el-checkbox-button label="gate">gate</el-checkbox-button>
+          <el-checkbox-button label="total">合计</el-checkbox-button>
+        </el-checkbox-group>
       </div>
       <div class="chart-wrap">
         <div ref="chartRef" class="echarts-chart"></div>
