@@ -783,9 +783,10 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
         )
 
         self.assertTrue(te._pass_rebound_check('BTC', 56.0, self._row('BTC', 56.0)))
-        self.assertEqual(te._peak_state['BTC']['trigger'], 'rebound_strong_cushion')
+        self.assertEqual(te._peak_state['BTC']['trigger'], 'rebound_strong')
         self.assertAlmostEqual(te._peak_state['BTC']['rebound_rise_bps'], 0.0)
         self.assertGreaterEqual(te._peak_state['BTC']['rebound_strong_cushion_bps'], 20.0)
+        self.assertLessEqual(len(te._peak_state['BTC']['trigger']), 20)
         te._resolve_signal.assert_not_called()
 
     def test_rebound_timeout_reason_includes_threshold_breakdown(self):

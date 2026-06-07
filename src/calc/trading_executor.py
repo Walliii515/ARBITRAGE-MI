@@ -23,6 +23,8 @@ from calc.orderbook_resiliency import (
 )
 from exchange_apis.get_gate_future_contracts import get_single_contract_funding_rate
 
+REBOUND_STRONG_TRIGGER = 'rebound_strong'
+
 
 @dataclass
 class TradingExecutorConfig:
@@ -1041,7 +1043,7 @@ class TradingExecutor:
             and strong_hold_sec >= self.rebound_strong_cushion_min_hold_sec
             and current_basis_bps >= min_basis
         ):
-            state['trigger'] = 'rebound_strong_cushion'
+            state['trigger'] = REBOUND_STRONG_TRIGGER
             state['rebound_rise_bps'] = rise_from_floor
             state['rebound_floor_bps'] = floor_bps
             state['rebound_strong_cushion_bps'] = strong_cushion_bps
@@ -1603,6 +1605,7 @@ class TradingExecutor:
         signal_basis = signal_basis_bps
         if signal_basis is None:
             signal_basis = state.get('signal_basis_bps')
+        trigger_type = self._normalize_signal_trigger_type(trigger_type)
 
         try:
             sql = """
@@ -1638,6 +1641,17 @@ class TradingExecutor:
         except Exception as e:
             logger.error(f"信号记录更新失败 {base_asset}: {e}")
         self._record_signal_noise_event(base_asset, status)
+
+    @staticmethod
+    def _normalize_signal_trigger_type(trigger_type: Optional[str]) -> Optional[str]:
+        """Keep persisted trigger_type within the DB varchar(20) contract."""
+        if not trigger_type:
+            return None
+        aliases = {
+            'rebound_strong_cushion': REBOUND_STRONG_TRIGGER,
+        }
+        normalized = aliases.get(str(trigger_type), str(trigger_type))
+        return normalized[:20]
 
     def _get_risk_fail_reason(self, row: Dict) -> str:
         """识别风控失败的具体原因（用于信号日志）"""
@@ -1764,10 +1778,10 @@ class TradingExecutor:
                     f"峰值回落(峰{peak_bps:.1f},持续{elapsed:.1f}s≥{self.sustain_sec}s,"
                     f"回落{self.peak_pullback_pct*100:.0f}%)"
                 )
-            elif trigger in ('rebound', 'rebound_strong_cushion'):
+            elif trigger in ('rebound', REBOUND_STRONG_TRIGGER, 'rebound_strong_cushion'):
                 floor_bps = float(peak_state.get('rebound_floor_bps', 0) or 0)
                 rise_bps = float(peak_state.get('rebound_rise_bps', 0) or 0)
-                if trigger == 'rebound_strong_cushion':
+                if trigger in (REBOUND_STRONG_TRIGGER, 'rebound_strong_cushion'):
                     cushion_bps = float(peak_state.get('rebound_strong_cushion_bps', 0) or 0)
                     hold_sec = float(peak_state.get('rebound_strong_hold_sec', 0) or 0)
                     parts.append(
