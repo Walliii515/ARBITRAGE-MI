@@ -84,6 +84,20 @@ class ClosingExecutor:
         self.protective_ioc_risk_slippage_bps = config.get_float(
             'trade.close.protective_ioc_risk_slippage_bps', 12.0
         )
+        self.future_maker_close_enabled = config.get_bool(
+            'trade.execution.future_maker_close.enabled', False
+        )
+        self.future_maker_close_allowed_tiers = {
+            str(t).strip().upper()
+            for t in config.get('trade.execution.future_maker_close.allowed_tiers', ['A', 'B'])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.future_maker_close_ttl_ms = max(
+            config.get_int('trade.execution.future_maker_close.ttl_ms', 800), 0
+        )
+        self.future_maker_close_price_offset_bps = config.get_float(
+            'trade.execution.future_maker_close.price_offset_bps', 0.0
+        )
 
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
@@ -320,7 +334,7 @@ class ClosingExecutor:
             if not orderbook_row:
                 logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                 continue
-            if self.protective_ioc_enabled:
+            if self.protective_ioc_enabled and not self.future_maker_close_enabled:
                 slippage_bps = (
                     self.protective_ioc_take_profit_slippage_bps
                     if close_reason == 'take_profit'
@@ -1268,7 +1282,18 @@ class ClosingExecutor:
     ) -> Dict:
         """构建平仓订单组 → 调用成交引擎 → 持久化"""
         ba = pos.get('base_asset', '')
-        order_group = self._build_close_order_group(pos, future_protective_price=future_protective_price)
+        order_group = self._build_close_order_group(
+            pos,
+            future_protective_price=future_protective_price,
+            orderbook_row=orderbook_row,
+        )
+        future_order = order_group.get('future_order') or {}
+        if future_order.get('execution_style') == 'maker':
+            close_reason_detail = (
+                f"{close_reason_detail}|future maker("
+                f"future_buy@{future_order.get('maker_price')},"
+                f"ttl={future_order.get('maker_ttl_ms')}ms)"
+            )
         exec_result = self.executor_client.execute(order_group, orderbook_row)
         self._save_close(
             pos,
@@ -1290,6 +1315,7 @@ class ClosingExecutor:
         self,
         pos: Dict,
         future_protective_price: Optional[float] = None,
+        orderbook_row: Optional[Dict] = None,
     ) -> Dict:
         """
         生成平仓订单组：
@@ -1328,6 +1354,7 @@ class ClosingExecutor:
         }
         if future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
+        self._apply_future_maker_close(pos, orderbook_row or {}, future_order)
 
         return {
             'order_uuid': order_uuid,
@@ -1337,6 +1364,42 @@ class ClosingExecutor:
             'spot_order': spot_order,
             'future_order': future_order,
         }
+
+    def _apply_future_maker_close(self, pos: Dict, row: Dict, future_order: Dict) -> None:
+        """给实盘平仓期货腿附加 maker 执行参数；空头买回挂在 future bid1。"""
+        if not self.future_maker_close_enabled:
+            return
+        if self.executor_client.channel != 'Live':
+            return
+
+        base_asset = str(pos.get('base_asset') or future_order.get('base_asset') or '').upper()
+        tier = str(pos.get('strategy_tier') or '').strip().upper()
+        if not tier:
+            # close path 没有注入 asset_tier_meta，未知时按 A/B 池处理，避免已有持仓不能平。
+            tier = 'B'
+        if tier not in self.future_maker_close_allowed_tiers:
+            return
+
+        maker_price = row.get('future_price_bid_1') or row.get('future_bid_price_1') or row.get('future_bid_1')
+        if maker_price is None:
+            return
+
+        maker_price = float(maker_price)
+        if maker_price <= 0:
+            return
+        if self.future_maker_close_price_offset_bps:
+            maker_price *= 1 - self.future_maker_close_price_offset_bps / 10000.0
+
+        future_order.pop('protective_price', None)
+        future_order.update({
+            'execution_style': 'maker',
+            'maker_ttl_ms': self.future_maker_close_ttl_ms,
+            'maker_price': maker_price,
+            'maker_price_source': 'future_bid1',
+            'maker_strategy_tier': tier,
+            'maker_taker_reference_price': row.get('future_close_vwap'),
+            'maker_spot_reference_price': row.get('spot_close_vwap'),
+        })
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         if base_asset in self.contract_meta:

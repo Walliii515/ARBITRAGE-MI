@@ -103,8 +103,8 @@ class RealExecutor:
             spot_order = order_group.get('spot_order', {})
             future_order = order_group.get('future_order', {})
 
-            if self._is_future_maker_open(future_order):
-                return self._execute_future_maker_open(order_group, orderbook_row)
+            if self._is_future_maker_order(future_order):
+                return self._execute_future_maker_then_spot(order_group, orderbook_row)
 
             # ── 并发下单：同时向 Binance 和 Gate 发送市价单 ──
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -164,22 +164,22 @@ class RealExecutor:
         return result
 
     @staticmethod
-    def _is_future_maker_open(future_order: Dict) -> bool:
+    def _is_future_maker_order(future_order: Dict) -> bool:
         return (
-            future_order.get('order_side') == 'open'
-            and future_order.get('market_type') == 'future'
+            future_order.get('market_type') == 'future'
             and future_order.get('execution_style') == 'maker'
         )
 
-    def _execute_future_maker_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:
+    def _execute_future_maker_then_spot(self, order_group: Dict, orderbook_row: Dict) -> Dict:
         """
-        开仓执行策略：Gate future post-only maker 先成交，成交多少就用 Binance spot taker 对冲多少。
-        未成交时不动现货，直接放弃本轮信号。
+        Gate future post-only maker 先成交，成交多少就用 Binance spot taker 对冲多少。
+        未成交时不动现货，直接放弃本轮开/平仓。
         """
         result = {'success': False, 'spot_order': None, 'future_order': None, 'message': ''}
         spot_order = dict(order_group.get('spot_order') or {})
         future_order = dict(order_group.get('future_order') or {})
         base_asset = future_order.get('base_asset') or spot_order.get('base_asset')
+        order_side = future_order.get('order_side', '')
 
         future_result = self._place_gate_futures_order(future_order)
         stats = future_result.get('execution_stats') or {}
@@ -187,11 +187,14 @@ class RealExecutor:
             result['future_order'] = future_result if future_result.get('exchange_order_id') else None
             result['message'] = f"future maker未成交/拒单: {future_result.get('reason', 'unknown')}"
             result['execution_stats'] = stats
-            logger.info(f"future maker 放弃开仓 | {base_asset} | {result['message']}")
+            logger.info(f"future maker 放弃{order_side} | {base_asset} | {result['message']}")
             return result
 
         hedge_order = dict(spot_order)
-        hedge_order['target_qty'] = future_result['exec_qty']
+        future_target_qty = float(future_order.get('target_qty') or 0)
+        spot_target_qty = float(spot_order.get('target_qty') or 0)
+        hedge_ratio = spot_target_qty / future_target_qty if future_target_qty > 0 else 1.0
+        hedge_order['target_qty'] = future_result['exec_qty'] * hedge_ratio
         hedge_order['target_amount'] = future_result['exec_amount']
         hedge_order['quantity_mode'] = 'base'
         spot_result = self._place_binance_spot_order(hedge_order)
@@ -206,11 +209,11 @@ class RealExecutor:
                 'success': True,
                 'spot_order': spot_result,
                 'future_order': future_result,
-                'message': '成交成功(future maker + spot taker)',
+                'message': f'成交成功({order_side} future maker + spot taker)',
                 'execution_stats': stats,
             })
             logger.info(
-                f"真实成交成功(future maker + spot taker) | {base_asset} | "
+                f"真实成交成功({order_side} future maker + spot taker) | {base_asset} | "
                 f"fill_ratio={maker_stats.get('fill_ratio', 0):.2f} | "
                 f"wait={maker_stats.get('wait_ms', 0):.0f}ms | "
                 f"spot: price={spot_result['exec_price']}, qty={spot_result['exec_qty']} | "
@@ -509,7 +512,7 @@ class RealExecutor:
         protective_price = order.get('protective_price')
         if order.get('order_side') == 'close' and protective_price is not None:
             price = self._format_gate_price(base_asset, float(protective_price))
-        if self._is_future_maker_open(order):
+        if self._is_future_maker_order(order):
             maker_price = float(order.get('maker_price') or 0)
             if maker_price <= 0:
                 return {'success': False, 'reason': 'future maker缺少有效挂单价'}
@@ -609,12 +612,17 @@ class RealExecutor:
         improvement_bps = None
         exec_price = result.get('exec_price')
         if exec_price and taker_reference_price and spot_reference_price:
-            improvement_bps = (float(exec_price) - float(taker_reference_price)) / float(spot_reference_price) * 10000.0
+            if order.get('trade_direction') == 'buy':
+                improvement_bps = (float(taker_reference_price) - float(exec_price)) / float(spot_reference_price) * 10000.0
+            else:
+                improvement_bps = (float(exec_price) - float(taker_reference_price)) / float(spot_reference_price) * 10000.0
 
         stats = {
             'future_maker': {
                 'attempted': True,
                 'filled': bool(result.get('success')),
+                'order_side': order.get('order_side'),
+                'trade_direction': order.get('trade_direction'),
                 'fill_ratio': round(fill_ratio, 4),
                 'wait_ms': round(elapsed_ms, 0),
                 'ttl_ms': ttl_ms,

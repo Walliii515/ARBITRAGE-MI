@@ -26,7 +26,7 @@ trade:
     spot_open: 0.00075
     spot_close: 0.00075
     future_open: 0.0002
-    future_close: 0.0005
+    future_close: 0.0002
 
   # ─── 执行策略 ───
   execution:
@@ -35,6 +35,11 @@ trade:
       allowed_tiers: [A, B]                 # A/B 档参与；C 档不订阅、不交易
       ttl_ms: 800                           # maker 单最多挂单等待时间
       price_offset_bps: 0                   # 卖空挂 future ask1；正数表示更靠后排队
+    future_maker_close:
+      enabled: true                         # 平仓先尝试 Gate future reduce-only post-only maker
+      allowed_tiers: [A, B]                 # A/B 档参与；未知历史持仓按 B 档处理
+      ttl_ms: 800                           # maker 单最多挂单等待时间
+      price_offset_bps: 0                   # 买回挂 future bid1；正数表示更靠后排队
 
   # ─── 开仓策略 ───
   open:
