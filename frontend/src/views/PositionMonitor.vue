@@ -873,13 +873,6 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
   const sumField = (field: keyof PositionRow): number =>
     rows.reduce((acc, r) => acc + ((r[field] as number | null | undefined) ?? 0), 0)
 
-  const totalOpenAmount = rows.reduce((acc, r) => {
-    const amount = Number(r.spot_open_amount)
-    return acc + (Number.isFinite(amount) && amount > 0 ? amount : openAmountUsdt.value)
-  }, 0)
-  const toPortfolioBps = (amount: number): number | null =>
-    totalOpenAmount > 0 ? Math.round((amount / totalOpenAmount) * 10000 * 100) / 100 : null
-
   const floatingPnlTotal = sumField('floating_pnl_total')
   const realizedPnl = sumField('realized_pnl')
   const fundingTotalPnl = sumField('funding_total_pnl')
@@ -902,13 +895,13 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     current_spot_price: null,
     current_future_price: null,
     current_spread_bps: null,
-    spot_open_amount: totalOpenAmount,
-    floating_pnl_bps: toPortfolioBps(floatingPnlTotal),
+    spot_open_amount: null,
+    floating_pnl_bps: sumField('floating_pnl_bps'),
     floating_pnl_total: floatingPnlTotal,
     fee_bps: null,
     fee_cost: sumField('fee_cost'),
     risk_relief_bps: null,
-    funding_pnl_bps: toPortfolioBps(fundingTotalPnl),
+    funding_pnl_bps: sumField('funding_pnl_bps'),
     funding_rate: null,
     funding_rate_24h: null,
     funding_interval: null,
@@ -918,9 +911,9 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     funding_total_pnl: fundingTotalPnl,
     funding_payments_count: null,
     funding_history: null,
-    realized_pnl_bps: toPortfolioBps(realizedPnl),
+    realized_pnl_bps: sumField('realized_pnl_bps'),
     realized_pnl: realizedPnl,
-    total_pnl_bps: toPortfolioBps(totalPnl),
+    total_pnl_bps: sumField('total_pnl_bps'),
     total_pnl: totalPnl,
     margin_topup_count: null,
     margin_topup_total: sumField('margin_topup_total'),
