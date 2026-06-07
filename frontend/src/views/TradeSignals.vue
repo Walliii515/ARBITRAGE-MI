@@ -12,6 +12,7 @@ import { showSuccess, showError } from '../utils/message'
 interface SignalRow {
   id: number
   base_asset: string
+  strategy_tier: 'A' | 'B' | 'C' | string | null
   signal_time: string
   resolved_time: string | null
   status: 'monitoring' | 'opened' | 'conditions_lost' | 'rejected' | 'gate_rejected'
@@ -132,6 +133,12 @@ const statusMap: Record<string, { label: string; color: string }> = {
   gate_rejected: { label: '被拒', color: '#f56c6c' },
 }
 
+const tierColorMap: Record<string, string> = {
+  A: '#67c23a',
+  B: '#e6a23c',
+  C: '#909399',
+}
+
 function formatBps(value: unknown): string {
   if (value == null || value === '') return ''
   const n = Number(value)
@@ -154,6 +161,17 @@ const exitReasonOptions = [
 
 const columnDefs = ref<ColDef[]>([
   { headerName: '标的资产', field: 'base_asset', width: 110, pinned: 'left' },
+  {
+    headerName: '类别',
+    field: 'strategy_tier',
+    width: 70,
+    pinned: 'left',
+    cellRenderer: (params: any) => {
+      const tier = params.value || 'C'
+      const color = tierColorMap[tier] || '#909399'
+      return `<span style="color:${color};font-weight:700">${tier}</span>`
+    },
+  },
   { headerName: '信号时间', field: 'signal_time', width: 165 },
   {
     headerName: '状态',

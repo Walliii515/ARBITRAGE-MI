@@ -888,20 +888,26 @@ async def get_signals(
 
     # 查询分页数据
     offset = (page - 1) * page_size
-    sql = "SELECT * FROM mi_trade_signal WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+    sql = """
+        SELECT s.*, COALESCE(b.strategy_tier, 'C') AS strategy_tier
+        FROM mi_trade_signal s
+        LEFT JOIN mi_base_asset b
+          ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))
+        WHERE s.signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)
+    """
     params: List = [days]
 
     if status:
-        sql += " AND status = %s"
+        sql += " AND s.status = %s"
         params.append(status)
     if exit_reason:
-        sql += " AND exit_reason LIKE %s"
+        sql += " AND s.exit_reason LIKE %s"
         params.append(f"%{exit_reason}%")
     if base_asset:
-        sql += " AND base_asset LIKE %s"
+        sql += " AND s.base_asset LIKE %s"
         params.append(f"%{base_asset}%")
 
-    sql += " ORDER BY signal_time DESC LIMIT %s OFFSET %s"
+    sql += " ORDER BY s.signal_time DESC LIMIT %s OFFSET %s"
     params.extend([page_size, offset])
 
     with db_manager.get_cursor() as cursor:
