@@ -925,6 +925,7 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
 
     def setUp(self):
         self.ce = make_closing_executor()
+        self.ce.fixed_take_profit_bps = 30.0
         self.pos = {
             'base_asset': 'BTC',
             'future_contract': 'BTC_USDT',
@@ -1024,6 +1025,31 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn('基差回弹过大', reason)
 
+    def test_fixed_net_take_profit_shortfall_blocks(self):
+        """固定净止盈复核不足 → 旁路拦截。"""
+        self.ce.fixed_take_profit_bps = 50.0
+        self._setup_books()
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(vwap_basis_bps=35)
+        with m_merge, m_hedge, m_vwap:
+            passed, _, basis, reason = self.ce._pre_execution_gate(
+                'BTC', 'BTC_USDT', 'BTCUSDT', self.pos
+            )
+        self.assertFalse(passed)
+        self.assertEqual(basis, 35)
+        self.assertIn('固定净止盈不足', reason)
+
+    def test_risk_gate_does_not_require_profit(self):
+        """风险平仓旁路只查执行质量，不用收敛盈利性挡住退出。"""
+        self._setup_books()
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(vwap_basis_bps=105)
+        with m_merge, m_hedge, m_vwap:
+            passed, _, basis, reason = self.ce._pre_execution_gate(
+                'BTC', 'BTC_USDT', 'BTCUSDT', self.pos, require_profit=False
+            )
+        self.assertTrue(passed)
+        self.assertEqual(basis, 105)
+        self.assertEqual(reason, '')
+
     def test_full_pass_writes_lag_cache(self):
         """全部通过 → 返回 True + 写入 _last_orderbook_lag_ms（bug 修复验证）"""
         self._setup_books(gate_lag_sec=0.05, spot_lag_sec=0.06)
@@ -1101,6 +1127,56 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertIn('鲜度(gate=', detail)
         self.assertNotIn('鲜度(NA)', detail)
         self.assertIn('旁路✓', detail)
+
+
+class TestClosingExecutorFundingAwareClose(unittest.TestCase):
+    """固定净止盈 + funding-aware 平仓触发。"""
+
+    def setUp(self):
+        self.ce = make_closing_executor()
+        self.ce.fixed_take_profit_bps = 50.0
+        self.ce.contract_meta = {'BTC': {'funding_interval': 28800}}
+        self.pos = {
+            'base_asset': 'BTC',
+            'open_spread_bps': 120.0,
+            'current_spread_bps': 40.0,
+            'funding_pnl_bps': 0.0,
+            'funding_rate_24h': 0.0,
+            'funding_next_apply': (datetime.now() + timedelta(minutes=120)).strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+    def test_fixed_net_take_profit_uses_fee_adjusted_profit(self):
+        self.assertTrue(self.ce._check_take_profit(self.pos, 40.0))
+        self.assertFalse(self.ce._check_take_profit(self.pos, 75.0))
+
+    def test_positive_funding_near_settlement_holds_take_profit(self):
+        self.pos['funding_rate_24h'] = 0.003  # 约每8小时 +10bps
+        self.pos['funding_next_apply'] = (
+            datetime.now() + timedelta(minutes=20)
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        self.assertFalse(self.ce._check_take_profit(self.pos, 40.0))
+
+    def test_pre_funding_risk_triggers_before_negative_settlement(self):
+        self.pos.update({
+            'open_spread_bps': 60.0,
+            'current_spread_bps': 60.0,
+            'funding_rate_24h': -0.003,  # 约每8小时 -10bps
+            'funding_next_apply': (
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        self.assertTrue(self.ce._check_pre_funding_risk(self.pos, 60.0))
+
+    def test_close_order_group_carries_future_protective_price(self):
+        group = self.ce._build_close_order_group({
+            'base_asset': 'BTC',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'future_contract': 'BTC_USDT',
+        }, future_protective_price=101.23)
+
+        self.assertNotIn('protective_price', group['spot_order'])
+        self.assertEqual(group['future_order']['protective_price'], 101.23)
 
 
 class TestMarginTopupCalculation(unittest.TestCase):

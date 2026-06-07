@@ -34,7 +34,7 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
-    max_positions_per_asset: 3              # 同标的最大持仓数
+    max_positions_per_asset: 5              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
@@ -153,7 +153,20 @@ trade:
   close:
     check_interval_sec: 0.2                 # 平仓检查间隔（秒）；与开仓对称
     cooldown_sec: 60                        # 平仓失败冷却（秒）
-    take_profit_days_multiplier: 10         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
+    take_profit_mode: fixed_net_bps         # 止盈模式：fixed_net_bps=固定净收益；legacy_p40=历史p40资金费倍数
+    fixed_take_profit_bps: 50               # 固定净止盈阈值：收敛收益 + 已收资金费 - 全部手续费
+    positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
+    positive_funding_hold_window_min: 60    # 距下一次资金费结算多少分钟内启用暂缓
+    positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
+    pre_funding_guard_enabled: true         # 临近结算且下一期大额负资金费时提前风险平仓
+    pre_funding_guard_window_min: 30        # 距下一次资金费结算多少分钟内启用提前风险平仓
+    pre_funding_guard_large_negative_bps: 5 # 下一期预计支付资金费 <= -此值时视为大额负资金费
+    pre_funding_guard_min_deterioration_bps: 5 # 预计净收益劣化至少多少bps才触发
+    pre_funding_guard_min_projected_profit_bps: 0 # 付完下一期资金费后的预计净收益低于此值才触发
+    protective_ioc_enabled: true            # 平仓Gate期货腿使用 reduce_only 保护限价 IOC
+    protective_ioc_take_profit_slippage_bps: 5 # 止盈平仓期货买回保护价允许高于旁路VWAP的bps
+    protective_ioc_risk_slippage_bps: 12    # 风险平仓期货买回保护价允许高于旁路VWAP的bps
+    take_profit_days_multiplier: 10         # legacy_p40模式止盈倍数
     # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
     max_funding_payments: 30                # 最大资金费支付次数，超过强制平仓
     # max_funding_payments: 2                # 最大资金费支付次数，超过强制平仓

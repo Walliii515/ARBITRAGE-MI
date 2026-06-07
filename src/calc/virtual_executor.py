@@ -135,6 +135,19 @@ class VirtualExecutor:
         exec_price = calc_vwap(prices, volumes, target_qty, qty_multiplier)
         if exec_price is None:
             return {'success': False, 'reason': 'VWAP计算失败'}
+        protective_price = order.get('protective_price')
+        if protective_price is not None:
+            protective_price = float(protective_price)
+            if order['trade_direction'] == 'buy' and exec_price > protective_price:
+                return {
+                    'success': False,
+                    'reason': f'保护IOC未成交(买入VWAP {exec_price:.8f} > 保护价 {protective_price:.8f})',
+                }
+            if order['trade_direction'] == 'sell' and exec_price < protective_price:
+                return {
+                    'success': False,
+                    'reason': f'保护IOC未成交(卖出VWAP {exec_price:.8f} < 保护价 {protective_price:.8f})',
+                }
 
         # VWAP = 加权平均价（市价单真实成交均价，无需floor截断）
         # 说明：市价单按盘口逐档成交，VWAP是计算结果而非提交的限价

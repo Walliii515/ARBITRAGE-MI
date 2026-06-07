@@ -6,10 +6,10 @@
 
 平仓触发条件（按优先级）：
   0. 保证金爆仓风控（距爆仓距离 < 阈值）
-  1. 资金费次数 >= max_funding_payments
-  2. 止盈: 总盈亏bps(基差收敛 + 已收资金费) >= 24h资金费率bps * multiplier + 手续费bps
-     (止盈下单前有最终风控旁路，确认仍满足止盈)
-  3. 累计资金费超阈值: 费率为负时，累计支出bps >= max(open_p20 - close_p20, 15) × 0.5
+  1. 结算前大额负资金费风险平仓
+  2. 资金费次数 >= max_funding_payments
+  3. 固定净收益止盈（下单前有最终风控旁路复核）
+  4. 累计资金费超阈值
 """
 import time
 import uuid
@@ -48,8 +48,41 @@ class ClosingExecutor:
         executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
         self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
 
+        self.take_profit_mode = config.get_str('trade.close.take_profit_mode', 'fixed_net_bps')
+        self.fixed_take_profit_bps = config.get_float('trade.close.fixed_take_profit_bps', 50.0)
         self.take_profit_multiplier = config.get_float('trade.close.take_profit_days_multiplier', 6.0)
         self.max_funding_payments = config.get_int('trade.close.max_funding_payments', 30)
+        self.positive_funding_hold_enabled = config.get_bool(
+            'trade.close.positive_funding_hold_enabled', True
+        )
+        self.positive_funding_hold_window_min = config.get_float(
+            'trade.close.positive_funding_hold_window_min', 60.0
+        )
+        self.positive_funding_hold_min_bps = config.get_float(
+            'trade.close.positive_funding_hold_min_bps', 5.0
+        )
+        self.pre_funding_guard_enabled = config.get_bool(
+            'trade.close.pre_funding_guard_enabled', True
+        )
+        self.pre_funding_guard_window_min = config.get_float(
+            'trade.close.pre_funding_guard_window_min', 30.0
+        )
+        self.pre_funding_guard_large_negative_bps = config.get_float(
+            'trade.close.pre_funding_guard_large_negative_bps', 5.0
+        )
+        self.pre_funding_guard_min_deterioration_bps = config.get_float(
+            'trade.close.pre_funding_guard_min_deterioration_bps', 5.0
+        )
+        self.pre_funding_guard_min_projected_profit_bps = config.get_float(
+            'trade.close.pre_funding_guard_min_projected_profit_bps', 0.0
+        )
+        self.protective_ioc_enabled = config.get_bool('trade.close.protective_ioc_enabled', True)
+        self.protective_ioc_take_profit_slippage_bps = config.get_float(
+            'trade.close.protective_ioc_take_profit_slippage_bps', 5.0
+        )
+        self.protective_ioc_risk_slippage_bps = config.get_float(
+            'trade.close.protective_ioc_risk_slippage_bps', 12.0
+        )
 
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
@@ -181,6 +214,8 @@ class ClosingExecutor:
             # ── 按优先级检查平仓条件 ──
             close_reason = None
             close_reason_detail = None
+            pre_gate_basis_bps = None
+            future_protective_price = None
 
             topup_result = self._check_and_topup_margin(pos)
             if topup_result:
@@ -200,6 +235,11 @@ class ClosingExecutor:
                     f"|当前{pos.get('current_future_price', 0):.4f}"
                 )
                 # 紧急平仓，清除谷底状态
+                self._valley_state.pop(ba, None)
+                self._close_resiliency.clear(ba)
+            elif self._check_pre_funding_risk(pos, current_spread_bps):
+                close_reason = 'pre_funding_risk'
+                close_reason_detail = self._build_pre_funding_risk_detail(pos, current_spread_bps)
                 self._valley_state.pop(ba, None)
                 self._close_resiliency.clear(ba)
             elif self._check_funding_count(pos):
@@ -241,12 +281,13 @@ class ClosingExecutor:
             if not close_reason:
                 continue
 
-            # ── 最终风控旁路：仅对止盈平仓生效，确认下单前仍满足止盈 ──
-            if close_reason == 'take_profit':
+            # ── 最终风控旁路：止盈复核盈利性；风险平仓复核新鲜度/同步/深度 ──
+            guarded_reasons = {'take_profit', 'pre_funding_risk', 'funding_count', 'funding_cost_exceeded'}
+            if close_reason in guarded_reasons:
                 contract = pos.get('future_contract', '')
                 symbol = pos.get('spot_symbol') or f"{ba}USDT"
                 gate_passed, gate_row, gate_basis, gate_reason = self._pre_execution_gate(
-                    ba, contract, symbol, pos
+                    ba, contract, symbol, pos, require_profit=(close_reason == 'take_profit')
                 )
                 if not gate_passed:
                     logger.info(
@@ -256,11 +297,15 @@ class ClosingExecutor:
                     # 旁路拦截后清除谷底状态，下一轮重新判断
                     self._valley_state.pop(ba, None)
                     continue
+                pre_gate_basis_bps = gate_basis
                 # 使用旁路返回的最新盘口行（确保下单数据 = 校验数据）
                 if gate_row is not None:
                     orderbook_rows_by_asset[ba] = gate_row
-                # 旁路通过后再构建详情，才能把本次旁路写入的 lag 拼入“鲜度”字段
-                close_reason_detail = self._build_take_profit_detail(pos, current_spread_bps)
+                if close_reason == 'take_profit':
+                    # 旁路通过后再构建详情，才能把本次旁路写入的 lag 拼入“鲜度”字段
+                    close_reason_detail = self._build_take_profit_detail(pos, current_spread_bps)
+                else:
+                    close_reason_detail = self._append_lag_detail(ba, close_reason_detail)
                 # 补充旁路判定信息到原因详情（供复盘）
                 if gate_basis is not None:
                     drift_bps = gate_basis - current_spread_bps
@@ -274,9 +319,27 @@ class ClosingExecutor:
             if not orderbook_row:
                 logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                 continue
+            if self.protective_ioc_enabled:
+                slippage_bps = (
+                    self.protective_ioc_take_profit_slippage_bps
+                    if close_reason == 'take_profit'
+                    else self.protective_ioc_risk_slippage_bps
+                )
+                future_protective_price = self._future_close_protective_price(orderbook_row, slippage_bps)
+                if future_protective_price is not None:
+                    close_reason_detail = (
+                        f"{close_reason_detail}|保护IOC(future_buy≤{future_protective_price})"
+                    )
 
             try:
-                result = self._execute_close(pos, close_reason, close_reason_detail, orderbook_row)
+                result = self._execute_close(
+                    pos,
+                    close_reason,
+                    close_reason_detail,
+                    orderbook_row,
+                    pre_gate_basis_bps=pre_gate_basis_bps,
+                    future_protective_price=future_protective_price,
+                )
                 results.append(result)
                 if result.get('success'):
                     # 平仓成功，清除谷底监控状态和冷却记录
@@ -341,6 +404,107 @@ class ClosingExecutor:
     # ──────────────────────────────────────────────────────────────────
     # 条件检查
     # ──────────────────────────────────────────────────────────────────
+
+    def _parse_datetime(self, value) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace('Z', '').replace('+00:00', '')
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f'):
+            try:
+                return datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(text.replace('Z', '+00:00')).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    def _funding_periods_per_day(self, base_asset: str) -> float:
+        meta = self.contract_meta.get(base_asset, {})
+        interval_sec = float(meta.get('funding_interval') or meta.get('funding_interval_sec') or 28800)
+        if interval_sec <= 0:
+            interval_sec = 28800
+        return max(1.0, 86400.0 / interval_sec)
+
+    def _next_funding_bps(self, pos: Dict) -> Optional[float]:
+        funding_rate_24h = pos.get('funding_rate_24h')
+        if funding_rate_24h is None:
+            return None
+        base_asset = pos.get('base_asset', '')
+        return float(funding_rate_24h) * 10000.0 / self._funding_periods_per_day(base_asset)
+
+    def _time_to_next_funding_min(self, pos: Dict) -> Optional[float]:
+        next_at = self._parse_datetime(pos.get('funding_next_apply') or pos.get('next_funding_time'))
+        if next_at is None:
+            return None
+        return (next_at - datetime.now()).total_seconds() / 60.0
+
+    def _profit_components(self, pos: Dict, close_basis_bps: float) -> Dict[str, float]:
+        open_spread_bps = float(pos.get('open_spread_bps') or 0)
+        funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
+        spread_profit_bps = open_spread_bps - float(close_basis_bps)
+        gross_profit_bps = spread_profit_bps + funding_earned_bps
+        net_profit_bps = gross_profit_bps - self.fee_full_bps
+        return {
+            'open_spread_bps': open_spread_bps,
+            'close_basis_bps': float(close_basis_bps),
+            'spread_profit_bps': spread_profit_bps,
+            'funding_earned_bps': funding_earned_bps,
+            'gross_profit_bps': gross_profit_bps,
+            'fee_full_bps': self.fee_full_bps,
+            'net_profit_bps': net_profit_bps,
+        }
+
+    def _funding_context_text(self, pos: Dict) -> str:
+        next_bps = self._next_funding_bps(pos)
+        next_min = self._time_to_next_funding_min(pos)
+        if next_bps is None or next_min is None:
+            return 'nextFunding(NA)'
+        return f'nextFunding({next_bps:+.1f}bps,{next_min:.0f}min)'
+
+    def _should_hold_for_positive_funding(self, pos: Dict, close_basis_bps: float) -> bool:
+        if not self.positive_funding_hold_enabled:
+            return False
+        next_bps = self._next_funding_bps(pos)
+        next_min = self._time_to_next_funding_min(pos)
+        if next_bps is None or next_min is None:
+            return False
+        if next_min < 0 or next_min > self.positive_funding_hold_window_min:
+            return False
+        if next_bps < self.positive_funding_hold_min_bps:
+            return False
+        comps = self._profit_components(pos, close_basis_bps)
+        logger.info(
+            f"止盈暂缓等待正资金费 | {pos.get('base_asset')} | "
+            f"net={comps['net_profit_bps']:.1f}bps | next={next_bps:+.1f}bps | "
+            f"next_in={next_min:.1f}min"
+        )
+        return True
+
+    def _check_pre_funding_risk(self, pos: Dict, current_spread_bps: float) -> bool:
+        """下一期资金费预计明显为负，且临近结算时，提前风险平仓。"""
+        if not self.pre_funding_guard_enabled:
+            return False
+        next_bps = self._next_funding_bps(pos)
+        next_min = self._time_to_next_funding_min(pos)
+        if next_bps is None or next_min is None:
+            return False
+        if next_min < 0 or next_min > self.pre_funding_guard_window_min:
+            return False
+        if next_bps > -abs(self.pre_funding_guard_large_negative_bps):
+            return False
+        comps = self._profit_components(pos, current_spread_bps)
+        projected_net = comps['net_profit_bps'] + next_bps
+        deterioration = comps['net_profit_bps'] - projected_net
+        return (
+            deterioration >= self.pre_funding_guard_min_deterioration_bps
+            and projected_net < self.pre_funding_guard_min_projected_profit_bps
+        )
 
     def _check_margin_liquidation(self, pos: Dict) -> bool:
         """
@@ -587,12 +751,19 @@ class ClosingExecutor:
     def _check_take_profit(self, pos: Dict, current_spread_bps: float) -> bool:
         """
         止盈条件：
-            总盈亏bps(基差收敛 + 已收资金费) >= percentile_40费率(bps) * multiplier + 手续费(bps)
-
-        使用历史 percentile_40 资金费率（约为中位数正费率）作为基准，
-        避免当前费率为负时止盈失效。
+            fixed_net_bps:
+                基差收敛 + 已收资金费 - 全部手续费 >= fixed_take_profit_bps
+            legacy_p40:
+                总盈亏bps(基差收敛 + 已收资金费) >= percentile_40费率(bps) * multiplier + 手续费(bps)
         """
         ba = pos.get('base_asset', '')
+        if self.take_profit_mode == 'fixed_net_bps':
+            comps = self._profit_components(pos, current_spread_bps)
+            if comps['net_profit_bps'] < self.fixed_take_profit_bps:
+                return False
+            if self._should_hold_for_positive_funding(pos, current_spread_bps):
+                return False
+            return True
 
         # 从历史分位获取基准费率
         funding_rate_p40 = self.funding_rate_p40_meta.get(ba)
@@ -640,7 +811,14 @@ class ClosingExecutor:
 
         return abs(funding_pnl_bps) >= threshold
 
-    def _pre_execution_gate(self, base_asset: str, contract: str, symbol: str, pos: Dict) -> tuple:
+    def _pre_execution_gate(
+        self,
+        base_asset: str,
+        contract: str,
+        symbol: str,
+        pos: Dict,
+        require_profit: bool = True,
+    ) -> tuple:
         """
         平仓最终风控旁路：下单前用单标的最短链路重新校验平仓条件。
 
@@ -657,6 +835,7 @@ class ClosingExecutor:
             contract: Gate合约名 (e.g. 'BTC_USDT')
             symbol: Binance交易对 (e.g. 'BTCUSDT')
             pos: 当前持仓记录（含 open_spread_bps）
+            require_profit: True=止盈旁路，复核收敛/固定净收益；False=风险平仓旁路，只查执行质量
 
         Returns:
             (passed, fresh_row, gate_basis_bps, reject_reason)
@@ -743,6 +922,33 @@ class ClosingExecutor:
                 return False, None, None, '平仓VWAP基差计算失败(盘口深度不足)'
             gate_basis_bps = round(gate_basis_bps, 2)
 
+            coverages = [
+                row.get('close_coverage'),
+                row.get('spot_close_coverage'),
+                row.get('future_close_coverage'),
+            ]
+            valid_coverages = [float(c) for c in coverages if c is not None]
+            coverage = max(valid_coverages) if valid_coverages else None
+            if coverage is not None and coverage > self._close_resiliency_coverage_threshold:
+                logger.info(
+                    f"平仓旁路-盘口覆盖过高拦截 | {base_asset} | "
+                    f"coverage={coverage:.3f} > max={self._close_resiliency_coverage_threshold:.3f}"
+                )
+                return False, row, gate_basis_bps, (
+                    f'盘口覆盖过高(coverage={coverage:.3f} > '
+                    f'{self._close_resiliency_coverage_threshold:.3f})'
+                )
+
+            if not require_profit:
+                self._last_orderbook_lag_ms[base_asset] = (gate_lag_ms, spot_lag_ms)
+                logger.info(
+                    f"风险平仓旁路通过 | {base_asset} | "
+                    f"gate_basis={gate_basis_bps:.2f}bps | "
+                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms,"
+                    f"skew={book_skew_ms:.0f}ms,max={self._max_orderbook_lag_ms:.0f}ms)"
+                )
+                return True, row, gate_basis_bps, ''
+
             # ── 5. 盈利性校验：确认平仓仍有利可图 ──
             # 平仓基差应 < 开仓基差（即价差已收敛）
             # 如果新基差 >= 开仓基差，说明收敛已完全逆转，平仓会亏损
@@ -773,6 +979,23 @@ class ClosingExecutor:
                     return False, row, gate_basis_bps, (
                         f'基差回弹过大(回弹{reversion_ratio:.0%}, '
                         f'触发时{pos.get("current_spread_bps")}bps→当前{gate_basis_bps}bps)'
+                    )
+
+            if self.take_profit_mode == 'fixed_net_bps':
+                comps = self._profit_components(pos, gate_basis_bps)
+                if comps['net_profit_bps'] < self.fixed_take_profit_bps:
+                    logger.info(
+                        f"平仓旁路-固定净止盈不足拦截 | {base_asset} | "
+                        f"net={comps['net_profit_bps']:.2f}bps < {self.fixed_take_profit_bps:.2f}bps | "
+                        f"gate_basis={gate_basis_bps:.2f}bps"
+                    )
+                    return False, row, gate_basis_bps, (
+                        f'固定净止盈不足(净{comps["net_profit_bps"]:.1f}bps < '
+                        f'{self.fixed_take_profit_bps:.1f}bps)'
+                    )
+                if self._should_hold_for_positive_funding(pos, gate_basis_bps):
+                    return False, row, gate_basis_bps, (
+                        f'下一期正资金费暂缓({self._funding_context_text(pos)})'
                     )
 
             # ── 全部通过 ──
@@ -871,22 +1094,31 @@ class ClosingExecutor:
     def _build_take_profit_detail(self, pos: Dict, current_spread_bps: float) -> str:
         """构建止盈平仓的详细原因字符串（含谷底确认信息 + 行情新鲜度）"""
         ba = pos.get('base_asset', '')
-        open_spread_bps = float(pos.get('open_spread_bps') or 0)
-        spread_profit_bps = open_spread_bps - current_spread_bps
-        funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
-        total_pnl_bps = spread_profit_bps + funding_earned_bps
+        if self.take_profit_mode == 'fixed_net_bps':
+            comps = self._profit_components(pos, current_spread_bps)
+            detail = (
+                f"固定净止盈|净{comps['net_profit_bps']:.1f}bps"
+                f"(收敛{comps['spread_profit_bps']:.1f}+资金费{comps['funding_earned_bps']:.1f}"
+                f"-{comps['fee_full_bps']:.0f}费)"
+                f">={self.fixed_take_profit_bps:.1f}bps"
+                f"|{self._funding_context_text(pos)}"
+            )
+        else:
+            open_spread_bps = float(pos.get('open_spread_bps') or 0)
+            spread_profit_bps = open_spread_bps - current_spread_bps
+            funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
+            total_pnl_bps = spread_profit_bps + funding_earned_bps
+            funding_rate_p40 = self.funding_rate_p40_meta.get(ba, 0)
+            funding_rate_bps = funding_rate_p40 * 10000
+            fee_cost_bps = self.fee_full_bps
+            threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
 
-        funding_rate_p40 = self.funding_rate_p40_meta.get(ba, 0)
-        funding_rate_bps = funding_rate_p40 * 10000
-        fee_cost_bps = self.fee_full_bps
-        threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
-
-        detail = (
-            f"止盈|总盈亏{total_pnl_bps:.1f}bps"
-            f"(收敛{spread_profit_bps:.1f}+资金费{funding_earned_bps:.1f})"
-            f">={threshold:.1f}bps"
-            f"(p40={funding_rate_bps:.1f}×{self.take_profit_multiplier:.0f}+{fee_cost_bps:.0f}费)"
-        )
+            detail = (
+                f"止盈|总盈亏{total_pnl_bps:.1f}bps"
+                f"(收敛{spread_profit_bps:.1f}+资金费{funding_earned_bps:.1f})"
+                f">={threshold:.1f}bps"
+                f"(p40={funding_rate_bps:.1f}×{self.take_profit_multiplier:.0f}+{fee_cost_bps:.0f}费)"
+            )
 
         # 附加谷底反弹信息
         valley_state = self._valley_state.get(ba)
@@ -912,6 +1144,62 @@ class ClosingExecutor:
             detail += "|鲜度(NA)"
 
         return detail
+
+    def _build_pre_funding_risk_detail(self, pos: Dict, current_spread_bps: float) -> str:
+        """构建下一期负资金费风险平仓原因。"""
+        comps = self._profit_components(pos, current_spread_bps)
+        next_bps = self._next_funding_bps(pos)
+        next_min = self._time_to_next_funding_min(pos)
+        projected = comps['net_profit_bps'] + (next_bps or 0)
+        return (
+            f"结算前负资金费风险|next={next_bps:+.1f}bps"
+            f"|距结算{next_min:.1f}min"
+            f"|净收益{comps['net_profit_bps']:.1f}->{projected:.1f}bps"
+            f"|阈值(next<=-{self.pre_funding_guard_large_negative_bps:.1f},"
+            f"projected<{self.pre_funding_guard_min_projected_profit_bps:.1f})"
+        )
+
+    def _append_lag_detail(self, base_asset: str, detail: str) -> str:
+        lag = self._last_orderbook_lag_ms.pop(base_asset, None)
+        if lag is None:
+            return f"{detail}|鲜度(NA)"
+        gate_lag_ms, spot_lag_ms = lag
+
+        def _fmt(ms):
+            if ms is None or ms == float('inf'):
+                return 'NA'
+            return f'{ms:.0f}ms'
+
+        return f"{detail}|鲜度(gate={_fmt(gate_lag_ms)},spot={_fmt(spot_lag_ms)})"
+
+    def _future_close_protective_price(self, row: Dict, slippage_bps: float) -> Optional[float]:
+        """期货空头平仓是 buy，用旁路 close VWAP 加保护垫作为 IOC 最高成交价。"""
+        price = row.get('future_close_vwap') or row.get('future_ask_price_1') or row.get('future_ask_1')
+        if price is None:
+            return None
+        price = float(price)
+        if price <= 0:
+            return None
+        return round(price * (1 + max(float(slippage_bps), 0.0) / 10000.0), 10)
+
+    def _append_close_basis_compare(
+        self,
+        detail: str,
+        trigger_basis_bps,
+        pre_gate_basis_bps,
+        actual_basis_bps,
+    ) -> str:
+        def _fmt(value):
+            if value is None:
+                return 'NA'
+            return f'{float(value):.1f}bps'
+
+        return (
+            f"{detail}|平仓基差对比("
+            f"trigger={_fmt(trigger_basis_bps)},"
+            f"pre_gate={_fmt(pre_gate_basis_bps)},"
+            f"actual={_fmt(actual_basis_bps)})"
+        )
 
     def _build_funding_cost_detail(self, pos: Dict, threshold_data: Dict) -> str:
         """构建累计资金费超阈值平仓的详细原因"""
@@ -968,12 +1256,27 @@ class ClosingExecutor:
     # 订单构建与执行
     # ──────────────────────────────────────────────────────────────────
 
-    def _execute_close(self, pos: Dict, close_reason: str, close_reason_detail: str, orderbook_row: Dict) -> Dict:
+    def _execute_close(
+        self,
+        pos: Dict,
+        close_reason: str,
+        close_reason_detail: str,
+        orderbook_row: Dict,
+        pre_gate_basis_bps: Optional[float] = None,
+        future_protective_price: Optional[float] = None,
+    ) -> Dict:
         """构建平仓订单组 → 调用成交引擎 → 持久化"""
         ba = pos.get('base_asset', '')
-        order_group = self._build_close_order_group(pos)
+        order_group = self._build_close_order_group(pos, future_protective_price=future_protective_price)
         exec_result = self.executor_client.execute(order_group, orderbook_row)
-        self._save_close(pos, order_group, exec_result, close_reason, close_reason_detail)
+        self._save_close(
+            pos,
+            order_group,
+            exec_result,
+            close_reason,
+            close_reason_detail,
+            pre_gate_basis_bps=pre_gate_basis_bps,
+        )
         return {
             'base_asset': ba,
             'success': exec_result['success'],
@@ -982,7 +1285,11 @@ class ClosingExecutor:
             'message': exec_result.get('message'),
         }
 
-    def _build_close_order_group(self, pos: Dict) -> Dict:
+    def _build_close_order_group(
+        self,
+        pos: Dict,
+        future_protective_price: Optional[float] = None,
+    ) -> Dict:
         """
         生成平仓订单组：
           现货 sell（bid 侧）+ 期货 buy（ask 侧），方向与开仓相反
@@ -1018,6 +1325,8 @@ class ClosingExecutor:
             'target_qty': float(pos.get('future_open_qty') or 0),
             'target_amount': target_amount,
         }
+        if future_protective_price is not None:
+            future_order['protective_price'] = future_protective_price
 
         return {
             'order_uuid': order_uuid,
@@ -1039,7 +1348,8 @@ class ClosingExecutor:
 
     def _save_close(
         self, pos: Dict, order_group: Dict, exec_result: Dict,
-        close_reason: str, close_reason_detail: str
+        close_reason: str, close_reason_detail: str,
+        pre_gate_basis_bps: Optional[float] = None,
     ):
         """插入 2 笔平仓订单到 mi_trade_order，成功时更新 mi_trade_position 状态"""
         position_id = pos.get('id')
@@ -1058,6 +1368,12 @@ class ClosingExecutor:
             if spot_close_price and future_close_price:
                 basis = calc_vwap_basis_bps(float(spot_close_price), float(future_close_price))
                 close_spread_bps = round(basis, 2) if basis is not None else None
+            close_reason_detail = self._append_close_basis_compare(
+                close_reason_detail,
+                pos.get('current_spread_bps'),
+                pre_gate_basis_bps,
+                close_spread_bps,
+            )
 
         # ── 插入平仓订单 ──
         insert_sql = """

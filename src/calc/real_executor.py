@@ -427,11 +427,16 @@ class RealExecutor:
         else:
             contracts_size = abs(contracts_size)
 
+        price = '0'
+        protective_price = order.get('protective_price')
+        if order.get('order_side') == 'close' and protective_price is not None:
+            price = self._format_gate_price(base_asset, float(protective_price))
+
         # 构造请求体
         body = {
             'contract': contract,
             'size': contracts_size,
-            'price': '0',       # 市价单
+            'price': price,     # 0=市价IOC；非0=保护限价IOC
             'tif': 'ioc',       # 即时成交或取消
             'text': f"t-arb{order.get('order_uuid', '')[:8]}",
         }
@@ -630,6 +635,29 @@ class RealExecutor:
         if base_asset in self.contract_meta:
             return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
         return 1.0
+
+    def _format_gate_price(self, base_asset: str, price: float) -> str:
+        """按 Gate 合约价格最小变动单位格式化保护限价。"""
+        if price <= 0:
+            return '0'
+        precision = 8
+        if base_asset in self.contract_meta:
+            order_price_round = self.contract_meta[base_asset].get('order_price_round')
+            if order_price_round:
+                try:
+                    precision = self._precision_from_tick_str(str(order_price_round))
+                except Exception:
+                    precision = 8
+        return f"{price:.{precision}f}"
+
+    @staticmethod
+    def _precision_from_tick_str(tick_str: str) -> int:
+        from decimal import Decimal, InvalidOperation
+        try:
+            d = Decimal(tick_str)
+            return max(0, -d.as_tuple().exponent)
+        except (InvalidOperation, ValueError):
+            return 8
 
     def _get_spot_qty_precision(self, base_asset: str) -> int:
         """从 spot_meta 的 step_size 推导数量小数位数"""
