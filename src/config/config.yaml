@@ -257,6 +257,7 @@ account_capital:
   enabled: true
   snapshot_interval_sec: 60
   retention_days: 30
+  pnl_lookback_days: 90
   max_age_sec: 180
 
 # 基础持仓对账配置（Binance 现货 + Gate 期货，只记录差异，不自动修复）

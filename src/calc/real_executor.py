@@ -445,6 +445,47 @@ class RealExecutor:
                 result[symbol[:-4]] = float(item.get('price') or 0)
         return result
 
+    def fetch_binance_my_trades(self, symbol: str, start_time_ms: Optional[int] = None, limit: int = 1000) -> List[Dict]:
+        """拉取 Binance 现货账户成交记录（只读，资金快照手续费使用）。"""
+        symbol = str(symbol or '').upper()
+        if not symbol:
+            return []
+
+        all_rows: List[Dict] = []
+        from_id: Optional[int] = None
+        while True:
+            params = {
+                'symbol': symbol,
+                'limit': min(max(int(limit or 1000), 1), 1000),
+                'timestamp': int(time.time() * 1000),
+            }
+            if start_time_ms is not None and from_id is None:
+                params['startTime'] = int(start_time_ms)
+            if from_id is not None:
+                params['fromId'] = from_id
+
+            query_string = urlencode(params)
+            params['signature'] = self._binance_sign(query_string)
+            url = f"{self.config.binance_base_url}/api/v3/myTrades"
+            headers = {'X-MBX-APIKEY': self.config.binance_api_key}
+            resp = self._session.get(url, params=params, headers=headers, timeout=self.config.timeout_sec)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Binance myTrades {symbol} HTTP {resp.status_code}: {resp.text[:200]}")
+
+            data = resp.json()
+            rows = data if isinstance(data, list) else []
+            all_rows.extend(rows)
+            if len(rows) < params['limit']:
+                break
+            last_id = rows[-1].get('id')
+            if last_id is None:
+                break
+            from_id = int(last_id) + 1
+            if len(all_rows) >= 10000:
+                logger.warning(f"Binance myTrades {symbol} reached 10000 row cap for capital snapshot")
+                break
+        return all_rows
+
     # ──────────────────────────────────────────────────────────────────
     # Gate 期货
     # ──────────────────────────────────────────────────────────────────
@@ -804,6 +845,43 @@ class RealExecutor:
             raise RuntimeError(f"Gate futures account HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
         return data if isinstance(data, dict) else {}
+
+    def fetch_gate_futures_account_book(
+        self,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict]:
+        """拉取 Gate USDT 永续账户账务流水（只读，资金快照收益使用）。"""
+        method = 'GET'
+        api_path = '/api/v4/futures/usdt/account_book'
+        all_rows: List[Dict] = []
+        offset = 0
+        page_limit = min(max(int(limit or 1000), 1), 1000)
+
+        while True:
+            params = {'limit': page_limit, 'offset': offset}
+            if start_time is not None:
+                params['from'] = int(start_time)
+            if end_time is not None:
+                params['to'] = int(end_time)
+            query_string = urlencode(params)
+            headers = self._gate_sign(method, api_path, query_string, '')
+            url = f"{self.config.gate_base_url}{api_path}?{query_string}"
+            resp = self._session.get(url, headers=headers, timeout=self.config.timeout_sec)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Gate account_book HTTP {resp.status_code}: {resp.text[:200]}")
+
+            data = resp.json()
+            rows = data if isinstance(data, list) else []
+            all_rows.extend(rows)
+            if len(rows) < page_limit:
+                break
+            offset += page_limit
+            if len(all_rows) >= 10000:
+                logger.warning("Gate account_book reached 10000 row cap for capital snapshot")
+                break
+        return all_rows
 
     def topup_gate_margin(self, contract: str, amount: float) -> Dict:
         """

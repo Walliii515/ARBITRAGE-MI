@@ -22,18 +22,35 @@ interface CapitalRow {
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
-type ChartMetric = 'equity_usdt' | 'available_usdt' | 'realized_pnl_usdt' | 'total_pnl_usdt'
+type ChartMetric =
+  | 'equity_usdt'
+  | 'available_usdt'
+  | 'unrealized_pnl_usdt'
+  | 'realized_pnl_usdt'
+  | 'funding_pnl_usdt'
+  | 'fee_cost_usdt'
+  | 'total_pnl_usdt'
 
 const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
 const loading = ref(false)
 const running = ref(false)
 const filterDays = ref(7)
-const selectedMetric = ref<ChartMetric>('equity_usdt')
+const selectedMetrics = ref<ChartMetric[]>(['equity_usdt', 'total_pnl_usdt', 'funding_pnl_usdt', 'fee_cost_usdt'])
 const selectedExchanges = ref<ExchangeKey[]>(['total'])
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
+
+const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | 'pnl'; color: string }> = [
+  { key: 'equity_usdt', label: '总资产', group: 'asset', color: '#67c23a' },
+  { key: 'available_usdt', label: '可用资金', group: 'asset', color: '#409eff' },
+  { key: 'unrealized_pnl_usdt', label: '未实现盈亏', group: 'pnl', color: '#e6a23c' },
+  { key: 'realized_pnl_usdt', label: '平仓盈亏', group: 'pnl', color: '#9b59b6' },
+  { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
+  { key: 'fee_cost_usdt', label: '手续费成本', group: 'pnl', color: '#f56c6c' },
+  { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#303133' },
+]
 
 const latestByExchange = computed(() => {
   const result: Record<string, CapitalRow | undefined> = {}
@@ -41,29 +58,32 @@ const latestByExchange = computed(() => {
   return result
 })
 
-const metricLabel = computed(() => {
-  if (selectedMetric.value === 'equity_usdt') return '总资产'
-  if (selectedMetric.value === 'available_usdt') return '可用资金'
-  if (selectedMetric.value === 'realized_pnl_usdt') return '已实现盈亏'
-  if (selectedMetric.value === 'total_pnl_usdt') return '综合盈亏'
-  return '资金'
-})
-
 const chartSeries = computed(() => {
-  const colors: Record<ExchangeKey, string> = {
-    binance: '#f0b90b',
-    gate: '#409eff',
-    total: '#67c23a',
+  const exchangeLineType: Record<ExchangeKey, 'solid' | 'dashed' | 'dotted'> = {
+    total: 'solid',
+    gate: 'dashed',
+    binance: 'dotted',
   }
-  return selectedExchanges.value.map((exchange) => {
-    const points = historyRows.value
-      .filter((row) => row.exchange === exchange)
-      .map((row) => ({
-        time: row.snapshot_at,
-        value: Number(row[selectedMetric.value] ?? 0),
-      }))
-    return { exchange, color: colors[exchange], points }
-  })
+  return selectedExchanges.value.flatMap((exchange) =>
+    selectedMetrics.value.map((metric) => {
+      const option = metricOptions.find((item) => item.key === metric)!
+      const points = historyRows.value
+        .filter((row) => row.exchange === exchange)
+        .map((row) => ({
+          time: row.snapshot_at,
+          value: Number(row[metric] ?? 0),
+        }))
+      return {
+        exchange,
+        metric,
+        label: `${exchangeLabel(exchange)} ${option.label}`,
+        color: option.color,
+        group: option.group,
+        lineType: exchangeLineType[exchange],
+        points,
+      }
+    })
+  )
 })
 
 function formatAmount(value: number | null | undefined): string {
@@ -77,6 +97,10 @@ function exchangeLabel(exchange: string): string {
 
 function onExchangeChange(value: ExchangeKey[]) {
   if (!value.length) selectedExchanges.value = ['total']
+}
+
+function onMetricChange(value: ChartMetric[]) {
+  if (!value.length) selectedMetrics.value = ['equity_usdt']
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -107,7 +131,14 @@ function buildChartOption(): EChartsOption {
   return {
     color: chartSeries.value.map((series) => series.color),
     animation: false,
-    grid: { top: 28, right: 28, bottom: 48, left: 72 },
+    grid: { top: 44, right: 82, bottom: 56, left: 72 },
+    legend: {
+      type: 'scroll',
+      top: 0,
+      textStyle: { color: mutedColor },
+      pageIconColor: textColor,
+      pageTextStyle: { color: mutedColor },
+    },
     tooltip: {
       trigger: 'axis',
       confine: true,
@@ -133,24 +164,38 @@ function buildChartOption(): EChartsOption {
       axisLabel: { color: mutedColor },
       splitLine: { show: false },
     },
-    yAxis: {
-      type: 'value',
-      scale: true,
-      axisLabel: {
-        color: mutedColor,
-        formatter: (value: number) => formatAmount(value),
+    yAxis: [
+      {
+        type: 'value',
+        name: '资产',
+        scale: true,
+        axisLabel: {
+          color: mutedColor,
+          formatter: (value: number) => formatAmount(value),
+        },
+        splitLine: { lineStyle: { color: borderColor, type: 'dashed' } },
       },
-      splitLine: { lineStyle: { color: borderColor, type: 'dashed' } },
-    },
+      {
+        type: 'value',
+        name: '收益',
+        scale: true,
+        axisLabel: {
+          color: mutedColor,
+          formatter: (value: number) => formatAmount(value),
+        },
+        splitLine: { show: false },
+      },
+    ],
     series: chartSeries.value.map((series) => ({
-      name: exchangeLabel(series.exchange),
+      name: series.label,
       type: 'line',
       smooth: true,
       showSymbol: false,
       symbolSize: 7,
+      yAxisIndex: series.group === 'asset' ? 0 : 1,
       emphasis: { focus: 'series' },
       data: series.points.map((point) => [point.time, point.value]),
-      lineStyle: { width: 2.2 },
+      lineStyle: { width: 2.2, type: series.lineType },
     })),
   }
 }
@@ -216,7 +261,7 @@ onMounted(async () => {
   await initChart()
 })
 
-watch([historyRows, selectedMetric, selectedExchanges], () => {
+watch([historyRows, selectedMetrics, selectedExchanges], () => {
   updateChart()
 })
 
@@ -240,12 +285,6 @@ onBeforeUnmount(() => {
         <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDays(30)">30天</el-button>
         <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDays(90)">90天</el-button>
       </el-button-group>
-      <el-select v-model="selectedMetric" size="small" style="width: 140px">
-        <el-option label="总资产" value="equity_usdt" />
-        <el-option label="可用资金" value="available_usdt" />
-        <el-option label="已实现盈亏" value="realized_pnl_usdt" />
-        <el-option label="综合盈亏" value="total_pnl_usdt" />
-      </el-select>
       <el-button size="small" :loading="loading" @click="fetchCapital">刷新</el-button>
     </div>
 
@@ -281,7 +320,19 @@ onBeforeUnmount(() => {
           </strong>
         </div>
         <div class="metric-row">
-          <span>综合盈亏</span>
+          <span>资金费收益</span>
+          <strong :class="Number(latestByExchange[exchange]?.funding_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+            {{ formatAmount(latestByExchange[exchange]?.funding_pnl_usdt) }}
+          </strong>
+        </div>
+        <div class="metric-row">
+          <span>手续费成本</span>
+          <strong :class="Number(latestByExchange[exchange]?.fee_cost_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+            {{ formatAmount(latestByExchange[exchange]?.fee_cost_usdt) }}
+          </strong>
+        </div>
+        <div class="metric-row">
+          <span>净已实现收益</span>
           <strong :class="Number(latestByExchange[exchange]?.total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.total_pnl_usdt) }}
           </strong>
@@ -291,7 +342,7 @@ onBeforeUnmount(() => {
 
     <div class="chart-panel">
       <div class="chart-header">
-        <span>{{ metricLabel }}趋势</span>
+        <span>资金趋势</span>
         <el-checkbox-group
           v-model="selectedExchanges"
           size="small"
@@ -301,6 +352,22 @@ onBeforeUnmount(() => {
           <el-checkbox-button label="binance">binance</el-checkbox-button>
           <el-checkbox-button label="gate">gate</el-checkbox-button>
           <el-checkbox-button label="total">合计</el-checkbox-button>
+        </el-checkbox-group>
+      </div>
+      <div class="metric-selector-row">
+        <el-checkbox-group
+          v-model="selectedMetrics"
+          size="small"
+          class="metric-selector"
+          @change="onMetricChange"
+        >
+          <el-checkbox-button
+            v-for="metric in metricOptions"
+            :key="metric.key"
+            :label="metric.key"
+          >
+            {{ metric.label }}
+          </el-checkbox-button>
         </el-checkbox-group>
       </div>
       <div class="chart-wrap">
@@ -385,23 +452,17 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
 }
 
-.legend {
+.metric-selector-row {
   display: flex;
-  gap: 12px;
-  font-size: 12px;
-  color: var(--app-text-muted);
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 
-.legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.legend-item i {
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
+.exchange-selector,
+.metric-selector {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .chart-wrap {
@@ -430,6 +491,18 @@ onBeforeUnmount(() => {
 @media (max-width: 900px) {
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .chart-header,
+  .metric-selector-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .exchange-selector,
+  .metric-selector {
+    justify-content: flex-start;
   }
 }
 </style>

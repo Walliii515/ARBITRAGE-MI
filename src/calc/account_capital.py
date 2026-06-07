@@ -2,8 +2,9 @@
 """
 真实账户资金快照。
 
-按分钟级频率读取 Binance 现货和 Gate 永续账户资金，汇总本地已实现盈亏、
-资金费和手续费，写入 mi_capital_snapshot；开仓逻辑读取最新缓存即可。
+按分钟级频率读取 Binance 现货和 Gate 永续账户资金，并从交易所账务/成交
+流水聚合已实现收益、资金费和手续费，写入 mi_capital_snapshot；开仓逻辑
+读取最新缓存即可。
 """
 import json
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ logger = get_logger(__name__)
 @dataclass
 class AccountCapitalConfig:
     retention_days: int = 30
+    pnl_lookback_days: int = 90
 
 
 def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
@@ -38,6 +40,7 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
         executor,
         AccountCapitalConfig(
             retention_days=config.get_int('account_capital.retention_days', 30),
+            pnl_lookback_days=config.get_int('account_capital.pnl_lookback_days', 90),
         ),
     )
 
@@ -51,7 +54,7 @@ class AccountCapitalSnapshotter:
 
     def run_once(self) -> Dict:
         snapshot_at = datetime.now()
-        pnl = self._load_local_pnl_summary()
+        pnl = self._load_exchange_pnl_summary(snapshot_at)
         binance = self._build_binance_row(snapshot_at, pnl)
         gate = self._build_gate_row(snapshot_at, pnl)
         total = self._build_total_row(snapshot_at, binance, gate, pnl)
@@ -142,11 +145,17 @@ class AccountCapitalSnapshotter:
             'position_value_usdt': spot_value,
             'margin_used_usdt': 0.0,
             'unrealized_pnl_usdt': 0.0,
-            'realized_pnl_usdt': pnl['binance_realized_pnl'],
+            'realized_pnl_usdt': 0.0,
             'funding_pnl_usdt': 0.0,
             'fee_cost_usdt': pnl['binance_fee_cost'],
-            'total_pnl_usdt': pnl['binance_realized_pnl'] + pnl['binance_fee_cost'],
-            'detail': {'balances': balances, 'prices': prices},
+            'total_pnl_usdt': pnl['binance_fee_cost'],
+            'detail': {
+                'source': 'exchange_api',
+                'balances': balances,
+                'prices': prices,
+                'pnl_window': pnl.get('window'),
+                'note': 'Binance spot does not expose a single realized PnL field; fees are aggregated from myTrades.',
+            },
         }
 
     def _build_gate_row(self, snapshot_at: datetime, pnl: Dict) -> Dict:
@@ -173,7 +182,12 @@ class AccountCapitalSnapshotter:
             'funding_pnl_usdt': pnl['funding_pnl'],
             'fee_cost_usdt': pnl['gate_fee_cost'],
             'total_pnl_usdt': pnl['gate_realized_pnl'] + pnl['funding_pnl'] + pnl['gate_fee_cost'],
-            'detail': account,
+            'detail': {
+                'source': 'exchange_api',
+                'account': account,
+                'pnl_window': pnl.get('window'),
+                'gate_account_book_types': pnl.get('gate_account_book_types'),
+            },
         }
 
     def _build_total_row(self, snapshot_at: datetime, binance: Dict, gate: Dict, pnl: Dict) -> Dict:
@@ -190,56 +204,117 @@ class AccountCapitalSnapshotter:
             'funding_pnl_usdt': pnl['funding_pnl'],
             'fee_cost_usdt': pnl['fee_cost'],
             'total_pnl_usdt': pnl['total_pnl'],
-            'detail': {'source': 'binance+gate'},
+            'detail': {
+                'source': 'exchange_api',
+                'components': 'binance account/myTrades + gate futures accounts/account_book',
+                'pnl_window': pnl.get('window'),
+            },
         }
 
-    def _load_local_pnl_summary(self) -> Dict:
-        fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
-        fee_spot_close = config.get_float('trade.fee.spot_close', 0.00075)
-        fee_future_open = config.get_float('trade.fee.future_open', 0.0005)
-        fee_future_close = config.get_float('trade.fee.future_close', 0.0005)
+    def _load_exchange_pnl_summary(self, snapshot_at: datetime) -> Dict:
+        start_at = snapshot_at - timedelta(days=max(int(self.cfg.pnl_lookback_days or 1), 1))
+        start_sec = int(start_at.timestamp())
+        end_sec = int(snapshot_at.timestamp())
+        gate_summary = self._load_gate_account_book_summary(start_sec, end_sec)
+        binance_fee = self._load_binance_trade_fee_summary(start_at)
+        fee_cost = gate_summary['fee_cost'] + binance_fee
+        realized_pnl = gate_summary['realized_pnl']
+        funding_pnl = gate_summary['funding_pnl']
+        return {
+            'binance_realized_pnl': 0.0,
+            'gate_realized_pnl': realized_pnl,
+            'realized_pnl': realized_pnl,
+            'funding_pnl': funding_pnl,
+            'binance_fee_cost': binance_fee,
+            'gate_fee_cost': gate_summary['fee_cost'],
+            'fee_cost': fee_cost,
+            'total_pnl': realized_pnl + funding_pnl + fee_cost,
+            'gate_account_book_types': gate_summary['types'],
+            'window': {
+                'from': start_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'to': snapshot_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'lookback_days': self.cfg.pnl_lookback_days,
+            },
+        }
+
+    def _load_gate_account_book_summary(self, start_sec: int, end_sec: int) -> Dict:
+        rows = self.executor.fetch_gate_futures_account_book(start_sec, end_sec)
+        realized = funding = fee = 0.0
+        type_totals: Dict[str, float] = {}
+        for row in rows:
+            row_type = str(row.get('type') or row.get('ctype') or '').lower()
+            change = _first_float(row, ['change', 'amount', 'delta', 'value'])
+            type_totals[row_type or 'unknown'] = type_totals.get(row_type or 'unknown', 0.0) + change
+            if _is_gate_funding_type(row_type):
+                funding += change
+            elif _is_gate_fee_type(row_type):
+                fee += change
+            elif _is_gate_realized_pnl_type(row_type):
+                realized += change
+        return {
+            'realized_pnl': realized,
+            'funding_pnl': funding,
+            'fee_cost': fee,
+            'types': type_totals,
+        }
+
+    def _load_binance_trade_fee_summary(self, start_at: datetime) -> float:
         sql = """
-            SELECT *
+            SELECT DISTINCT base_asset
             FROM mi_trade_position
             WHERE status IN ('holding', 'closed')
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
-            positions = cursor.fetchall()
+            assets = [str(row.get('base_asset') or '').upper() for row in cursor.fetchall()]
 
-        binance_realized = gate_realized = funding = 0.0
-        binance_fee = gate_fee = 0.0
-        for pos in positions:
-            spot_open_amount = _float(pos.get('spot_open_amount'))
-            future_open_amount = _float(pos.get('future_open_amount'))
-            if not future_open_amount:
-                future_open_amount = _float(pos.get('future_open_qty')) * _float(pos.get('future_open_price'))
-            binance_fee += spot_open_amount * fee_spot_open
-            gate_fee += future_open_amount * fee_future_open
-            funding += _float(pos.get('funding_total_pnl'))
-            if pos.get('status') == 'closed':
-                spot_close_amount = _float(pos.get('spot_close_amount'))
-                future_qty = _float(pos.get('future_open_qty'))
-                future_open_price = _float(pos.get('future_open_price'))
-                future_close_price = _float(pos.get('future_close_price'))
-                future_close_amount = _float(pos.get('future_close_amount'))
-                if not future_close_amount:
-                    future_close_amount = future_qty * future_close_price
-                binance_realized += spot_close_amount - spot_open_amount
-                gate_realized += future_qty * (future_open_price - future_close_price)
-                binance_fee += spot_close_amount * fee_spot_close
-                gate_fee += future_close_amount * fee_future_close
-        fee_cost = -(binance_fee + gate_fee)
-        return {
-            'binance_realized_pnl': binance_realized,
-            'gate_realized_pnl': gate_realized,
-            'realized_pnl': binance_realized + gate_realized,
-            'funding_pnl': funding,
-            'binance_fee_cost': -binance_fee,
-            'gate_fee_cost': -gate_fee,
-            'fee_cost': fee_cost,
-            'total_pnl': binance_realized + gate_realized + funding + fee_cost,
-        }
+        assets = sorted({asset for asset in assets if asset})
+        if not assets:
+            return 0.0
+
+        start_ms = int(start_at.timestamp() * 1000)
+        bnb_fee = 0.0
+        fee_usdt = 0.0
+        fee_by_asset: Dict[str, float] = {}
+        for asset in assets:
+            symbol = f'{asset}USDT'
+            try:
+                trades = self.executor.fetch_binance_my_trades(symbol, start_ms)
+            except Exception as e:
+                logger.warning(f"Binance myTrades fee fetch failed | {symbol} | {e}")
+                continue
+            for trade in trades:
+                fee_asset = str(trade.get('commissionAsset') or '').upper()
+                fee = _float(trade.get('commission'))
+                if not fee_asset or not fee:
+                    continue
+                if fee_asset == 'USDT':
+                    fee_usdt += fee
+                elif fee_asset == asset:
+                    fee_usdt += fee * _float(trade.get('price'))
+                elif fee_asset == 'BNB':
+                    bnb_fee += fee
+                else:
+                    fee_by_asset[fee_asset] = fee_by_asset.get(fee_asset, 0.0) + fee
+
+        if bnb_fee:
+            fee_by_asset['BNB'] = fee_by_asset.get('BNB', 0.0) + bnb_fee
+        return -(fee_usdt + self._convert_fee_assets_to_usdt(fee_by_asset))
+
+    def _convert_fee_assets_to_usdt(self, fee_by_asset: Dict[str, float]) -> float:
+        total = 0.0
+        non_usdt_assets = [asset for asset in fee_by_asset if asset != 'USDT']
+        prices = self.executor.fetch_binance_ticker_prices(non_usdt_assets)
+        for asset, fee in fee_by_asset.items():
+            if asset == 'USDT':
+                total += fee
+            else:
+                price = float(prices.get(asset) or 0)
+                if price <= 0:
+                    logger.warning(f"Missing Binance fee asset price for capital snapshot | asset={asset}")
+                    continue
+                total += fee * price
+        return total
 
     def _insert_rows(self, rows: List[Dict]):
         sql = """
@@ -271,6 +346,25 @@ def _float(value) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _first_float(row: Dict, keys: List[str]) -> float:
+    for key in keys:
+        if key in row:
+            return _float(row.get(key))
+    return 0.0
+
+
+def _is_gate_funding_type(row_type: str) -> bool:
+    return row_type in {'fund', 'funding', 'funding_fee'}
+
+
+def _is_gate_fee_type(row_type: str) -> bool:
+    return row_type in {'fee', 'trade_fee', 'order_fee'}
+
+
+def _is_gate_realized_pnl_type(row_type: str) -> bool:
+    return row_type in {'pnl', 'realized_pnl', 'realised_pnl'}
 
 
 def _serialize_capital_row(row: Dict) -> Dict:

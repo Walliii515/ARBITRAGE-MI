@@ -486,7 +486,12 @@ async def get_capital_latest():
     sql = """
         SELECT *
         FROM mi_capital_snapshot
-        WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM mi_capital_snapshot)
+        WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
+          AND snapshot_at = (
+              SELECT MAX(snapshot_at)
+              FROM mi_capital_snapshot
+              WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
+          )
         ORDER BY FIELD(exchange, 'binance', 'gate', 'total')
     """
     with db_manager.get_cursor() as cursor:
@@ -503,6 +508,7 @@ async def get_capital_history(
     """返回资金历史曲线数据。"""
     where = ["snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
     params: List[Any] = [days]
+    where.append("JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'")
     if exchange in ('binance', 'gate', 'total'):
         where.append("exchange = %s")
         params.append(exchange)
