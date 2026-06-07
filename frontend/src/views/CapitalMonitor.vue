@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import * as echarts from 'echarts'
+import type { ECharts, EChartsOption } from 'echarts'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
 
@@ -25,6 +27,9 @@ const loading = ref(false)
 const running = ref(false)
 const filterDays = ref(7)
 const selectedMetric = ref<'equity_usdt' | 'available_usdt' | 'total_pnl_usdt'>('equity_usdt')
+const chartRef = ref<HTMLDivElement | null>(null)
+let chart: ECharts | null = null
+let resizeObserver: ResizeObserver | null = null
 
 const latestByExchange = computed(() => {
   const result: Record<string, CapitalRow | undefined> = {}
@@ -55,35 +60,103 @@ const chartSeries = computed(() => {
   })
 })
 
-const chartPathData = computed(() => {
-  const width = 920
-  const height = 300
-  const padX = 48
-  const padY = 28
-  const allPoints = chartSeries.value.flatMap((s) => s.points)
-  if (!allPoints.length) return []
-  const times = allPoints.map((p) => new Date(p.time).getTime()).filter(Number.isFinite)
-  const values = allPoints.map((p) => p.value).filter(Number.isFinite)
-  const minTime = Math.min(...times)
-  const maxTime = Math.max(...times)
-  const minVal = Math.min(...values)
-  const maxVal = Math.max(...values)
-  const timeRange = Math.max(1, maxTime - minTime)
-  const valueRange = Math.max(1, maxVal - minVal)
-  return chartSeries.value.map((series) => {
-    const d = series.points.map((point, index) => {
-      const t = new Date(point.time).getTime()
-      const x = padX + ((t - minTime) / timeRange) * (width - padX * 2)
-      const y = height - padY - ((point.value - minVal) / valueRange) * (height - padY * 2)
-      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`
-    }).join(' ')
-    return { ...series, d }
-  })
-})
-
 function formatAmount(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+function exchangeLabel(exchange: string): string {
+  return exchange === 'total' ? '合计' : exchange
+}
+
+function formatTooltipTime(value: unknown): string {
+  const date = new Date(String(value))
+  if (!Number.isFinite(date.getTime())) return String(value ?? '-')
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function buildChartOption(): EChartsOption {
+  const textColor = getComputedStyle(document.documentElement)
+    .getPropertyValue('--app-text')
+    .trim() || '#303133'
+  const mutedColor = getComputedStyle(document.documentElement)
+    .getPropertyValue('--app-text-muted')
+    .trim() || '#909399'
+  const borderColor = getComputedStyle(document.documentElement)
+    .getPropertyValue('--app-border')
+    .trim() || '#dcdfe6'
+  const surfaceColor = getComputedStyle(document.documentElement)
+    .getPropertyValue('--app-surface')
+    .trim() || '#ffffff'
+
+  return {
+    color: chartSeries.value.map((series) => series.color),
+    animation: false,
+    grid: { top: 28, right: 28, bottom: 48, left: 72 },
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      backgroundColor: surfaceColor,
+      borderColor,
+      textStyle: { color: textColor },
+      valueFormatter: (value) => `${formatAmount(Number(value))} USDT`,
+      axisPointer: { type: 'cross', label: { backgroundColor: '#606266' } },
+      formatter: (params) => {
+        const items: any[] = Array.isArray(params) ? params : [params]
+        const title = formatTooltipTime(items[0]?.axisValue)
+        const rows = items.map((item: any) => {
+          const value = Array.isArray(item.value) ? item.value[1] : item.value
+          return `${item.marker}${item.seriesName}: ${formatAmount(Number(value))} USDT`
+        })
+        return [title, ...rows].join('<br/>')
+      },
+    },
+    xAxis: {
+      type: 'time',
+      axisLine: { lineStyle: { color: borderColor } },
+      axisTick: { show: false },
+      axisLabel: { color: mutedColor },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      axisLabel: {
+        color: mutedColor,
+        formatter: (value: number) => formatAmount(value),
+      },
+      splitLine: { lineStyle: { color: borderColor, type: 'dashed' } },
+    },
+    series: chartSeries.value.map((series) => ({
+      name: exchangeLabel(series.exchange),
+      type: 'line',
+      smooth: true,
+      showSymbol: false,
+      symbolSize: 7,
+      emphasis: { focus: 'series' },
+      data: series.points.map((point) => [point.time, point.value]),
+      lineStyle: { width: 2.2 },
+    })),
+  }
+}
+
+function updateChart() {
+  if (!chart) return
+  chart.setOption(buildChartOption(), true)
+}
+
+async function initChart() {
+  await nextTick()
+  if (!chartRef.value) return
+  chart = echarts.init(chartRef.value)
+  updateChart()
+  resizeObserver = new ResizeObserver(() => chart?.resize())
+  resizeObserver.observe(chartRef.value)
 }
 
 async function fetchCapital() {
@@ -128,7 +201,21 @@ function setDays(days: number) {
   fetchCapital()
 }
 
-onMounted(fetchCapital)
+onMounted(async () => {
+  await fetchCapital()
+  await initChart()
+})
+
+watch([historyRows, selectedMetric], () => {
+  updateChart()
+})
+
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  chart?.dispose()
+  chart = null
+})
 </script>
 
 <template>
@@ -196,25 +283,13 @@ onMounted(fetchCapital)
         <span>{{ metricLabel }}趋势</span>
         <div class="legend">
           <span v-for="series in chartSeries" :key="series.exchange" class="legend-item">
-            <i :style="{ backgroundColor: series.color }"></i>{{ series.exchange === 'total' ? '合计' : series.exchange }}
+            <i :style="{ backgroundColor: series.color }"></i>{{ exchangeLabel(series.exchange) }}
           </span>
         </div>
       </div>
       <div class="chart-wrap">
-        <svg viewBox="0 0 920 300" role="img">
-          <line x1="48" y1="272" x2="872" y2="272" class="axis" />
-          <line x1="48" y1="28" x2="48" y2="272" class="axis" />
-          <path
-            v-for="series in chartPathData"
-            :key="series.exchange"
-            :d="series.d"
-            :stroke="series.color"
-            class="chart-line"
-          />
-          <text v-if="!historyRows.length" x="460" y="150" text-anchor="middle" class="empty-text">
-            暂无资金快照
-          </text>
-        </svg>
+        <div ref="chartRef" class="echarts-chart"></div>
+        <div v-if="!historyRows.length" class="empty-text">暂无资金快照</div>
       </div>
     </div>
   </div>
@@ -314,28 +389,25 @@ onMounted(fetchCapital)
 }
 
 .chart-wrap {
+  position: relative;
   width: 100%;
   overflow-x: auto;
 }
 
-svg {
+.echarts-chart {
   width: 100%;
   min-width: 720px;
   height: 320px;
 }
 
-.axis {
-  stroke: var(--app-border);
-  stroke-width: 1;
-}
-
-.chart-line {
-  fill: none;
-  stroke-width: 2.2;
-}
-
 .empty-text {
-  fill: var(--app-text-muted);
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  color: var(--app-text-muted);
   font-size: 13px;
 }
 

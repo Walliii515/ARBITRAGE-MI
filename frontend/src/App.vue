@@ -185,13 +185,13 @@ function toggleMenu() {
           <el-icon><TrendCharts /></el-icon>
           <template #title>资金监控</template>
         </el-menu-item>
-        <el-menu-item index="/connections">
-          <el-icon><Connection /></el-icon>
-          <template #title>连接状态</template>
-        </el-menu-item>
         <el-menu-item index="/reconciliation">
           <el-icon><DataAnalysis /></el-icon>
           <template #title>持仓对账</template>
+        </el-menu-item>
+        <el-menu-item index="/connections">
+          <el-icon><Connection /></el-icon>
+          <template #title>连接状态</template>
         </el-menu-item>
         <el-sub-menu index="settings">
           <template #title>
