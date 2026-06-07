@@ -100,6 +100,8 @@ SPOT_OPEN_FEE = config.get_float('trade.fee.spot_open', 0.00075)
 SPOT_CLOSE_FEE = config.get_float('trade.fee.spot_close', 0.00075)
 FUTURE_OPEN_FEE = config.get_float('trade.fee.future_open', 0.00075)
 FUTURE_CLOSE_FEE = config.get_float('trade.fee.future_close', 0.00075)
+FUTURE_TAKER_OPEN_FEE = config.get_float('trade.fee.future_taker_open', FUTURE_OPEN_FEE)
+FUTURE_TAKER_CLOSE_FEE = config.get_float('trade.fee.future_taker_close', FUTURE_CLOSE_FEE)
 
 # 富化配置实例（快照推送、开仓检查共用）
 _enrich_cfg = EnrichConfig(
@@ -128,6 +130,8 @@ _pnl_cfg = PnlConfig(
     spot_close_fee=SPOT_CLOSE_FEE,
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
+    future_taker_open_fee=FUTURE_TAKER_OPEN_FEE,
+    future_taker_close_fee=FUTURE_TAKER_CLOSE_FEE,
     risk_relief_bps=RISK_RELIEF_BPS,
     margin_leverage=config.get_float('margin.leverage', 2.0),
     margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
@@ -980,6 +984,14 @@ def _run_open_position_check_once():
                 fee_spot_close=config.get_float('trade.fee.spot_close', 0.00075),
                 fee_future_open=config.get_float('trade.fee.future_open', 0.00075),
                 fee_future_close=config.get_float('trade.fee.future_close', 0.00075),
+                fee_future_taker_open=config.get_float(
+                    'trade.fee.future_taker_open',
+                    config.get_float('trade.fee.future_open', 0.00075),
+                ),
+                fee_future_taker_close=config.get_float(
+                    'trade.fee.future_taker_close',
+                    config.get_float('trade.fee.future_close', 0.00075),
+                ),
                 close_threshold_percentile=config.get_str('trade.vwap.close_threshold_percentile', 'close_basis_p20').strip(),
                 min_spot_volume_24h_usdt=config.get_float('trade.filter.min_spot_volume_24h_usdt', 0),
                 min_future_volume_24h_usdt=config.get_float('trade.filter.min_future_volume_24h_usdt', 0),

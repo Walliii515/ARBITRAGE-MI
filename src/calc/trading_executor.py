@@ -22,6 +22,7 @@ from calc.orderbook_resiliency import (
     ResiliencyConfig,
 )
 from calc.execution_audit import format_execution_audit
+from calc.order_fee_resolver import build_order_execution_fields
 from exchange_apis.get_gate_future_contracts import get_single_contract_funding_info
 
 REBOUND_STRONG_TRIGGER = 'rebound_strong'
@@ -52,6 +53,8 @@ class TradingExecutorConfig:
     fee_spot_close: float = 0.00075
     fee_future_open: float = 0.00075
     fee_future_close: float = 0.00075
+    fee_future_taker_open: float = 0.00075
+    fee_future_taker_close: float = 0.00075
 
     # ─── VWAP基差阈值 ───
     close_threshold_percentile: str = 'close_basis_p20'
@@ -189,7 +192,11 @@ class TradingExecutor:
         )
         # 单纯开仓费率（用于持久化计算边际基差）
         self._fee_spot_open = cfg.fee_spot_open
+        self._fee_spot_close = cfg.fee_spot_close
         self._fee_future_open = cfg.fee_future_open
+        self._fee_future_close = cfg.fee_future_close
+        self._fee_future_taker_open = cfg.fee_future_taker_open
+        self._fee_future_taker_close = cfg.fee_future_taker_close
         self._risk_relief_bps = cfg.risk_relief_bps
 
         # 平仓基差分位字段名（旧盈利性守卫仍使用）
@@ -2212,13 +2219,10 @@ class TradingExecutor:
 
     def _actual_future_open_fee(self, base_asset: Optional[str], exec_result: Dict) -> float:
         maker = (exec_result.get('execution_stats') or {}).get('future_maker') or {}
-        meta = self.contract_meta.get(str(base_asset or '').upper(), {})
         if maker.get('fallback_filled'):
-            value = meta.get('taker_fee_rate')
-            return float(value) if value is not None else self._fee_future_open
+            return self._fee_future_taker_open
         if maker.get('filled'):
-            value = meta.get('maker_fee_rate')
-            return float(value) if value is not None else self._fee_future_open
+            return self._fee_future_open
         return self._fee_future_open
 
     def _save_orders(self, order_group: Dict, exec_result: Dict):
@@ -2236,14 +2240,16 @@ class TradingExecutor:
                 trade_direction, status, channel, reject_reason, target_qty, target_amount,
                 exec_price, exec_qty, exec_amount, coverage_ratio,
                 open_coverage, open_vwap_basis_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps,
-                risk_relief_bps, open_marginal_basis_bps, funding_rate_24h, executed_at
+                risk_relief_bps, open_marginal_basis_bps, funding_rate_24h,
+                liquidity_role, fee_rate, fee_amount, fee_asset, exchange_order_id, executed_at
             ) VALUES (
                 %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 %(order_side)s, %(market_type)s, %(trade_direction)s, %(status)s, %(channel)s,
                 %(reject_reason)s, %(target_qty)s, %(target_amount)s,
                 %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
                 %(open_coverage)s, %(open_vwap_basis_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s,
-                %(risk_relief_bps)s, %(open_marginal_basis_bps)s, %(funding_rate_24h)s, %(executed_at)s
+                %(risk_relief_bps)s, %(open_marginal_basis_bps)s, %(funding_rate_24h)s,
+                %(liquidity_role)s, %(fee_rate)s, %(fee_amount)s, %(fee_asset)s, %(exchange_order_id)s, %(executed_at)s
             )
         """
         
@@ -2276,6 +2282,18 @@ class TradingExecutor:
                 order['exec_qty'] = exec_data['exec_qty']
                 order['exec_amount'] = exec_data['exec_amount']
                 order['coverage_ratio'] = exec_data.get('coverage_ratio')
+                order.update(build_order_execution_fields(
+                    market_key,
+                    order,
+                    exec_data,
+                    exec_result,
+                    spot_open_fee=self._fee_spot_open,
+                    spot_close_fee=self._fee_spot_close,
+                    future_open_fee=self._fee_future_open,
+                    future_close_fee=self._fee_future_close,
+                    future_taker_open_fee=self._fee_future_taker_open,
+                    future_taker_close_fee=self._fee_future_taker_close,
+                ))
                 # 开仓成功时，将开仓原因写入reject_reason供前端复盘查看
                 order['reject_reason'] = order_group.get('open_reason')
                 order['executed_at'] = datetime.now()
@@ -2286,6 +2304,11 @@ class TradingExecutor:
                 order['exec_qty'] = None
                 order['exec_amount'] = None
                 order['coverage_ratio'] = None
+                order['liquidity_role'] = None
+                order['fee_rate'] = None
+                order['fee_amount'] = None
+                order['fee_asset'] = None
+                order['exchange_order_id'] = None
                 order['executed_at'] = None
             
             with db_manager.get_cursor() as cursor:

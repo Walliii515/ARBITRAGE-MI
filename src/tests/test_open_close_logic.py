@@ -858,6 +858,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         te._fee_spot_open = 0.00075
         te._fee_future_open = 0.0002
+        te._fee_future_taker_open = 0.0005
         te._risk_relief_bps = 10
         order_group = {
             'base_asset': 'BANK',
@@ -881,7 +882,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te._attach_actual_basis_audit(order_group, exec_result)
 
         self.assertAlmostEqual(order_group['actual_basis_bps'], 20.0)
-        self.assertAlmostEqual(order_group['open_marginal_basis_bps'], 15.0)
+        self.assertAlmostEqual(order_group['open_marginal_basis_bps'], 17.5)
 
     def test_open_marginal_basis_uses_contract_maker_fee_when_maker_fills(self):
         te = make_trading_executor(
@@ -890,6 +891,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         te._fee_spot_open = 0.00075
         te._fee_future_open = 0.0002
+        te._fee_future_taker_open = 0.0005
         te._risk_relief_bps = 10
         order_group = {
             'base_asset': 'BANK',
@@ -913,7 +915,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te._attach_actual_basis_audit(order_group, exec_result)
 
         self.assertAlmostEqual(order_group['actual_basis_bps'], 20.0)
-        self.assertAlmostEqual(order_group['open_marginal_basis_bps'], 23.5)
+        self.assertAlmostEqual(order_group['open_marginal_basis_bps'], 20.5)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1720,7 +1722,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
             'open_spread_bps': 0.0,
             'funding_total_pnl': 0,
             'margin_topup_total': 0.0,
-            'open_reason': '执行(future_maker=Y,filled=N,fallback=Y,fallback_filled=Y)',
+            'future_open_fee_rate': 0.0005,
         }]
         cfg = PnlConfig(
             open_amount_usdt=100.0,
@@ -1728,6 +1730,8 @@ class TestMarginTopupCalculation(unittest.TestCase):
             spot_close_fee=0.00075,
             future_open_fee=0.0002,
             future_close_fee=0.0002,
+            future_taker_open_fee=0.0005,
+            future_taker_close_fee=0.0005,
             risk_relief_bps=0,
             margin_leverage=2.0,
             margin_default_mmr=0.005,
@@ -1740,8 +1744,8 @@ class TestMarginTopupCalculation(unittest.TestCase):
             cfg,
         )
 
-        self.assertAlmostEqual(positions[0]['fee_bps'], -15.0)
-        self.assertAlmostEqual(positions[0]['fee_cost'], -0.15)
+        self.assertAlmostEqual(positions[0]['fee_bps'], -12.5)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.125)
 
     def test_holding_fee_uses_future_maker_when_maker_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -1756,7 +1760,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
             'open_spread_bps': 0.0,
             'funding_total_pnl': 0,
             'margin_topup_total': 0.0,
-            'open_reason': '执行(future_maker=Y,filled=Y,fallback=N,fallback_filled=N)',
+            'future_open_fee_rate': 0.0002,
         }]
         cfg = PnlConfig(
             open_amount_usdt=100.0,
@@ -1764,6 +1768,8 @@ class TestMarginTopupCalculation(unittest.TestCase):
             spot_close_fee=0.00075,
             future_open_fee=0.0002,
             future_close_fee=0.0002,
+            future_taker_open_fee=0.0005,
+            future_taker_close_fee=0.0005,
             risk_relief_bps=0,
             margin_leverage=2.0,
             margin_default_mmr=0.005,
@@ -1776,8 +1782,8 @@ class TestMarginTopupCalculation(unittest.TestCase):
             cfg,
         )
 
-        self.assertAlmostEqual(positions[0]['fee_bps'], -6.5)
-        self.assertAlmostEqual(positions[0]['fee_cost'], -0.065)
+        self.assertAlmostEqual(positions[0]['fee_bps'], -9.5)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.095)
 
 
 # ══════════════════════════════════════════════════════════════════

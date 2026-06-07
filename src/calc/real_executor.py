@@ -402,9 +402,14 @@ class RealExecutor:
         base_asset = symbol.replace('USDT', '') if symbol.endswith('USDT') else symbol
         fills = data.get('fills', [])
         commission_in_base = 0.0
+        commission_by_asset = {}
         for fill in fills:
-            if fill.get('commissionAsset', '') == base_asset:
-                commission_in_base += float(fill.get('commission', 0))
+            fee_asset = fill.get('commissionAsset', '')
+            commission = float(fill.get('commission', 0))
+            if fee_asset == base_asset:
+                commission_in_base += commission
+            if fee_asset:
+                commission_by_asset[fee_asset] = commission_by_asset.get(fee_asset, 0.0) + commission
 
         # 实际可用数量 = 成交量 - 手续费
         net_qty = exec_qty - commission_in_base
@@ -417,6 +422,11 @@ class RealExecutor:
                 f"net_qty={net_qty}"
             )
 
+        fee_asset = None
+        fee_amount = None
+        if len(commission_by_asset) == 1:
+            fee_asset, fee_amount = next(iter(commission_by_asset.items()))
+
         return {
             'success': True,
             'exec_price': exec_price,
@@ -424,6 +434,8 @@ class RealExecutor:
             'exec_amount': exec_amount,
             'coverage_ratio': 0,  # 实盘无覆盖率概念
             'exchange_order_id': str(data.get('orderId', '')),
+            'fee_amount': fee_amount,
+            'fee_asset': fee_asset,
         }
 
     def _binance_sign(self, query_string: str) -> str:
@@ -823,6 +835,7 @@ class RealExecutor:
                          f"finish_as={data.get('finish_as', 'unknown')}"
             }
 
+        fee_amount = data.get('fee')
         return {
             'success': True,
             'exec_price': exec_price,
@@ -830,6 +843,8 @@ class RealExecutor:
             'exec_amount': exec_amount,
             'coverage_ratio': 0,
             'exchange_order_id': str(data.get('id', '')),
+            'fee_amount': float(fee_amount) if fee_amount not in (None, '') else None,
+            'fee_asset': 'USDT' if fee_amount not in (None, '') else None,
         }
 
     def _gate_sign(self, method: str, api_path: str, query_string: str, body: str) -> Dict:

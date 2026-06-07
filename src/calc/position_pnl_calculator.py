@@ -5,9 +5,9 @@
 计算持仓实时盈亏（浮动盈亏、已实现盈亏、总盈亏），与推送逻辑解耦。
 """
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from calc.orderbook_enricher import calc_vwap_basis_bps, calc_open_fee_bps, calc_full_fee_bps
+from calc.orderbook_enricher import calc_vwap_basis_bps
 
 
 @dataclass
@@ -19,6 +19,8 @@ class PnlConfig:
     future_open_fee: float
     future_close_fee: float
     risk_relief_bps: float
+    future_taker_open_fee: float = 0.0005
+    future_taker_close_fee: float = 0.0005
     margin_leverage: float = 2.0
     margin_default_mmr: float = 0.005
 
@@ -49,46 +51,59 @@ def _format_dt(value) -> str | None:
     return str(value) if value else None
 
 
-def _fee_rate(meta: Dict, key: str, fallback: float) -> float:
-    value = meta.get(key)
-    if value is None:
-        return float(fallback or 0.0)
-    return float(value)
+def _float_or_none(value) -> Optional[float]:
+    if value is None or value == '':
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _future_fee_from_reason(
-    reason: str | None,
-    meta: Dict,
-    default_fee: float,
-    direct_taker_markers: tuple[str, ...] = (),
-) -> float:
-    """根据成交原因里的执行审计推导 Gate future 实际 maker/taker 费率。"""
-    text = reason or ''
-    maker_fee = _fee_rate(meta, 'maker_fee_rate', default_fee)
-    taker_fee = _fee_rate(meta, 'taker_fee_rate', default_fee)
-
-    if 'fallback_filled=Y' in text:
-        return taker_fee
-    if 'future_maker=Y' in text and 'filled=Y' in text:
-        return maker_fee
-    if any(marker in text for marker in direct_taker_markers):
-        return taker_fee
-    return float(default_fee or 0.0)
-
-
-def _position_fee_rates(pos: Dict, meta: Dict, cfg: PnlConfig) -> Tuple[float, float]:
-    future_open_fee = _future_fee_from_reason(
-        pos.get('open_reason'),
-        meta,
-        cfg.future_open_fee,
-    )
-    future_close_fee = _future_fee_from_reason(
-        pos.get('close_reason'),
-        meta,
-        cfg.future_close_fee,
-        direct_taker_markers=('保护IOC', '保证金风控', 'manual', '手动'),
-    )
+def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
+    future_open_fee = _float_or_none(pos.get('future_open_fee_rate'))
+    future_close_fee = _float_or_none(pos.get('future_close_fee_rate'))
+    if future_open_fee is None:
+        future_open_fee = cfg.future_open_fee
+    if future_close_fee is None:
+        future_close_fee = cfg.future_close_fee
     return future_open_fee, future_close_fee
+
+
+def _fee_cost_from_actual_or_rate(
+    actual_future_fee_amount: Optional[float],
+    estimated_spot_fee: float,
+    estimated_future_fee: float,
+    open_amount_usdt: float,
+) -> Tuple[float, float]:
+    future_fee_amount = (
+        float(actual_future_fee_amount)
+        if actual_future_fee_amount is not None
+        else estimated_future_fee * open_amount_usdt
+    )
+    total_fee_amount = estimated_spot_fee * open_amount_usdt + future_fee_amount
+    fee_bps = round(-total_fee_amount / open_amount_usdt * 10000, 2) if open_amount_usdt else 0.0
+    fee_cost = round(-total_fee_amount, 4)
+    return fee_bps, fee_cost
+
+
+def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float, float, float]:
+    future_open_fee, future_close_fee = _position_fee_rates(pos, cfg)
+    open_actual = _float_or_none(pos.get('future_open_fee_amount_usdt'))
+    close_actual = _float_or_none(pos.get('future_close_fee_amount_usdt'))
+    open_fee_bps, open_fee_cost = _fee_cost_from_actual_or_rate(
+        open_actual,
+        cfg.spot_open_fee,
+        future_open_fee,
+        cfg.open_amount_usdt,
+    )
+    close_fee_bps, close_fee_cost = _fee_cost_from_actual_or_rate(
+        close_actual,
+        cfg.spot_close_fee,
+        future_close_fee,
+        cfg.open_amount_usdt,
+    )
+    return open_fee_bps, open_fee_cost, round(open_fee_bps + close_fee_bps, 2), round(open_fee_cost + close_fee_cost, 4)
 
 
 def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
@@ -115,14 +130,7 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
 
         # 注入费率 (bps) - 根据状态区分：持仓中只显示开仓费，已平仓显示全部费
         c_meta = contract_meta.get(ba, {})
-        future_open_fee, future_close_fee = _position_fee_rates(pos, c_meta, cfg)
-        fee_bps_full = calc_full_fee_bps(
-            cfg.spot_open_fee,
-            cfg.spot_close_fee,
-            future_open_fee,
-            future_close_fee,
-        )
-        fee_bps_open = calc_open_fee_bps(cfg.spot_open_fee, future_open_fee)
+        fee_bps_open, fee_cost_open, fee_bps_full, fee_cost_full = _position_fee_bps_and_cost(pos, cfg)
         if pos.get('status') == 'closed':
             pos['fee_bps'] = fee_bps_full
         else:
@@ -163,8 +171,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             )
             pos['funding_pnl_bps'] = funding_pnl_bps
 
-            # 手续费金额 - 已平仓用全部手续费(30bps)
-            fee_cost_usdt = round(fee_bps_full / 10000 * cfg.open_amount_usdt, 4)
+            # 手续费金额 - 已平仓用全部手续费
+            fee_cost_usdt = fee_cost_full
             pos['fee_cost'] = fee_cost_usdt
 
             # 已实现盈亏 = 纯价差利润（开仓基差 - 平仓基差）
@@ -214,8 +222,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             )
             pos['funding_pnl_bps'] = funding_pnl_bps
 
-            # 手续费金额 - 持仓中只计开仓手续费(15bps)
-            fee_cost_usdt = round(fee_bps_open / 10000 * cfg.open_amount_usdt, 4)
+            # 手续费金额 - 持仓中只计开仓手续费
+            fee_cost_usdt = fee_cost_open
             pos['fee_cost'] = fee_cost_usdt
 
             # 已实现盈亏 = 0（持仓中尚无价差利润）

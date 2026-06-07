@@ -21,6 +21,7 @@ from common.logger import get_logger
 from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
+from calc.position_order_fees import attach_position_order_fee_summary
 
 logger = get_logger(__name__)
 
@@ -335,6 +336,7 @@ async def get_positions(
             })
         
         # 注入到每个持仓记录
+        attach_position_order_fee_summary(rows)
         serialized = _serialize_rows(rows)
         _inject_current_funding_fields(serialized)
         for row in serialized:

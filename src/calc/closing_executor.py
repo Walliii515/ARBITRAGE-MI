@@ -27,6 +27,7 @@ from calc.orderbook_resiliency import (
     ResiliencyConfig,
 )
 from calc.execution_audit import format_execution_audit
+from calc.order_fee_resolver import build_order_execution_fields
 
 logger = get_logger(__name__)
 
@@ -112,6 +113,8 @@ class ClosingExecutor:
         self.fee_spot_close = config.get_float('trade.fee.spot_close', 0.00075)
         self.fee_future_open = config.get_float('trade.fee.future_open', 0.00075)
         self.fee_future_close = config.get_float('trade.fee.future_close', 0.00075)
+        self.fee_future_taker_open = config.get_float('trade.fee.future_taker_open', self.fee_future_open)
+        self.fee_future_taker_close = config.get_float('trade.fee.future_taker_close', self.fee_future_close)
         # 全部手续费 BPS（正数，用于止盈阈值累加）
         self.fee_full_bps = -calc_full_fee_bps(
             self.fee_spot_open, self.fee_spot_close,
@@ -1502,7 +1505,8 @@ class ClosingExecutor:
                 reject_reason, target_qty, target_amount,
                 exec_price, exec_qty, exec_amount, coverage_ratio,
                 open_coverage, open_vwap_basis_bps, risk_relief_bps,
-                open_marginal_basis_bps, funding_rate_24h, executed_at
+                open_marginal_basis_bps, funding_rate_24h,
+                liquidity_role, fee_rate, fee_amount, fee_asset, exchange_order_id, executed_at
             ) VALUES (
                 %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s,
                 %(future_contract)s, %(order_side)s, %(market_type)s,
@@ -1510,7 +1514,8 @@ class ClosingExecutor:
                 %(reject_reason)s, %(target_qty)s, %(target_amount)s,
                 %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
                 %(open_coverage)s, %(open_vwap_basis_bps)s, %(risk_relief_bps)s,
-                %(open_marginal_basis_bps)s, %(funding_rate_24h)s, %(executed_at)s
+                %(open_marginal_basis_bps)s, %(funding_rate_24h)s,
+                %(liquidity_role)s, %(fee_rate)s, %(fee_amount)s, %(fee_asset)s, %(exchange_order_id)s, %(executed_at)s
             )
         """
 
@@ -1534,6 +1539,18 @@ class ClosingExecutor:
                 order['exec_qty'] = exec_data.get('exec_qty')
                 order['exec_amount'] = exec_data.get('exec_amount')
                 order['coverage_ratio'] = exec_data.get('coverage_ratio')
+                order.update(build_order_execution_fields(
+                    market_key,
+                    order,
+                    exec_data,
+                    exec_result,
+                    spot_open_fee=self.fee_spot_open,
+                    spot_close_fee=self.fee_spot_close,
+                    future_open_fee=self.fee_future_open,
+                    future_close_fee=self.fee_future_close,
+                    future_taker_open_fee=self.fee_future_taker_open,
+                    future_taker_close_fee=self.fee_future_taker_close,
+                ))
                 order['executed_at'] = datetime.now()
             else:
                 # 失败时写入拒单原因：触发原因 + 执行器拒绝消息
@@ -1544,6 +1561,11 @@ class ClosingExecutor:
                 order['exec_qty'] = None
                 order['exec_amount'] = None
                 order['coverage_ratio'] = None
+                order['liquidity_role'] = None
+                order['fee_rate'] = None
+                order['fee_amount'] = None
+                order['fee_asset'] = None
+                order['exchange_order_id'] = None
                 order['executed_at'] = None
 
             with db_manager.get_cursor() as cursor:

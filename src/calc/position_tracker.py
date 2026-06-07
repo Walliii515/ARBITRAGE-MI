@@ -9,6 +9,7 @@ from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
 from calc.orderbook_enricher import calc_vwap_basis_bps
+from calc.position_order_fees import attach_position_order_fee_summary
 
 logger = get_logger(__name__)
 
@@ -356,7 +357,7 @@ class PositionTracker:
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
-            return cursor.fetchall()
+            return attach_position_order_fee_summary(cursor.fetchall())
 
     def get_all_positions(self) -> List[Dict]:
         """获取全部持仓记录（含已平仓），用于实时推送"""
@@ -366,7 +367,7 @@ class PositionTracker:
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
-            return cursor.fetchall()
+            return attach_position_order_fee_summary(cursor.fetchall())
 
     def get_all_funding_histories(self) -> Dict[int, List[Dict]]:
         """
