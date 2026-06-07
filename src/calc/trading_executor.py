@@ -1011,13 +1011,19 @@ class TradingExecutor:
             state['rebound_floor_bps'] = floor_bps
 
         waited_sec = (now - state.get('rebound_start_time', now)).total_seconds()
+        rise_from_floor = current_basis_bps - floor_bps
+        slope_bps = current_basis_bps - last_basis
         if waited_sec > self.rebound_max_wait_sec:
             self._resolve_signal(
                 base_asset,
                 'monitor_timeout',
                 (
                     f'回弹等待{waited_sec:.1f}s未再突破('
-                    f'floor={floor_bps:.1f},current={current_basis_bps:.1f})'
+                    f'floor={floor_bps:.1f},current={current_basis_bps:.1f},'
+                    f'rise={rise_from_floor:.1f}/{self.rebound_min_rise_bps:.1f}bps,'
+                    f'slope={slope_bps:.1f}/{self.rebound_min_slope_bps:.1f}bps,'
+                    f'min_basis={min_basis:.1f},'
+                    f'entry_floor={entry_floor:.1f}+buffer={self.rebound_min_basis_buffer_bps:.1f})'
                 ),
                 exit_basis_bps=current_basis_bps,
                 trigger_type='rebound_timeout',
@@ -1027,12 +1033,13 @@ class TradingExecutor:
             self._start_rebound_timeout_cooldown(base_asset, current_basis_bps)
             logger.info(
                 f"回调后再突破超时放弃 | {base_asset} | "
-                f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | waited={waited_sec:.1f}s"
+                f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | "
+                f"rise={rise_from_floor:.2f}/{self.rebound_min_rise_bps:.1f}bps | "
+                f"slope={slope_bps:.2f}/{self.rebound_min_slope_bps:.1f}bps | "
+                f"min_basis={min_basis:.2f} | waited={waited_sec:.1f}s"
             )
             return False
 
-        rise_from_floor = current_basis_bps - floor_bps
-        slope_bps = current_basis_bps - last_basis
         state['rebound_last_basis_bps'] = current_basis_bps
 
         if (

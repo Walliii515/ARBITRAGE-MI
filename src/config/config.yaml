@@ -87,7 +87,7 @@ trade:
     allowed_tiers: [A, B]
     min_rise_bps: 4                         # 从回调低点至少回升多少 bps
     min_slope_bps: 0.5                      # 当前样本相对上一样本仍需向上
-    min_basis_buffer_bps: 4                 # 当前基差需至少高于 p20 的额外安全垫
+    min_basis_buffer_bps: 4                 # 当前基差需至少高于 entry_floor 的额外安全垫
     max_wait_sec: 4.0                       # 回调恢复后最多等待二次突破多久
 
   # ─── 下单前执行质量保护 ───
