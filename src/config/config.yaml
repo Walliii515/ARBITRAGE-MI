@@ -217,7 +217,8 @@ trade:
 
   # ─── 持仓管理 ───
   position:
-    funding_update_sec: 3600                # 资金费更新间隔（秒）
+    funding_update_sec: 3600                # 资金费更新兜底间隔（秒）
+    funding_update_offset_sec: 10           # 每个整点后多少秒检查资金费入账
     push_interval_sec: 5                    # 实时数据推送间隔（秒）
 
 # 保证金风控配置（逐仓模式）
