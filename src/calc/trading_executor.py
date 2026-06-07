@@ -136,6 +136,10 @@ class TradingExecutorConfig:
     future_maker_open_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
     future_maker_open_ttl_ms: int = 800
     future_maker_open_price_offset_bps: float = 0.0
+    future_maker_open_fallback_ioc_enabled: bool = True
+    future_maker_open_fallback_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
+    future_maker_open_fallback_min_buffer_bps: float = 8.0
+    future_maker_open_fallback_slippage_bps: float = 5.0
 
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
@@ -327,6 +331,20 @@ class TradingExecutor:
         }
         self.future_maker_open_ttl_ms = max(int(cfg.future_maker_open_ttl_ms or 0), 0)
         self.future_maker_open_price_offset_bps = float(cfg.future_maker_open_price_offset_bps or 0)
+        self.future_maker_open_fallback_ioc_enabled = bool(
+            cfg.future_maker_open_fallback_ioc_enabled
+        )
+        self.future_maker_open_fallback_allowed_tiers: Set[str] = {
+            str(t).strip().upper()
+            for t in (cfg.future_maker_open_fallback_allowed_tiers or [])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.future_maker_open_fallback_min_buffer_bps = float(
+            cfg.future_maker_open_fallback_min_buffer_bps or 0
+        )
+        self.future_maker_open_fallback_slippage_bps = float(
+            cfg.future_maker_open_fallback_slippage_bps or 0
+        )
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
@@ -2097,7 +2115,7 @@ class TradingExecutor:
         if self.future_maker_open_price_offset_bps:
             maker_price *= 1 + self.future_maker_open_price_offset_bps / 10000.0
 
-        future_order.update({
+        maker_params = {
             'execution_style': 'maker',
             'maker_ttl_ms': self.future_maker_open_ttl_ms,
             'maker_price': maker_price,
@@ -2105,7 +2123,51 @@ class TradingExecutor:
             'maker_strategy_tier': tier,
             'maker_taker_reference_price': row.get('future_open_vwap'),
             'maker_spot_reference_price': row.get('spot_open_vwap'),
-        })
+        }
+        if self.future_maker_open_fallback_ioc_enabled and tier in self.future_maker_open_fallback_allowed_tiers:
+            fallback_price = self._future_open_protective_price(
+                row, self.future_maker_open_fallback_slippage_bps
+            )
+            fallback_min_basis = self._fallback_min_open_basis(row, base_asset)
+            current_basis = row.get('pre_gate_basis_bps') or row.get('open_vwap_basis_bps')
+            fallback_allowed = (
+                fallback_price is not None
+                and current_basis is not None
+                and float(current_basis) >= fallback_min_basis
+            )
+            maker_params.update({
+                'maker_fallback_ioc_enabled': fallback_allowed,
+                'maker_fallback_protective_price': fallback_price,
+                'maker_fallback_min_basis_bps': round(fallback_min_basis, 2),
+                'maker_fallback_current_basis_bps': round(float(current_basis), 2)
+                if current_basis is not None else None,
+                'maker_fallback_slippage_bps': self.future_maker_open_fallback_slippage_bps,
+            })
+        future_order.update(maker_params)
+
+    def _future_open_protective_price(self, row: Dict, slippage_bps: float) -> Optional[float]:
+        """开仓 future 卖空 fallback IOC 的最低可接受成交价。"""
+        price = row.get('future_open_vwap') or row.get('future_bid_price_1') or row.get('future_bid_1')
+        if price is None:
+            return None
+        price = float(price)
+        if price <= 0:
+            return None
+        return round(price * (1 - max(float(slippage_bps), 0.0) / 10000.0), 10)
+
+    def _fallback_min_open_basis(self, row: Dict, base_asset: str) -> float:
+        """maker 未成交后允许转保护 IOC 的最低 pre-gate 基差。"""
+        entry_snapshot = row.get('_entry_snapshot') or self._entry_snapshot(
+            base_asset,
+            float(row.get('pre_gate_basis_bps') or row.get('open_vwap_basis_bps') or 0.0),
+            row,
+        )
+        entry_floor = float(entry_snapshot.get('entry_floor_bps') or 0.0)
+        buffer_bps = max(
+            self.execution_guard_min_p20_buffer_bps,
+            self.future_maker_open_fallback_min_buffer_bps,
+        )
+        return entry_floor + buffer_bps
     
     def _format_basis_audit(self, order_group: Dict) -> str:
         def _fmt(value):

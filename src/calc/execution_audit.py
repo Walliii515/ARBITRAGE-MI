@@ -27,6 +27,10 @@ def format_execution_audit(exec_result: Dict) -> Optional[str]:
         f"maker_px={_fmt_num(maker.get('maker_price'), 8)},"
         f"future_px={_fmt_num(maker.get('future_exec_price'), 8)},"
         f"spot_px={_fmt_num(maker.get('spot_exec_price'), 8)},"
-        f"improve={_fmt_num(maker.get('improvement_bps'), 1, 'bps')}"
+        f"improve={_fmt_num(maker.get('improvement_bps'), 1, 'bps')},"
+        f"fallback={'Y' if maker.get('fallback_attempted') else 'N'},"
+        f"fallback_filled={'Y' if maker.get('fallback_filled') else 'N'},"
+        f"fallback_px={_fmt_num(maker.get('fallback_protective_price'), 8)},"
+        f"fallback_future_px={_fmt_num(maker.get('fallback_future_exec_price'), 8)}"
         ")"
     )

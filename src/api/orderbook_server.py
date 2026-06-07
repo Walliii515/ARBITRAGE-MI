@@ -1046,6 +1046,18 @@ def _run_open_position_check_once():
                 future_maker_open_price_offset_bps=config.get_float(
                     'trade.execution.future_maker_open.price_offset_bps', 0.0
                 ),
+                future_maker_open_fallback_ioc_enabled=config.get_bool(
+                    'trade.execution.future_maker_open.fallback_ioc_enabled', True
+                ),
+                future_maker_open_fallback_allowed_tiers=config.get(
+                    'trade.execution.future_maker_open.fallback_allowed_tiers', ['A', 'B']
+                ),
+                future_maker_open_fallback_min_buffer_bps=config.get_float(
+                    'trade.execution.future_maker_open.fallback_min_buffer_bps', 8.0
+                ),
+                future_maker_open_fallback_slippage_bps=config.get_float(
+                    'trade.execution.future_maker_open.fallback_slippage_bps', 5.0
+                ),
                 capital_required=config.get_trade_mode() != 'virtual',
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
                 capital_gate_leverage=config.get_float('margin.leverage', 2.0),

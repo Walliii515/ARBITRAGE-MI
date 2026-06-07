@@ -35,11 +35,17 @@ trade:
       allowed_tiers: [A, B]                 # A/B 档参与；C 档不订阅、不交易
       ttl_ms: 800                           # maker 单最多挂单等待时间
       price_offset_bps: 0                   # 卖空挂 future ask1；正数表示更靠后排队
+      fallback_ioc_enabled: true            # maker未成交后，若安全垫仍够，转保护IOC兜底
+      fallback_allowed_tiers: [A, B]        # 允许 maker->IOC 兜底的分层
+      fallback_min_buffer_bps: 8            # fallback 时 pre_gate 至少高于 entry_floor 的额外安全垫
+      fallback_slippage_bps: 5              # 开仓future卖出IOC保护价低于旁路VWAP的最大bps
     future_maker_close:
       enabled: true                         # 平仓先尝试 Gate future reduce-only post-only maker
       allowed_tiers: [A, B]                 # A/B 档参与；未知历史持仓按 B 档处理
       ttl_ms: 800                           # maker 单最多挂单等待时间
       price_offset_bps: 0                   # 买回挂 future bid1；正数表示更靠后排队
+      fallback_ioc_enabled: true            # maker未成交后，转reduce-only保护IOC兜底
+      fallback_allowed_tiers: [A, B]        # 允许平仓 maker->IOC 兜底的分层
 
   # ─── 开仓策略 ───
   open:

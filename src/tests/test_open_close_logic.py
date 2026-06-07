@@ -343,6 +343,113 @@ class TestRealExecutorGateParsing(unittest.TestCase):
             1.99,
         )
 
+    def test_future_maker_fallback_ioc_then_spot(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(side_effect=[
+            {
+                'success': False,
+                'reason': 'future maker未成交(fill=0%)',
+                'execution_stats': {
+                    'future_maker': {
+                        'attempted': True,
+                        'filled': False,
+                        'fill_ratio': 0,
+                        'wait_ms': 800,
+                        'ttl_ms': 800,
+                    }
+                },
+            },
+            {
+                'success': True,
+                'exec_price': 2.01,
+                'exec_qty': 10.0,
+                'exec_amount': 20.1,
+                'coverage_ratio': 0,
+            },
+        ])
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 2.0,
+            'exec_qty': 10.0,
+            'exec_amount': 20.0,
+            'coverage_ratio': 0,
+        })
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'BANK',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 10,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'BANK',
+                'future_contract': 'BANK_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_fallback_ioc_enabled': True,
+                'maker_fallback_protective_price': 2.005,
+                'target_qty': 10,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor._place_gate_futures_order.call_count, 2)
+        fallback_order = executor._place_gate_futures_order.call_args_list[1].args[0]
+        self.assertNotIn('execution_style', fallback_order)
+        self.assertEqual(fallback_order['protective_price'], 2.005)
+        self.assertEqual(result['execution_stats']['future_maker']['fallback_attempted'], True)
+        self.assertEqual(result['execution_stats']['future_maker']['fallback_filled'], True)
+        executor._place_binance_spot_order.assert_called_once()
+
+    def test_future_maker_no_fallback_keeps_rejected(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'future maker未成交(fill=0%)',
+            'execution_stats': {'future_maker': {'attempted': True, 'filled': False}},
+        })
+        executor._place_binance_spot_order = MagicMock()
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'BANK',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 10,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'BANK',
+                'future_contract': 'BANK_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_fallback_ioc_enabled': False,
+                'target_qty': 10,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertEqual(executor._place_gate_futures_order.call_count, 1)
+        executor._place_binance_spot_order.assert_not_called()
+
     def test_future_maker_close_hedges_spot_by_position_ratio(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 

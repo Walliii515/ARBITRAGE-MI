@@ -184,11 +184,16 @@ class RealExecutor:
         future_result = self._place_gate_futures_order(future_order)
         stats = future_result.get('execution_stats') or {}
         if not future_result.get('success'):
-            result['future_order'] = future_result if future_result.get('exchange_order_id') else None
-            result['message'] = f"future maker未成交/拒单: {future_result.get('reason', 'unknown')}"
-            result['execution_stats'] = stats
-            logger.info(f"future maker 放弃{order_side} | {base_asset} | {result['message']}")
-            return result
+            fallback_result = self._try_future_maker_fallback_ioc(
+                future_order, future_result, stats
+            )
+            if not fallback_result.get('success'):
+                result['future_order'] = future_result if future_result.get('exchange_order_id') else None
+                result['message'] = f"future maker未成交/拒单: {fallback_result.get('reason', 'unknown')}"
+                result['execution_stats'] = stats
+                logger.info(f"future maker 放弃{order_side} | {base_asset} | {result['message']}")
+                return result
+            future_result = fallback_result
 
         hedge_order = dict(spot_order)
         future_target_qty = float(future_order.get('target_qty') or 0)
@@ -205,15 +210,20 @@ class RealExecutor:
             maker_stats['spot_exec_price'] = spot_result.get('exec_price')
 
         if spot_result.get('success'):
+            future_style = (
+                'future maker/fallback IOC'
+                if maker_stats.get('fallback_filled')
+                else 'future maker'
+            )
             result.update({
                 'success': True,
                 'spot_order': spot_result,
                 'future_order': future_result,
-                'message': f'成交成功({order_side} future maker + spot taker)',
+                'message': f'成交成功({order_side} {future_style} + spot taker)',
                 'execution_stats': stats,
             })
             logger.info(
-                f"真实成交成功({order_side} future maker + spot taker) | {base_asset} | "
+                f"真实成交成功({order_side} {future_style} + spot taker) | {base_asset} | "
                 f"fill_ratio={maker_stats.get('fill_ratio', 0):.2f} | "
                 f"wait={maker_stats.get('wait_ms', 0):.0f}ms | "
                 f"spot: price={spot_result['exec_price']}, qty={spot_result['exec_qty']} | "
@@ -234,6 +244,57 @@ class RealExecutor:
                 f"期货maker已成交但现货失败: {spot_result.get('reason')}"
             )
         return result
+
+    def _try_future_maker_fallback_ioc(
+        self,
+        maker_order: Dict,
+        maker_result: Dict,
+        stats: Dict,
+    ) -> Dict:
+        """Future maker 未成交后，按预先写入的保护价尝试一次 IOC 兜底。"""
+        maker_stats = stats.setdefault('future_maker', {})
+        maker_stats['fallback_ioc_enabled'] = bool(
+            maker_order.get('maker_fallback_ioc_enabled')
+        )
+        maker_stats['fallback_protective_price'] = maker_order.get(
+            'maker_fallback_protective_price'
+        )
+        maker_stats['fallback_min_basis_bps'] = maker_order.get(
+            'maker_fallback_min_basis_bps'
+        )
+        maker_stats['fallback_current_basis_bps'] = maker_order.get(
+            'maker_fallback_current_basis_bps'
+        )
+        maker_stats['fallback_attempted'] = False
+        maker_stats['fallback_filled'] = False
+
+        protective_price = maker_order.get('maker_fallback_protective_price')
+        if not maker_order.get('maker_fallback_ioc_enabled') or protective_price is None:
+            maker_stats['fallback_reason'] = 'disabled_or_no_protective_price'
+            return {'success': False, 'reason': maker_result.get('reason', 'future maker未成交')}
+
+        fallback_order = dict(maker_order)
+        fallback_order.pop('execution_style', None)
+        fallback_order.pop('maker_ttl_ms', None)
+        fallback_order.pop('maker_price', None)
+        fallback_order.pop('maker_price_source', None)
+        fallback_order['protective_price'] = protective_price
+        maker_stats['fallback_attempted'] = True
+
+        fallback_result = self._place_gate_futures_order(fallback_order)
+        maker_stats['fallback_filled'] = bool(fallback_result.get('success'))
+        maker_stats['fallback_future_exec_price'] = fallback_result.get('exec_price')
+        if not fallback_result.get('success'):
+            maker_stats['fallback_reason'] = fallback_result.get('reason')
+            fallback_result['reason'] = (
+                f"{maker_result.get('reason', 'future maker未成交')}; "
+                f"fallback_ioc未成交: {fallback_result.get('reason', 'unknown')}"
+            )
+            return fallback_result
+
+        fallback_stats = fallback_result.setdefault('execution_stats', {})
+        fallback_stats['future_maker'] = maker_stats
+        return fallback_result
 
     # ──────────────────────────────────────────────────────────────────
     # Binance 现货
@@ -551,7 +612,7 @@ class RealExecutor:
         price = '0'
         tif = 'ioc'
         protective_price = order.get('protective_price')
-        if order.get('order_side') == 'close' and protective_price is not None:
+        if protective_price is not None:
             price = self._format_gate_price(base_asset, float(protective_price))
         if self._is_future_maker_order(order):
             maker_price = float(order.get('maker_price') or 0)

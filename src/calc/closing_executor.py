@@ -98,6 +98,14 @@ class ClosingExecutor:
         self.future_maker_close_price_offset_bps = config.get_float(
             'trade.execution.future_maker_close.price_offset_bps', 0.0
         )
+        self.future_maker_close_fallback_ioc_enabled = config.get_bool(
+            'trade.execution.future_maker_close.fallback_ioc_enabled', True
+        )
+        self.future_maker_close_fallback_allowed_tiers = {
+            str(t).strip().upper()
+            for t in config.get('trade.execution.future_maker_close.fallback_allowed_tiers', ['A', 'B'])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
 
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
@@ -1375,7 +1383,7 @@ class ClosingExecutor:
         if future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
         if close_reason not in {'margin_close', 'manual'}:
-            self._apply_future_maker_close(pos, orderbook_row or {}, future_order)
+            self._apply_future_maker_close(pos, orderbook_row or {}, future_order, close_reason)
 
         return {
             'order_uuid': order_uuid,
@@ -1386,7 +1394,13 @@ class ClosingExecutor:
             'future_order': future_order,
         }
 
-    def _apply_future_maker_close(self, pos: Dict, row: Dict, future_order: Dict) -> None:
+    def _apply_future_maker_close(
+        self,
+        pos: Dict,
+        row: Dict,
+        future_order: Dict,
+        close_reason: Optional[str] = None,
+    ) -> None:
         """给实盘平仓期货腿附加 maker 执行参数；空头买回挂在 future bid1。"""
         if not self.future_maker_close_enabled:
             return
@@ -1411,6 +1425,18 @@ class ClosingExecutor:
         if self.future_maker_close_price_offset_bps:
             maker_price *= 1 - self.future_maker_close_price_offset_bps / 10000.0
 
+        fallback_price = None
+        if (
+            self.future_maker_close_fallback_ioc_enabled
+            and tier in self.future_maker_close_fallback_allowed_tiers
+        ):
+            slippage_bps = (
+                self.protective_ioc_take_profit_slippage_bps
+                if close_reason == 'take_profit'
+                else self.protective_ioc_risk_slippage_bps
+            )
+            fallback_price = self._future_close_protective_price(row, slippage_bps)
+
         future_order.pop('protective_price', None)
         future_order.update({
             'execution_style': 'maker',
@@ -1420,6 +1446,10 @@ class ClosingExecutor:
             'maker_strategy_tier': tier,
             'maker_taker_reference_price': row.get('future_close_vwap'),
             'maker_spot_reference_price': row.get('spot_close_vwap'),
+            'maker_fallback_ioc_enabled': fallback_price is not None,
+            'maker_fallback_protective_price': fallback_price,
+            'maker_fallback_slippage_bps': slippage_bps
+            if fallback_price is not None else None,
         })
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
