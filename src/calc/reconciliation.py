@@ -7,9 +7,9 @@
 """
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from calc.real_executor import ExchangeConfig, RealExecutor
 from common.config import config
@@ -30,6 +30,28 @@ class ReconciliationConfig:
     enabled: bool = True
     retention_days: int = 30
     leverage: int = 2
+    ignored_binance_spot_assets: Set[str] = field(default_factory=lambda: {'BNB'})
+
+
+def normalize_asset_set(values) -> Set[str]:
+    """Normalize config values such as ['BNB'] or 'BNB,FDUSD' into upper-case asset symbols."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        raw_values = values.split(',')
+    else:
+        raw_values = values
+    result: Set[str] = set()
+    for value in raw_values:
+        asset = str(value or '').strip().upper()
+        if asset:
+            result.add(asset)
+    return result
+
+
+def get_ignored_binance_spot_assets() -> Set[str]:
+    """Assets intentionally held in Binance spot wallet but excluded from position reconciliation."""
+    return normalize_asset_set(config.get('reconciliation.ignored_binance_spot_assets', ['BNB']))
 
 
 def build_exchange_config() -> ExchangeConfig:
@@ -73,6 +95,7 @@ def build_default_reconciler() -> 'Reconciler':
         enabled=config.get_bool('reconciliation.enabled', True),
         retention_days=config.get_int('reconciliation.retention_days', 30),
         leverage=config.get_int('margin.leverage', 2),
+        ignored_binance_spot_assets=get_ignored_binance_spot_assets(),
     )
     return Reconciler(executor, cfg)
 
@@ -157,9 +180,10 @@ class Reconciler:
         return {r['base_asset']: abs(float(r.get('local_contracts') or 0)) for r in rows}
 
     def _compare_binance(self, snapshot_at: datetime, local: Dict[str, float], balances: List[Dict]) -> List[Dict]:
+        ignored = {asset.upper() for asset in self.cfg.ignored_binance_spot_assets}
         exchange = {str(b.get('asset') or '').upper(): float(b.get('total') or 0) for b in balances}
         detail = {str(b.get('asset') or '').upper(): b for b in balances}
-        assets = sorted(set(local) | set(exchange))
+        assets = sorted((set(local) | set(exchange)) - ignored)
         return [
             self._position_row(
                 snapshot_at=snapshot_at,

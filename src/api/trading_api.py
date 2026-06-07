@@ -18,7 +18,7 @@ from fastapi import APIRouter, Query
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
-from calc.reconciliation import build_default_reconciler
+from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
 
 logger = get_logger(__name__)
@@ -356,17 +356,27 @@ _capital_running = False
 _capital_lock = threading.Lock()
 
 
+def _reconciliation_ignore_clause() -> tuple[str, List[Any]]:
+    ignored = sorted(get_ignored_binance_spot_assets())
+    if not ignored:
+        return '', []
+    placeholders = ','.join(['%s'] * len(ignored))
+    return f" AND NOT (exchange = 'binance' AND base_asset IN ({placeholders}))", ignored
+
+
 @router.get('/reconciliation/latest')
 async def get_reconciliation_latest():
     """返回最近一轮对账快照。"""
+    ignore_sql, ignore_params = _reconciliation_ignore_clause()
     sql = """
         SELECT *
         FROM mi_recon_snapshot
         WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)
+        {ignore_sql}
         ORDER BY exchange ASC, base_asset ASC
-    """
+    """.format(ignore_sql=ignore_sql)
     with db_manager.get_cursor() as cursor:
-        cursor.execute(sql)
+        cursor.execute(sql, ignore_params)
         rows = cursor.fetchall()
     return {'rows': _serialize_rows(rows)}
 
@@ -383,10 +393,14 @@ async def get_reconciliation_history(
     params: List[Any] = [days]
     if mismatches_only:
         where_clauses.append("is_match = 0")
+    ignore_sql, ignore_params = _reconciliation_ignore_clause()
     where_sql = " AND ".join(where_clauses)
 
     with db_manager.get_cursor() as cursor:
-        cursor.execute(f"SELECT COUNT(*) AS total FROM mi_recon_snapshot WHERE {where_sql}", params)
+        cursor.execute(
+            f"SELECT COUNT(*) AS total FROM mi_recon_snapshot WHERE {where_sql}{ignore_sql}",
+            [*params, *ignore_params],
+        )
         total_row = cursor.fetchone()
         total = int(total_row['total']) if total_row else 0
 
@@ -394,12 +408,12 @@ async def get_reconciliation_history(
     sql = f"""
         SELECT *
         FROM mi_recon_snapshot
-        WHERE {where_sql}
+        WHERE {where_sql}{ignore_sql}
         ORDER BY snapshot_at DESC, exchange ASC, base_asset ASC
         LIMIT %s OFFSET %s
     """
     with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, [*params, page_size, offset])
+        cursor.execute(sql, [*params, *ignore_params, page_size, offset])
         rows = cursor.fetchall()
     return {
         'rows': _serialize_rows(rows),
