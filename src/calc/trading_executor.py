@@ -21,6 +21,7 @@ from calc.orderbook_resiliency import (
     OrderBookResiliencyMonitor,
     ResiliencyConfig,
 )
+from calc.execution_audit import format_execution_audit
 from exchange_apis.get_gate_future_contracts import get_single_contract_funding_info
 
 REBOUND_STRONG_TRIGGER = 'rebound_strong'
@@ -129,6 +130,12 @@ class TradingExecutorConfig:
     execution_drift_cooldown_enabled: bool = True
     execution_drift_max_bps: float = 40.0
     execution_drift_cooldown_hour: float = 6.0
+
+    # ─── 执行策略：Gate future maker + Binance spot taker ───
+    future_maker_open_enabled: bool = False
+    future_maker_open_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
+    future_maker_open_ttl_ms: int = 800
+    future_maker_open_price_offset_bps: float = 0.0
 
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
@@ -311,6 +318,15 @@ class TradingExecutor:
         self.execution_drift_max_bps = float(cfg.execution_drift_max_bps)
         self.execution_drift_cooldown_sec = int(float(cfg.execution_drift_cooldown_hour) * 3600)
         self._execution_drift_cooldown_until: Dict[str, datetime] = {}
+
+        self.future_maker_open_enabled = bool(cfg.future_maker_open_enabled)
+        self.future_maker_open_allowed_tiers: Set[str] = {
+            str(t).strip().upper()
+            for t in (cfg.future_maker_open_allowed_tiers or [])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.future_maker_open_ttl_ms = max(int(cfg.future_maker_open_ttl_ms or 0), 0)
+        self.future_maker_open_price_offset_bps = float(cfg.future_maker_open_price_offset_bps or 0)
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
@@ -2038,6 +2054,7 @@ class TradingExecutor:
             'target_qty': target_qty,
             'target_amount': target_amount,
         }
+        self._apply_future_maker_open(row, future_order)
         
         return {
             'order_uuid': order_uuid,
@@ -2057,6 +2074,38 @@ class TradingExecutor:
             'open_marginal_basis_bps': row.get('open_marginal_basis_bps'),
             'funding_rate_24h': row.get('funding_rate_24h')
         }
+
+    def _apply_future_maker_open(self, row: Dict, future_order: Dict) -> None:
+        """给实盘开仓期货腿附加 maker 执行参数；缺少卖一价时保持原 taker 逻辑。"""
+        if not self.future_maker_open_enabled:
+            return
+        if self.executor_client.channel != 'Live':
+            return
+
+        base_asset = str(row.get('base_asset') or '').upper()
+        tier = self._asset_tier(base_asset)
+        if tier not in self.future_maker_open_allowed_tiers:
+            return
+
+        maker_price = row.get('future_price_ask_1') or row.get('future_ask_price_1') or row.get('future_ask_1')
+        if maker_price is None:
+            return
+
+        maker_price = float(maker_price)
+        if maker_price <= 0:
+            return
+        if self.future_maker_open_price_offset_bps:
+            maker_price *= 1 + self.future_maker_open_price_offset_bps / 10000.0
+
+        future_order.update({
+            'execution_style': 'maker',
+            'maker_ttl_ms': self.future_maker_open_ttl_ms,
+            'maker_price': maker_price,
+            'maker_price_source': 'future_ask1',
+            'maker_strategy_tier': tier,
+            'maker_taker_reference_price': row.get('future_open_vwap'),
+            'maker_spot_reference_price': row.get('spot_open_vwap'),
+        })
     
     def _format_basis_audit(self, order_group: Dict) -> str:
         def _fmt(value):
@@ -2095,6 +2144,9 @@ class TradingExecutor:
         reason = order_group.get('open_reason') or ''
         audit_text = self._format_basis_audit(order_group)
         order_group['open_reason'] = f"{reason}|{audit_text}" if reason else audit_text
+        execution_audit = format_execution_audit(exec_result)
+        if execution_audit:
+            order_group['open_reason'] = f"{order_group['open_reason']}|{execution_audit}"
 
     def _save_orders(self, order_group: Dict, exec_result: Dict):
         """持久化订单到数据库"""

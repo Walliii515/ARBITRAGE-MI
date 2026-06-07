@@ -1,0 +1,32 @@
+# coding: utf-8
+"""执行结果复盘文本格式化。"""
+from typing import Dict, Optional
+
+
+def _fmt_num(value, digits: int = 1, suffix: str = '') -> str:
+    if value is None:
+        return 'NA'
+    return f"{float(value):.{digits}f}{suffix}"
+
+
+def format_execution_audit(exec_result: Dict) -> Optional[str]:
+    """把成交引擎返回的 execution_stats 压成订单原因里的短文本。"""
+    stats = exec_result.get('execution_stats') or {}
+    maker = stats.get('future_maker') or {}
+    if not maker:
+        return None
+
+    fill_ratio = maker.get('fill_ratio')
+    fill_pct = float(fill_ratio) * 100 if fill_ratio is not None else None
+    return (
+        "执行("
+        f"future_maker={'Y' if maker.get('attempted') else 'N'},"
+        f"filled={'Y' if maker.get('filled') else 'N'},"
+        f"fill={_fmt_num(fill_pct, 0, '%')},"
+        f"wait={_fmt_num(maker.get('wait_ms'), 0, 'ms')}/{_fmt_num(maker.get('ttl_ms'), 0, 'ms')},"
+        f"maker_px={_fmt_num(maker.get('maker_price'), 8)},"
+        f"future_px={_fmt_num(maker.get('future_exec_price'), 8)},"
+        f"spot_px={_fmt_num(maker.get('spot_exec_price'), 8)},"
+        f"improve={_fmt_num(maker.get('improvement_bps'), 1, 'bps')}"
+        ")"
+    )

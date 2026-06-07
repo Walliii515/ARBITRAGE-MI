@@ -1040,6 +1040,12 @@ def _run_open_position_check_once():
                 execution_drift_cooldown_enabled=config.get_bool('trade.execution_drift_cooldown.enabled', True),
                 execution_drift_max_bps=config.get_float('trade.execution_drift_cooldown.max_drift_bps', 40.0),
                 execution_drift_cooldown_hour=config.get_float('trade.execution_drift_cooldown.cooldown_hour', 6.0),
+                future_maker_open_enabled=config.get_bool('trade.execution.future_maker_open.enabled', False),
+                future_maker_open_allowed_tiers=config.get('trade.execution.future_maker_open.allowed_tiers', ['A', 'B']),
+                future_maker_open_ttl_ms=config.get_int('trade.execution.future_maker_open.ttl_ms', 800),
+                future_maker_open_price_offset_bps=config.get_float(
+                    'trade.execution.future_maker_open.price_offset_bps', 0.0
+                ),
                 capital_required=config.get_trade_mode() != 'virtual',
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
                 capital_gate_leverage=config.get_float('margin.leverage', 2.0),

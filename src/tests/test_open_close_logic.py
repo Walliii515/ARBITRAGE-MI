@@ -212,6 +212,138 @@ class TestGateOrderBookManagerObu(unittest.TestCase):
         manager._schedule_resubscribe.assert_called_once_with('BTC_USDT')
 
 
+class TestFutureMakerOpenConfig(unittest.TestCase):
+    """开仓订单生成：实盘 A/B 档可带 future maker 执行参数。"""
+
+    def test_live_ab_asset_adds_future_maker_order_params(self):
+        te = make_trading_executor(
+            asset_tier_meta={'ASR': 'B'},
+            contract_meta={'ASR': {'quanto_multiplier': 1}},
+            spot_meta={'ASR': {'step_size': 1}},
+        )
+        te.executor_client.channel = 'Live'
+        te.future_maker_open_enabled = True
+        te.future_maker_open_allowed_tiers = {'A', 'B'}
+        te.future_maker_open_ttl_ms = 800
+
+        group = te._create_order_group({
+            'base_asset': 'ASR',
+            'contract': 'ASR_USDT',
+            'spot_qty': 10,
+            'open_amount_usdt': 10,
+            'future_price_ask_1': 1.0123,
+            'future_open_vwap': 1.01,
+            'spot_open_vwap': 1.0,
+        })
+
+        future_order = group['future_order']
+        self.assertEqual(future_order.get('execution_style'), 'maker')
+        self.assertEqual(future_order.get('maker_ttl_ms'), 800)
+        self.assertEqual(future_order.get('maker_price'), 1.0123)
+        self.assertEqual(future_order.get('maker_strategy_tier'), 'B')
+        self.assertEqual(future_order.get('maker_taker_reference_price'), 1.01)
+
+    def test_mock_channel_keeps_plain_taker_order(self):
+        te = make_trading_executor(asset_tier_meta={'ASR': 'B'})
+        te.executor_client.channel = 'Mock'
+        te.future_maker_open_enabled = True
+        te.future_maker_open_allowed_tiers = {'A', 'B'}
+
+        group = te._create_order_group({
+            'base_asset': 'ASR',
+            'contract': 'ASR_USDT',
+            'spot_qty': 10,
+            'future_price_ask_1': 1.0123,
+        })
+
+        self.assertNotIn('execution_style', group['future_order'])
+
+
+class TestRealExecutorGateParsing(unittest.TestCase):
+    """Gate 成交解析：部分成交按 size-left 计算。"""
+
+    def test_partial_fill_uses_size_minus_left(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        parsed = executor._parse_gate_response(
+            {
+                'id': '123',
+                'status': 'finished',
+                'size': '-10',
+                'left': '-4',
+                'fill_price': '1.25',
+            },
+            quanto_multiplier=2,
+            allow_partial=True,
+        )
+
+        self.assertTrue(parsed['success'])
+        self.assertEqual(parsed['exec_qty'], 12)
+        self.assertEqual(parsed['exec_amount'], 15.0)
+
+    def test_future_maker_execute_hedges_filled_qty_only(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 2.0,
+            'exec_qty': 3.0,
+            'exec_amount': 6.0,
+            'coverage_ratio': 0,
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': True,
+                    'fill_ratio': 0.3,
+                    'wait_ms': 120,
+                    'ttl_ms': 800,
+                }
+            },
+        })
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 1.99,
+            'exec_qty': 3.0,
+            'exec_amount': 5.97,
+            'coverage_ratio': 0,
+        })
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'ASR',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 10,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'ASR',
+                'future_contract': 'ASR_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'target_qty': 10,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        hedge_order = executor._place_binance_spot_order.call_args.args[0]
+        self.assertEqual(hedge_order['target_qty'], 3.0)
+        self.assertEqual(hedge_order['target_amount'], 6.0)
+        self.assertEqual(hedge_order['quantity_mode'], 'base')
+        self.assertEqual(
+            result['execution_stats']['future_maker']['spot_exec_price'],
+            1.99,
+        )
+
+
 class TestTradingExecutorPeakCheck(unittest.TestCase):
     """峰值回落 + sustain 确认（开仓回落通道）"""
 

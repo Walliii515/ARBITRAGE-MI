@@ -26,6 +26,7 @@ from calc.orderbook_resiliency import (
     OrderBookResiliencyMonitor,
     ResiliencyConfig,
 )
+from calc.execution_audit import format_execution_audit
 
 logger = get_logger(__name__)
 
@@ -1374,6 +1375,10 @@ class ClosingExecutor:
                 pre_gate_basis_bps,
                 close_spread_bps,
             )
+
+        execution_audit = format_execution_audit(exec_result)
+        if execution_audit:
+            close_reason_detail = f"{close_reason_detail}|{execution_audit}"
 
         # ── 插入平仓订单 ──
         insert_sql = """

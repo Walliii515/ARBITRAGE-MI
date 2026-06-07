@@ -7,8 +7,8 @@
 TradingExecutor 通过 ExecutorClient 调用时无需关心底层实现。
 
 设计要点：
-1. 顺序下单（先现货后期货），避免单边成交风险
-2. 市价单 IOC 模式，确保即时成交或拒绝
+1. 默认并发双腿下单，降低基差滑点
+2. 开仓可切换为 Gate future post-only maker → Binance spot taker hedge
 3. 支持 Testnet / Mainnet 通过配置切换
 """
 import time
@@ -103,6 +103,9 @@ class RealExecutor:
             spot_order = order_group.get('spot_order', {})
             future_order = order_group.get('future_order', {})
 
+            if self._is_future_maker_open(future_order):
+                return self._execute_future_maker_open(order_group, orderbook_row)
+
             # ── 并发下单：同时向 Binance 和 Gate 发送市价单 ──
             with ThreadPoolExecutor(max_workers=2) as pool:
                 spot_future = pool.submit(self._place_binance_spot_order, spot_order)
@@ -160,6 +163,75 @@ class RealExecutor:
 
         return result
 
+    @staticmethod
+    def _is_future_maker_open(future_order: Dict) -> bool:
+        return (
+            future_order.get('order_side') == 'open'
+            and future_order.get('market_type') == 'future'
+            and future_order.get('execution_style') == 'maker'
+        )
+
+    def _execute_future_maker_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:
+        """
+        开仓执行策略：Gate future post-only maker 先成交，成交多少就用 Binance spot taker 对冲多少。
+        未成交时不动现货，直接放弃本轮信号。
+        """
+        result = {'success': False, 'spot_order': None, 'future_order': None, 'message': ''}
+        spot_order = dict(order_group.get('spot_order') or {})
+        future_order = dict(order_group.get('future_order') or {})
+        base_asset = future_order.get('base_asset') or spot_order.get('base_asset')
+
+        future_result = self._place_gate_futures_order(future_order)
+        stats = future_result.get('execution_stats') or {}
+        if not future_result.get('success'):
+            result['future_order'] = future_result if future_result.get('exchange_order_id') else None
+            result['message'] = f"future maker未成交/拒单: {future_result.get('reason', 'unknown')}"
+            result['execution_stats'] = stats
+            logger.info(f"future maker 放弃开仓 | {base_asset} | {result['message']}")
+            return result
+
+        hedge_order = dict(spot_order)
+        hedge_order['target_qty'] = future_result['exec_qty']
+        hedge_order['target_amount'] = future_result['exec_amount']
+        hedge_order['quantity_mode'] = 'base'
+        spot_result = self._place_binance_spot_order(hedge_order)
+
+        maker_stats = stats.setdefault('future_maker', {})
+        maker_stats['future_exec_price'] = future_result.get('exec_price')
+        if spot_result.get('success'):
+            maker_stats['spot_exec_price'] = spot_result.get('exec_price')
+
+        if spot_result.get('success'):
+            result.update({
+                'success': True,
+                'spot_order': spot_result,
+                'future_order': future_result,
+                'message': '成交成功(future maker + spot taker)',
+                'execution_stats': stats,
+            })
+            logger.info(
+                f"真实成交成功(future maker + spot taker) | {base_asset} | "
+                f"fill_ratio={maker_stats.get('fill_ratio', 0):.2f} | "
+                f"wait={maker_stats.get('wait_ms', 0):.0f}ms | "
+                f"spot: price={spot_result['exec_price']}, qty={spot_result['exec_qty']} | "
+                f"future: price={future_result['exec_price']}, qty={future_result['exec_qty']}"
+            )
+        else:
+            result.update({
+                'future_order': future_result,
+                'message': (
+                    f"现货拒单(期货maker已成交,需人工处理): {spot_result.get('reason')} | "
+                    f"future_exec: price={future_result.get('exec_price')}, "
+                    f"qty={future_result.get('exec_qty')}"
+                ),
+                'execution_stats': stats,
+            })
+            logger.critical(
+                f"⚠️ 单边成交风险 | {base_asset} | "
+                f"期货maker已成交但现货失败: {spot_result.get('reason')}"
+            )
+        return result
+
     # ──────────────────────────────────────────────────────────────────
     # Binance 现货
     # ──────────────────────────────────────────────────────────────────
@@ -189,7 +261,12 @@ class RealExecutor:
             'newClientOrderId': f"arb_{order.get('order_uuid', '')[:8]}_spot",
         }
 
-        if side == 'BUY':
+        if side == 'BUY' and order.get('quantity_mode') == 'base':
+            quantity = float(order.get('target_qty', 0))
+            qty_precision = self._get_spot_qty_precision(base_asset)
+            quantity = truncate_to_precision(quantity, qty_precision)
+            params['quantity'] = str(quantity)
+        elif side == 'BUY':
             # 开仓: 使用 quoteOrderQty（花费固定 USDT 金额买入）
             # 优势: 精确控制花费、避免 NOTIONAL 和余额不足问题
             quote_amount = order.get('target_amount', 10)
@@ -428,16 +505,23 @@ class RealExecutor:
             contracts_size = abs(contracts_size)
 
         price = '0'
+        tif = 'ioc'
         protective_price = order.get('protective_price')
         if order.get('order_side') == 'close' and protective_price is not None:
             price = self._format_gate_price(base_asset, float(protective_price))
+        if self._is_future_maker_open(order):
+            maker_price = float(order.get('maker_price') or 0)
+            if maker_price <= 0:
+                return {'success': False, 'reason': 'future maker缺少有效挂单价'}
+            price = self._format_gate_price(base_asset, maker_price)
+            tif = 'poc'
 
         # 构造请求体
         body = {
             'contract': contract,
             'size': contracts_size,
-            'price': price,     # 0=市价IOC；非0=保护限价IOC
-            'tif': 'ioc',       # 即时成交或取消
+            'price': price,     # 0=市价IOC；非0=保护限价/POC
+            'tif': tif,         # ioc=即时成交或取消；poc=post-only
             'text': f"t-arb{order.get('order_uuid', '')[:8]}",
         }
 
@@ -466,6 +550,16 @@ class RealExecutor:
                 return {'success': False, 'reason': f"HTTP {resp.status_code}: {error_msg}"}
 
             data = resp.json()
+            if tif == 'poc':
+                return self._wait_gate_maker_fill(
+                    order=order,
+                    initial_order=data,
+                    quanto_multiplier=quanto_multiplier,
+                    requested_contracts=abs(contracts_size),
+                    maker_price=float(price),
+                    taker_reference_price=order.get('maker_taker_reference_price'),
+                    spot_reference_price=order.get('maker_spot_reference_price'),
+                )
             return self._parse_gate_response(data, quanto_multiplier)
 
         except requests.exceptions.Timeout:
@@ -475,7 +569,118 @@ class RealExecutor:
         except Exception as e:
             return {'success': False, 'reason': f'Gate 异常: {str(e)[:100]}'}
 
-    def _parse_gate_response(self, data: Dict, quanto_multiplier: float) -> Dict:
+    def _wait_gate_maker_fill(
+        self,
+        order: Dict,
+        initial_order: Dict,
+        quanto_multiplier: float,
+        requested_contracts: int,
+        maker_price: float,
+        taker_reference_price: Optional[float] = None,
+        spot_reference_price: Optional[float] = None,
+    ) -> Dict:
+        order_id = str(initial_order.get('id') or '')
+        contract = order.get('future_contract') or f"{order.get('base_asset')}_USDT"
+        ttl_ms = max(int(order.get('maker_ttl_ms') or 0), 0)
+        deadline = time.monotonic() + ttl_ms / 1000.0
+        latest = dict(initial_order)
+
+        while order_id and time.monotonic() < deadline:
+            filled_contracts = self._gate_filled_contracts(latest)
+            if filled_contracts >= requested_contracts:
+                break
+            sleep_sec = min(0.1, max(deadline - time.monotonic(), 0))
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+            fresh = self._get_gate_futures_order(contract, order_id)
+            if fresh:
+                latest = fresh
+
+        filled_contracts = self._gate_filled_contracts(latest)
+        if order_id and filled_contracts < requested_contracts:
+            cancelled = self._cancel_gate_futures_order(contract, order_id)
+            if cancelled:
+                latest = cancelled
+                filled_contracts = self._gate_filled_contracts(latest)
+
+        elapsed_ms = (ttl_ms / 1000.0 - max(deadline - time.monotonic(), 0)) * 1000.0
+        result = self._parse_gate_response(latest, quanto_multiplier, allow_partial=True)
+        fill_ratio = (filled_contracts / requested_contracts) if requested_contracts > 0 else 0
+        improvement_bps = None
+        exec_price = result.get('exec_price')
+        if exec_price and taker_reference_price and spot_reference_price:
+            improvement_bps = (float(exec_price) - float(taker_reference_price)) / float(spot_reference_price) * 10000.0
+
+        stats = {
+            'future_maker': {
+                'attempted': True,
+                'filled': bool(result.get('success')),
+                'fill_ratio': round(fill_ratio, 4),
+                'wait_ms': round(elapsed_ms, 0),
+                'ttl_ms': ttl_ms,
+                'maker_price': maker_price,
+                'future_exec_price': exec_price,
+                'requested_contracts': requested_contracts,
+                'filled_contracts': filled_contracts,
+                'exchange_order_id': order_id,
+                'improvement_bps': round(improvement_bps, 2) if improvement_bps is not None else None,
+            }
+        }
+        result['execution_stats'] = stats
+        if not result.get('success'):
+            result['reason'] = (
+                f"future maker未成交(fill={fill_ratio:.0%},wait={elapsed_ms:.0f}ms,"
+                f"ttl={ttl_ms}ms,id={order_id})"
+            )
+        return result
+
+    def _get_gate_futures_order(self, contract: str, order_id: str) -> Optional[Dict]:
+        method = 'GET'
+        api_path = f'/api/v4/futures/usdt/orders/{order_id}'
+        headers = self._gate_sign(method, api_path, '', '')
+        url = f"{self.config.gate_base_url}{api_path}"
+        try:
+            resp = self._session.get(url, headers=headers, timeout=self.config.timeout_sec)
+            if resp.status_code != 200:
+                logger.debug(f"Gate 查询订单失败 | {contract} | {order_id} | HTTP {resp.status_code}: {resp.text[:120]}")
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.debug(f"Gate 查询订单异常 | {contract} | {order_id} | {e}")
+            return None
+
+    def _cancel_gate_futures_order(self, contract: str, order_id: str) -> Optional[Dict]:
+        method = 'DELETE'
+        api_path = f'/api/v4/futures/usdt/orders/{order_id}'
+        headers = self._gate_sign(method, api_path, '', '')
+        url = f"{self.config.gate_base_url}{api_path}"
+        try:
+            resp = self._session.delete(url, headers=headers, timeout=self.config.timeout_sec)
+            if resp.status_code not in (200, 201):
+                logger.warning(f"Gate 撤单失败 | {contract} | {order_id} | HTTP {resp.status_code}: {resp.text[:150]}")
+                return None
+            data = resp.json() if resp.text else {}
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning(f"Gate 撤单异常 | {contract} | {order_id} | {e}")
+            return None
+
+    @staticmethod
+    def _gate_int(value) -> int:
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _gate_filled_contracts(self, data: Dict) -> int:
+        size = abs(self._gate_int(data.get('size')))
+        if data.get('left') is None:
+            return size if data.get('status') == 'finished' else 0
+        left = abs(self._gate_int(data.get('left')))
+        return max(size - left, 0)
+
+    def _parse_gate_response(self, data: Dict, quanto_multiplier: float, allow_partial: bool = False) -> Dict:
         """
         解析 Gate 期货订单响应
 
@@ -485,7 +690,8 @@ class RealExecutor:
         - fill_price: 成交均价
         """
         status = data.get('status', '')
-        if status != 'finished':
+        filled_size = self._gate_filled_contracts(data)
+        if status != 'finished' and not (allow_partial and filled_size > 0):
             return {
                 'success': False,
                 'reason': f"订单状态异常: {status}, id={data.get('id')}, "
@@ -494,7 +700,7 @@ class RealExecutor:
 
         fill_price_str = data.get('fill_price', '0')
         exec_price = float(fill_price_str) if fill_price_str else 0
-        size = abs(int(data.get('size', 0)))
+        size = filled_size
 
         # 将张数转回标的资产数量
         exec_qty = size * quanto_multiplier
