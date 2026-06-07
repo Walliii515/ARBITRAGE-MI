@@ -18,6 +18,7 @@ from fastapi import APIRouter, Query
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
+from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
 
@@ -58,6 +59,31 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
 def _serialize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """批量序列化数据库行"""
     return [_serialize_row(row) for row in rows]
+
+
+def _format_meta_dt(value) -> str | None:
+    if hasattr(value, 'strftime'):
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+    return str(value) if value else None
+
+
+def _inject_current_funding_fields(rows: List[Dict[str, Any]]) -> None:
+    """持仓列表展示实时合约 funding 元数据，不使用开仓时快照。"""
+    contract_meta = fetch_contract_meta()
+    for row in rows:
+        base_asset = row.get('base_asset')
+        meta = contract_meta.get(base_asset or '', {})
+        if not meta:
+            continue
+        interval_sec = meta.get('funding_interval')
+        row['funding_rate'] = meta.get('funding_rate')
+        row['funding_rate_24h'] = meta.get('funding_rate_24h')
+        row['funding_interval'] = interval_sec
+        row['funding_interval_hours'] = (
+            round(float(interval_sec) / 3600, 4) if interval_sec else None
+        )
+        row['funding_last_apply'] = _format_meta_dt(meta.get('funding_last_apply'))
+        row['funding_next_apply'] = _format_meta_dt(meta.get('funding_next_apply'))
 
 
 @router.get('/orders')
@@ -310,6 +336,7 @@ async def get_positions(
         
         # 注入到每个持仓记录
         serialized = _serialize_rows(rows)
+        _inject_current_funding_fields(serialized)
         for row in serialized:
             row['funding_history'] = histories.get(row.get('id'), [])
         

@@ -421,6 +421,52 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         self.assertAlmostEqual(gate_lag, 50, delta=30)
         self.assertAlmostEqual(spot_lag, 60, delta=30)
 
+    def test_live_pre_gate_uses_realtime_funding_snapshot(self):
+        """实盘旁路用下单前实时 funding 覆盖缓存 funding，并重算 entry snapshot。"""
+        self.te.funding_entry_enabled = True
+        self.te.executor_client.channel = 'Live'
+        self.te.contract_meta = {
+            'BTC': {
+                'funding_rate': 0.002,
+                'funding_rate_24h': 0.008,
+                'funding_interval': 21600,
+            }
+        }
+        self.te.vwap_threshold_meta = {'BTC': {'p20': 10.0}}
+        self.te._peak_state['BTC'] = {
+            'peak_bps': 60.0,
+            'start_time': datetime.now(),
+            'signal_id': 1,
+            'signal_basis_bps': 60.0,
+        }
+        self._setup_books(gate_lag_sec=0.05, spot_lag_sec=0.05)
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(
+            vwap_basis_bps=50, open_coverage=0.5,
+        )
+        realtime_info = {
+            'funding_rate': 0.00075,
+            'funding_rate_24h': 0.003,
+            'funding_interval': 21600,
+            'funding_next_apply': '2026-06-07 20:00:00',
+            'funding_last_apply': '2026-06-07 14:00:00',
+        }
+        with m_merge, m_hedge, m_vwap, patch(
+            'calc.trading_executor.get_single_contract_funding_info',
+            return_value=realtime_info,
+        ):
+            passed, row, basis, reason = self.te._pre_execution_gate('BTC', 'BTC_USDT', 'BTCUSDT')
+
+        self.assertTrue(passed)
+        self.assertEqual(reason, '')
+        self.assertEqual(basis, 50)
+        self.assertEqual(row['funding_rate_24h'], 0.003)
+        self.assertEqual(row['_cached_funding_rate_24h'], 0.008)
+        self.assertEqual(self.te.contract_meta['BTC']['funding_rate_24h'], 0.003)
+        self.assertAlmostEqual(
+            self.te._peak_state['BTC']['entry_snapshot']['funding_24h_bps'],
+            30.0,
+        )
+
 
 # ══════════════════════════════════════════════════════════════════
 # Funding-adjusted entry 测试

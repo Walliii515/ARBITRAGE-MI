@@ -21,7 +21,7 @@ from calc.orderbook_resiliency import (
     OrderBookResiliencyMonitor,
     ResiliencyConfig,
 )
-from exchange_apis.get_gate_future_contracts import get_single_contract_funding_rate
+from exchange_apis.get_gate_future_contracts import get_single_contract_funding_info
 
 REBOUND_STRONG_TRIGGER = 'rebound_strong'
 
@@ -197,6 +197,7 @@ class TradingExecutor:
         self._timeout_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 超时冷却截止时间
         # 临时槽位：实时费率校验通过时记录的实时费率(bps)，供 _build_open_reason 取用
         self._last_realtime_rate_bps: Dict[str, float] = {}
+        self._last_realtime_funding_info: Dict[str, Dict] = {}
 
         # 保证金风控：距爆仓距离低于此值时禁止开仓
         self.margin_warning_pct = cfg.margin_warning_pct
@@ -500,9 +501,10 @@ class TradingExecutor:
                 # 使用旁路返回的最新数据（单标的最短链路）
                 if gate_row is not None:
                     row = gate_row
-                    row['funding_rate_24h'] = row.get('funding_rate_24h') or self.contract_meta.get(
-                        base_asset, {}
-                    ).get('funding_rate_24h')
+                    if row.get('funding_rate_24h') is None:
+                        row['funding_rate_24h'] = self.contract_meta.get(
+                            base_asset, {}
+                        ).get('funding_rate_24h')
                 if gate_basis is not None:
                     open_vwap_basis = gate_basis
                 self._annotate_entry_snapshot(row, open_vwap_basis)
@@ -858,6 +860,11 @@ class TradingExecutor:
         if len(recent_samples) < params['min_samples']:
             return False
 
+        contract = row.get('contract', '')
+        if not self._verify_realtime_funding_rate(base_asset, contract):
+            return False
+        self._apply_realtime_funding_info(base_asset, row)
+
         entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
         entry_floor = float(entry_snapshot.get('entry_floor_bps'))
         min_entry_basis = entry_floor + params['min_basis_buffer_bps']
@@ -889,10 +896,6 @@ class TradingExecutor:
                 return False
         else:
             min_profit_basis = min_entry_basis
-
-        contract = row.get('contract', '')
-        if not self._verify_realtime_funding_rate(base_asset, contract):
-            return False
 
         now = datetime.now()
         signal_id = self._create_signal(base_asset, current_basis_bps)
@@ -1266,6 +1269,44 @@ class TradingExecutor:
             + self.open_amount_usdt * self._fee_future_open
         )
         return binance_available >= spot_required and gate_available >= gate_required
+
+    def _apply_realtime_funding_info(self, base_asset: str, row: Optional[Dict]) -> None:
+        """
+        将已通过实时校验的 funding 信息写入本轮 row 与共享合约元数据。
+
+        row['_cached_funding_rate_24h'] 仅用于开仓原因诊断；决策字段 funding_rate_24h
+        会被实时值覆盖，保证 entry_floor/carry/订单记录和持仓展示口径一致。
+        """
+        if row is None:
+            return
+        info = self._last_realtime_funding_info.get(base_asset)
+        if not info:
+            return
+
+        if '_cached_funding_rate_24h' not in row:
+            cached = row.get('funding_rate_24h')
+            if cached is None:
+                cached = self.contract_meta.get(base_asset, {}).get('funding_rate_24h')
+            row['_cached_funding_rate_24h'] = cached
+
+        for key in (
+            'funding_rate',
+            'funding_rate_24h',
+            'funding_interval',
+            'funding_next_apply',
+            'funding_last_apply',
+        ):
+            row[key] = info.get(key)
+        row['_realtime_funding_24h_bps'] = float(info.get('funding_rate_24h') or 0) * 10000.0
+
+        meta = self.contract_meta.setdefault(base_asset, {})
+        meta.update({
+            'funding_rate': info.get('funding_rate'),
+            'funding_rate_24h': info.get('funding_rate_24h'),
+            'funding_interval': info.get('funding_interval'),
+            'funding_next_apply': info.get('funding_next_apply'),
+            'funding_last_apply': info.get('funding_last_apply'),
+        })
     
     def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
         """
@@ -1273,14 +1314,15 @@ class TradingExecutor:
         若 API 调用失败（网络问题等），回退为放行（不阻塞开仓）。
         """
         try:
-            realtime_rate_24h = get_single_contract_funding_rate(contract)
-            if realtime_rate_24h is None:
+            self._last_realtime_funding_info.pop(base_asset, None)
+            info = get_single_contract_funding_info(contract)
+            if not info or info.get('funding_rate_24h') is None:
                 # API 调用失败，回退为放行（不因网络问题阻止开仓）
                 logger.debug(f"实时费率校验跳过(获取失败) | {base_asset}")
                 return True
             
             # 校验费率 >= 下限(min_funding_rate_bps)
-            rate_bps = realtime_rate_24h * 10000
+            rate_bps = float(info['funding_rate_24h']) * 10000
             if rate_bps < self.min_funding_rate_bps:
                 logger.info(
                     f"实时费率校验拦截 | {base_asset} | "
@@ -1290,6 +1332,7 @@ class TradingExecutor:
 
             # 校验通过：记录实时费率，供 _build_open_reason 拼接到开仓原因
             self._last_realtime_rate_bps[base_asset] = rate_bps
+            self._last_realtime_funding_info[base_asset] = info
             return True
         except Exception as e:
             # 任何异常均回退为放行
@@ -1376,7 +1419,12 @@ class TradingExecutor:
             )
             row = merged[0]
             row['base_asset'] = base_asset
-            row['funding_rate_24h'] = self.contract_meta.get(base_asset, {}).get('funding_rate_24h')
+            c_meta = self.contract_meta.get(base_asset, {})
+            row['funding_rate'] = c_meta.get('funding_rate')
+            row['funding_rate_24h'] = c_meta.get('funding_rate_24h')
+            row['funding_interval'] = c_meta.get('funding_interval')
+            row['funding_next_apply'] = c_meta.get('funding_next_apply')
+            row['funding_last_apply'] = c_meta.get('funding_last_apply')
 
             # ── 4. 计算VWAP基差 ──
             gate_basis_bps = calc_vwap_basis_bps(
@@ -1386,8 +1434,18 @@ class TradingExecutor:
                 return False, None, None, 'VWAP基差计算失败(盘口深度不足)'
             gate_basis_bps = round(gate_basis_bps, 2)
 
+            # ── 4.5 实时资金费刷新：实盘最终旁路用下单前最新 funding 重算门槛 ──
+            if self.executor_client.channel == 'Live':
+                if not self._verify_realtime_funding_rate(base_asset, contract):
+                    return False, row, gate_basis_bps, '实时资金费率低于下限'
+                self._apply_realtime_funding_info(base_asset, row)
+
             # ── 5. 统一入场门槛校验 ──
-            entry_snapshot = self._state_entry_snapshot(base_asset, row, gate_basis_bps)
+            entry_snapshot = self._entry_snapshot(base_asset, gate_basis_bps, row)
+            self._annotate_entry_snapshot(row, gate_basis_bps)
+            state = self._peak_state.get(base_asset)
+            if state is not None:
+                state['entry_snapshot'] = entry_snapshot
             entry_floor = float(entry_snapshot.get('entry_floor_bps'))
             if gate_basis_bps < entry_floor:
                 logger.info(
@@ -1481,6 +1539,7 @@ class TradingExecutor:
             # 首次进入监控：实时费率校验 + 记录峰值 + 创建信号
             if not self._verify_realtime_funding_rate(base_asset, contract):
                 return False
+            self._apply_realtime_funding_info(base_asset, row)
 
             entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
             signal_id = self._create_signal(base_asset, current_basis_bps)
@@ -1754,17 +1813,27 @@ class TradingExecutor:
             f"edge={float(entry_snapshot.get('expected_edge_bps', 0)):.1f}bps)"
         )
 
-        # 2. 24h资金费率
+        # 2. 24h资金费率（决策口径：实时值优先）
         funding_rate = row.get('funding_rate_24h')
         if funding_rate is not None:
             rate_pct = float(funding_rate) * 100
-            parts.append(f"费率{rate_pct:.4f}%")
+            parts.append(f"实时24h费率{rate_pct:.4f}%")
 
-        # 3. 实时费率校验结果（峰值首次入场时调 API 一次）
+        cached_rate = row.get('_cached_funding_rate_24h')
+        if cached_rate is not None and funding_rate is not None:
+            cached_bps = float(cached_rate) * 10000
+            realtime_bps = float(funding_rate) * 10000
+            if abs(cached_bps - realtime_bps) >= 0.05:
+                parts.append(
+                    f"缓存24h费率{float(cached_rate) * 100:.4f}%"
+                    f"(偏移{realtime_bps - cached_bps:+.1f}bps)"
+                )
+
+        # 3. 实时费率校验结果
         rt_rate = self._last_realtime_rate_bps.pop(base_asset, None)
         if rt_rate is not None:
             parts.append(
-                f"实时费率✓({rt_rate:.2f}bps≥{self.min_funding_rate_bps:.1f})"
+                f"实时24h校验✓({rt_rate:.2f}bps≥{self.min_funding_rate_bps:.1f})"
             )
 
         # 4. 峰值回落 / 超时信息

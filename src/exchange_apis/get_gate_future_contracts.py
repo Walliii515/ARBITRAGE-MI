@@ -2,6 +2,7 @@
 import requests
 import os
 import sys
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 添加项目根目录到 Python 路径
@@ -105,15 +106,22 @@ def get_futures_contracts():
         return None
 
 
-def get_single_contract_funding_rate(contract_name: str) -> float | None:
+def get_single_contract_funding_info(contract_name: str) -> dict | None:
     """
-    实时获取单个合约的当前资金费率（用于开仓前的最终校验）
+    实时获取单个合约资金费信息（用于开仓前最终校验和展示）。
     
     Args:
         contract_name: 合约名称，如 'BTC_USDT'
     
     Returns:
-        24h 资金费率（float），失败时返回 None
+        {
+            funding_rate: 单次资金费率,
+            funding_rate_24h: 折算 24h 资金费率,
+            funding_interval: 支付间隔（秒）,
+            funding_next_apply: 下次支付时间字符串,
+            funding_last_apply: 上次支付时间字符串,
+        }
+        失败时返回 None
     """
     url = f'/futures/usdt/contracts/{contract_name}'
     query_string = ''
@@ -134,16 +142,33 @@ def get_single_contract_funding_rate(contract_name: str) -> float | None:
         contract = response.json()
         funding_rate = contract.get('funding_rate')
         funding_interval = contract.get('funding_interval')
-        if funding_rate and funding_interval:
-            rate_24h = float(funding_rate) * (86400 / int(funding_interval))
-            return rate_24h
+        if funding_rate is not None and funding_interval:
+            interval_sec = int(funding_interval)
+            rate = float(funding_rate)
+            next_apply = contract.get('funding_next_apply')
+            next_dt = datetime.fromtimestamp(int(next_apply)) if next_apply else None
+            last_dt = next_dt - timedelta(seconds=interval_sec) if next_dt else None
+            return {
+                'funding_rate': rate,
+                'funding_rate_24h': rate * (86400 / interval_sec),
+                'funding_interval': interval_sec,
+                'funding_next_apply': next_dt.strftime('%Y-%m-%d %H:%M:%S') if next_dt else None,
+                'funding_last_apply': last_dt.strftime('%Y-%m-%d %H:%M:%S') if last_dt else None,
+            }
         return None
     except Exception as e:
         logger.warning(f"实时获取资金费率失败 {contract_name}: {e}")
         return None
 
 
+def get_single_contract_funding_rate(contract_name: str) -> float | None:
+    """
+    实时获取单个合约的 24h 资金费率（兼容旧调用）。
+    """
+    info = get_single_contract_funding_info(contract_name)
+    return info.get('funding_rate_24h') if info else None
+
+
 if __name__ == '__main__':
     log_print("正在获取 Gate.io 永续合约列表...")
     get_futures_contracts()
-

@@ -7,7 +7,6 @@ import type {
   GridApi,
   GridReadyEvent,
   ValueFormatterParams,
-  ColumnState,
 } from 'ag-grid-community'
 import { ElPopover } from 'element-plus'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -58,7 +57,11 @@ interface PositionRow {
   fee_bps: number | null
   risk_relief_bps: number | null
   funding_pnl_bps: number | null
+  funding_rate: number | null
   funding_rate_24h: number | null
+  funding_interval: number | null
+  funding_interval_hours: number | null
+  funding_last_apply: string | null
   funding_next_apply: string | null
   funding_total_pnl: number | null
   funding_payments_count: number | null
@@ -116,6 +119,7 @@ interface AccountSummary {
 
 /* ───── 状态 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
+void gridContainerRef
 const rowData = shallowRef<PositionRow[]>([])
 const positionMap = new Map<number, PositionRow>()
 let gridApi: GridApi<PositionRow> | null = null
@@ -331,6 +335,18 @@ const pnlFormatter = (params: ValueFormatterParams) => {
   return Number(params.value).toFixed(4)
 }
 
+const percentFormatter = (params: ValueFormatterParams) => {
+  if (params.value == null) return ''
+  return (Number(params.value) * 100).toFixed(4) + '%'
+}
+
+const fundingIntervalFormatter = (params: ValueFormatterParams) => {
+  if (params.value == null) return ''
+  const value = Number(params.value)
+  if (!Number.isFinite(value)) return ''
+  return Number.isInteger(value) ? `${value}h` : `${value.toFixed(2)}h`
+}
+
 const intFormatter = (params: ValueFormatterParams) => {
   if (params.value == null) return ''
   return String(params.value)
@@ -500,14 +516,14 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     valueFormatter: bpsFormatter,
   },
   {
-    headerName: '当前24h资金费率',
+    headerName: '实时24h资金费率',
     field: 'funding_rate_24h',
-    width: 120,
+    width: 135,
     type: 'numericColumn',
     enableCellChangeFlash: true,
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
-    valueFormatter: (p: ValueFormatterParams) => p.value != null ? (p.value * 100).toFixed(4) + '%' : '',
+    valueFormatter: percentFormatter,
     cellStyle: (params: any) => {
       const value = params.value as number | null
       if (value == null) return { color: '#909399' }
@@ -516,20 +532,34 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     },
   },
   {
+    headerName: '单次资金费率',
+    field: 'funding_rate',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: percentFormatter,
+  },
+  {
+    headerName: '资金费间隔',
+    field: 'funding_interval_hours',
+    width: 105,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: fundingIntervalFormatter,
+  },
+  {
+    headerName: '上次支付时间',
+    field: 'funding_last_apply',
+    width: 170,
+    valueFormatter: timeFormatter,
+  },
+  {
     headerName: '下次支付时间',
     field: 'funding_next_apply',
-    width: 160,
-    valueFormatter: (p: ValueFormatterParams) => {
-      if (!p.value) return '—'
-      const d = new Date(p.value)
-      if (isNaN(d.getTime())) return p.value
-      const year = d.getFullYear()
-      const month = String(d.getMonth() + 1).padStart(2, '0')
-      const day = String(d.getDate()).padStart(2, '0')
-      const hour = String(d.getHours()).padStart(2, '0')
-      const minute = String(d.getMinutes()).padStart(2, '0')
-      return `${year}-${month}-${day} ${hour}:${minute}`
-    },
+    width: 170,
+    valueFormatter: timeFormatter,
   },
   {
     headerName: '资金费收益(bps)',
@@ -865,7 +895,11 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     fee_cost: sumField('fee_cost'),
     risk_relief_bps: null,
     funding_pnl_bps: null,
+    funding_rate: null,
     funding_rate_24h: null,
+    funding_interval: null,
+    funding_interval_hours: null,
+    funding_last_apply: null,
     funding_next_apply: null,
     funding_total_pnl: sumField('funding_total_pnl'),
     funding_payments_count: null,
@@ -967,13 +1001,6 @@ function onBaseAssetFilterChange() {
   fetchPositions()
 }
 
-/* ───── 状态过滤选项 ───── */
-const statusOptions = [
-  { label: '全部', value: '' },
-  { label: '持仓中', value: 'holding' },
-  { label: '已平仓', value: 'closed' },
-]
-
 /* ───── 列选择面板 ───── */
 function refreshColumnVisibilities() {
   if (!gridApi) return
@@ -1033,10 +1060,6 @@ function onGridReady(params: GridReadyEvent<PositionRow>) {
   gridApi = params.api
   loadColumnState()
   setupGridCopy(params.api)
-}
-
-function triggerFilterChanged() {
-  gridApi?.onFilterChanged()
 }
 
 /* ───── 生命周期 ───── */
@@ -1281,6 +1304,7 @@ onUnmounted(() => {
         :getRowClass="getRowClass"
         :header-height="32"
         :row-height="32"
+        :localeText="localeText"
         :tooltipShowDelay="300"
         :isExternalFilterPresent="isExternalFilterPresent"
         :doesExternalFilterPass="doesExternalFilterPass"

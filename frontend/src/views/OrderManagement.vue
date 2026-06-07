@@ -72,6 +72,7 @@ interface PositionRow {
 
 /* ───── 状态 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
+void gridContainerRef
 const rowData = shallowRef<PositionRow[]>([])
 let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)

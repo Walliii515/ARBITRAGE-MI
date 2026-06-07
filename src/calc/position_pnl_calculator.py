@@ -43,6 +43,12 @@ def _calc_total_pnl(floating_pnl_bps, realized_pnl_bps: float,
     return total_bps, total_amt
 
 
+def _format_dt(value) -> str | None:
+    if hasattr(value, 'strftime'):
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+    return str(value) if value else None
+
+
 def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
                            contract_meta: Dict[str, Dict], cfg: PnlConfig) -> List[Dict]:
     """
@@ -78,14 +84,17 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         # 注入风险缓释 (bps)
         pos['risk_relief_bps'] = cfg.risk_relief_bps
 
-        # 注入 24h 资金费率 & 下次支付时间
+        # 注入实时资金费率与支付窗口
         c_meta = contract_meta.get(ba, {})
+        pos['funding_rate'] = c_meta.get('funding_rate')
         pos['funding_rate_24h'] = c_meta.get('funding_rate_24h')
-        fna = c_meta.get('funding_next_apply')
-        pos['funding_next_apply'] = (
-            fna.strftime('%Y-%m-%d %H:%M:%S') if hasattr(fna, 'strftime')
-            else str(fna) if fna else None
+        interval_sec = c_meta.get('funding_interval')
+        pos['funding_interval'] = interval_sec
+        pos['funding_interval_hours'] = (
+            round(float(interval_sec) / 3600, 4) if interval_sec else None
         )
+        pos['funding_last_apply'] = _format_dt(c_meta.get('funding_last_apply'))
+        pos['funding_next_apply'] = _format_dt(c_meta.get('funding_next_apply'))
 
         # ── 已平仓分支：浮动盈亏归零，用实际平仓VWAP锁定已实现盈亏 ──
         if pos.get('status') == 'closed':

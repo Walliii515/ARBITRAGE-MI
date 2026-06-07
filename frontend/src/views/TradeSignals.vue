@@ -300,6 +300,7 @@ function setDaysFilter(days: number) {
 
 /* ───── 复制 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
+void gridContainerRef
 
 /** 格式化时间 */
 function formatTime(timeStr: string | null): string {
