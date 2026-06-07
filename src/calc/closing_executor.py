@@ -334,7 +334,9 @@ class ClosingExecutor:
             if not orderbook_row:
                 logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                 continue
-            if self.protective_ioc_enabled and not self.future_maker_close_enabled:
+            if self.protective_ioc_enabled and (
+                not self.future_maker_close_enabled or close_reason in {'margin_close', 'manual'}
+            ):
                 slippage_bps = (
                     self.protective_ioc_take_profit_slippage_bps
                     if close_reason == 'take_profit'
@@ -1265,7 +1267,23 @@ class ClosingExecutor:
         if liq_distance is not None:
             parts.append(f"距爆仓{float(liq_distance):.2f}%")
         close_reason_detail = '|'.join(parts)
-        return self._execute_close(pos, close_reason, close_reason_detail, orderbook_row)
+        future_protective_price = None
+        if self.protective_ioc_enabled:
+            future_protective_price = self._future_close_protective_price(
+                orderbook_row,
+                self.protective_ioc_risk_slippage_bps,
+            )
+            if future_protective_price is not None:
+                close_reason_detail = (
+                    f"{close_reason_detail}|保护IOC(future_buy≤{future_protective_price})"
+                )
+        return self._execute_close(
+            pos,
+            close_reason,
+            close_reason_detail,
+            orderbook_row,
+            future_protective_price=future_protective_price,
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # 订单构建与执行
@@ -1286,6 +1304,7 @@ class ClosingExecutor:
             pos,
             future_protective_price=future_protective_price,
             orderbook_row=orderbook_row,
+            close_reason=close_reason,
         )
         future_order = order_group.get('future_order') or {}
         if future_order.get('execution_style') == 'maker':
@@ -1316,6 +1335,7 @@ class ClosingExecutor:
         pos: Dict,
         future_protective_price: Optional[float] = None,
         orderbook_row: Optional[Dict] = None,
+        close_reason: Optional[str] = None,
     ) -> Dict:
         """
         生成平仓订单组：
@@ -1354,7 +1374,8 @@ class ClosingExecutor:
         }
         if future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
-        self._apply_future_maker_close(pos, orderbook_row or {}, future_order)
+        if close_reason not in {'margin_close', 'manual'}:
+            self._apply_future_maker_close(pos, orderbook_row or {}, future_order)
 
         return {
             'order_uuid': order_uuid,

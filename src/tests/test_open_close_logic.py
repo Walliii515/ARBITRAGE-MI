@@ -1436,6 +1436,48 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(future_order.get('maker_taker_reference_price'), 101.0)
         self.assertEqual(future_order.get('maker_spot_reference_price'), 100.0)
 
+    def test_force_close_reasons_keep_protective_ioc(self):
+        self.ce.executor_client.channel = 'Live'
+        self.ce.future_maker_close_enabled = True
+        self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
+
+        for reason in ('margin_close', 'manual'):
+            group = self.ce._build_close_order_group({
+                'base_asset': 'BTC',
+                'spot_open_qty': 1.0,
+                'future_open_qty': 1.0,
+                'future_contract': 'BTC_USDT',
+            }, future_protective_price=101.23, orderbook_row={
+                'future_price_bid_1': 100.5,
+                'future_close_vwap': 101.0,
+                'spot_close_vwap': 100.0,
+            }, close_reason=reason)
+
+            future_order = group['future_order']
+            self.assertNotIn('execution_style', future_order)
+            self.assertEqual(future_order['protective_price'], 101.23)
+
+    def test_manual_close_uses_protective_ioc_when_maker_close_enabled(self):
+        self.ce.executor_client.channel = 'Live'
+        self.ce.future_maker_close_enabled = True
+        self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
+        self.ce._execute_close = MagicMock(return_value={'success': True})
+
+        self.ce.manual_close({
+            'id': 1,
+            'base_asset': 'BTC',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'future_contract': 'BTC_USDT',
+        }, {
+            'future_close_vwap': 100.0,
+            'future_price_bid_1': 99.0,
+        })
+
+        kwargs = self.ce._execute_close.call_args.kwargs
+        self.assertIsNotNone(kwargs.get('future_protective_price'))
+        self.assertGreater(kwargs['future_protective_price'], 100.0)
+
 
 class TestMarginTopupCalculation(unittest.TestCase):
     """自动追保核心公式。"""
