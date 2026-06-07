@@ -2196,7 +2196,7 @@ class TradingExecutor:
 
         open_fee_bps = calc_open_fee_bps(
             self._fee_spot_open,
-            self._fee_future_open
+            self._actual_future_open_fee(order_group.get('base_asset'), exec_result)
         )
         if actual_basis_bps is not None:
             order_group['open_marginal_basis_bps'] = round(
@@ -2209,6 +2209,17 @@ class TradingExecutor:
         execution_audit = format_execution_audit(exec_result)
         if execution_audit:
             order_group['open_reason'] = f"{order_group['open_reason']}|{execution_audit}"
+
+    def _actual_future_open_fee(self, base_asset: Optional[str], exec_result: Dict) -> float:
+        maker = (exec_result.get('execution_stats') or {}).get('future_maker') or {}
+        meta = self.contract_meta.get(str(base_asset or '').upper(), {})
+        if maker.get('fallback_filled'):
+            value = meta.get('taker_fee_rate')
+            return float(value) if value is not None else self._fee_future_open
+        if maker.get('filled'):
+            value = meta.get('maker_fee_rate')
+            return float(value) if value is not None else self._fee_future_open
+        return self._fee_future_open
 
     def _save_orders(self, order_group: Dict, exec_result: Dict):
         """持久化订单到数据库"""

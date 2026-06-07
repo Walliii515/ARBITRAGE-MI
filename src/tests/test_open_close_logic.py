@@ -851,6 +851,70 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te._execution_drift_cooldown_until['OPN'] = datetime.now() - timedelta(seconds=1)
         self.assertTrue(te._pass_execution_drift_cooldown('OPN'))
 
+    def test_open_marginal_basis_uses_fallback_taker_fee(self):
+        te = make_trading_executor(
+            contract_meta={'BANK': {'taker_fee_rate': 0.00075, 'maker_fee_rate': -0.0001}},
+            asset_tier_meta={'BANK': 'B'},
+        )
+        te._fee_spot_open = 0.00075
+        te._fee_future_open = 0.0002
+        te._risk_relief_bps = 10
+        order_group = {
+            'base_asset': 'BANK',
+            'open_reason': 'x',
+            'pre_gate_basis_bps': 22.2,
+            'open_vwap_basis_bps': 22.2,
+        }
+        exec_result = {
+            'success': True,
+            'spot_order': {'exec_price': 0.033, 'exec_qty': 1, 'exec_amount': 0.033},
+            'future_order': {'exec_price': 0.033066, 'exec_qty': 1, 'exec_amount': 0.033066},
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': False,
+                    'fallback_filled': True,
+                }
+            },
+        }
+
+        te._attach_actual_basis_audit(order_group, exec_result)
+
+        self.assertAlmostEqual(order_group['actual_basis_bps'], 20.0)
+        self.assertAlmostEqual(order_group['open_marginal_basis_bps'], 15.0)
+
+    def test_open_marginal_basis_uses_contract_maker_fee_when_maker_fills(self):
+        te = make_trading_executor(
+            contract_meta={'BANK': {'taker_fee_rate': 0.00075, 'maker_fee_rate': -0.0001}},
+            asset_tier_meta={'BANK': 'B'},
+        )
+        te._fee_spot_open = 0.00075
+        te._fee_future_open = 0.0002
+        te._risk_relief_bps = 10
+        order_group = {
+            'base_asset': 'BANK',
+            'open_reason': 'x',
+            'pre_gate_basis_bps': 22.2,
+            'open_vwap_basis_bps': 22.2,
+        }
+        exec_result = {
+            'success': True,
+            'spot_order': {'exec_price': 0.033, 'exec_qty': 1, 'exec_amount': 0.033},
+            'future_order': {'exec_price': 0.033066, 'exec_qty': 1, 'exec_amount': 0.033066},
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': True,
+                    'fallback_filled': False,
+                }
+            },
+        }
+
+        te._attach_actual_basis_audit(order_group, exec_result)
+
+        self.assertAlmostEqual(order_group['actual_basis_bps'], 20.0)
+        self.assertAlmostEqual(order_group['open_marginal_basis_bps'], 23.5)
+
 
 # ══════════════════════════════════════════════════════════════════
 # Shared resiliency monitor 测试
@@ -1642,6 +1706,78 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertAlmostEqual(positions[0]['margin_initial'], 50.0)
         self.assertAlmostEqual(positions[0]['current_margin'], 60.0)
         self.assertAlmostEqual(positions[0]['liq_price'], 159.5)
+
+    def test_holding_fee_uses_future_taker_when_open_fallback_fills(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'BANK',
+            'spot_open_price': 100.0,
+            'spot_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'future_open_qty': 1.0,
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0,
+            'margin_topup_total': 0.0,
+            'open_reason': '执行(future_maker=Y,filled=N,fallback=Y,fallback_filled=Y)',
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=100.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            risk_relief_bps=0,
+            margin_leverage=2.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(
+            positions,
+            {'BANK': {'spot_close_vwap': 100.0, 'future_close_vwap': 100.0}},
+            {'BANK': {'maker_fee_rate': -0.0001, 'taker_fee_rate': 0.00075}},
+            cfg,
+        )
+
+        self.assertAlmostEqual(positions[0]['fee_bps'], -15.0)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.15)
+
+    def test_holding_fee_uses_future_maker_when_maker_fills(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'BANK',
+            'spot_open_price': 100.0,
+            'spot_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'future_open_qty': 1.0,
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0,
+            'margin_topup_total': 0.0,
+            'open_reason': '执行(future_maker=Y,filled=Y,fallback=N,fallback_filled=N)',
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=100.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            risk_relief_bps=0,
+            margin_leverage=2.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(
+            positions,
+            {'BANK': {'spot_close_vwap': 100.0, 'future_close_vwap': 100.0}},
+            {'BANK': {'maker_fee_rate': -0.0001, 'taker_fee_rate': 0.00075}},
+            cfg,
+        )
+
+        self.assertAlmostEqual(positions[0]['fee_bps'], -6.5)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.065)
 
 
 # ══════════════════════════════════════════════════════════════════

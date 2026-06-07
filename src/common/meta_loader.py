@@ -24,7 +24,8 @@ def fetch_contract_meta() -> Dict[str, Dict]:
     sql = """
         SELECT base_asset, quanto_multiplier, order_price_round, order_size_min,
                enable_decimal, funding_rate, funding_rate_24h, funding_interval,
-               volume_24h_settle, funding_next_apply, maintenance_rate
+               volume_24h_settle, funding_next_apply, maintenance_rate,
+               maker_fee_rate, taker_fee_rate
         FROM mi_gate_future_contracts
     """
     result = {}
@@ -52,6 +53,8 @@ def fetch_contract_meta() -> Dict[str, Dict]:
                     'funding_next_apply': funding_next_apply,
                     'funding_last_apply': funding_last_apply,
                     'maintenance_rate': float(row['maintenance_rate']) if row.get('maintenance_rate') is not None else None,
+                    'maker_fee_rate': float(row['maker_fee_rate']) if row.get('maker_fee_rate') is not None else None,
+                    'taker_fee_rate': float(row['taker_fee_rate']) if row.get('taker_fee_rate') is not None else None,
                 }
     except Exception as e:
         logger.error(f'加载合约元数据失败: {e}', exc_info=True)

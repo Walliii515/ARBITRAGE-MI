@@ -49,6 +49,48 @@ def _format_dt(value) -> str | None:
     return str(value) if value else None
 
 
+def _fee_rate(meta: Dict, key: str, fallback: float) -> float:
+    value = meta.get(key)
+    if value is None:
+        return float(fallback or 0.0)
+    return float(value)
+
+
+def _future_fee_from_reason(
+    reason: str | None,
+    meta: Dict,
+    default_fee: float,
+    direct_taker_markers: tuple[str, ...] = (),
+) -> float:
+    """根据成交原因里的执行审计推导 Gate future 实际 maker/taker 费率。"""
+    text = reason or ''
+    maker_fee = _fee_rate(meta, 'maker_fee_rate', default_fee)
+    taker_fee = _fee_rate(meta, 'taker_fee_rate', default_fee)
+
+    if 'fallback_filled=Y' in text:
+        return taker_fee
+    if 'future_maker=Y' in text and 'filled=Y' in text:
+        return maker_fee
+    if any(marker in text for marker in direct_taker_markers):
+        return taker_fee
+    return float(default_fee or 0.0)
+
+
+def _position_fee_rates(pos: Dict, meta: Dict, cfg: PnlConfig) -> Tuple[float, float]:
+    future_open_fee = _future_fee_from_reason(
+        pos.get('open_reason'),
+        meta,
+        cfg.future_open_fee,
+    )
+    future_close_fee = _future_fee_from_reason(
+        pos.get('close_reason'),
+        meta,
+        cfg.future_close_fee,
+        direct_taker_markers=('保护IOC', '保证金风控', 'manual', '手动'),
+    )
+    return future_open_fee, future_close_fee
+
+
 def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
                            contract_meta: Dict[str, Dict], cfg: PnlConfig) -> List[Dict]:
     """
@@ -63,10 +105,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
     Returns:
         注入了 PnL 字段的持仓列表（同一引用）
     """
-    fee_bps_full = calc_full_fee_bps(cfg.spot_open_fee, cfg.spot_close_fee,
-                                      cfg.future_open_fee, cfg.future_close_fee)
-    fee_bps_open = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
-
     # 保证金风控配置（通过 PnlConfig 注入）
     margin_leverage = cfg.margin_leverage
     margin_default_mmr = cfg.margin_default_mmr
@@ -76,6 +114,15 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         vwap_data = close_vwaps.get(ba)
 
         # 注入费率 (bps) - 根据状态区分：持仓中只显示开仓费，已平仓显示全部费
+        c_meta = contract_meta.get(ba, {})
+        future_open_fee, future_close_fee = _position_fee_rates(pos, c_meta, cfg)
+        fee_bps_full = calc_full_fee_bps(
+            cfg.spot_open_fee,
+            cfg.spot_close_fee,
+            future_open_fee,
+            future_close_fee,
+        )
+        fee_bps_open = calc_open_fee_bps(cfg.spot_open_fee, future_open_fee)
         if pos.get('status') == 'closed':
             pos['fee_bps'] = fee_bps_full
         else:
@@ -85,7 +132,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         pos['risk_relief_bps'] = cfg.risk_relief_bps
 
         # 注入实时资金费率与支付窗口
-        c_meta = contract_meta.get(ba, {})
         pos['funding_rate'] = c_meta.get('funding_rate')
         pos['funding_rate_24h'] = c_meta.get('funding_rate_24h')
         interval_sec = c_meta.get('funding_interval')
