@@ -853,6 +853,17 @@ class RealExecutor:
         limit: int = 1000,
     ) -> List[Dict]:
         """拉取 Gate USDT 永续账户账务流水（只读，资金快照收益使用）。"""
+        if start_time is not None and end_time is not None and end_time - start_time > 30 * 86400:
+            rows: List[Dict] = []
+            cursor = int(start_time)
+            end = int(end_time)
+            max_span = 30 * 86400 - 1
+            while cursor <= end:
+                chunk_end = min(cursor + max_span, end)
+                rows.extend(self.fetch_gate_futures_account_book(cursor, chunk_end, limit))
+                cursor = chunk_end + 1
+            return rows
+
         method = 'GET'
         api_path = '/api/v4/futures/usdt/account_book'
         all_rows: List[Dict] = []
