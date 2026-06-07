@@ -78,7 +78,10 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           momentum_allowed_tiers=None,
                           momentum_tier_overrides=None,
                           rebound_enabled=True,
-                          rebound_allowed_tiers=None):
+                          rebound_allowed_tiers=None,
+                          funding_entry_enabled=True,
+                          contract_meta=None,
+                          spot_meta=None):
     """构造独立的 TradingExecutor 实例（不依赖 DB / API）"""
     from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 
@@ -94,9 +97,10 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         momentum_tier_overrides=momentum_tier_overrides or {},
         rebound_enabled=rebound_enabled,
         rebound_allowed_tiers=rebound_allowed_tiers or ['A', 'B'],
+        funding_entry_enabled=funding_entry_enabled,
     )
     te = TradingExecutor(
-        cfg, contract_meta={}, spot_meta={},
+        cfg, contract_meta=contract_meta or {}, spot_meta=spot_meta or {},
         vwap_threshold_meta=vwap_threshold_meta,
         close_vwap_threshold_meta=close_vwap_threshold_meta,
         asset_tier_meta=asset_tier_meta,
@@ -303,6 +307,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
             max_orderbook_lag_ms=200.0,
             vwap_threshold_meta={'BTC': {'p20': -50}},
             close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
+            funding_entry_enabled=False,
         )
 
     def _patch_gate_chain(self, vwap_basis_bps, open_coverage):
@@ -415,6 +420,95 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         gate_lag, spot_lag = self.te._last_orderbook_lag_ms['BTC']
         self.assertAlmostEqual(gate_lag, 50, delta=30)
         self.assertAlmostEqual(spot_lag, 60, delta=30)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Funding-adjusted entry 测试
+# ══════════════════════════════════════════════════════════════════
+
+class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
+    """Funding 是核心收益，但 entry_floor 仍要保护入场位置和执行质量。"""
+
+    def _row(self, base_asset, basis, funding_rate_24h, coverage=0.5):
+        return {
+            'base_asset': base_asset,
+            'contract': f'{base_asset}_USDT',
+            'symbol': f'{base_asset}USDT',
+            'spot_qty': 1.0,
+            'open_vwap_basis_bps': basis,
+            'open_coverage': coverage,
+            'funding_rate_24h': funding_rate_24h,
+        }
+
+    def test_high_funding_gets_capped_discount_not_unlimited_entry(self):
+        te = make_trading_executor(
+            vwap_threshold_meta={'ALLO': {'p20': 26.9}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+
+        snapshot = te._entry_snapshot('ALLO', 20.0, self._row('ALLO', 20.0, 0.008646))
+
+        self.assertAlmostEqual(snapshot['funding_24h_bps'], 86.46, places=2)
+        self.assertAlmostEqual(snapshot['entry_floor_bps'], 16.9, places=1)
+        self.assertFalse(te._pass_risk_check(self._row('ALLO', 10.0, 0.008646)))
+        self.assertTrue(te._pass_risk_check(self._row('ALLO', 20.0, 0.008646)))
+
+    def test_low_funding_negative_p20_requires_positive_carry_floor(self):
+        te = make_trading_executor(
+            vwap_threshold_meta={'NFP': {'p20': -36.6}},
+            close_vwap_threshold_meta={'NFP': {'close_basis_p20': -100}},
+        )
+
+        row = self._row('NFP', -12.0, 0.0003)
+        snapshot = te._entry_snapshot('NFP', -12.0, row)
+
+        self.assertAlmostEqual(snapshot['entry_floor_bps'], 38.5, places=1)
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('entry_floor=38.5', te._get_risk_fail_reason(row))
+
+    def test_rebound_uses_entry_floor_instead_of_raw_p20(self):
+        te = make_trading_executor(
+            vwap_threshold_meta={'ALLO': {'p20': 30.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+            asset_tier_meta={'ALLO': 'B'},
+        )
+        te.rebound_min_rise_bps = 4.0
+        te.rebound_min_slope_bps = 0.5
+        te.rebound_min_basis_buffer_bps = 2.0
+        te._resolve_signal = MagicMock()
+        row = self._row('ALLO', 25.0, 0.01)
+        te._peak_state['ALLO'] = {
+            'peak_bps': 60.0,
+            'start_time': datetime.now(),
+            'trigger': 'pullback',
+            'signal_id': 1001,
+            'signal_basis_bps': 60.0,
+            'resiliency_active': True,
+            'entry_snapshot': te._entry_snapshot('ALLO', 25.0, row),
+        }
+
+        self.assertFalse(te._pass_rebound_check('ALLO', 25.0, row))
+        self.assertTrue(te._pass_rebound_check('ALLO', 29.0, self._row('ALLO', 29.0, 0.01)))
+        self.assertEqual(te._peak_state['ALLO']['trigger'], 'rebound')
+        te._resolve_signal.assert_not_called()
+
+    def test_rebound_timeout_cooldown_resets_when_basis_moves(self):
+        te = make_trading_executor()
+        te._start_rebound_timeout_cooldown('BTC', 50.0)
+
+        self.assertFalse(te._pass_rebound_timeout_cooldown('BTC', 51.0))
+        self.assertTrue(te._pass_rebound_timeout_cooldown('BTC', 55.0))
+
+    def test_execution_drift_cooldown_starts_after_bad_fill(self):
+        te = make_trading_executor()
+        te._maybe_start_execution_drift_cooldown(
+            'OPN',
+            {'pre_gate_basis_bps': 47.9, 'actual_basis_bps': -12.0},
+        )
+
+        self.assertFalse(te._pass_execution_drift_cooldown('OPN'))
+        te._execution_drift_cooldown_until['OPN'] = datetime.now() - timedelta(seconds=1)
+        self.assertTrue(te._pass_execution_drift_cooldown('OPN'))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -610,19 +704,19 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
 
     def test_a_tier_can_enter_momentum_channel(self):
         te = self._executor('A')
-        for basis in [30.0, 32.0, 34.0]:
+        for basis in [30.0, 36.0, 42.0]:
             te._record_momentum_sample('BTC', basis)
 
-        self.assertTrue(te._pass_momentum_check('BTC', 34.0, self._row('BTC', 34.0)))
+        self.assertTrue(te._pass_momentum_check('BTC', 42.0, self._row('BTC', 42.0)))
         self.assertEqual(te._peak_state['BTC']['trigger'], 'momentum')
         self.assertEqual(te._peak_state['BTC']['strategy_tier'], 'A')
 
     def test_b_tier_does_not_enter_momentum_channel(self):
         te = self._executor('B')
-        for basis in [30.0, 32.0, 34.0]:
+        for basis in [30.0, 36.0, 42.0]:
             te._record_momentum_sample('BTC', basis)
 
-        self.assertFalse(te._pass_momentum_check('BTC', 34.0, self._row('BTC', 34.0)))
+        self.assertFalse(te._pass_momentum_check('BTC', 42.0, self._row('BTC', 42.0)))
         self.assertNotIn('BTC', te._peak_state)
 
     def _assert_waits_for_rebound_after_pullback_resiliency(self, tier):

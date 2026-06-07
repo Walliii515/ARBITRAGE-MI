@@ -60,6 +60,7 @@ trade:
 
   # ─── 动量开仓通道 ───
   # 用于高流动性标的在“超阈值 + 上升期 + 盘口好”时直接进入最终旁路，不等待回调。
+  # “超阈值”指达到 funding_adjusted_entry 计算出的 entry_floor，不再是单独的 p20。
   # 只对 A 级标的启用；B 级仍走 pullback + resiliency + rebound，C 级不订阅 WS。
   momentum_open:
     enabled: true
@@ -68,14 +69,14 @@ trade:
     min_samples: 3                          # 默认动量判断最少样本数
     min_rise_bps: 3                         # 默认窗口内基差最小上升幅度
     min_basis_buffer_bps: 8                 # 默认当前基差需高于 p20 的额外安全垫
-    safety_bps: 8                           # 默认盈利性守卫的额外安全垫
+    safety_bps: 8                           # 旧模式盈利性守卫额外安全垫；新模式主要使用 entry_floor
     tier_overrides:
       A:
         window_sec: 1.0                     # A 级流动性好，动量确认窗口更短
         min_samples: 3
         min_rise_bps: 3
         min_basis_buffer_bps: 6             # A 级安全垫略小
-        safety_bps: 6                       # A 级盈利性守卫额外安全垫略小
+        safety_bps: 6                       # A 级旧模式盈利性守卫额外安全垫略小
 
   # ─── 回调后再突破开仓通道 ───
   # 用于 A/B 级标的：先等冲击释放和盘口恢复，但不在回调后立刻接单；
@@ -94,8 +95,41 @@ trade:
   execution_guard:
     enabled: true
     min_profit_buffer_bps: 15               # pre_gate 需高于 平仓阈值+全手续费 的额外安全垫
-    min_p20_buffer_bps: 3                   # pre_gate 需高于 p20 的额外安全垫
+    min_p20_buffer_bps: 3                   # 新模式下表示 pre_gate 需高于 entry_floor 的额外安全垫
     max_peak_decay_bps: 45                  # pre_gate 相对峰值最多允许衰减
+
+  # ─── Funding-adjusted 统一入场门槛 ───
+  # entry_floor = max(
+  #   fee_full_bps + slippage_buffer_bps + min_expected_edge_bps - funding_24h_bps * funding_capture_ratio,
+  #   open_basis_p20 - min(max_funding_discount_bps, funding_24h_bps * discount_ratio)
+  # )
+  # funding 不够厚时，不允许低于 p20；funding 很厚时，也最多只给 max_funding_discount_bps 折扣。
+  funding_adjusted_entry:
+    enabled: true
+    funding_capture_ratio: 0.5              # 只把 24h funding 的一部分计入本轮预期，避免高估收益
+    min_expected_edge_bps: 0                # funding + basis - 手续费 - 滑点缓冲 至少为 0
+    slippage_buffer_bps: 10                 # 统一预留成交滑点/冲击缓冲
+    strong_funding_24h_bps: 50              # funding≥该值才允许低于 p20 少量入场
+    discount_ratio: 0.2                     # funding 对 p20 的折扣比例
+    max_funding_discount_bps: 10            # 最多比 p20 放宽 10bps，避免开在太差位置
+
+  # ─── 信号降噪 / 执行质量冷却 ───
+  rebound_timeout_cooldown:
+    enabled: true
+    cooldown_sec: 45                        # 回弹等待超时后短冷却，防止同一状态反复刷信号
+    basis_change_reset_bps: 5               # 若基差相对超时点变化足够大，提前解除冷却
+
+  asset_noise_cooldown:
+    enabled: true
+    lookback_min: 60                        # 单标的近 60 分钟信号过密且不开仓，则临时降噪
+    max_signals: 100
+    min_opened: 1
+    cooldown_min: 30
+
+  execution_drift_cooldown:
+    enabled: true
+    max_drift_bps: 40                       # pre_gate_basis - actual_basis 超过该值，视为执行质量异常
+    cooldown_hour: 6
 
   # ─── 开仓盘口恢复确认 ───
   # 当开仓信号已经完成“峰值回落”确认后，系统不会立刻下单，而是进入最多 3.0 秒的盘口恢复观察期；
@@ -148,7 +182,7 @@ trade:
     snapshot_retention_days: 60             # 快照保留天数
     update_threshold_enabled: true           # 是否由系统更新 mi_vwap_basis_threshold；false 时仅保留 mi_vwap_basis_snapshot 快照
     threshold_lookback_days: 7              # 阈值回溯天数（用于每日统计分析）
-    # 平仓基差阈值分位列（用于开仓盈利性守卫：开仓基差需明显高于未来可能的平仓基差）
+    # 平仓基差阈值分位列（旧模式用于开仓盈利性守卫；新模式主要用于平仓/复盘）
     # 可选值: close_basis_p10 / close_basis_p20
     close_threshold_percentile: close_basis_p20
 

@@ -103,6 +103,28 @@ class TradingExecutorConfig:
     execution_guard_min_p20_buffer_bps: float = 3.0
     execution_guard_max_peak_decay_bps: float = 45.0
 
+    # ─── funding-adjusted 统一入场门槛 ───
+    funding_entry_enabled: bool = True
+    funding_entry_capture_ratio: float = 0.5
+    funding_entry_slippage_buffer_bps: float = 10.0
+    funding_entry_min_expected_edge_bps: float = 0.0
+    funding_entry_strong_funding_24h_bps: float = 50.0
+    funding_entry_discount_ratio: float = 0.2
+    funding_entry_max_discount_bps: float = 10.0
+
+    # ─── 信号降噪 / 执行质量冷却 ───
+    rebound_timeout_cooldown_enabled: bool = True
+    rebound_timeout_cooldown_sec: int = 45
+    rebound_timeout_basis_change_reset_bps: float = 5.0
+    asset_noise_cooldown_enabled: bool = True
+    asset_noise_lookback_min: int = 60
+    asset_noise_max_signals: int = 100
+    asset_noise_min_opened: int = 1
+    asset_noise_cooldown_min: int = 30
+    execution_drift_cooldown_enabled: bool = True
+    execution_drift_max_bps: float = 40.0
+    execution_drift_cooldown_hour: float = 6.0
+
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
     capital_max_age_sec: int = 180
@@ -122,7 +144,7 @@ class TradingExecutor:
             contract_meta: base_asset -> {quanto_multiplier, order_size_min, price_decimal, size_decimal, ...}
             spot_meta: base_asset -> {step_size, min_qty, ...}
             vwap_threshold_meta: base_asset -> threshold_bps (按标的VWAP基差阈值)
-            close_vwap_threshold_meta: base_asset -> {close_basis_p10..p40} (平仓基差阈值，用于盈利性守卫)
+            close_vwap_threshold_meta: base_asset -> {close_basis_p10..p40} (平仓基差阈值；旧模式用于盈利性守卫)
             asset_tier_meta: base_asset -> strategy_tier ('A'/'B'/'C')
         """
         self.contract_meta = contract_meta
@@ -144,7 +166,7 @@ class TradingExecutor:
         self.cooldown_sec = cfg.cooldown_sec
         self.min_funding_rate_bps = cfg.min_funding_rate_bps
 
-        # 手续费率（用于盈利性守卫计算）
+        # 手续费率（用于 entry_floor / 旧盈利性守卫计算）
         self.fee_cost_bps = -calc_full_fee_bps(
             cfg.fee_spot_open, cfg.fee_spot_close,
             cfg.fee_future_open, cfg.fee_future_close
@@ -154,7 +176,7 @@ class TradingExecutor:
         self._fee_future_open = cfg.fee_future_open
         self._risk_relief_bps = cfg.risk_relief_bps
 
-        # 盈利性守卫使用的平仓基差分位字段名
+        # 平仓基差分位字段名（旧盈利性守卫仍使用）
         self.close_threshold_col = cfg.close_threshold_percentile
 
         # 24小时成交量过滤阈值（USDT）
@@ -254,6 +276,32 @@ class TradingExecutor:
         self.execution_guard_min_profit_buffer_bps = float(cfg.execution_guard_min_profit_buffer_bps)
         self.execution_guard_min_p20_buffer_bps = float(cfg.execution_guard_min_p20_buffer_bps)
         self.execution_guard_max_peak_decay_bps = float(cfg.execution_guard_max_peak_decay_bps)
+
+        self.funding_entry_enabled = bool(cfg.funding_entry_enabled)
+        self.funding_entry_capture_ratio = float(cfg.funding_entry_capture_ratio)
+        self.funding_entry_slippage_buffer_bps = float(cfg.funding_entry_slippage_buffer_bps)
+        self.funding_entry_min_expected_edge_bps = float(cfg.funding_entry_min_expected_edge_bps)
+        self.funding_entry_strong_funding_24h_bps = float(cfg.funding_entry_strong_funding_24h_bps)
+        self.funding_entry_discount_ratio = float(cfg.funding_entry_discount_ratio)
+        self.funding_entry_max_discount_bps = float(cfg.funding_entry_max_discount_bps)
+
+        self.rebound_timeout_cooldown_enabled = bool(cfg.rebound_timeout_cooldown_enabled)
+        self.rebound_timeout_cooldown_sec = int(cfg.rebound_timeout_cooldown_sec)
+        self.rebound_timeout_basis_change_reset_bps = float(cfg.rebound_timeout_basis_change_reset_bps)
+        self._rebound_timeout_cooldown: Dict[str, Dict] = {}
+
+        self.asset_noise_cooldown_enabled = bool(cfg.asset_noise_cooldown_enabled)
+        self.asset_noise_lookback_sec = int(cfg.asset_noise_lookback_min) * 60
+        self.asset_noise_max_signals = int(cfg.asset_noise_max_signals)
+        self.asset_noise_min_opened = int(cfg.asset_noise_min_opened)
+        self.asset_noise_cooldown_sec = int(cfg.asset_noise_cooldown_min) * 60
+        self._asset_noise_events: Dict[str, deque] = {}
+        self._asset_noise_cooldown_until: Dict[str, datetime] = {}
+
+        self.execution_drift_cooldown_enabled = bool(cfg.execution_drift_cooldown_enabled)
+        self.execution_drift_max_bps = float(cfg.execution_drift_max_bps)
+        self.execution_drift_cooldown_sec = int(float(cfg.execution_drift_cooldown_hour) * 3600)
+        self._execution_drift_cooldown_until: Dict[str, datetime] = {}
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
@@ -359,6 +407,18 @@ class TradingExecutor:
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     continue
+
+                open_vwap_basis = float(row.get('open_vwap_basis_bps'))
+                self._annotate_entry_snapshot(row, open_vwap_basis)
+
+                # 这些冷却只拦截“新一轮信号”，不打断已经进入状态机的信号。
+                if base_asset not in self._peak_state:
+                    if not self._pass_asset_noise_cooldown(base_asset):
+                        continue
+                    if not self._pass_rebound_timeout_cooldown(base_asset, open_vwap_basis):
+                        continue
+                    if not self._pass_execution_drift_cooldown(base_asset):
+                        continue
                                 
                 # 1. 风控检查
                 if not self._pass_risk_check(row):
@@ -387,7 +447,6 @@ class TradingExecutor:
                                 
                 # 3. 峰值回落 + sustain 确认（单通道）
                 self._annotate_resiliency_row(row)
-                open_vwap_basis = float(row.get('open_vwap_basis_bps'))
                 self._record_momentum_sample(base_asset, open_vwap_basis)
                 momentum_ready = self._pass_momentum_check(base_asset, open_vwap_basis, row)
 
@@ -433,8 +492,12 @@ class TradingExecutor:
                 # 使用旁路返回的最新数据（单标的最短链路）
                 if gate_row is not None:
                     row = gate_row
+                    row['funding_rate_24h'] = row.get('funding_rate_24h') or self.contract_meta.get(
+                        base_asset, {}
+                    ).get('funding_rate_24h')
                 if gate_basis is not None:
                     open_vwap_basis = gate_basis
+                self._annotate_entry_snapshot(row, open_vwap_basis)
                 peak_state = self._peak_state.get(base_asset, {})
                 signal_basis = peak_state.get('signal_basis_bps')
                 row['signal_basis_bps'] = signal_basis
@@ -471,6 +534,7 @@ class TradingExecutor:
                 
                 # 7. 持久化订单
                 self._save_orders(order_group, exec_result)
+                self._maybe_start_execution_drift_cooldown(base_asset, order_group)
                 
                 # 8. 更新信号状态
                 peak_state = self._peak_state.get(base_asset, {})
@@ -550,6 +614,209 @@ class TradingExecutor:
     def _asset_tier(self, base_asset: str) -> str:
         return self.asset_tier_meta.get((base_asset or '').strip().upper(), 'C')
 
+    def _funding_24h_bps(self, base_asset: str, row: Optional[Dict] = None) -> float:
+        row = row or {}
+        funding_rate = row.get('funding_rate_24h')
+        if funding_rate is None and base_asset in self.contract_meta:
+            funding_rate = self.contract_meta[base_asset].get('funding_rate_24h')
+        if funding_rate is None:
+            return 0.0
+        return float(funding_rate) * 10000.0
+
+    def _entry_snapshot(self, base_asset: str, basis_bps: float, row: Optional[Dict] = None) -> Dict:
+        """
+        统一开仓门槛。
+
+        p20 只是历史位置参考；真正的 entry_floor 同时考虑 funding、手续费、
+        滑点缓冲和一个有上限的 funding 折扣，避免高 funding 标的被放到太差位置。
+        """
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        p20 = float(threshold_data.get('p20', self.basis_threshold_bps))
+        funding_24h_bps = self._funding_24h_bps(base_asset, row)
+
+        if not self.funding_entry_enabled:
+            entry_floor = p20
+            expected_funding_bps = 0.0
+            carry_floor = p20
+            timing_floor = p20
+            discount_bps = 0.0
+        else:
+            expected_funding_bps = funding_24h_bps * self.funding_entry_capture_ratio
+            carry_floor = (
+                self.funding_entry_min_expected_edge_bps
+                + self.fee_cost_bps
+                + self.funding_entry_slippage_buffer_bps
+                - expected_funding_bps
+            )
+            discount_bps = min(
+                self.funding_entry_max_discount_bps,
+                max(0.0, funding_24h_bps) * self.funding_entry_discount_ratio,
+            )
+            timing_floor = p20 - discount_bps
+            entry_floor = max(carry_floor, timing_floor)
+
+            # funding 不够厚时，不允许因为历史 p20 很低而提前做 carry。
+            if funding_24h_bps < self.funding_entry_strong_funding_24h_bps:
+                entry_floor = max(entry_floor, p20)
+
+        expected_edge_bps = (
+            basis_bps
+            + expected_funding_bps
+            - self.fee_cost_bps
+            - self.funding_entry_slippage_buffer_bps
+        )
+        return {
+            'p20_bps': round(p20, 4),
+            'entry_floor_bps': round(entry_floor, 4),
+            'funding_24h_bps': round(funding_24h_bps, 4),
+            'expected_funding_bps': round(expected_funding_bps, 4),
+            'carry_floor_bps': round(carry_floor, 4),
+            'timing_floor_bps': round(timing_floor, 4),
+            'funding_discount_bps': round(discount_bps, 4),
+            'expected_edge_bps': round(expected_edge_bps, 4),
+        }
+
+    def _annotate_entry_snapshot(self, row: Dict, basis_bps: Optional[float] = None) -> Dict:
+        base_asset = row.get('base_asset', '')
+        if basis_bps is None:
+            basis_bps = float(row.get('open_vwap_basis_bps') or 0)
+        snapshot = self._entry_snapshot(base_asset, float(basis_bps), row)
+        for key, value in snapshot.items():
+            row[f'_entry_{key}'] = value
+        return snapshot
+
+    def _state_entry_snapshot(self, base_asset: str, row: Optional[Dict] = None,
+                              basis_bps: Optional[float] = None) -> Dict:
+        state = self._peak_state.get(base_asset) or {}
+        snapshot = state.get('entry_snapshot')
+        if snapshot:
+            return snapshot
+        if row and '_entry_entry_floor_bps' in row:
+            return {
+                'p20_bps': row.get('_entry_p20_bps'),
+                'entry_floor_bps': row.get('_entry_entry_floor_bps'),
+                'funding_24h_bps': row.get('_entry_funding_24h_bps'),
+                'expected_funding_bps': row.get('_entry_expected_funding_bps'),
+                'carry_floor_bps': row.get('_entry_carry_floor_bps'),
+                'timing_floor_bps': row.get('_entry_timing_floor_bps'),
+                'funding_discount_bps': row.get('_entry_funding_discount_bps'),
+                'expected_edge_bps': row.get('_entry_expected_edge_bps'),
+            }
+        if basis_bps is None:
+            basis_bps = float((row or {}).get('open_vwap_basis_bps') or 0)
+        return self._entry_snapshot(base_asset, float(basis_bps), row)
+
+    def _entry_floor_bps(self, base_asset: str, row: Optional[Dict] = None,
+                         basis_bps: Optional[float] = None) -> float:
+        return float(self._state_entry_snapshot(base_asset, row, basis_bps).get('entry_floor_bps'))
+
+    def _format_entry_snapshot(self, snapshot: Dict) -> str:
+        return (
+            f"entry_floor={float(snapshot.get('entry_floor_bps', 0)):.1f},"
+            f"p20={float(snapshot.get('p20_bps', 0)):.1f},"
+            f"funding24h={float(snapshot.get('funding_24h_bps', 0)):.1f},"
+            f"edge={float(snapshot.get('expected_edge_bps', 0)):.1f}"
+        )
+
+    def _pass_rebound_timeout_cooldown(self, base_asset: str, basis_bps: float) -> bool:
+        if not self.rebound_timeout_cooldown_enabled:
+            return True
+        cooldown = self._rebound_timeout_cooldown.get(base_asset)
+        if not cooldown:
+            return True
+        now = datetime.now()
+        if now >= cooldown.get('until', now):
+            self._rebound_timeout_cooldown.pop(base_asset, None)
+            return True
+        anchor_basis = float(cooldown.get('basis_bps', basis_bps))
+        if abs(float(basis_bps) - anchor_basis) >= self.rebound_timeout_basis_change_reset_bps:
+            self._rebound_timeout_cooldown.pop(base_asset, None)
+            logger.info(
+                f"回弹超时冷却解除 | {base_asset} | "
+                f"basis变化{abs(float(basis_bps) - anchor_basis):.1f}bps"
+            )
+            return True
+        return False
+
+    def _start_rebound_timeout_cooldown(self, base_asset: str, basis_bps: float) -> None:
+        if not self.rebound_timeout_cooldown_enabled:
+            return
+        until = datetime.now() + timedelta(seconds=self.rebound_timeout_cooldown_sec)
+        self._rebound_timeout_cooldown[base_asset] = {
+            'until': until,
+            'basis_bps': float(basis_bps),
+        }
+        logger.info(
+            f"回弹超时冷却启动 | {base_asset} | "
+            f"cooldown={self.rebound_timeout_cooldown_sec}s | basis={float(basis_bps):.1f}bps"
+        )
+
+    def _pass_asset_noise_cooldown(self, base_asset: str) -> bool:
+        if not self.asset_noise_cooldown_enabled:
+            return True
+        until = self._asset_noise_cooldown_until.get(base_asset)
+        if not until:
+            return True
+        if datetime.now() >= until:
+            self._asset_noise_cooldown_until.pop(base_asset, None)
+            logger.info(f"信号降噪冷却解除 | {base_asset}")
+            return True
+        return False
+
+    def _record_signal_noise_event(self, base_asset: str, status: str) -> None:
+        if not self.asset_noise_cooldown_enabled or not base_asset:
+            return
+        now = datetime.now()
+        events = self._asset_noise_events.setdefault(base_asset, deque())
+        events.append((now, status))
+        cutoff = now - timedelta(seconds=self.asset_noise_lookback_sec)
+        while events and events[0][0] < cutoff:
+            events.popleft()
+
+        total = len(events)
+        opened = sum(1 for _, s in events if s == 'opened')
+        if total >= self.asset_noise_max_signals and opened < self.asset_noise_min_opened:
+            until = now + timedelta(seconds=self.asset_noise_cooldown_sec)
+            prev_until = self._asset_noise_cooldown_until.get(base_asset)
+            if prev_until is None or until > prev_until:
+                self._asset_noise_cooldown_until[base_asset] = until
+                logger.info(
+                    f"信号降噪冷却启动 | {base_asset} | "
+                    f"近{self.asset_noise_lookback_sec // 60}min信号{total}个/"
+                    f"开仓{opened}个 | 冷却{self.asset_noise_cooldown_sec // 60}min"
+                )
+
+    def _pass_execution_drift_cooldown(self, base_asset: str) -> bool:
+        if not self.execution_drift_cooldown_enabled:
+            return True
+        until = self._execution_drift_cooldown_until.get(base_asset)
+        if not until:
+            return True
+        if datetime.now() >= until:
+            self._execution_drift_cooldown_until.pop(base_asset, None)
+            logger.info(f"执行漂移冷却解除 | {base_asset}")
+            return True
+        return False
+
+    def _maybe_start_execution_drift_cooldown(self, base_asset: str, order_group: Dict) -> None:
+        if not self.execution_drift_cooldown_enabled:
+            return
+        pre_gate = order_group.get('pre_gate_basis_bps')
+        actual = order_group.get('actual_basis_bps')
+        if pre_gate is None or actual is None:
+            return
+        drift_bps = float(pre_gate) - float(actual)
+        if drift_bps <= self.execution_drift_max_bps:
+            return
+        until = datetime.now() + timedelta(seconds=self.execution_drift_cooldown_sec)
+        self._execution_drift_cooldown_until[base_asset] = until
+        logger.warning(
+            f"执行漂移冷却启动 | {base_asset} | "
+            f"pre_gate={float(pre_gate):.1f}bps actual={float(actual):.1f}bps "
+            f"drift={drift_bps:.1f}>{self.execution_drift_max_bps:.1f}bps | "
+            f"cooldown={self.execution_drift_cooldown_sec // 3600:.1f}h"
+        )
+
     def _momentum_params_for_tier(self, tier: str) -> Dict[str, float]:
         override = self.momentum_tier_overrides.get((tier or '').strip().upper(), {})
         return {
@@ -565,7 +832,7 @@ class TradingExecutor:
     def _pass_momentum_check(self, base_asset: str, current_basis_bps: float, row: Dict) -> bool:
         """
         动量开仓通道：当基差已经明显超过阈值，并且短窗口内继续上行，
-        且盘口覆盖和盈利性守卫仍然健康时，直接进入最终旁路，不等待回调。
+        且盘口覆盖和 entry_floor 仍然健康时，直接进入最终旁路，不等待回调。
         """
         if not self.momentum_enabled:
             return False
@@ -583,9 +850,9 @@ class TradingExecutor:
         if len(recent_samples) < params['min_samples']:
             return False
 
-        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-        p20 = threshold_data.get('p20', self.basis_threshold_bps)
-        min_entry_basis = float(p20) + params['min_basis_buffer_bps']
+        entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
+        entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+        min_entry_basis = entry_floor + params['min_basis_buffer_bps']
         if current_basis_bps < min_entry_basis:
             return False
 
@@ -602,15 +869,18 @@ class TradingExecutor:
         if open_coverage is not None and float(open_coverage) > self.coverage_threshold:
             return False
 
-        close_data = self.close_vwap_threshold_meta.get(base_asset)
-        if not close_data:
-            return False
-        close_thr = close_data.get(self.close_threshold_col)
-        if close_thr is None:
-            return False
-        min_profit_basis = float(close_thr) + self.fee_cost_bps + params['safety_bps']
-        if current_basis_bps <= min_profit_basis:
-            return False
+        if not self.funding_entry_enabled:
+            close_data = self.close_vwap_threshold_meta.get(base_asset)
+            if not close_data:
+                return False
+            close_thr = close_data.get(self.close_threshold_col)
+            if close_thr is None:
+                return False
+            min_profit_basis = float(close_thr) + self.fee_cost_bps + params['safety_bps']
+            if current_basis_bps <= min_profit_basis:
+                return False
+        else:
+            min_profit_basis = min_entry_basis
 
         contract = row.get('contract', '')
         if not self._verify_realtime_funding_rate(base_asset, contract):
@@ -628,19 +898,19 @@ class TradingExecutor:
             'strategy_tier': tier,
             'momentum_window_sec': params['window_sec'],
             'momentum_min_basis_buffer_bps': params['min_basis_buffer_bps'],
+            'entry_snapshot': entry_snapshot,
         }
         logger.info(
             f"动量开仓确认 | {base_asset} | "
             f"tier={tier} | "
-            f"basis={current_basis_bps:.2f}bps≥p20+buffer={min_entry_basis:.2f} | "
+            f"basis={current_basis_bps:.2f}bps≥entry_floor+buffer={min_entry_basis:.2f} | "
             f"rise={rise_bps:.2f}bps/{params['window_sec']:.1f}s | "
             f"coverage={open_coverage} | guard>{min_profit_basis:.2f}"
         )
         return True
 
     def _pass_open_resiliency_check(self, base_asset: str, row: Dict, open_vwap_basis: float) -> bool:
-        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-        min_basis = threshold_data.get('p20', self.basis_threshold_bps)
+        min_basis = self._entry_floor_bps(base_asset, row, open_vwap_basis)
         result = self._open_resiliency.check(
             base_asset,
             row,
@@ -706,15 +976,15 @@ class TradingExecutor:
             return False
 
         now = datetime.now()
-        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-        p20 = float(threshold_data.get('p20', self.basis_threshold_bps))
-        min_basis = p20 + self.rebound_min_basis_buffer_bps
+        entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
+        entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+        min_basis = entry_floor + self.rebound_min_basis_buffer_bps
 
-        if current_basis_bps < p20:
+        if current_basis_bps < entry_floor:
             self._resolve_signal(
                 base_asset,
                 'conditions_lost',
-                f'回弹等待中基差跌回阈值下({current_basis_bps:.1f}<p20={p20:.1f}bps)',
+                f'回弹等待中基差跌回入场门槛下({current_basis_bps:.1f}<entry_floor={entry_floor:.1f}bps)',
                 exit_basis_bps=current_basis_bps,
                 trigger_type='pullback',
             )
@@ -730,7 +1000,7 @@ class TradingExecutor:
             logger.info(
                 f"回调后再突破等待开始 | {base_asset} | tier={tier} | "
                 f"floor={current_basis_bps:.2f}bps | "
-                f"需回升{self.rebound_min_rise_bps:.1f}bps且≥p20+buffer={min_basis:.2f}bps"
+                f"需回升{self.rebound_min_rise_bps:.1f}bps且≥entry_floor+buffer={min_basis:.2f}bps"
             )
             return False
 
@@ -754,6 +1024,7 @@ class TradingExecutor:
             )
             self._peak_state.pop(base_asset, None)
             self._open_resiliency.clear(base_asset)
+            self._start_rebound_timeout_cooldown(base_asset, current_basis_bps)
             logger.info(
                 f"回调后再突破超时放弃 | {base_asset} | "
                 f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | waited={waited_sec:.1f}s"
@@ -793,30 +1064,42 @@ class TradingExecutor:
         if not self.execution_guard_enabled:
             return True, ''
 
-        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-        p20 = threshold_data.get('p20', self.basis_threshold_bps)
-        if p20 is not None:
-            min_p20_basis = float(p20) + self.execution_guard_min_p20_buffer_bps
-            if pre_gate_basis_bps < min_p20_basis:
+        if self.funding_entry_enabled:
+            entry_snapshot = (peak_state or {}).get('entry_snapshot') or self._entry_snapshot(
+                base_asset, pre_gate_basis_bps
+            )
+            entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+            min_entry_basis = entry_floor + self.execution_guard_min_p20_buffer_bps
+            if pre_gate_basis_bps < min_entry_basis:
                 return False, (
                     f'执行保护(pregate={pre_gate_basis_bps:.1f}<'
-                    f'p20+buffer={min_p20_basis:.1f})'
+                    f'entry_floor+buffer={min_entry_basis:.1f})'
                 )
-
-        close_data = self.close_vwap_threshold_meta.get(base_asset)
-        if close_data:
-            close_thr = close_data.get(self.close_threshold_col)
-            if close_thr is not None:
-                min_profit_basis = (
-                    float(close_thr)
-                    + self.fee_cost_bps
-                    + self.execution_guard_min_profit_buffer_bps
-                )
-                if pre_gate_basis_bps <= min_profit_basis:
+        else:
+            threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+            p20 = threshold_data.get('p20', self.basis_threshold_bps)
+            if p20 is not None:
+                min_p20_basis = float(p20) + self.execution_guard_min_p20_buffer_bps
+                if pre_gate_basis_bps < min_p20_basis:
                     return False, (
                         f'执行保护(pregate={pre_gate_basis_bps:.1f}<='
-                        f'close+fee+buffer={min_profit_basis:.1f})'
+                        f'p20+buffer={min_p20_basis:.1f})'
                     )
+
+            close_data = self.close_vwap_threshold_meta.get(base_asset)
+            if close_data:
+                close_thr = close_data.get(self.close_threshold_col)
+                if close_thr is not None:
+                    min_profit_basis = (
+                        float(close_thr)
+                        + self.fee_cost_bps
+                        + self.execution_guard_min_profit_buffer_bps
+                    )
+                    if pre_gate_basis_bps <= min_profit_basis:
+                        return False, (
+                            f'执行保护(pregate={pre_gate_basis_bps:.1f}<='
+                            f'close+fee+buffer={min_profit_basis:.1f})'
+                        )
 
         peak_bps = peak_state.get('peak_bps') if peak_state else None
         if peak_bps is not None:
@@ -835,8 +1118,8 @@ class TradingExecutor:
         0. 保证金风控: 该标的现有持仓距爆仓距离 < warning_pct 时禁止开仓
         1. 资金费率 >= 下限(min_funding_rate_bps)
         2. 开仓盘口覆盖 <= 阈值
-        3. 开仓边际基差 >= 阈值
-        4. 盈利性守卫: 开仓基差 > 平仓基差阈值 + 手续费(确保价差有收敛空间)
+        3. 开仓基差 >= funding-adjusted entry_floor
+        4. 旧模式下保留盈利性守卫；新模式下 entry_floor 已合并 funding、手续费和滑点缓冲
         """
         base_asset = row.get('base_asset', '')
 
@@ -870,24 +1153,15 @@ class TradingExecutor:
             if float(open_coverage) > self.coverage_threshold:
                 return False
         
-        # 边际基差检查（支持按标的VWAP基差阈值）
-        # 统一口径：均与纯基差（open_vwap_basis_bps）对比，不含手续费和风险缓释
-        # 入场最低门槛：使用 p20 作为入场最低要求
+        # 统一入场门槛：p20 是历史位置参考，entry_floor 同时考虑 funding、手续费和滑点缓冲。
         open_vwap_basis = row.get('open_vwap_basis_bps')
         if open_vwap_basis is not None:
-            if base_asset in self.vwap_threshold_meta:
-                p20 = self.vwap_threshold_meta[base_asset].get('p20')
-                if p20 is not None and float(open_vwap_basis) < p20:
-                    return False
-            else:
-                # 全局回退阈值
-                if float(open_vwap_basis) < self.basis_threshold_bps:
-                    return False
+            entry_floor = self._entry_floor_bps(base_asset, row, float(open_vwap_basis))
+            if float(open_vwap_basis) < entry_floor:
+                return False
         
-        # 盈利性守卫: 开仓基差 > 平仓基差阈值 + 手续费成本
-        # 确保即使按历史分位平仓，利润仍能覆盖手续费（过滤结构性亏损标的）
-        # 若平仓阈值缺失（未加载到或该标的无数据），直接拒单以防止无守卫开仓
-        if open_vwap_basis is not None:
+        # 兼容旧模式：未启用 funding-adjusted entry 时仍使用传统盈利性守卫。
+        if open_vwap_basis is not None and not self.funding_entry_enabled:
             if base_asset not in self.close_vwap_threshold_meta:
                 return False
             close_data = self.close_vwap_threshold_meta[base_asset]
@@ -967,7 +1241,7 @@ class TradingExecutor:
         - 检测盘口数据陈旧性（低流动性标的WS更新稀疏）
         - 确保下单用的数据 = 校验用的数据（同一份最短链路读取）
     
-        最短链路：单标的盘口读取 → 新鲜度硬约束(lag_ms) → VWAP基差计算 → 阈值+盈利性守卫+覆盖率校验
+        最短链路：单标的盘口读取 → 新鲜度硬约束(lag_ms) → VWAP基差计算 → 统一入场门槛+覆盖率校验
         """
         # 未注入 manager 时退化为放行（兼容测试场景）
         if not self._gate_manager or not self._spot_manager:
@@ -1037,6 +1311,8 @@ class TradingExecutor:
                 merged, self.contract_meta, self.spot_meta, self.open_amount_usdt
             )
             row = merged[0]
+            row['base_asset'] = base_asset
+            row['funding_rate_24h'] = self.contract_meta.get(base_asset, {}).get('funding_rate_24h')
 
             # ── 4. 计算VWAP基差 ──
             gate_basis_bps = calc_vwap_basis_bps(
@@ -1046,57 +1322,50 @@ class TradingExecutor:
                 return False, None, None, 'VWAP基差计算失败(盘口深度不足)'
             gate_basis_bps = round(gate_basis_bps, 2)
 
-            # ── 5. 基差阈值校验 ──
-            if base_asset in self.vwap_threshold_meta:
-                p20 = self.vwap_threshold_meta[base_asset].get('p20')
-                if p20 is not None and gate_basis_bps < p20:
-                    logger.info(
-                        f"开仓旁路-基差衰减拦截 | {base_asset} | "
-                        f"gate_basis={gate_basis_bps:.2f}bps < p20={p20:.2f}bps | "
-                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
-                    )
-                    return False, row, gate_basis_bps, (
-                        f'基差衰减({gate_basis_bps:.1f}bps < 阈值p20={p20:.1f})'
-                    )
-            else:
-                if gate_basis_bps < self.basis_threshold_bps:
-                    logger.info(
-                        f"开仓旁路-基差衰减(全局阈值)拦截 | {base_asset} | "
-                        f"gate_basis={gate_basis_bps:.2f}bps < threshold={self.basis_threshold_bps}bps | "
-                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
-                    )
-                    return False, row, gate_basis_bps, (
-                        f'基差衰减({gate_basis_bps:.1f}bps < 全局阈值{self.basis_threshold_bps})'
-                    )
-
-            # ── 6. 盈利性守卫 ──
-            if base_asset not in self.close_vwap_threshold_meta:
+            # ── 5. 统一入场门槛校验 ──
+            entry_snapshot = self._state_entry_snapshot(base_asset, row, gate_basis_bps)
+            entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+            if gate_basis_bps < entry_floor:
                 logger.info(
-                    f"开仓旁路-盈利性守卫拦截(无平仓阈值) | {base_asset} | "
-                    f"close_vwap_threshold_meta 未包含该标的 | "
-                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
-                )
-                return False, row, gate_basis_bps, '盈利性守卫拦截(无平仓阈值,拒绝开仓)'
-            close_data = self.close_vwap_threshold_meta[base_asset]
-            close_threshold = close_data.get(self.close_threshold_col)
-            if close_threshold is None:
-                logger.info(
-                    f"开仓旁路-盈利性守卫拦截(阈值为NULL) | {base_asset} | "
-                    f"{self.close_threshold_col}=None | "
-                    f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
-                )
-                return False, row, gate_basis_bps, f'盈利性守卫拦截({self.close_threshold_col}为NULL,拒绝开仓)'
-            if gate_basis_bps <= float(close_threshold) + self.fee_cost_bps:
-                logger.info(
-                    f"开仓旁路-盈利性守卫拦截 | {base_asset} | "
-                    f"gate_basis={gate_basis_bps:.2f}bps <= "
-                    f"close_thr={float(close_threshold):.2f}+fee={self.fee_cost_bps:.0f} | "
+                    f"开仓旁路-入场门槛拦截 | {base_asset} | "
+                    f"gate_basis={gate_basis_bps:.2f}bps < entry_floor={entry_floor:.2f}bps | "
+                    f"{self._format_entry_snapshot(entry_snapshot)} | "
                     f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
                 )
                 return False, row, gate_basis_bps, (
-                    f'盈利性守卫拦截(basis={gate_basis_bps:.1f} <= '
-                    f'close_thr={float(close_threshold):.1f}+fee={self.fee_cost_bps:.0f})'
+                    f'基差衰减({gate_basis_bps:.1f}bps < entry_floor={entry_floor:.1f}|'
+                    f'{self._format_entry_snapshot(entry_snapshot)})'
                 )
+
+            # ── 6. 兼容旧模式：盈利性守卫 ──
+            if not self.funding_entry_enabled:
+                if base_asset not in self.close_vwap_threshold_meta:
+                    logger.info(
+                        f"开仓旁路-盈利性守卫拦截(无平仓阈值) | {base_asset} | "
+                        f"close_vwap_threshold_meta 未包含该标的 | "
+                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
+                    return False, row, gate_basis_bps, '盈利性守卫拦截(无平仓阈值,拒绝开仓)'
+                close_data = self.close_vwap_threshold_meta[base_asset]
+                close_threshold = close_data.get(self.close_threshold_col)
+                if close_threshold is None:
+                    logger.info(
+                        f"开仓旁路-盈利性守卫拦截(阈值为NULL) | {base_asset} | "
+                        f"{self.close_threshold_col}=None | "
+                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
+                    return False, row, gate_basis_bps, f'盈利性守卫拦截({self.close_threshold_col}为NULL,拒绝开仓)'
+                if gate_basis_bps <= float(close_threshold) + self.fee_cost_bps:
+                    logger.info(
+                        f"开仓旁路-盈利性守卫拦截 | {base_asset} | "
+                        f"gate_basis={gate_basis_bps:.2f}bps <= "
+                        f"close_thr={float(close_threshold):.2f}+fee={self.fee_cost_bps:.0f} | "
+                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
+                    return False, row, gate_basis_bps, (
+                        f'盈利性守卫拦截(basis={gate_basis_bps:.1f} <= '
+                        f'close_thr={float(close_threshold):.1f}+fee={self.fee_cost_bps:.0f})'
+                    )
 
             # ── 7. 盘口覆盖校验 ──
             open_coverage = row.get('open_coverage')
@@ -1149,6 +1418,7 @@ class TradingExecutor:
             if not self._verify_realtime_funding_rate(base_asset, contract):
                 return False
 
+            entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
             signal_id = self._create_signal(base_asset, current_basis_bps)
             self._peak_state[base_asset] = {
                 'peak_bps': current_basis_bps,
@@ -1156,10 +1426,13 @@ class TradingExecutor:
                 'trigger': None,
                 'signal_id': signal_id,
                 'signal_basis_bps': current_basis_bps,
+                'entry_snapshot': entry_snapshot,
             }
             logger.info(
                 f"峰值监控开始 | {base_asset} | "
-                f"basis={current_basis_bps:.2f}bps | 需持续{self.sustain_sec}s且回落{self.peak_pullback_pct*100:.0f}% | "
+                f"basis={current_basis_bps:.2f}bps | "
+                f"{self._format_entry_snapshot(entry_snapshot)} | "
+                f"需持续{self.sustain_sec}s且回落{self.peak_pullback_pct*100:.0f}% | "
                 f"start_time={now.strftime('%H:%M:%S.%f')[:-3]}"
             )
             return False
@@ -1302,6 +1575,7 @@ class TradingExecutor:
                 })
         except Exception as e:
             logger.error(f"信号记录更新失败 {base_asset}: {e}")
+        self._record_signal_noise_event(base_asset, status)
 
     def _get_risk_fail_reason(self, row: Dict) -> str:
         """识别风控失败的具体原因（用于信号日志）"""
@@ -1348,16 +1622,23 @@ class TradingExecutor:
         if open_coverage is not None and float(open_coverage) > self.coverage_threshold:
             return f"盘口覆盖超限({float(open_coverage):.2f}>{self.coverage_threshold})"
 
-        # 基差不达标
+        # 统一入场门槛不达标
         open_vwap_basis = row.get('open_vwap_basis_bps')
         if open_vwap_basis is not None:
-            threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-            p20 = threshold_data.get('p20', self.basis_threshold_bps)
-            if float(open_vwap_basis) < p20:
-                return f"基差跌回阈值下({float(open_vwap_basis):.1f}<p20={p20:.1f}bps)"
+            entry_snapshot = self._state_entry_snapshot(base_asset, row, float(open_vwap_basis))
+            entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+            if float(open_vwap_basis) < entry_floor:
+                return (
+                    f"基差跌回入场门槛下({float(open_vwap_basis):.1f}<"
+                    f"entry_floor={entry_floor:.1f}bps|{self._format_entry_snapshot(entry_snapshot)})"
+                )
 
-        # 盈利性守卫
-        if open_vwap_basis is not None and base_asset in self.close_vwap_threshold_meta:
+        # 兼容旧模式：盈利性守卫
+        if (
+            open_vwap_basis is not None
+            and not self.funding_entry_enabled
+            and base_asset in self.close_vwap_threshold_meta
+        ):
             close_data = self.close_vwap_threshold_meta[base_asset]
             close_thr = close_data.get(self.close_threshold_col)
             if close_thr is not None:
@@ -1380,14 +1661,22 @@ class TradingExecutor:
     def _build_open_reason(self, row: Dict, base_asset: str, open_vwap_basis: float) -> str:
         """
         构建开仓原因字符串，记录关键决策参数，便于复盘。
-        格式: "基差{bps}(阈值p20={thr})|费率{rate}|峰值{info}|守卫|量"
+        格式: "基差{bps}(entry_floor={floor},p20={p20})|carry(...)|费率|峰值|门槛|量"
         """
         parts = []
 
-        # 1. VWAP基差 vs p20 阈值
-        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
-        p20 = threshold_data.get('p20', self.basis_threshold_bps)
-        parts.append(f"基差{open_vwap_basis:.1f}bps(阈值p20={p20:.1f})")
+        # 1. VWAP基差 vs funding-adjusted entry floor
+        entry_snapshot = dict(self._state_entry_snapshot(base_asset, row, open_vwap_basis))
+        current_snapshot = self._entry_snapshot(base_asset, open_vwap_basis, row)
+        entry_snapshot['expected_edge_bps'] = current_snapshot.get('expected_edge_bps')
+        p20 = float(entry_snapshot.get('p20_bps', self.basis_threshold_bps))
+        entry_floor = float(entry_snapshot.get('entry_floor_bps', p20))
+        parts.append(f"基差{open_vwap_basis:.1f}bps(entry_floor={entry_floor:.1f},p20={p20:.1f})")
+        parts.append(
+            f"carry(funding24h={float(entry_snapshot.get('funding_24h_bps', 0)):.1f}bps,"
+            f"预期={float(entry_snapshot.get('expected_funding_bps', 0)):.1f}bps,"
+            f"edge={float(entry_snapshot.get('expected_edge_bps', 0)):.1f}bps)"
+        )
 
         # 2. 24h资金费率
         funding_rate = row.get('funding_rate_24h')
@@ -1434,8 +1723,14 @@ class TradingExecutor:
             else:
                 parts.append(f"峰值{peak_bps:.1f}")
 
-        # 5. 盈利性守卫（始终打印：无平仓阈值时显式标注，避免日志间歇缺失影响排查）
-        if base_asset in self.close_vwap_threshold_meta:
+        # 5. 入场门槛 / 旧盈利性守卫
+        if self.funding_entry_enabled:
+            parts.append(
+                f"门槛({open_vwap_basis:.1f}>={entry_floor:.1f}|"
+                f"carry_floor={float(entry_snapshot.get('carry_floor_bps', 0)):.1f},"
+                f"timing_floor={float(entry_snapshot.get('timing_floor_bps', 0)):.1f})"
+            )
+        elif base_asset in self.close_vwap_threshold_meta:
             close_data = self.close_vwap_threshold_meta[base_asset]
             close_thr = close_data.get(self.close_threshold_col)
             if close_thr is not None:
