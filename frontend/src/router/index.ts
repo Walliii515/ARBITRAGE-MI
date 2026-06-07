@@ -1,6 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { isLoggedIn, isSessionExpired, removeToken } from '../utils/auth'
 
+const ROUTE_CHUNK_RELOAD_KEY = 'route_chunk_reload_attempted'
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
@@ -53,22 +55,44 @@ const router = createRouter({
 })
 
 // 全局路由守卫
-router.beforeEach((to, _from, next) => {
+router.beforeEach((to) => {
   const loggedIn = isLoggedIn()
   
   if (!loggedIn && to.name !== 'login') {
     // 未登录且访问的不是登录页 -> 跳转登录
-    next({ name: 'login' })
-  } else if (loggedIn && to.name === 'login') {
+    return { name: 'login' }
+  }
+
+  if (loggedIn && to.name === 'login') {
     // 已登录且访问登录页 -> 跳转首页
-    next({ path: '/' })
-  } else if (loggedIn && isSessionExpired()) {
+    return { path: '/' }
+  }
+
+  if (loggedIn && isSessionExpired()) {
     // session 已过期 -> 清除 token 并跳转登录
     removeToken()
-    next({ name: 'login' })
-  } else {
-    next()
+    return { name: 'login' }
   }
+})
+
+router.afterEach(() => {
+  sessionStorage.removeItem(ROUTE_CHUNK_RELOAD_KEY)
+})
+
+router.onError((error, to) => {
+  const message = error?.message || ''
+  const isChunkLoadError =
+    message.includes('Failed to fetch dynamically imported module') ||
+    message.includes('Importing a module script failed') ||
+    message.includes('Loading chunk')
+
+  if (!isChunkLoadError) return
+
+  const target = to?.fullPath || window.location.pathname
+  if (sessionStorage.getItem(ROUTE_CHUNK_RELOAD_KEY) === target) return
+
+  sessionStorage.setItem(ROUTE_CHUNK_RELOAD_KEY, target)
+  window.location.assign(target)
 })
 
 export default router

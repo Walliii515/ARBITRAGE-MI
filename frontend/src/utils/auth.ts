@@ -1,6 +1,9 @@
 export const TOKEN_KEY = 'auth_token'
 export const LAST_ACTIVITY_KEY = 'last_activity_time'
 export const SESSION_TIMEOUT = 60 * 60 * 1000 // 1小时 (毫秒)
+const ACTIVITY_WRITE_INTERVAL = 30 * 1000
+
+let lastActivityWrite = 0
 
 export function setToken(token: string): void {
   localStorage.setItem(TOKEN_KEY, token)
@@ -16,7 +19,16 @@ export function removeToken(): void {
 }
 
 export function updateActivityTime(): void {
-  localStorage.setItem(LAST_ACTIVITY_KEY, Date.now().toString())
+  const now = Date.now()
+  localStorage.setItem(LAST_ACTIVITY_KEY, now.toString())
+  lastActivityWrite = now
+}
+
+export function markUserActivity(): void {
+  const now = Date.now()
+  if (now - lastActivityWrite < ACTIVITY_WRITE_INTERVAL) return
+  localStorage.setItem(LAST_ACTIVITY_KEY, now.toString())
+  lastActivityWrite = now
 }
 
 export function getLastActivityTime(): number {

@@ -2241,7 +2241,7 @@ class TradingExecutor:
                 exec_price, exec_qty, exec_amount, coverage_ratio,
                 open_coverage, open_vwap_basis_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps,
                 risk_relief_bps, open_marginal_basis_bps, funding_rate_24h,
-                liquidity_role, fee_rate, fee_amount, fee_asset, exchange_order_id, executed_at
+                liquidity_role, fee_rate, fee_amount, fee_amount_usdt, fee_asset, exchange_order_id, executed_at
             ) VALUES (
                 %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 %(order_side)s, %(market_type)s, %(trade_direction)s, %(status)s, %(channel)s,
@@ -2249,7 +2249,7 @@ class TradingExecutor:
                 %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
                 %(open_coverage)s, %(open_vwap_basis_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s,
                 %(risk_relief_bps)s, %(open_marginal_basis_bps)s, %(funding_rate_24h)s,
-                %(liquidity_role)s, %(fee_rate)s, %(fee_amount)s, %(fee_asset)s, %(exchange_order_id)s, %(executed_at)s
+                %(liquidity_role)s, %(fee_rate)s, %(fee_amount)s, %(fee_amount_usdt)s, %(fee_asset)s, %(exchange_order_id)s, %(executed_at)s
             )
         """
         
@@ -2307,6 +2307,7 @@ class TradingExecutor:
                 order['liquidity_role'] = None
                 order['fee_rate'] = None
                 order['fee_amount'] = None
+                order['fee_amount_usdt'] = None
                 order['fee_asset'] = None
                 order['exchange_order_id'] = None
                 order['executed_at'] = None

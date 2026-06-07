@@ -1,4 +1,4 @@
-import { removeToken, getToken, updateActivityTime } from './auth'
+import { removeToken, getToken, markUserActivity } from './auth'
 import { ElMessage } from 'element-plus'
 import router from '../router'
 
@@ -13,7 +13,7 @@ export async function request(url: string, options: RequestOptions = {}): Promis
   const token = getToken()
   
   // 更新活动时间
-  updateActivityTime()
+  markUserActivity()
   
   // 构建完整 URL
   const fullUrl = options.baseURL ? `${options.baseURL}${url}` : `${API_BASE}${url}`

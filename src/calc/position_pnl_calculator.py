@@ -70,18 +70,24 @@ def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
     return future_open_fee, future_close_fee
 
 
+def _leg_fee_cost(actual_fee_amount: Optional[float], estimated_fee_rate: float, open_amount_usdt: float) -> float:
+    if actual_fee_amount is not None:
+        return float(actual_fee_amount)
+    return float(estimated_fee_rate or 0.0) * open_amount_usdt
+
+
 def _fee_cost_from_actual_or_rate(
+    actual_spot_fee_amount: Optional[float],
     actual_future_fee_amount: Optional[float],
     estimated_spot_fee: float,
     estimated_future_fee: float,
     open_amount_usdt: float,
 ) -> Tuple[float, float]:
-    future_fee_amount = (
-        float(actual_future_fee_amount)
-        if actual_future_fee_amount is not None
-        else estimated_future_fee * open_amount_usdt
+    total_fee_amount = _leg_fee_cost(
+        actual_spot_fee_amount, estimated_spot_fee, open_amount_usdt
+    ) + _leg_fee_cost(
+        actual_future_fee_amount, estimated_future_fee, open_amount_usdt
     )
-    total_fee_amount = estimated_spot_fee * open_amount_usdt + future_fee_amount
     fee_bps = round(-total_fee_amount / open_amount_usdt * 10000, 2) if open_amount_usdt else 0.0
     fee_cost = round(-total_fee_amount, 4)
     return fee_bps, fee_cost
@@ -89,16 +95,20 @@ def _fee_cost_from_actual_or_rate(
 
 def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float, float, float]:
     future_open_fee, future_close_fee = _position_fee_rates(pos, cfg)
-    open_actual = _float_or_none(pos.get('future_open_fee_amount_usdt'))
-    close_actual = _float_or_none(pos.get('future_close_fee_amount_usdt'))
+    spot_open_actual = _float_or_none(pos.get('spot_open_fee_amount_usdt'))
+    future_open_actual = _float_or_none(pos.get('future_open_fee_amount_usdt'))
+    spot_close_actual = _float_or_none(pos.get('spot_close_fee_amount_usdt'))
+    future_close_actual = _float_or_none(pos.get('future_close_fee_amount_usdt'))
     open_fee_bps, open_fee_cost = _fee_cost_from_actual_or_rate(
-        open_actual,
+        spot_open_actual,
+        future_open_actual,
         cfg.spot_open_fee,
         future_open_fee,
         cfg.open_amount_usdt,
     )
     close_fee_bps, close_fee_cost = _fee_cost_from_actual_or_rate(
-        close_actual,
+        spot_close_actual,
+        future_close_actual,
         cfg.spot_close_fee,
         future_close_fee,
         cfg.open_amount_usdt,

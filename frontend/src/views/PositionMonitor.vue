@@ -122,6 +122,7 @@ interface AccountSummary {
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
 const rowData = shallowRef<PositionRow[]>([])
+const derivedRows = shallowRef<PositionRow[]>([])
 const positionMap = new Map<number, PositionRow>()
 let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)
@@ -154,6 +155,7 @@ const columnVisibilities = ref<ColumnVisibility[]>([])
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let pingInterval: ReturnType<typeof setInterval> | null = null
+let derivedRowsTimer: ReturnType<typeof setTimeout> | null = null
 /** 页面可见性：隐藏时跳过消息处理和 ping */
 let pageVisible = true
 
@@ -239,6 +241,24 @@ function matchesActiveFilter(row: PositionRow): boolean {
   return true
 }
 
+function syncGridRowsFromMap() {
+  const rows = Array.from(positionMap.values())
+  rowData.value = rows
+  derivedRows.value = rows
+}
+
+function refreshDerivedRowsFromMap() {
+  derivedRows.value = Array.from(positionMap.values())
+}
+
+function scheduleDerivedRowsRefresh() {
+  if (derivedRowsTimer) return
+  derivedRowsTimer = setTimeout(() => {
+    derivedRowsTimer = null
+    refreshDerivedRowsFromMap()
+  }, 250)
+}
+
 function applyPositionUpdates(updates: PositionRow[]) {
   ensureFundingBps(updates)
   // WS 推送不携带 funding_history（后端为压缩消息体不下发），需保留 REST 初始加载/funding_history_update 已注入的字段，避免被覆盖
@@ -258,7 +278,7 @@ function applyPositionUpdates(updates: PositionRow[]) {
     for (const row of filtered) {
       positionMap.set(row.id, row)
     }
-    rowData.value = Array.from(positionMap.values())
+    syncGridRowsFromMap()
     return
   }
 
@@ -287,8 +307,8 @@ function applyPositionUpdates(updates: PositionRow[]) {
 
   if (add.length > 0 || update.length > 0 || remove.length > 0) {
     gridApi.applyTransaction({ add, update, remove })
-    // 同步更新 rowData，触发 pinnedBottomRowData 重新计算
-    rowData.value = Array.from(positionMap.values())
+    // 增量路径不更新 :rowData，避免 Vue 触发整表重绘；汇总/下拉数据低频刷新即可。
+    scheduleDerivedRowsRefresh()
   }
 }
 
@@ -310,7 +330,7 @@ function applyFundingHistoryUpdate(histories: Record<number, any[]>) {
   if (changed && gridApi) {
     // 触发列刷新
     gridApi.refreshCells({ columns: ['funding_history'] })
-    rowData.value = Array.from(positionMap.values())
+    scheduleDerivedRowsRefresh()
   }
 }
 
@@ -802,12 +822,12 @@ function doesExternalFilterPass(params: any): boolean {
 /* ───── 过滤后的数据（用于汇总行） ───── */
 /** 从当前数据中提取唯一标的资产列表，供下拉框选择 */
 const assetOptions = computed(() => {
-  const assets = new Set(rowData.value.map(r => r.base_asset).filter(Boolean) as string[])
+  const assets = new Set(derivedRows.value.map(r => r.base_asset).filter(Boolean) as string[])
   return Array.from(assets).sort()
 })
 
 const filteredRows = computed(() => {
-  let rows = rowData.value
+  let rows = derivedRows.value
   if (statusFilter.value) {
     rows = rows.filter(r => r.status === statusFilter.value)
   }
@@ -956,6 +976,7 @@ async function fetchPositions() {
       positionMap.set(row.id, row)
     }
     rowData.value = rows
+    derivedRows.value = rows
     
     // 更新分页信息
     if (data.pagination) {
@@ -1090,14 +1111,16 @@ function handleVisibilityChange() {
 }
 
 onMounted(() => {
-  fetchPositions()
-  connectWs()
+  fetchPositions().finally(() => {
+    requestAnimationFrame(connectWs)
+  })
   document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 onUnmounted(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (pingInterval) clearInterval(pingInterval)
+  if (derivedRowsTimer) clearTimeout(derivedRowsTimer)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   socket?.close()
   socket = null

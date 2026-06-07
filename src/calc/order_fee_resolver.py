@@ -83,6 +83,7 @@ def build_order_execution_fields(
         'liquidity_role': role,
         'fee_rate': fee_rate,
         'fee_amount': _float_or_none(exec_data.get('fee_amount')),
+        'fee_amount_usdt': _float_or_none(exec_data.get('fee_amount_usdt')),
         'fee_asset': exec_data.get('fee_asset'),
         'exchange_order_id': exec_data.get('exchange_order_id'),
     }

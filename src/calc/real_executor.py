@@ -68,6 +68,7 @@ class RealExecutor:
         self.leverage = leverage
         self._leverage_set: set = set()  # 已设置过杠杆的合约（避免重复调用）
         self._session = requests.Session()
+        self._binance_price_cache: Dict[str, tuple[float, float]] = {}
         logger.info(
             f'RealExecutor 已初始化: env={self.config.env}, '
             f'binance={self.config.binance_base_url}, '
@@ -424,8 +425,19 @@ class RealExecutor:
 
         fee_asset = None
         fee_amount = None
+        fee_amount_usdt = 0.0
+        fee_amount_usdt_complete = True
         if len(commission_by_asset) == 1:
             fee_asset, fee_amount = next(iter(commission_by_asset.items()))
+        elif len(commission_by_asset) > 1:
+            fee_asset = 'MIXED'
+
+        for asset, amount in commission_by_asset.items():
+            converted = self._convert_fee_to_usdt(asset, amount, base_asset, exec_price)
+            if converted is None:
+                fee_amount_usdt_complete = False
+                continue
+            fee_amount_usdt += converted
 
         return {
             'success': True,
@@ -435,8 +447,59 @@ class RealExecutor:
             'coverage_ratio': 0,  # 实盘无覆盖率概念
             'exchange_order_id': str(data.get('orderId', '')),
             'fee_amount': fee_amount,
+            'fee_amount_usdt': round(fee_amount_usdt, 8) if fee_amount_usdt_complete else None,
             'fee_asset': fee_asset,
         }
+
+    def _convert_fee_to_usdt(
+        self,
+        fee_asset: str,
+        fee_amount: float,
+        base_asset: str,
+        exec_price: float,
+    ) -> Optional[float]:
+        fee_asset = str(fee_asset or '').upper()
+        fee_amount = float(fee_amount or 0)
+        if fee_amount == 0:
+            return 0.0
+        if fee_asset == 'USDT':
+            return fee_amount
+        if fee_asset == str(base_asset or '').upper() and exec_price:
+            return fee_amount * float(exec_price)
+        price = self._get_binance_usdt_price(fee_asset)
+        if price is None:
+            logger.warning(f"Binance 手续费USDT折算失败 | asset={fee_asset} | amount={fee_amount}")
+            return None
+        return fee_amount * price
+
+    def _get_binance_usdt_price(self, asset: str) -> Optional[float]:
+        asset = str(asset or '').upper()
+        if not asset or asset == 'USDT':
+            return 1.0
+        symbol = f'{asset}USDT'
+        now = time.time()
+        cached = self._binance_price_cache.get(symbol)
+        if cached and now - cached[1] <= 60:
+            return cached[0]
+
+        url = f"{self.config.binance_base_url}/api/v3/ticker/price"
+        try:
+            resp = self._session.get(
+                url,
+                params={'symbol': symbol},
+                timeout=min(self.config.timeout_sec, 5),
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Binance 价格查询失败 | {symbol} | HTTP {resp.status_code}: {resp.text[:120]}")
+                return None
+            price = float(resp.json().get('price') or 0)
+            if price <= 0:
+                return None
+            self._binance_price_cache[symbol] = (price, now)
+            return price
+        except Exception as e:
+            logger.warning(f"Binance 价格查询异常 | {symbol} | {e}")
+            return None
 
     def _binance_sign(self, query_string: str) -> str:
         """Binance HMAC SHA256 签名"""
@@ -836,6 +899,7 @@ class RealExecutor:
             }
 
         fee_amount = data.get('fee')
+        fee_amount = float(fee_amount) if fee_amount not in (None, '') else None
         return {
             'success': True,
             'exec_price': exec_price,
@@ -843,8 +907,9 @@ class RealExecutor:
             'exec_amount': exec_amount,
             'coverage_ratio': 0,
             'exchange_order_id': str(data.get('id', '')),
-            'fee_amount': float(fee_amount) if fee_amount not in (None, '') else None,
-            'fee_asset': 'USDT' if fee_amount not in (None, '') else None,
+            'fee_amount': fee_amount,
+            'fee_amount_usdt': fee_amount,
+            'fee_asset': 'USDT' if fee_amount is not None else None,
         }
 
     def _gate_sign(self, method: str, api_path: str, query_string: str, body: str) -> Dict:

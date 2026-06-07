@@ -22,12 +22,20 @@ def fetch_position_order_fee_summary(position_ids: List[int]) -> Dict[int, Dict]
             MAX(CASE WHEN order_side = 'close' AND market_type = 'future' THEN liquidity_role END)
                 AS future_close_liquidity_role,
             SUM(CASE
-                WHEN order_side = 'open' AND market_type = 'future' AND fee_asset = 'USDT' THEN fee_amount
-                ELSE 0
+                WHEN order_side = 'open' AND market_type = 'spot' THEN fee_amount_usdt
+                ELSE NULL
+            END) AS spot_open_fee_amount_usdt,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'future' THEN fee_amount_usdt
+                ELSE NULL
             END) AS future_open_fee_amount_usdt,
             SUM(CASE
-                WHEN order_side = 'close' AND market_type = 'future' AND fee_asset = 'USDT' THEN fee_amount
-                ELSE 0
+                WHEN order_side = 'close' AND market_type = 'spot' THEN fee_amount_usdt
+                ELSE NULL
+            END) AS spot_close_fee_amount_usdt,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'future' THEN fee_amount_usdt
+                ELSE NULL
             END) AS future_close_fee_amount_usdt
         FROM mi_trade_order
         WHERE position_id IN ({placeholders})
