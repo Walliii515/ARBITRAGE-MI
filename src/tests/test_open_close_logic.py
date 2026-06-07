@@ -753,6 +753,41 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
     def test_b_tier_waits_for_rebound_after_pullback_resiliency(self):
         self._assert_waits_for_rebound_after_pullback_resiliency('B')
 
+    def test_rebound_strong_cushion_passes_after_hold_without_extra_rise(self):
+        te = make_trading_executor(
+            basis_threshold_bps=20,
+            vwap_threshold_meta={'BTC': {'p20': 20}},
+            close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
+            asset_tier_meta={'BTC': 'B'},
+            rebound_enabled=True,
+            rebound_allowed_tiers=['A', 'B'],
+        )
+        te.rebound_min_rise_bps = 4.0
+        te.rebound_min_slope_bps = 0.5
+        te.rebound_min_basis_buffer_bps = 2.0
+        te.rebound_strong_cushion_bps = 20.0
+        te.rebound_strong_cushion_min_hold_sec = 1.0
+        te._resolve_signal = MagicMock()
+        te._peak_state['BTC'] = {
+            'peak_bps': 70.0,
+            'start_time': datetime.now(),
+            'trigger': 'pullback',
+            'signal_id': 1001,
+            'signal_basis_bps': 70.0,
+            'resiliency_active': True,
+        }
+
+        self.assertFalse(te._pass_rebound_check('BTC', 56.0, self._row('BTC', 56.0)))
+        te._peak_state['BTC']['rebound_strong_cushion_start_time'] = (
+            datetime.now() - timedelta(seconds=2)
+        )
+
+        self.assertTrue(te._pass_rebound_check('BTC', 56.0, self._row('BTC', 56.0)))
+        self.assertEqual(te._peak_state['BTC']['trigger'], 'rebound_strong_cushion')
+        self.assertAlmostEqual(te._peak_state['BTC']['rebound_rise_bps'], 0.0)
+        self.assertGreaterEqual(te._peak_state['BTC']['rebound_strong_cushion_bps'], 20.0)
+        te._resolve_signal.assert_not_called()
+
     def test_rebound_timeout_reason_includes_threshold_breakdown(self):
         te = make_trading_executor(
             basis_threshold_bps=20,
@@ -787,6 +822,9 @@ class TestTradingExecutorTierMomentum(unittest.TestCase):
         self.assertIn('min_basis=', reason)
         self.assertIn('entry_floor=', reason)
         self.assertIn('+buffer=2.0', reason)
+        self.assertIn('strong_cushion=', reason)
+        self.assertIn('strong_hold=', reason)
+        self.assertIn('timeout=2.0/1.0s', reason)
 
     def test_pullback_direct_open_is_blocked_for_non_rebound_tier(self):
         te = make_trading_executor(

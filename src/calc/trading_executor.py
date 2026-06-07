@@ -96,6 +96,9 @@ class TradingExecutorConfig:
     rebound_min_slope_bps: float = 0.5
     rebound_min_basis_buffer_bps: float = 4.0
     rebound_max_wait_sec: float = 4.0
+    rebound_strong_cushion_bps: float = 20.0
+    rebound_strong_cushion_min_hold_sec: float = 1.0
+    rebound_strong_cushion_max_wait_sec: float = 8.0
 
     # ─── 下单前执行质量保护 ───
     execution_guard_enabled: bool = True
@@ -271,6 +274,9 @@ class TradingExecutor:
         self.rebound_min_slope_bps = float(cfg.rebound_min_slope_bps)
         self.rebound_min_basis_buffer_bps = float(cfg.rebound_min_basis_buffer_bps)
         self.rebound_max_wait_sec = float(cfg.rebound_max_wait_sec)
+        self.rebound_strong_cushion_bps = float(cfg.rebound_strong_cushion_bps)
+        self.rebound_strong_cushion_min_hold_sec = float(cfg.rebound_strong_cushion_min_hold_sec)
+        self.rebound_strong_cushion_max_wait_sec = float(cfg.rebound_strong_cushion_max_wait_sec)
 
         self.execution_guard_enabled = cfg.execution_guard_enabled
         self.execution_guard_min_profit_buffer_bps = float(cfg.execution_guard_min_profit_buffer_bps)
@@ -979,6 +985,7 @@ class TradingExecutor:
         entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
         entry_floor = float(entry_snapshot.get('entry_floor_bps'))
         min_basis = entry_floor + self.rebound_min_basis_buffer_bps
+        strong_basis = entry_floor + self.rebound_strong_cushion_bps
 
         if current_basis_bps < entry_floor:
             self._resolve_signal(
@@ -997,10 +1004,14 @@ class TradingExecutor:
             state['rebound_start_time'] = now
             state['rebound_floor_bps'] = current_basis_bps
             state['rebound_last_basis_bps'] = current_basis_bps
+            if current_basis_bps >= strong_basis:
+                state['rebound_strong_cushion_start_time'] = now
             logger.info(
                 f"回调后再突破等待开始 | {base_asset} | tier={tier} | "
                 f"floor={current_basis_bps:.2f}bps | "
-                f"需回升{self.rebound_min_rise_bps:.1f}bps且≥entry_floor+buffer={min_basis:.2f}bps"
+                f"需回升{self.rebound_min_rise_bps:.1f}bps且≥entry_floor+buffer={min_basis:.2f}bps | "
+                f"强安全垫≥entry_floor+{self.rebound_strong_cushion_bps:.1f}bps后持有"
+                f"{self.rebound_strong_cushion_min_hold_sec:.1f}s"
             )
             return False
 
@@ -1013,17 +1024,56 @@ class TradingExecutor:
         waited_sec = (now - state.get('rebound_start_time', now)).total_seconds()
         rise_from_floor = current_basis_bps - floor_bps
         slope_bps = current_basis_bps - last_basis
-        if waited_sec > self.rebound_max_wait_sec:
+        strong_cushion_bps = current_basis_bps - entry_floor
+        strong_active = current_basis_bps >= strong_basis
+        strong_hold_sec = 0.0
+        if strong_active:
+            strong_start = state.get('rebound_strong_cushion_start_time')
+            if not strong_start:
+                strong_start = now
+                state['rebound_strong_cushion_start_time'] = strong_start
+            strong_hold_sec = (now - strong_start).total_seconds()
+        else:
+            state.pop('rebound_strong_cushion_start_time', None)
+
+        if (
+            strong_active
+            and strong_hold_sec >= self.rebound_strong_cushion_min_hold_sec
+            and current_basis_bps >= min_basis
+        ):
+            state['trigger'] = 'rebound_strong_cushion'
+            state['rebound_rise_bps'] = rise_from_floor
+            state['rebound_floor_bps'] = floor_bps
+            state['rebound_strong_cushion_bps'] = strong_cushion_bps
+            state['rebound_strong_hold_sec'] = strong_hold_sec
+            logger.info(
+                f"回调后强安全垫确认 | {base_asset} | tier={tier} | "
+                f"floor={floor_bps:.2f}bps -> current={current_basis_bps:.2f}bps | "
+                f"cushion={strong_cushion_bps:.2f}/{self.rebound_strong_cushion_bps:.1f}bps | "
+                f"hold={strong_hold_sec:.1f}/{self.rebound_strong_cushion_min_hold_sec:.1f}s | "
+                f"rise={rise_from_floor:.2f}bps | slope={slope_bps:.2f}bps"
+            )
+            return True
+
+        timeout_sec = (
+            self.rebound_strong_cushion_max_wait_sec
+            if strong_active
+            else self.rebound_max_wait_sec
+        )
+        if waited_sec > timeout_sec:
             self._resolve_signal(
                 base_asset,
                 'monitor_timeout',
                 (
-                    f'回弹等待{waited_sec:.1f}s未再突破('
+                    f'回弹等待{waited_sec:.1f}s未确认('
                     f'floor={floor_bps:.1f},current={current_basis_bps:.1f},'
                     f'rise={rise_from_floor:.1f}/{self.rebound_min_rise_bps:.1f}bps,'
                     f'slope={slope_bps:.1f}/{self.rebound_min_slope_bps:.1f}bps,'
                     f'min_basis={min_basis:.1f},'
-                    f'entry_floor={entry_floor:.1f}+buffer={self.rebound_min_basis_buffer_bps:.1f})'
+                    f'entry_floor={entry_floor:.1f}+buffer={self.rebound_min_basis_buffer_bps:.1f},'
+                    f'strong_cushion={strong_cushion_bps:.1f}/{self.rebound_strong_cushion_bps:.1f}bps,'
+                    f'strong_hold={strong_hold_sec:.1f}/{self.rebound_strong_cushion_min_hold_sec:.1f}s,'
+                    f'timeout={waited_sec:.1f}/{timeout_sec:.1f}s)'
                 ),
                 exit_basis_bps=current_basis_bps,
                 trigger_type='rebound_timeout',
@@ -1036,7 +1086,10 @@ class TradingExecutor:
                 f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | "
                 f"rise={rise_from_floor:.2f}/{self.rebound_min_rise_bps:.1f}bps | "
                 f"slope={slope_bps:.2f}/{self.rebound_min_slope_bps:.1f}bps | "
-                f"min_basis={min_basis:.2f} | waited={waited_sec:.1f}s"
+                f"min_basis={min_basis:.2f} | "
+                f"strong_cushion={strong_cushion_bps:.2f}/{self.rebound_strong_cushion_bps:.1f}bps | "
+                f"strong_hold={strong_hold_sec:.1f}/{self.rebound_strong_cushion_min_hold_sec:.1f}s | "
+                f"waited={waited_sec:.1f}/{timeout_sec:.1f}s"
             )
             return False
 
@@ -1062,7 +1115,9 @@ class TradingExecutor:
             f"floor={floor_bps:.2f} | current={current_basis_bps:.2f} | "
             f"rise={rise_from_floor:.2f}/{self.rebound_min_rise_bps:.1f}bps | "
             f"slope={slope_bps:.2f}/{self.rebound_min_slope_bps:.1f}bps | "
-            f"min_basis={min_basis:.2f}"
+            f"min_basis={min_basis:.2f} | "
+            f"strong_cushion={strong_cushion_bps:.2f}/{self.rebound_strong_cushion_bps:.1f}bps | "
+            f"strong_hold={strong_hold_sec:.1f}/{self.rebound_strong_cushion_min_hold_sec:.1f}s"
         )
         return False
 
@@ -1709,13 +1764,21 @@ class TradingExecutor:
                     f"峰值回落(峰{peak_bps:.1f},持续{elapsed:.1f}s≥{self.sustain_sec}s,"
                     f"回落{self.peak_pullback_pct*100:.0f}%)"
                 )
-            elif trigger == 'rebound':
+            elif trigger in ('rebound', 'rebound_strong_cushion'):
                 floor_bps = float(peak_state.get('rebound_floor_bps', 0) or 0)
                 rise_bps = float(peak_state.get('rebound_rise_bps', 0) or 0)
-                parts.append(
-                    f"回调再突破(峰{peak_bps:.1f},低{floor_bps:.1f},"
-                    f"回升{rise_bps:.1f}bps)"
-                )
+                if trigger == 'rebound_strong_cushion':
+                    cushion_bps = float(peak_state.get('rebound_strong_cushion_bps', 0) or 0)
+                    hold_sec = float(peak_state.get('rebound_strong_hold_sec', 0) or 0)
+                    parts.append(
+                        f"回调强垫(峰{peak_bps:.1f},低{floor_bps:.1f},"
+                        f"垫{cushion_bps:.1f}bps,hold={hold_sec:.1f}s)"
+                    )
+                else:
+                    parts.append(
+                        f"回调再突破(峰{peak_bps:.1f},低{floor_bps:.1f},"
+                        f"回升{rise_bps:.1f}bps)"
+                    )
             elif trigger == 'momentum':
                 rise_bps = float(peak_state.get('momentum_rise_bps', 0) or 0)
                 tier = peak_state.get('strategy_tier', self._asset_tier(base_asset))

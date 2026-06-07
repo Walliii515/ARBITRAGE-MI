@@ -88,7 +88,10 @@ trade:
     min_rise_bps: 4                         # 从回调低点至少回升多少 bps
     min_slope_bps: 0.5                      # 当前样本相对上一样本仍需向上
     min_basis_buffer_bps: 4                 # 当前基差需至少高于 entry_floor 的额外安全垫
-    max_wait_sec: 4.0                       # 回调恢复后最多等待二次突破多久
+    max_wait_sec: 5.0                       # 回调恢复后最多等待普通二次突破多久
+    strong_cushion_bps: 20                  # 若当前基差已高于 entry_floor 这么多，可走强安全垫确认
+    strong_cushion_min_hold_sec: 1.0        # 强安全垫需连续保持多久，避免单跳误触发
+    strong_cushion_max_wait_sec: 8.0        # 强安全垫活跃时最多等待确认多久
 
   # ─── 下单前执行质量保护 ───
   # 过滤 pre_gate 已经缺少安全垫、或相对峰值衰减太多的机会。

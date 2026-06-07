@@ -1011,6 +1011,13 @@ def _run_open_position_check_once():
                 rebound_min_slope_bps=config.get_float('trade.rebound_open.min_slope_bps', 0.5),
                 rebound_min_basis_buffer_bps=config.get_float('trade.rebound_open.min_basis_buffer_bps', 4.0),
                 rebound_max_wait_sec=config.get_float('trade.rebound_open.max_wait_sec', 4.0),
+                rebound_strong_cushion_bps=config.get_float('trade.rebound_open.strong_cushion_bps', 20.0),
+                rebound_strong_cushion_min_hold_sec=config.get_float(
+                    'trade.rebound_open.strong_cushion_min_hold_sec', 1.0
+                ),
+                rebound_strong_cushion_max_wait_sec=config.get_float(
+                    'trade.rebound_open.strong_cushion_max_wait_sec', 8.0
+                ),
                 execution_guard_enabled=config.get_bool('trade.execution_guard.enabled', True),
                 execution_guard_min_profit_buffer_bps=config.get_float('trade.execution_guard.min_profit_buffer_bps', 15.0),
                 execution_guard_min_p20_buffer_bps=config.get_float('trade.execution_guard.min_p20_buffer_bps', 3.0),
