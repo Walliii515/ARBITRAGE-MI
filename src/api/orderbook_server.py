@@ -1167,11 +1167,10 @@ async def _margin_status_loop():
 
 
 async def _position_funding_loop():
-    """定时更新资金费收益（启动后立即执行一次，之后对齐到每个整点后检查）
+    """定时从交易所真实流水同步资金费收益。
     结算完成后通过 WS 推送 funding_history_update 事件，前端按需更新。
     """
-    offset_sec = max(config.get_int('trade.position.funding_update_offset_sec', 10), 0)
-    fallback_interval = max(config.get_int('trade.position.funding_update_sec', 3600), 60)
+    interval = max(config.get_int('trade.position.funding_update_sec', 600), 60)
 
     # 启动后等待服务就绪再执行第一次
     await asyncio.sleep(10)
@@ -1192,16 +1191,9 @@ async def _position_funding_loop():
         except Exception as e:
             logger.error(f"资金费更新失败: {e}")
 
-        now = datetime.now()
-        next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(seconds=offset_sec)
-        if next_run <= now:
-            next_run += timedelta(hours=1)
-        sleep_sec = max((next_run - now).total_seconds(), 1.0)
-        if sleep_sec > fallback_interval * 2:
-            logger.warning(f"资金费下次调度异常，使用兜底间隔: sleep={sleep_sec:.0f}s")
-            sleep_sec = fallback_interval
+        next_run = datetime.now() + timedelta(seconds=interval)
         logger.info(f"资金费下次检查时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-        await asyncio.sleep(sleep_sec)
+        await asyncio.sleep(interval)
 
 
 def _run_close_position_check_once():

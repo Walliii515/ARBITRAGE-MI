@@ -225,7 +225,8 @@ trade:
 
   # ─── 持仓管理 ───
   position:
-    funding_update_sec: 3600                # 资金费更新兜底间隔（秒）
+    funding_update_sec: 600                 # 资金费真实流水同步间隔（秒）
+    funding_sync_lookback_days: 7           # Gate fund 流水回看天数，用于重启/漏记回补
     funding_update_offset_sec: 10           # 每个整点后多少秒检查资金费入账
     push_interval_sec: 5                    # 实时数据推送间隔（秒）
 

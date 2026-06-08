@@ -3,7 +3,7 @@
 - PositionTracker: 持仓创建、资金费累加、盈亏计算
 """
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from common.database import db_manager
 from common.config import config
@@ -13,8 +13,8 @@ from calc.position_order_fees import attach_position_order_fee_summary
 
 logger = get_logger(__name__)
 
-# Gate 资金费结算间隔（秒）
-FUNDING_INTERVAL_SEC = 8 * 3600
+# 仅作为旧兼容逻辑的兜底值；真实同步优先使用 Gate 流水时间。
+DEFAULT_FUNDING_INTERVAL_SEC = 8 * 3600
 
 
 class PositionTracker:
@@ -26,6 +26,7 @@ class PositionTracker:
             contract_meta: base_asset -> {quanto_multiplier, ...} (可选，用于计算张数)
         """
         self.contract_meta = contract_meta or {}
+        self._real_executor = None
     
     def create_position(self, order_group: Dict, exec_result: Dict):
         """
@@ -106,158 +107,286 @@ class PositionTracker:
     
     def update_funding_pnl(self):
         """
-        定时更新资金费收益
-        逻辑：
-        1. 仅使用持仓自身的 next_funding_time 判断是否到期
-        2. 支持追补：若 next_funding_time 为 NULL 或已过多个结算周期，一次性追补所有缺失的结算
-        3. 每次结算查历史费率表取当期真实费率，写入 mi_trade_funding_fee_history 记录明细
-        4. settled_at 基于 next_funding_time 正向推算，确保时间戳与真实结算周期对齐
+        从 Gate 真实账户 fund 流水同步持仓资金费。
+
+        资金费收益以交易所实际入账为准：拉取 Gate futures account_book 中的
+        type=fund 记录，按结算时刻本地实际开着的同合约持仓张数占比分摊到
+        mi_trade_funding_fee_history，再由明细反向聚合回 mi_trade_position。
         """
+        lookback_days = max(config.get_int('trade.position.funding_sync_lookback_days', 7), 1)
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=lookback_days)
+        fund_rows = self._fetch_gate_fund_rows(start_time, end_time)
+        if not fund_rows:
+            logger.info("资金费同步：Gate fund 流水为空")
+            return
+
+        with db_manager.get_cursor() as cursor:
+            positions = self._load_positions_for_funding_sync(cursor, start_time)
+
+        if not positions:
+            logger.info("资金费同步：没有可分摊持仓")
+            return
+
+        entries_by_position = self._build_exchange_funding_entries(fund_rows, positions)
+        if not entries_by_position:
+            logger.info("资金费同步：Gate fund 流水未匹配到本地持仓")
+            self._sync_next_funding_times()
+            return
+
+        affected_ids = sorted(entries_by_position.keys())
+        with db_manager.get_connection() as conn:
+            with conn.cursor() as cursor:
+                self._replace_exchange_funding_history(cursor, affected_ids, start_time, entries_by_position)
+                self._refresh_position_funding_summary(cursor, affected_ids)
+
+        self._sync_next_funding_times()
+        total_rows = sum(len(rows) for rows in entries_by_position.values())
+        logger.info(
+            f"资金费真实流水同步完成 | fund_rows={len(fund_rows)} | "
+            f"positions={len(affected_ids)} | history_rows={total_rows}"
+        )
+
+    def _fetch_gate_fund_rows(self, start_time: datetime, end_time: datetime) -> List[Dict]:
+        executor = self._get_real_executor()
+        rows = executor.fetch_gate_futures_account_book(
+            int(start_time.timestamp()),
+            int(end_time.timestamp()),
+        )
+        result = []
+        for row in rows:
+            if str(row.get('type') or '').lower() != 'fund':
+                continue
+            contract = str(row.get('contract') or row.get('text') or '').upper()
+            if not contract.endswith('_USDT'):
+                continue
+            settled_at = datetime.fromtimestamp(int(row.get('time') or 0))
+            result.append({
+                'contract': contract,
+                'base_asset': contract[:-5],
+                'settled_at': settled_at.replace(microsecond=0),
+                'change': _float(row.get('change')),
+                'raw': row,
+            })
+        result.sort(key=lambda item: (item['settled_at'], item['contract']))
+        return result
+
+    def _get_real_executor(self):
+        if self._real_executor is None:
+            from calc.reconciliation import build_exchange_config
+            from calc.real_executor import RealExecutor
+            from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+
+            self._real_executor = RealExecutor(
+                build_exchange_config(),
+                contract_meta=fetch_contract_meta(),
+                spot_meta=fetch_spot_meta(),
+                leverage=config.get_int('margin.leverage', 2),
+            )
+        return self._real_executor
+
+    def _load_positions_for_funding_sync(self, cursor, start_time: datetime) -> List[Dict]:
         sql = """
-            SELECT p.*, c.funding_rate_24h, c.funding_next_apply
+            SELECT p.*, c.funding_interval, c.funding_next_apply
             FROM mi_trade_position p
             LEFT JOIN mi_gate_future_contracts c 
                 ON p.future_contract = CONCAT(c.base_asset, '_USDT')
-            WHERE p.status = 'holding'
+            WHERE p.opened_at <= NOW()
+              AND (p.closed_at IS NULL OR p.closed_at >= %s)
         """
-        
+        cursor.execute(sql, (start_time,))
+        return cursor.fetchall()
+
+    def _build_exchange_funding_entries(self, fund_rows: List[Dict], positions: List[Dict]) -> Dict[int, List[Dict]]:
+        rate_map = self._load_funding_rate_map(fund_rows)
+        by_position: Dict[int, List[Dict]] = {}
+
+        for fund in fund_rows:
+            matched = [
+                pos for pos in positions
+                if str(pos.get('future_contract') or f"{pos.get('base_asset')}_USDT").upper() == fund['contract']
+                and pos.get('opened_at') is not None
+                and pos['opened_at'] <= fund['settled_at']
+                and (pos.get('closed_at') is None or pos['closed_at'] > fund['settled_at'])
+            ]
+            if not matched:
+                logger.warning(
+                    f"Gate资金费未匹配本地持仓 | {fund['contract']} | "
+                    f"{fund['settled_at']} | change={fund['change']}"
+                )
+                continue
+
+            weights = [(pos, self._funding_weight(pos)) for pos in matched]
+            total_weight = sum(weight for _, weight in weights)
+            if total_weight <= 0:
+                continue
+
+            rate_info = rate_map.get((fund['contract'], fund['settled_at']))
+            for pos, weight in weights:
+                pnl = fund['change'] * weight / total_weight
+                notional = self._position_notional(pos)
+                single_rate = (pnl / notional) if notional else (rate_info[0] if rate_info else 0.0)
+                rate_24h = rate_info[1] if rate_info else self._rate_24h_from_single_rate(pos, single_rate)
+                by_position.setdefault(pos['id'], []).append({
+                    'base_asset': pos['base_asset'],
+                    'funding_rate': single_rate,
+                    'funding_rate_24h': rate_24h,
+                    'funding_pnl': pnl,
+                    'future_notional': notional,
+                    'settled_at': fund['settled_at'],
+                })
+
+        for rows in by_position.values():
+            rows.sort(key=lambda item: item['settled_at'])
+        return by_position
+
+    def _load_funding_rate_map(self, fund_rows: List[Dict]) -> Dict[Tuple[str, datetime], Tuple[float, float]]:
+        if not fund_rows:
+            return {}
+        contracts = sorted({row['contract'] for row in fund_rows})
+        min_ts = min(int(row['settled_at'].timestamp()) for row in fund_rows) - 60
+        max_ts = max(int(row['settled_at'].timestamp()) for row in fund_rows) + 60
+        placeholders = ','.join(['%s'] * len(contracts))
+        sql = f"""
+            SELECT contract, funding_rate, funding_rate_24h, timestamp
+            FROM mi_gate_future_his_funding_rates
+            WHERE contract IN ({placeholders})
+              AND timestamp BETWEEN %s AND %s
+        """
+        params = contracts + [min_ts, max_ts]
+        result: Dict[Tuple[str, datetime], Tuple[float, float]] = {}
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, params)
+            for row in cursor.fetchall():
+                settled_at = datetime.fromtimestamp(int(row['timestamp'])).replace(microsecond=0)
+                result[(row['contract'], settled_at)] = (
+                    float(row['funding_rate'] or 0),
+                    float(row['funding_rate_24h'] or 0),
+                )
+        return result
+
+    def _replace_exchange_funding_history(
+        self,
+        cursor,
+        affected_ids: List[int],
+        start_time: datetime,
+        entries_by_position: Dict[int, List[Dict]],
+    ):
+        placeholders = ','.join(['%s'] * len(affected_ids))
+        cursor.execute(
+            f"""
+                DELETE FROM mi_trade_funding_fee_history
+                WHERE position_id IN ({placeholders}) AND settled_at >= %s
+            """,
+            affected_ids + [start_time],
+        )
+
+        existing_counts = self._history_counts_before(cursor, affected_ids, start_time)
+        insert_sql = """
+            INSERT INTO mi_trade_funding_fee_history
+                (position_id, base_asset, payment_seq, funding_rate, funding_rate_24h,
+                 funding_pnl, future_notional, settled_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        rows = []
+        for position_id, entries in entries_by_position.items():
+            base_seq = existing_counts.get(position_id, 0)
+            for index, entry in enumerate(entries, 1):
+                rows.append((
+                    position_id,
+                    entry['base_asset'],
+                    base_seq + index,
+                    round(entry['funding_rate'], 10),
+                    round(entry['funding_rate_24h'], 10),
+                    round(entry['funding_pnl'], 6),
+                    round(entry['future_notional'], 6),
+                    entry['settled_at'],
+                ))
+        if rows:
+            cursor.executemany(insert_sql, rows)
+
+    def _history_counts_before(self, cursor, position_ids: List[int], start_time: datetime) -> Dict[int, int]:
+        placeholders = ','.join(['%s'] * len(position_ids))
+        cursor.execute(
+            f"""
+                SELECT position_id, COUNT(*) AS cnt
+                FROM mi_trade_funding_fee_history
+                WHERE position_id IN ({placeholders}) AND settled_at < %s
+                GROUP BY position_id
+            """,
+            position_ids + [start_time],
+        )
+        return {row['position_id']: int(row['cnt'] or 0) for row in cursor.fetchall()}
+
+    def _refresh_position_funding_summary(self, cursor, position_ids: List[int]):
+        placeholders = ','.join(['%s'] * len(position_ids))
+        cursor.execute(
+            f"""
+                SELECT position_id,
+                       COUNT(*) AS cnt,
+                       COALESCE(SUM(funding_pnl), 0) AS total_pnl,
+                       COALESCE(SUM(funding_rate * 10000), 0) AS rate_bps
+                FROM mi_trade_funding_fee_history
+                WHERE position_id IN ({placeholders})
+                GROUP BY position_id
+            """,
+            position_ids,
+        )
+        summaries = {
+            row['position_id']: {
+                'cnt': int(row['cnt'] or 0),
+                'total_pnl': float(row['total_pnl'] or 0),
+                'rate_bps': float(row['rate_bps'] or 0),
+            }
+            for row in cursor.fetchall()
+        }
+        for position_id in position_ids:
+            summary = summaries.get(position_id, {'cnt': 0, 'total_pnl': 0.0, 'rate_bps': 0.0})
+            cursor.execute(
+                """
+                    UPDATE mi_trade_position
+                    SET funding_payments_count = %s,
+                        funding_total_pnl = %s,
+                        funding_rate_sum_bps = %s
+                    WHERE id = %s
+                """,
+                (
+                    summary['cnt'],
+                    round(summary['total_pnl'], 4),
+                    round(summary['rate_bps'], 2),
+                    position_id,
+                ),
+            )
+
+    def _sync_next_funding_times(self):
+        sql = """
+            UPDATE mi_trade_position p
+            JOIN mi_gate_future_contracts c
+              ON p.future_contract = CONCAT(c.base_asset, '_USDT')
+            SET p.next_funding_time = c.funding_next_apply
+            WHERE p.status = 'holding'
+              AND c.funding_next_apply IS NOT NULL
+        """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
-            positions = cursor.fetchall()
-        
-        if not positions:
-            return
-        
-        updated_count = 0
-        now = datetime.now()
-        
-        for pos in positions:
-            try:
-                funding_rate_24h = pos.get('funding_rate_24h')
-                if funding_rate_24h is None:
-                    continue
-                
-                funding_rate_24h = float(funding_rate_24h)
-                
-                # ── 判断是否需要结算 ──
-                next_funding = pos.get('next_funding_time')
-                base_settle_time = None  # 第一笔待结算的真实时间点
-                
-                if next_funding is None:
-                    # 从未设置过 next_funding_time（历史遗留数据）
-                    opened_at = pos.get('opened_at')
-                    if not opened_at:
-                        continue
-                    
-                    elapsed_sec = (now - opened_at).total_seconds()
-                    # 守卫：持仓时长不足 8h，不可能产生任何结算
-                    if elapsed_sec < FUNDING_INTERVAL_SEC:
-                        exchange_next = pos.get('funding_next_apply')
-                        init_time = exchange_next if exchange_next and exchange_next > now else now + timedelta(hours=8)
-                        self._set_next_funding_time(pos['id'], init_time)
-                        continue
-                    
-                    expected_count = int(elapsed_sec / FUNDING_INTERVAL_SEC)
-                    actual_count = int(pos.get('funding_payments_count') or 0)
-                    payments_to_credit = max(expected_count - actual_count, 0)
-                    if payments_to_credit == 0:
-                        # 已全部结完，初始化 next_funding_time 后跳过
-                        exchange_next = pos.get('funding_next_apply')
-                        init_time = exchange_next if exchange_next and exchange_next > now else now + timedelta(hours=8)
-                        self._set_next_funding_time(pos['id'], init_time)
-                        continue
-                    # 基于 opened_at 推算第一笔未结算时间
-                    base_settle_time = opened_at + timedelta(seconds=FUNDING_INTERVAL_SEC * (actual_count + 1))
-                elif next_funding > now:
-                    continue  # 还未到结算时间
-                else:
-                    # next_funding_time <= now，可能有一次或多次结算到期
-                    elapsed_since_due = (now - next_funding).total_seconds()
-                    payments_to_credit = 1 + int(elapsed_since_due / FUNDING_INTERVAL_SEC)
-                    base_settle_time = next_funding
-                
-                # ── 计算每期真实结算时间 ──
-                settle_times = [
-                    base_settle_time + timedelta(seconds=FUNDING_INTERVAL_SEC * i)
-                    for i in range(payments_to_credit)
-                ]
-                
-                # ── 查历史费率表获取每期真实费率 ──
-                contract = pos.get('future_contract', f"{pos['base_asset']}_USDT")
-                historical_rates = self._get_historical_rates(contract, settle_times)
-                
-                # ── 逐期计算并汇总 ──
-                future_notional = float(pos['future_open_qty']) * float(pos['future_open_price'])
-                current_count = int(pos.get('funding_payments_count') or 0)
-                
-                period_data = []  # 每期详情：(rate_24h, single_rate, single_pnl, settle_time)
-                total_pnl = 0.0
-                total_rate_bps = 0.0
-                
-                for i in range(payments_to_credit):
-                    # 优先使用历史真实费率，回退到当前快照
-                    period_rate_24h = historical_rates[i] if historical_rates[i] is not None else funding_rate_24h
-                    period_single_rate = period_rate_24h / 3
-                    period_pnl = period_single_rate * future_notional
-                    
-                    total_pnl += period_pnl
-                    total_rate_bps += period_single_rate * 10000
-                    period_data.append((period_rate_24h, period_single_rate, period_pnl, settle_times[i]))
-                
-                total_pnl = round(total_pnl, 4)
-                total_rate_bps = round(total_rate_bps, 2)
-                
-                # 确定下次结算时间：基于最后一笔结算时间 + 8h
-                next_time = settle_times[-1] + timedelta(seconds=FUNDING_INTERVAL_SEC)
-                
-                # 累加资金费到持仓 + 写入历史明细：合并到同一事务，确保原子性。
-                # 任一失败则两边都回滚，避免出现 funding_payments_count 与 history 行数不一致。
-                update_sql = """
-                    UPDATE mi_trade_position SET
-                        funding_rate_sum_bps = funding_rate_sum_bps + %(rate_bps)s,
-                        funding_payments_count = funding_payments_count + %(credit_count)s,
-                        funding_total_pnl = funding_total_pnl + %(funding_pnl)s,
-                        next_funding_time = %(next_funding_time)s
-                    WHERE id = %(position_id)s
-                """
-                
-                with db_manager.get_connection() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(update_sql, {
-                            'rate_bps': total_rate_bps,
-                            'credit_count': payments_to_credit,
-                            'funding_pnl': total_pnl,
-                            'next_funding_time': next_time,
-                            'position_id': pos['id']
-                        })
-                        
-                        # 写入结算历史明细（逐期写入真实费率和时间）
-                        # 使用同一连接以保证与上面的 UPDATE 在同一事务
-                        self._insert_funding_history(
-                            cursor=cursor,
-                            position_id=pos['id'],
-                            base_asset=pos['base_asset'],
-                            current_count=current_count,
-                            period_data=period_data,
-                            future_notional=future_notional,
-                        )
-                
-                updated_count += 1
-                logger.info(
-                    f"资金费结算 | {pos['base_asset']} | "
-                    f"rate_24h(current)={funding_rate_24h:.6f} | "
-                    f"total_pnl={total_pnl:.4f} | "
-                    f"credited={payments_to_credit}次 | "
-                    f"total_count={current_count + payments_to_credit} | "
-                    f"settle_range=[{settle_times[0].strftime('%m-%d %H:%M')}~{settle_times[-1].strftime('%m-%d %H:%M')}] | "
-                    f"next={next_time}"
-                )
-                
-            except Exception as e:
-                logger.error(f"更新资金费收益失败 {pos.get('order_uuid', 'unknown')}: {e}")
-        
-        if updated_count > 0:
-            logger.info(f"资金费批量更新完成，共更新 {updated_count} 条持仓")
+
+    def _funding_weight(self, pos: Dict) -> float:
+        contracts = abs(_float(pos.get('future_open_contracts')))
+        if contracts > 0:
+            return contracts
+        return abs(_float(pos.get('future_open_qty')))
+
+    def _position_notional(self, pos: Dict) -> float:
+        return abs(_float(pos.get('future_open_qty')) * _float(pos.get('future_open_price')))
+
+    def _rate_24h_from_single_rate(self, pos: Dict, single_rate: float) -> float:
+        interval = int(pos.get('funding_interval') or self._get_funding_interval(pos.get('base_asset')))
+        periods_per_day = 86400 / max(interval, 1)
+        return single_rate * periods_per_day
+
+    def _get_funding_interval(self, base_asset: str) -> int:
+        meta = self.contract_meta.get(base_asset or '', {})
+        return int(meta.get('funding_interval') or DEFAULT_FUNDING_INTERVAL_SEC)
     
     def _set_next_funding_time(self, position_id: int, next_time: datetime):
         """仅设置持仓的 next_funding_time（不累加资金费）"""
@@ -274,7 +403,7 @@ class PositionTracker:
             return []
         
         # 扩大查询范围（前后各 4h 容差）
-        tolerance_sec = FUNDING_INTERVAL_SEC // 2
+        tolerance_sec = DEFAULT_FUNDING_INTERVAL_SEC // 2
         min_ts = int(settle_times[0].timestamp()) - tolerance_sec
         max_ts = int(settle_times[-1].timestamp()) + tolerance_sec
         
@@ -405,3 +534,10 @@ class PositionTracker:
         if base_asset in self.contract_meta:
             return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
         return 1.0
+
+
+def _float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
