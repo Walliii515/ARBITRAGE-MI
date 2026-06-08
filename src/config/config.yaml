@@ -175,7 +175,7 @@ trade:
     check_interval_sec: 0.2                 # 平仓检查间隔（秒）；与开仓对称
     cooldown_sec: 60                        # 平仓失败冷却（秒）
     take_profit_mode: fixed_net_bps         # 止盈模式：fixed_net_bps=固定净收益；legacy_p40=历史p40资金费倍数
-    fixed_take_profit_bps: 100              # 固定净止盈阈值：收敛收益 + 已收资金费 - 全部手续费
+    fixed_take_profit_bps: 200              # 固定净止盈阈值：收敛收益 + 已收资金费 - 全部手续费
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
     positive_funding_hold_window_min: 60    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
