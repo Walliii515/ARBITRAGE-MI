@@ -103,7 +103,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
-        funding_carry_max_next_funding_min=30.0,
+        funding_carry_max_next_funding_min=60.0,
         funding_carry_amount_usdt=10.0,
     )
     te = TradingExecutor(
@@ -951,7 +951,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertAlmostEqual(snapshot['entry_floor_bps'], -25.0)
         self.assertTrue(te._pass_risk_check(row))
 
-    def test_funding_carry_requires_near_next_funding(self):
+    def test_funding_carry_uses_60_min_next_funding_window(self):
         te = make_trading_executor(
             funding_carry_enabled=True,
             vwap_threshold_meta={'BANANA': {'p20': -18.0}},
@@ -959,9 +959,14 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             asset_tier_meta={'BANANA': 'B'},
         )
         row = self._row('BANANA', -20.0, 0.0030)
-        row['funding_next_apply'] = (datetime.now() + timedelta(minutes=31)).strftime('%Y-%m-%d %H:%M:%S')
+        row['funding_next_apply'] = (datetime.now() + timedelta(minutes=59)).strftime('%Y-%m-%d %H:%M:%S')
 
-        self.assertIsNone(te._annotate_funding_carry_candidate(row, -20.0))
+        self.assertIsNotNone(te._annotate_funding_carry_candidate(row, -20.0))
+
+        late_row = self._row('BANANA', -20.0, 0.0030)
+        late_row['funding_next_apply'] = (datetime.now() + timedelta(minutes=61)).strftime('%Y-%m-%d %H:%M:%S')
+
+        self.assertIsNone(te._annotate_funding_carry_candidate(late_row, -20.0))
 
     def test_funding_carry_creates_dedicated_signal_state(self):
         te = make_trading_executor(

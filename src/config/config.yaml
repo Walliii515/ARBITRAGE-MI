@@ -146,7 +146,7 @@ trade:
     allowed_tiers: [A, B]
     min_24h_bps: 30                         # 当前实时24h资金费率 >= 30bps
     basis_relax_bps: 15                     # current_basis >= max(开仓p20, 平仓p20) - 15bps
-    max_next_funding_min: 30                # 距离下次资金费结算 <= 30分钟
+    max_next_funding_min: 60                # 距离下次资金费结算 <= 60分钟
     amount_usdt: 10                         # 单笔小仓位金额；设0则跟随 trade.open.amount_usdt
 
   # ─── 信号降噪 / 执行质量冷却 ───

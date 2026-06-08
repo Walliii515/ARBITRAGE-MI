@@ -1047,7 +1047,7 @@ def _run_open_position_check_once():
                 funding_carry_min_24h_bps=config.get_float('trade.funding_carry_open.min_24h_bps', 30.0),
                 funding_carry_basis_relax_bps=config.get_float('trade.funding_carry_open.basis_relax_bps', 15.0),
                 funding_carry_max_next_funding_min=config.get_float(
-                    'trade.funding_carry_open.max_next_funding_min', 30.0
+                    'trade.funding_carry_open.max_next_funding_min', 60.0
                 ),
                 funding_carry_amount_usdt=config.get_float('trade.funding_carry_open.amount_usdt', 0.0),
                 rebound_timeout_cooldown_enabled=config.get_bool('trade.rebound_timeout_cooldown.enabled', True),

@@ -126,7 +126,7 @@ class TradingExecutorConfig:
     funding_carry_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
     funding_carry_min_24h_bps: float = 30.0
     funding_carry_basis_relax_bps: float = 15.0
-    funding_carry_max_next_funding_min: float = 30.0
+    funding_carry_max_next_funding_min: float = 60.0
     funding_carry_amount_usdt: float = 0.0
 
     # ─── 信号降噪 / 执行质量冷却 ───
