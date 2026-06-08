@@ -80,6 +80,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           rebound_enabled=True,
                           rebound_allowed_tiers=None,
                           funding_entry_enabled=True,
+                          funding_carry_enabled=False,
                           contract_meta=None,
                           spot_meta=None):
     """构造独立的 TradingExecutor 实例（不依赖 DB / API）"""
@@ -98,6 +99,12 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         rebound_enabled=rebound_enabled,
         rebound_allowed_tiers=rebound_allowed_tiers or ['A', 'B'],
         funding_entry_enabled=funding_entry_enabled,
+        funding_carry_enabled=funding_carry_enabled,
+        funding_carry_allowed_tiers=['A', 'B'],
+        funding_carry_min_24h_bps=30.0,
+        funding_carry_basis_relax_bps=15.0,
+        funding_carry_max_next_funding_min=30.0,
+        funding_carry_amount_usdt=10.0,
     )
     te = TradingExecutor(
         cfg, contract_meta=contract_meta or {}, spot_meta=spot_meta or {},
@@ -779,6 +786,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             'open_vwap_basis_bps': basis,
             'open_coverage': coverage,
             'funding_rate_24h': funding_rate_24h,
+            'funding_next_apply': (datetime.now() + timedelta(minutes=20)).strftime('%Y-%m-%d %H:%M:%S'),
         }
 
     def test_high_funding_gets_capped_discount_not_unlimited_entry(self):
@@ -832,6 +840,48 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertTrue(te._pass_rebound_check('ALLO', 29.0, self._row('ALLO', 29.0, 0.01)))
         self.assertEqual(te._peak_state['ALLO']['trigger'], 'rebound')
         te._resolve_signal.assert_not_called()
+
+    def test_funding_carry_allows_near_p20_before_standard_entry_floor(self):
+        te = make_trading_executor(
+            funding_carry_enabled=True,
+            vwap_threshold_meta={'BANANA': {'p20': -18.0}},
+            close_vwap_threshold_meta={'BANANA': {'close_basis_p20': -10.0}},
+            asset_tier_meta={'BANANA': 'B'},
+        )
+        row = self._row('BANANA', -20.0, 0.0030)
+        te._annotate_entry_snapshot(row, -20.0)
+        snapshot = te._annotate_funding_carry_candidate(row, -20.0)
+
+        self.assertIsNotNone(snapshot)
+        self.assertAlmostEqual(snapshot['entry_floor_bps'], -25.0)
+        self.assertTrue(te._pass_risk_check(row))
+
+    def test_funding_carry_requires_near_next_funding(self):
+        te = make_trading_executor(
+            funding_carry_enabled=True,
+            vwap_threshold_meta={'BANANA': {'p20': -18.0}},
+            close_vwap_threshold_meta={'BANANA': {'close_basis_p20': -10.0}},
+            asset_tier_meta={'BANANA': 'B'},
+        )
+        row = self._row('BANANA', -20.0, 0.0030)
+        row['funding_next_apply'] = (datetime.now() + timedelta(minutes=31)).strftime('%Y-%m-%d %H:%M:%S')
+
+        self.assertIsNone(te._annotate_funding_carry_candidate(row, -20.0))
+
+    def test_funding_carry_creates_dedicated_signal_state(self):
+        te = make_trading_executor(
+            funding_carry_enabled=True,
+            vwap_threshold_meta={'BANANA': {'p20': -18.0}},
+            close_vwap_threshold_meta={'BANANA': {'close_basis_p20': -10.0}},
+            asset_tier_meta={'BANANA': 'B'},
+        )
+        te._create_signal = MagicMock(return_value=123)
+        te._verify_realtime_funding_rate = MagicMock(return_value=True)
+        row = self._row('BANANA', -20.0, 0.0030)
+
+        self.assertTrue(te._pass_funding_carry_check('BANANA', -20.0, row))
+        self.assertEqual(te._peak_state['BANANA']['trigger'], 'funding_carry')
+        self.assertEqual(te._peak_state['BANANA']['signal_id'], 123)
 
     def test_rebound_timeout_cooldown_resets_when_basis_moves(self):
         te = make_trading_executor()

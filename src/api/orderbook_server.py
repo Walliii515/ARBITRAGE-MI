@@ -1041,6 +1041,14 @@ def _run_open_position_check_once():
                 funding_entry_strong_funding_24h_bps=config.get_float('trade.funding_adjusted_entry.strong_funding_24h_bps', 50.0),
                 funding_entry_discount_ratio=config.get_float('trade.funding_adjusted_entry.discount_ratio', 0.2),
                 funding_entry_max_discount_bps=config.get_float('trade.funding_adjusted_entry.max_funding_discount_bps', 10.0),
+                funding_carry_enabled=config.get_bool('trade.funding_carry_open.enabled', False),
+                funding_carry_allowed_tiers=config.get('trade.funding_carry_open.allowed_tiers', ['A', 'B']),
+                funding_carry_min_24h_bps=config.get_float('trade.funding_carry_open.min_24h_bps', 30.0),
+                funding_carry_basis_relax_bps=config.get_float('trade.funding_carry_open.basis_relax_bps', 15.0),
+                funding_carry_max_next_funding_min=config.get_float(
+                    'trade.funding_carry_open.max_next_funding_min', 30.0
+                ),
+                funding_carry_amount_usdt=config.get_float('trade.funding_carry_open.amount_usdt', 0.0),
                 rebound_timeout_cooldown_enabled=config.get_bool('trade.rebound_timeout_cooldown.enabled', True),
                 rebound_timeout_cooldown_sec=config.get_int('trade.rebound_timeout_cooldown.cooldown_sec', 45),
                 rebound_timeout_basis_change_reset_bps=config.get_float('trade.rebound_timeout_cooldown.basis_change_reset_bps', 5.0),

@@ -137,6 +137,17 @@ trade:
     discount_ratio: 0.2                     # funding 对 p20 的折扣比例
     max_funding_discount_bps: 10            # 最多比 p20 放宽 10bps，避免开在太差位置
 
+  # ─── 高资金费 Carry 开仓通道 ───
+  # 独立于 momentum / pullback / rebound：临近资金费结算且 funding 足够厚时，
+  # 允许 basis 未达到原 entry_floor，但仍必须通过盘口恢复、最终旁路和执行保护。
+  funding_carry_open:
+    enabled: true
+    allowed_tiers: [A, B]
+    min_24h_bps: 30                         # 当前实时24h资金费率 >= 30bps
+    basis_relax_bps: 15                     # current_basis >= max(开仓p20, 平仓p20) - 15bps
+    max_next_funding_min: 30                # 距离下次资金费结算 <= 30分钟
+    amount_usdt: 10                         # 单笔小仓位金额；设0则跟随 trade.open.amount_usdt
+
   # ─── 信号降噪 / 执行质量冷却 ───
   rebound_timeout_cooldown:
     enabled: true

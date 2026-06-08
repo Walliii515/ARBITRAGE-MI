@@ -121,6 +121,14 @@ class TradingExecutorConfig:
     funding_entry_discount_ratio: float = 0.2
     funding_entry_max_discount_bps: float = 10.0
 
+    # ─── 高资金费 carry 开仓通道 ───
+    funding_carry_enabled: bool = False
+    funding_carry_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
+    funding_carry_min_24h_bps: float = 30.0
+    funding_carry_basis_relax_bps: float = 15.0
+    funding_carry_max_next_funding_min: float = 30.0
+    funding_carry_amount_usdt: float = 0.0
+
     # ─── 信号降噪 / 执行质量冷却 ───
     rebound_timeout_cooldown_enabled: bool = True
     rebound_timeout_cooldown_sec: int = 45
@@ -312,6 +320,17 @@ class TradingExecutor:
         self.funding_entry_discount_ratio = float(cfg.funding_entry_discount_ratio)
         self.funding_entry_max_discount_bps = float(cfg.funding_entry_max_discount_bps)
 
+        self.funding_carry_enabled = bool(cfg.funding_carry_enabled)
+        self.funding_carry_allowed_tiers: Set[str] = {
+            str(t).strip().upper()
+            for t in (cfg.funding_carry_allowed_tiers or [])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.funding_carry_min_24h_bps = float(cfg.funding_carry_min_24h_bps)
+        self.funding_carry_basis_relax_bps = float(cfg.funding_carry_basis_relax_bps)
+        self.funding_carry_max_next_funding_min = float(cfg.funding_carry_max_next_funding_min)
+        self.funding_carry_amount_usdt = float(cfg.funding_carry_amount_usdt or 0.0)
+
         self.rebound_timeout_cooldown_enabled = bool(cfg.rebound_timeout_cooldown_enabled)
         self.rebound_timeout_cooldown_sec = int(cfg.rebound_timeout_cooldown_sec)
         self.rebound_timeout_basis_change_reset_bps = float(cfg.rebound_timeout_basis_change_reset_bps)
@@ -460,6 +479,7 @@ class TradingExecutor:
 
                 open_vwap_basis = float(row.get('open_vwap_basis_bps'))
                 self._annotate_entry_snapshot(row, open_vwap_basis)
+                self._annotate_funding_carry_candidate(row, open_vwap_basis)
 
                 # 这些冷却只拦截“新一轮信号”，不打断已经进入状态机的信号。
                 if base_asset not in self._peak_state:
@@ -498,9 +518,16 @@ class TradingExecutor:
                 # 3. 峰值回落 + sustain 确认（单通道）
                 self._annotate_resiliency_row(row)
                 self._record_momentum_sample(base_asset, open_vwap_basis)
-                momentum_ready = self._pass_momentum_check(base_asset, open_vwap_basis, row)
+                funding_carry_ready = self._pass_funding_carry_check(base_asset, open_vwap_basis, row)
+                momentum_ready = (
+                    False if funding_carry_ready
+                    else self._pass_momentum_check(base_asset, open_vwap_basis, row)
+                )
 
-                if not momentum_ready:
+                if funding_carry_ready:
+                    if not self._pass_open_resiliency_check(base_asset, row, open_vwap_basis):
+                        continue
+                elif not momentum_ready:
                     self._open_resiliency.observe_shock(base_asset, row)
                     if not self._pass_peak_check(base_asset, open_vwap_basis, row):
                         if base_asset not in self._peak_state:
@@ -674,6 +701,116 @@ class TradingExecutor:
             return 0.0
         return float(funding_rate) * 10000.0
 
+    def _parse_datetime(self, value) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(text[:19], fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _time_to_next_funding_min(self, base_asset: str, row: Optional[Dict] = None) -> Optional[float]:
+        row = row or {}
+        next_at = row.get('funding_next_apply')
+        if next_at is None and base_asset in self.contract_meta:
+            next_at = self.contract_meta[base_asset].get('funding_next_apply')
+        parsed = self._parse_datetime(next_at)
+        if not parsed:
+            return None
+        return (parsed - datetime.now()).total_seconds() / 60.0
+
+    def _open_close_p20_floor(self, base_asset: str) -> Optional[float]:
+        values = []
+        threshold_data = self.vwap_threshold_meta.get(base_asset, {})
+        if threshold_data.get('p20') is not None:
+            values.append(float(threshold_data['p20']))
+        close_data = self.close_vwap_threshold_meta.get(base_asset, {})
+        close_p20 = close_data.get(self.close_threshold_col)
+        if close_p20 is None:
+            close_p20 = close_data.get('close_basis_p20')
+        if close_p20 is not None:
+            values.append(float(close_p20))
+        return max(values) if values else None
+
+    def _funding_carry_amount(self) -> float:
+        return self.funding_carry_amount_usdt if self.funding_carry_amount_usdt > 0 else self.open_amount_usdt
+
+    def _active_open_amount_usdt(self, row: Optional[Dict] = None) -> float:
+        if row and row.get('open_amount_usdt') is not None:
+            return float(row.get('open_amount_usdt'))
+        return self.open_amount_usdt
+
+    def _funding_carry_snapshot(
+        self, base_asset: str, basis_bps: float, row: Optional[Dict] = None
+    ) -> Optional[Dict]:
+        if not self.funding_carry_enabled:
+            return None
+        tier = self._asset_tier(base_asset)
+        if tier not in self.funding_carry_allowed_tiers:
+            return None
+
+        funding_24h_bps = self._funding_24h_bps(base_asset, row)
+        if funding_24h_bps < self.funding_carry_min_24h_bps:
+            return None
+
+        next_min = self._time_to_next_funding_min(base_asset, row)
+        if next_min is None or next_min < 0 or next_min > self.funding_carry_max_next_funding_min:
+            return None
+
+        p20_floor = self._open_close_p20_floor(base_asset)
+        if p20_floor is None:
+            return None
+
+        entry_floor = p20_floor - self.funding_carry_basis_relax_bps
+        if float(basis_bps) < entry_floor:
+            return None
+
+        expected_funding_bps = funding_24h_bps * self.funding_entry_capture_ratio
+        expected_edge_bps = (
+            float(basis_bps)
+            + expected_funding_bps
+            - self.fee_cost_bps
+            - self.funding_entry_slippage_buffer_bps
+        )
+        open_p20 = self.vwap_threshold_meta.get(base_asset, {}).get('p20', self.basis_threshold_bps)
+        return {
+            'p20_bps': round(float(open_p20), 4),
+            'entry_floor_bps': round(entry_floor, 4),
+            'funding_24h_bps': round(funding_24h_bps, 4),
+            'expected_funding_bps': round(expected_funding_bps, 4),
+            'carry_floor_bps': round(entry_floor, 4),
+            'timing_floor_bps': round(entry_floor, 4),
+            'funding_discount_bps': round(self.funding_carry_basis_relax_bps, 4),
+            'expected_edge_bps': round(expected_edge_bps, 4),
+            'funding_carry': True,
+            'funding_carry_p20_floor_bps': round(p20_floor, 4),
+            'funding_carry_next_min': round(next_min, 4),
+            'funding_carry_tier': tier,
+            'funding_carry_amount_usdt': round(self._funding_carry_amount(), 4),
+        }
+
+    def _apply_entry_snapshot_to_row(self, row: Dict, snapshot: Dict) -> None:
+        for key, value in snapshot.items():
+            row[f'_entry_{key}'] = value
+
+    def _annotate_funding_carry_candidate(self, row: Dict, basis_bps: float) -> Optional[Dict]:
+        base_asset = row.get('base_asset', '')
+        snapshot = self._funding_carry_snapshot(base_asset, basis_bps, row)
+        if not snapshot:
+            row.pop('_funding_carry_candidate', None)
+            return None
+        row['_funding_carry_candidate'] = True
+        row['open_amount_usdt'] = self._funding_carry_amount()
+        self._apply_entry_snapshot_to_row(row, snapshot)
+        return snapshot
+
     def _entry_snapshot(self, base_asset: str, basis_bps: float, row: Optional[Dict] = None) -> Dict:
         """
         统一开仓门槛。
@@ -732,8 +869,7 @@ class TradingExecutor:
         if basis_bps is None:
             basis_bps = float(row.get('open_vwap_basis_bps') or 0)
         snapshot = self._entry_snapshot(base_asset, float(basis_bps), row)
-        for key, value in snapshot.items():
-            row[f'_entry_{key}'] = value
+        self._apply_entry_snapshot_to_row(row, snapshot)
         return snapshot
 
     def _state_entry_snapshot(self, base_asset: str, row: Optional[Dict] = None,
@@ -752,6 +888,11 @@ class TradingExecutor:
                 'timing_floor_bps': row.get('_entry_timing_floor_bps'),
                 'funding_discount_bps': row.get('_entry_funding_discount_bps'),
                 'expected_edge_bps': row.get('_entry_expected_edge_bps'),
+                'funding_carry': row.get('_entry_funding_carry'),
+                'funding_carry_p20_floor_bps': row.get('_entry_funding_carry_p20_floor_bps'),
+                'funding_carry_next_min': row.get('_entry_funding_carry_next_min'),
+                'funding_carry_tier': row.get('_entry_funding_carry_tier'),
+                'funding_carry_amount_usdt': row.get('_entry_funding_carry_amount_usdt'),
             }
         if basis_bps is None:
             basis_bps = float((row or {}).get('open_vwap_basis_bps') or 0)
@@ -880,6 +1021,55 @@ class TradingExecutor:
             'safety_bps': float(override.get('safety_bps', self.momentum_safety_bps)),
         }
 
+    def _pass_funding_carry_check(self, base_asset: str, current_basis_bps: float, row: Dict) -> bool:
+        """高资金费 carry 通道：不等触顶回调，临近结算且 basis 只差一小段时直接进入恢复确认。"""
+        state = self._peak_state.get(base_asset)
+        if state and state.get('trigger') == 'funding_carry':
+            return True
+        if state:
+            return False
+
+        snapshot = self._funding_carry_snapshot(base_asset, current_basis_bps, row)
+        if not snapshot:
+            return False
+
+        contract = row.get('contract', '')
+        if not self._verify_realtime_funding_rate(base_asset, contract):
+            return False
+        self._apply_realtime_funding_info(base_asset, row)
+
+        snapshot = self._funding_carry_snapshot(base_asset, current_basis_bps, row)
+        if not snapshot:
+            return False
+        row['_funding_carry_candidate'] = True
+        row['open_amount_usdt'] = self._funding_carry_amount()
+        self._apply_entry_snapshot_to_row(row, snapshot)
+
+        signal_id = self._create_signal(base_asset, current_basis_bps)
+        now = datetime.now()
+        self._peak_state[base_asset] = {
+            'peak_bps': current_basis_bps,
+            'start_time': now,
+            'trigger': 'funding_carry',
+            'signal_id': signal_id,
+            'signal_basis_bps': current_basis_bps,
+            'strategy_tier': snapshot.get('funding_carry_tier'),
+            'entry_snapshot': snapshot,
+            'resiliency_active': True,
+            'resiliency_start_time': now,
+        }
+        self._open_resiliency.observe_shock(base_asset, row, now)
+        logger.info(
+            f"Funding Carry 开仓候选 | {base_asset} | "
+            f"tier={snapshot.get('funding_carry_tier')} | "
+            f"basis={current_basis_bps:.2f}bps≥floor={float(snapshot['entry_floor_bps']):.2f} | "
+            f"p20_floor={float(snapshot['funding_carry_p20_floor_bps']):.2f} | "
+            f"funding24h={float(snapshot['funding_24h_bps']):.2f}bps | "
+            f"next_in={float(snapshot['funding_carry_next_min']):.1f}min | "
+            f"amount={float(snapshot['funding_carry_amount_usdt']):.2f}USDT"
+        )
+        return True
+
     def _pass_momentum_check(self, base_asset: str, current_basis_bps: float, row: Dict) -> bool:
         """
         动量开仓通道：当基差已经明显超过阈值，并且短窗口内继续上行，
@@ -983,12 +1173,14 @@ class TradingExecutor:
             logger.info(f"开仓盘口恢复通过 | {base_asset} | {metric_text}")
             return True
         if result.terminal:
+            state = self._peak_state.get(base_asset) or {}
+            trigger_type = state.get('trigger') or 'pullback'
             self._resolve_signal(
                 base_asset,
                 'gate_rejected',
                 f'resiliency:{result.reason}|{metric_text}',
                 exit_basis_bps=open_vwap_basis,
-                trigger_type='pullback',
+                trigger_type=trigger_type,
             )
             self._peak_state.pop(base_asset, None)
             self._open_resiliency.clear(base_asset)
@@ -1177,7 +1369,10 @@ class TradingExecutor:
                 base_asset, pre_gate_basis_bps
             )
             entry_floor = float(entry_snapshot.get('entry_floor_bps'))
-            min_entry_basis = entry_floor + self.execution_guard_min_p20_buffer_bps
+            if (peak_state or {}).get('trigger') == 'funding_carry':
+                min_entry_basis = entry_floor
+            else:
+                min_entry_basis = entry_floor + self.execution_guard_min_p20_buffer_bps
             if pre_gate_basis_bps < min_entry_basis:
                 return False, (
                     f'执行保护(pregate={pre_gate_basis_bps:.1f}<'
@@ -1244,9 +1439,10 @@ class TradingExecutor:
             return False
 
         # 最小名义价值检查：开仓金额低于交易所最低要求时直接过滤
+        active_amount = self._active_open_amount_usdt(row)
         if base_asset in self.spot_meta:
             min_notional = self.spot_meta[base_asset].get('min_notional')
-            if min_notional is not None and self.open_amount_usdt < min_notional:
+            if min_notional is not None and active_amount < min_notional:
                 return False
 
         # 资金费率下限检查：24h费率(bps) >= min_funding_rate_bps
@@ -1264,7 +1460,11 @@ class TradingExecutor:
         # 统一入场门槛：p20 是历史位置参考，entry_floor 同时考虑 funding、手续费和滑点缓冲。
         open_vwap_basis = row.get('open_vwap_basis_bps')
         if open_vwap_basis is not None:
-            entry_floor = self._entry_floor_bps(base_asset, row, float(open_vwap_basis))
+            if row.get('_funding_carry_candidate'):
+                entry_snapshot = self._state_entry_snapshot(base_asset, row, float(open_vwap_basis))
+                entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+            else:
+                entry_floor = self._entry_floor_bps(base_asset, row, float(open_vwap_basis))
             if float(open_vwap_basis) < entry_floor:
                 return False
         
@@ -1455,11 +1655,18 @@ class TradingExecutor:
             if not merged:
                 return False, None, None, '盘口合并失败'
 
+            state = self._peak_state.get(base_asset)
+            target_amount_usdt = (
+                self._funding_carry_amount()
+                if state and state.get('trigger') == 'funding_carry'
+                else self.open_amount_usdt
+            )
             merged = calculate_hedge_metrics(
-                merged, self.contract_meta, self.spot_meta, self.open_amount_usdt
+                merged, self.contract_meta, self.spot_meta, target_amount_usdt
             )
             row = merged[0]
             row['base_asset'] = base_asset
+            row['open_amount_usdt'] = target_amount_usdt
             c_meta = self.contract_meta.get(base_asset, {})
             row['funding_rate'] = c_meta.get('funding_rate')
             row['funding_rate_24h'] = c_meta.get('funding_rate_24h')
@@ -1482,9 +1689,18 @@ class TradingExecutor:
                 self._apply_realtime_funding_info(base_asset, row)
 
             # ── 5. 统一入场门槛校验 ──
-            entry_snapshot = self._entry_snapshot(base_asset, gate_basis_bps, row)
-            self._annotate_entry_snapshot(row, gate_basis_bps)
-            state = self._peak_state.get(base_asset)
+            if state and state.get('trigger') == 'funding_carry':
+                entry_snapshot = self._funding_carry_snapshot(base_asset, gate_basis_bps, row)
+                if not entry_snapshot:
+                    logger.info(
+                        f"开仓旁路-FundingCarry复核失败 | {base_asset} | "
+                        f"gate_basis={gate_basis_bps:.2f}bps | lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
+                    return False, row, gate_basis_bps, 'FundingCarry旁路复核失败(实时条件不满足)'
+                self._apply_entry_snapshot_to_row(row, entry_snapshot)
+            else:
+                entry_snapshot = self._entry_snapshot(base_asset, gate_basis_bps, row)
+                self._annotate_entry_snapshot(row, gate_basis_bps)
             if state is not None:
                 state['entry_snapshot'] = entry_snapshot
             entry_floor = float(entry_snapshot.get('entry_floor_bps'))
@@ -1782,10 +1998,11 @@ class TradingExecutor:
                 return f"资金风控(Gate可用{gate_available:.2f}<需{gate_required:.2f}USDT)"
 
         # 最小名义价值检查
+        active_amount = self._active_open_amount_usdt(row)
         if base_asset in self.spot_meta:
             min_notional = self.spot_meta[base_asset].get('min_notional')
-            if min_notional is not None and self.open_amount_usdt < min_notional:
-                return f"开仓金额低于最小名义值({self.open_amount_usdt}<{min_notional}USDT)"
+            if min_notional is not None and active_amount < min_notional:
+                return f"开仓金额低于最小名义值({active_amount}<{min_notional}USDT)"
         # 资金费率下限检查
         funding_rate = row.get('funding_rate_24h')
         if funding_rate is not None:
@@ -1804,6 +2021,13 @@ class TradingExecutor:
             entry_snapshot = self._state_entry_snapshot(base_asset, row, float(open_vwap_basis))
             entry_floor = float(entry_snapshot.get('entry_floor_bps'))
             if float(open_vwap_basis) < entry_floor:
+                if row.get('_funding_carry_candidate'):
+                    return (
+                        f"FundingCarry基差不足({float(open_vwap_basis):.1f}<"
+                        f"floor={entry_floor:.1f}|p20_floor="
+                        f"{float(entry_snapshot.get('funding_carry_p20_floor_bps', 0)):.1f}"
+                        f"-{self.funding_carry_basis_relax_bps:.1f})"
+                    )
                 return (
                     f"基差跌回入场门槛下({float(open_vwap_basis):.1f}<"
                     f"entry_floor={entry_floor:.1f}bps|{self._format_entry_snapshot(entry_snapshot)})"
@@ -1913,6 +2137,15 @@ class TradingExecutor:
                 parts.append(
                     f"动量开仓(tier={tier},升{rise_bps:.1f}bps/{window_sec:.1f}s,"
                     f"buffer={buffer_bps:.1f}bps)"
+                )
+            elif trigger == 'funding_carry':
+                tier = peak_state.get('strategy_tier', self._asset_tier(base_asset))
+                parts.append(
+                    f"FundingCarry(tier={tier},"
+                    f"p20_floor={float(entry_snapshot.get('funding_carry_p20_floor_bps', 0)):.1f},"
+                    f"放宽{self.funding_carry_basis_relax_bps:.1f}bps,"
+                    f"距结算{float(entry_snapshot.get('funding_carry_next_min', 0)):.1f}min,"
+                    f"金额{float(entry_snapshot.get('funding_carry_amount_usdt', self.open_amount_usdt)):.1f}U)"
                 )
             else:
                 parts.append(f"峰值{peak_bps:.1f}")
