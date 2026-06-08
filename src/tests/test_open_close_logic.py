@@ -1326,6 +1326,17 @@ class TestClosingExecutorValleyCheck(unittest.TestCase):
         self.assertTrue(ret)
         self.assertEqual(self.ce._valley_state['BTC']['trigger'], 'rebound')
 
+    def test_same_asset_positions_keep_independent_valleys(self):
+        """同一标的多笔持仓按 position_id 隔离谷底状态。"""
+        pos1 = dict(self.pos, id=101, open_spread_bps=100.0)
+        pos2 = dict(self.pos, id=102, open_spread_bps=80.0)
+
+        self.ce._pass_valley_check('BTC', 50.0, pos1)
+        self.ce._pass_valley_check('BTC', 30.0, pos2)
+
+        self.assertEqual(self.ce._valley_state[101]['valley_bps'], 50.0)
+        self.assertEqual(self.ce._valley_state[102]['valley_bps'], 30.0)
+
 
 class TestClosingExecutorPreExecutionGate(unittest.TestCase):
     """平仓最终风控旁路 6 个分支"""
@@ -1563,16 +1574,30 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         ).strftime('%Y-%m-%d %H:%M:%S')
         self.assertFalse(self.ce._check_take_profit(self.pos, 40.0))
 
-    def test_pre_funding_risk_triggers_before_negative_settlement(self):
+    def test_negative_funding_exit_triggers_on_current_24h_rate(self):
         self.pos.update({
             'open_spread_bps': 60.0,
             'current_spread_bps': 60.0,
-            'funding_rate_24h': -0.003,  # 约每8小时 -10bps
+            'funding_rate_24h': -0.003,  # 24h -30bps
             'funding_next_apply': (
-                datetime.now() + timedelta(minutes=20)
+                datetime.now() + timedelta(minutes=120)
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
-        self.assertTrue(self.ce._check_pre_funding_risk(self.pos, 60.0))
+        self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
+
+    def test_negative_funding_exit_triggers_on_cumulative_24h_rate(self):
+        self.pos.update({
+            'funding_rate_24h': 0.001,
+            'funding_rate_sum_bps': 26.0,
+        })
+        self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
+
+    def test_negative_funding_exit_ignores_positive_and_small_negative(self):
+        self.pos.update({
+            'funding_rate_24h': -0.0024,  # 24h -24bps
+            'funding_rate_sum_bps': 0.0,
+        })
+        self.assertFalse(self.ce._check_negative_funding_exit(self.pos))
 
     def test_close_order_group_carries_future_protective_price(self):
         group = self.ce._build_close_order_group({

@@ -6,10 +6,9 @@
 
 平仓触发条件（按优先级）：
   0. 保证金爆仓风控（距爆仓距离 < 阈值）
-  1. 结算前大额负资金费风险平仓
+  1. 当前/累计负24h资金费率超阈值
   2. 资金费次数 >= max_funding_payments
   3. 固定净收益止盈（下单前有最终风控旁路复核）
-  4. 累计资金费超阈值
 """
 import time
 import uuid
@@ -63,20 +62,11 @@ class ClosingExecutor:
         self.positive_funding_hold_min_bps = config.get_float(
             'trade.close.positive_funding_hold_min_bps', 5.0
         )
-        self.pre_funding_guard_enabled = config.get_bool(
-            'trade.close.pre_funding_guard_enabled', True
+        self.negative_funding_exit_enabled = config.get_bool(
+            'trade.close.negative_funding_exit_enabled', True
         )
-        self.pre_funding_guard_window_min = config.get_float(
-            'trade.close.pre_funding_guard_window_min', 30.0
-        )
-        self.pre_funding_guard_large_negative_bps = config.get_float(
-            'trade.close.pre_funding_guard_large_negative_bps', 5.0
-        )
-        self.pre_funding_guard_min_deterioration_bps = config.get_float(
-            'trade.close.pre_funding_guard_min_deterioration_bps', 5.0
-        )
-        self.pre_funding_guard_min_projected_profit_bps = config.get_float(
-            'trade.close.pre_funding_guard_min_projected_profit_bps', 0.0
+        self.negative_funding_exit_threshold_24h_bps = config.get_float(
+            'trade.close.negative_funding_exit_threshold_24h_bps', 25.0
         )
         self.protective_ioc_enabled = config.get_bool('trade.close.protective_ioc_enabled', True)
         self.protective_ioc_take_profit_slippage_bps = config.get_float(
@@ -124,16 +114,12 @@ class ClosingExecutor:
         # 谷底反弹止盈策略
         self.valley_rebound_pct = config.get_float('trade.valley_rebound.rebound_pct', 0.10)
         self.valley_monitor_timeout_sec = config.get_int('trade.valley_rebound.monitor_timeout_sec', 60)
-        self._valley_state: Dict[str, Dict] = {}  # base_asset -> {valley_bps, start_time, open_spread_bps}
+        self._valley_state: Dict[object, Dict] = {}  # position_id -> {valley_bps, start_time, open_spread_bps}
 
         # 平仓失败冷却机制
         self.close_cooldown_sec = config.get_int('trade.close.cooldown_sec', 60)
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
         self._margin_topup_attempt_cooldown: Dict[int, datetime] = {}
-
-        # 累计资金费支出阈值配置
-        self.funding_cost_tolerance_ratio = config.get_float('trade.close.funding_cost_tolerance_ratio', 0.5)
-        self.funding_cost_min_threshold_bps = config.get_float('trade.close.funding_cost_min_threshold_bps', 15.0)
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
@@ -231,6 +217,7 @@ class ClosingExecutor:
 
             if current_spread_bps is None:
                 continue  # 无盘口数据，跳过
+            valley_key = self._valley_key(ba, pos)
 
             # ── 冷却期检查：平仓失败后 N 秒内不重试 ──
             cooldown_until = self._close_cooldown.get(ba)
@@ -261,13 +248,11 @@ class ClosingExecutor:
                     f"|当前{pos.get('current_future_price', 0):.4f}"
                 )
                 # 紧急平仓，清除谷底状态
-                self._valley_state.pop(ba, None)
-                self._close_resiliency.clear(ba)
-            elif self._check_pre_funding_risk(pos, current_spread_bps):
-                close_reason = 'pre_funding_risk'
-                close_reason_detail = self._build_pre_funding_risk_detail(pos, current_spread_bps)
-                self._valley_state.pop(ba, None)
-                self._close_resiliency.clear(ba)
+                self._clear_position_close_state(ba, pos)
+            elif self._check_negative_funding_exit(pos):
+                close_reason = 'negative_funding_exit'
+                close_reason_detail = self._build_negative_funding_exit_detail(pos)
+                self._clear_position_close_state(ba, pos)
             elif self._check_funding_count(pos):
                 close_reason = 'funding_count'
                 count = int(pos.get('funding_payments_count') or 0)
@@ -276,8 +261,7 @@ class ClosingExecutor:
                     f"(~{count // 3}天)"
                 )
                 # 强制平仓，清除谷底状态
-                self._valley_state.pop(ba, None)
-                self._close_resiliency.clear(ba)
+                self._clear_position_close_state(ba, pos)
             elif self._check_take_profit(pos, current_spread_bps):
                 # 止盈条件满足，进入谷底反弹确认
                 orderbook_row = orderbook_rows_by_asset.get(ba)
@@ -296,19 +280,13 @@ class ClosingExecutor:
                 # else: 谷底监控中，不平仓
             else:
                 # 止盈不再满足，清除谷底监控状态
-                self._valley_state.pop(ba, None)
-                self._close_resiliency.clear(ba)
-                threshold_data = close_vwap_threshold_meta.get(ba, {})
-                if self._check_funding_cost_exceeded(pos, threshold_data):
-                    close_reason = 'funding_cost_exceeded'
-                    close_reason_detail = self._build_funding_cost_detail(pos, threshold_data)
-                    self._close_resiliency.clear(ba)
+                self._clear_position_close_state(ba, pos)
 
             if not close_reason:
                 continue
 
             # ── 最终风控旁路：止盈复核盈利性；风险平仓复核新鲜度/同步/深度 ──
-            guarded_reasons = {'take_profit', 'pre_funding_risk', 'funding_count', 'funding_cost_exceeded'}
+            guarded_reasons = {'take_profit', 'negative_funding_exit', 'funding_count'}
             if close_reason in guarded_reasons:
                 contract = pos.get('future_contract', '')
                 symbol = pos.get('spot_symbol') or f"{ba}USDT"
@@ -321,7 +299,7 @@ class ClosingExecutor:
                         f"gate_basis={gate_basis}bps | 原因: {gate_reason}"
                     )
                     # 旁路拦截后清除谷底状态，下一轮重新判断
-                    self._valley_state.pop(ba, None)
+                    self._valley_state.pop(valley_key, None)
                     continue
                 pre_gate_basis_bps = gate_basis
                 # 使用旁路返回的最新盘口行（确保下单数据 = 校验数据）
@@ -371,8 +349,7 @@ class ClosingExecutor:
                 results.append(result)
                 if result.get('success'):
                     # 平仓成功，清除谷底监控状态和冷却记录
-                    self._valley_state.pop(ba, None)
-                    self._close_resiliency.clear(ba)
+                    self._clear_position_close_state(ba, pos)
                     self._close_cooldown.pop(ba, None)
                     logger.info(
                         f"平仓成功 | {ba} | reason={close_reason} | "
@@ -382,8 +359,7 @@ class ClosingExecutor:
                     # 平仓失败，进入冷却期
                     self._close_cooldown[ba] = datetime.now()
                     # 超时触发的谷底状态也需清除，避免下次继续超时重试
-                    self._valley_state.pop(ba, None)
-                    self._close_resiliency.clear(ba)
+                    self._clear_position_close_state(ba, pos)
                     logger.warning(
                         f"平仓失败 | {ba} | reason={close_reason} | "
                         f"msg={result.get('message')} | "
@@ -394,6 +370,18 @@ class ClosingExecutor:
                 results.append({'base_asset': ba, 'success': False, 'message': str(e)})
 
         return results
+
+    def _valley_key(self, base_asset: str, pos: Optional[Dict] = None):
+        """止盈谷底状态按持仓隔离；无 position_id 时兼容旧测试/降级为 base_asset。"""
+        if pos:
+            position_id = pos.get('id') or pos.get('position_id')
+            if position_id:
+                return int(position_id)
+        return base_asset
+
+    def _clear_position_close_state(self, base_asset: str, pos: Optional[Dict] = None) -> None:
+        self._valley_state.pop(self._valley_key(base_asset, pos), None)
+        self._close_resiliency.clear(base_asset)
 
     def _annotate_resiliency_row(self, row: Dict, base_asset: str) -> None:
         row['_future_qty_multiplier'] = self._get_quanto_multiplier(base_asset)
@@ -422,8 +410,7 @@ class ClosingExecutor:
             logger.info(f"平仓盘口恢复通过 | {base_asset} | reason={result.reason} | {metric_text}")
             return True
         if result.terminal:
-            self._valley_state.pop(base_asset, None)
-            self._close_resiliency.clear(base_asset)
+            self._clear_position_close_state(base_asset, pos)
             logger.info(f"平仓盘口恢复终止 | {base_asset} | reason={result.reason} | {metric_text}")
             return False
         logger.info(f"平仓盘口恢复等待 | {base_asset} | reason={result.reason} | {metric_text}")
@@ -514,24 +501,26 @@ class ClosingExecutor:
         )
         return True
 
-    def _check_pre_funding_risk(self, pos: Dict, current_spread_bps: float) -> bool:
-        """下一期资金费预计明显为负，且临近结算时，提前风险平仓。"""
-        if not self.pre_funding_guard_enabled:
+    def _negative_current_24h_bps(self, pos: Dict) -> float:
+        funding_rate_24h = pos.get('funding_rate_24h')
+        if funding_rate_24h is None:
+            return 0.0
+        rate_bps = float(funding_rate_24h) * 10000.0
+        return abs(rate_bps) if rate_bps < 0 else 0.0
+
+    def _negative_cumulative_24h_bps(self, pos: Dict) -> float:
+        return max(0.0, float(pos.get('funding_rate_sum_bps') or 0.0))
+
+    def _check_negative_funding_exit(self, pos: Dict) -> bool:
+        """当前或累计负 24h 资金费率达到阈值时触发风险平仓。"""
+        if not self.negative_funding_exit_enabled:
             return False
-        next_bps = self._next_funding_bps(pos)
-        next_min = self._time_to_next_funding_min(pos)
-        if next_bps is None or next_min is None:
+        threshold = abs(float(self.negative_funding_exit_threshold_24h_bps or 0.0))
+        if threshold <= 0:
             return False
-        if next_min < 0 or next_min > self.pre_funding_guard_window_min:
-            return False
-        if next_bps > -abs(self.pre_funding_guard_large_negative_bps):
-            return False
-        comps = self._profit_components(pos, current_spread_bps)
-        projected_net = comps['net_profit_bps'] + next_bps
-        deterioration = comps['net_profit_bps'] - projected_net
         return (
-            deterioration >= self.pre_funding_guard_min_deterioration_bps
-            and projected_net < self.pre_funding_guard_min_projected_profit_bps
+            self._negative_current_24h_bps(pos) >= threshold
+            or self._negative_cumulative_24h_bps(pos) >= threshold
         )
 
     def _check_margin_liquidation(self, pos: Dict) -> bool:
@@ -813,32 +802,6 @@ class ClosingExecutor:
         threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
         return total_pnl_bps >= threshold
 
-    def _check_funding_cost_exceeded(self, pos: Dict, threshold_data: Dict) -> bool:
-        """
-        累计资金费支出超阈值：
-        - 前置：当前费率为负
-        - 阈值 = max(open_basis_p20 - close_basis_p20, min_threshold_bps) * tolerance_ratio
-        - 当 abs(funding_pnl_bps) >= 阈值时触发
-        """
-        funding_rate_24h = pos.get('funding_rate_24h')
-        if funding_rate_24h is None or float(funding_rate_24h) >= 0:
-            return False
-
-        funding_pnl_bps = float(pos.get('funding_pnl_bps') or 0)
-        if funding_pnl_bps >= 0:
-            return False  # 净收入，无需平仓
-
-        open_p20 = threshold_data.get('open_basis_p20')
-        close_p20 = threshold_data.get('close_basis_p20')
-        if open_p20 is None or close_p20 is None:
-            return False
-
-        convergence_space = float(open_p20) - float(close_p20)
-        effective_space = max(convergence_space, self.funding_cost_min_threshold_bps)
-        threshold = effective_space * self.funding_cost_tolerance_ratio
-
-        return abs(funding_pnl_bps) >= threshold
-
     def _pre_execution_gate(
         self,
         base_asset: str,
@@ -1052,12 +1015,13 @@ class ClosingExecutor:
         - 超时: 返回 True(直接平仓)
         """
         now = datetime.now()
-        state = self._valley_state.get(base_asset)
+        state_key = self._valley_key(base_asset, pos)
+        state = self._valley_state.get(state_key)
     
         if state is None:
             # 首次进入监控，记录谷底、开始时间
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
-            self._valley_state[base_asset] = {
+            self._valley_state[state_key] = {
                 'valley_bps': current_spread_bps,
                 'start_time': now,
                 'open_spread_bps': open_spread_bps,
@@ -1065,6 +1029,7 @@ class ClosingExecutor:
             }
             logger.info(
                 f"止盈谷底监控开始 | {base_asset} | "
+                f"position_id={state_key} | "
                 f"spread={current_spread_bps:.2f}bps | open_spread={open_spread_bps:.2f}bps | "
                 f"start_time={now.strftime('%H:%M:%S.%f')[:-3]}"
             )
@@ -1080,6 +1045,7 @@ class ClosingExecutor:
             state['trigger'] = 'timeout'
             logger.info(
                 f"止盈谷底监控超时，直接平仓 | {base_asset} | "
+                f"position_id={state_key} | "
                 f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
                 f"elapsed={elapsed_sec:.1f}s≥{self.valley_monitor_timeout_sec}s | "
                 f"start={state['start_time'].strftime('%H:%M:%S.%f')[:-3]}→"
@@ -1098,6 +1064,7 @@ class ClosingExecutor:
             # 异常: 谷底高于开仓基差，直接平仓（罕见场景，仍打详细日志）
             logger.info(
                 f"止盈谷底异常(谷底>=开仓基差)，直接平仓 | {base_asset} | "
+                f"position_id={state_key} | "
                 f"valley={state['valley_bps']:.2f} | open_spread={open_spread_bps:.2f} | "
                 f"current={current_spread_bps:.2f}"
             )
@@ -1108,6 +1075,7 @@ class ClosingExecutor:
             state['trigger'] = 'rebound'
             logger.info(
                 f"止盈谷底反弹确认，执行平仓 | {base_asset} | "
+                f"position_id={state_key} | "
                 f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
                 f"rebound_thr={rebound_threshold:.2f}bps | "
                 f"open_spread={open_spread_bps:.2f}bps | rebound_pct={self.valley_rebound_pct*100:.0f}% | "
@@ -1149,7 +1117,7 @@ class ClosingExecutor:
             )
 
         # 附加谷底反弹信息
-        valley_state = self._valley_state.get(ba)
+        valley_state = self._valley_state.get(self._valley_key(ba, pos))
         if valley_state:
             valley_bps = valley_state.get('valley_bps', 0)
             trigger = valley_state.get('trigger', 'unknown')
@@ -1173,18 +1141,20 @@ class ClosingExecutor:
 
         return detail
 
-    def _build_pre_funding_risk_detail(self, pos: Dict, current_spread_bps: float) -> str:
-        """构建下一期负资金费风险平仓原因。"""
-        comps = self._profit_components(pos, current_spread_bps)
+    def _build_negative_funding_exit_detail(self, pos: Dict) -> str:
+        """构建负24h资金费风险平仓原因。"""
+        current_neg = self._negative_current_24h_bps(pos)
+        cumulative_neg = self._negative_cumulative_24h_bps(pos)
+        threshold = abs(float(self.negative_funding_exit_threshold_24h_bps or 0.0))
         next_bps = self._next_funding_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
-        projected = comps['net_profit_bps'] + (next_bps or 0)
+        next_text = 'NA' if next_bps is None else f'{next_bps:+.1f}bps'
+        next_min_text = 'NA' if next_min is None else f'{next_min:.1f}min'
         return (
-            f"结算前负资金费风险|next={next_bps:+.1f}bps"
-            f"|距结算{next_min:.1f}min"
-            f"|净收益{comps['net_profit_bps']:.1f}->{projected:.1f}bps"
-            f"|阈值(next<=-{self.pre_funding_guard_large_negative_bps:.1f},"
-            f"projected<{self.pre_funding_guard_min_projected_profit_bps:.1f})"
+            f"负资金费风险|当前24h负费{current_neg:.1f}bps"
+            f"|累计24h负费{cumulative_neg:.1f}bps"
+            f"|阈值{threshold:.1f}bps"
+            f"|next={next_text}|距结算{next_min_text}"
         )
 
     def _append_lag_detail(self, base_asset: str, detail: str) -> str:
@@ -1227,21 +1197,6 @@ class ClosingExecutor:
             f"trigger={_fmt(trigger_basis_bps)},"
             f"pre_gate={_fmt(pre_gate_basis_bps)},"
             f"actual={_fmt(actual_basis_bps)})"
-        )
-
-    def _build_funding_cost_detail(self, pos: Dict, threshold_data: Dict) -> str:
-        """构建累计资金费超阈值平仓的详细原因"""
-        funding_pnl_bps = float(pos.get('funding_pnl_bps') or 0)
-        open_p20 = float(threshold_data.get('open_basis_p20') or 0)
-        close_p20 = float(threshold_data.get('close_basis_p20') or 0)
-        convergence_space = open_p20 - close_p20
-        effective_space = max(convergence_space, self.funding_cost_min_threshold_bps)
-        threshold = effective_space * self.funding_cost_tolerance_ratio
-
-        return (
-            f"资金费超限|累计{funding_pnl_bps:.1f}bps"
-            f"|阈值-{threshold:.1f}bps"
-            f"(收敛空间{effective_space:.1f}×{self.funding_cost_tolerance_ratio})"
         )
 
     # ──────────────────────────────────────────────────────────────────

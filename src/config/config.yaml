@@ -179,11 +179,8 @@ trade:
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
     positive_funding_hold_window_min: 60    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
-    pre_funding_guard_enabled: true         # 临近结算且下一期大额负资金费时提前风险平仓
-    pre_funding_guard_window_min: 30        # 距下一次资金费结算多少分钟内启用提前风险平仓
-    pre_funding_guard_large_negative_bps: 5 # 下一期预计支付资金费 <= -此值时视为大额负资金费
-    pre_funding_guard_min_deterioration_bps: 5 # 预计净收益劣化至少多少bps才触发
-    pre_funding_guard_min_projected_profit_bps: 0 # 付完下一期资金费后的预计净收益低于此值才触发
+    negative_funding_exit_enabled: true     # 当前/累计负24h资金费率过高时风险平仓
+    negative_funding_exit_threshold_24h_bps: 25 # 单次或累计负24h资金费率达到该阈值即进入平仓
     protective_ioc_enabled: true            # 平仓Gate期货腿使用 reduce_only 保护限价 IOC
     protective_ioc_take_profit_slippage_bps: 5 # 止盈平仓期货买回保护价允许高于旁路VWAP的bps
     protective_ioc_risk_slippage_bps: 12    # 风险平仓期货买回保护价允许高于旁路VWAP的bps
@@ -191,8 +188,6 @@ trade:
     # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
     max_funding_payments: 30                # 最大资金费支付次数，超过强制平仓
     # max_funding_payments: 2                # 最大资金费支付次数，超过强制平仓
-    funding_cost_tolerance_ratio: 0.2        # 累计资金费超过预期收敛空间此比例时平仓
-    funding_cost_min_threshold_bps: 10       # 累计资金费收敛空间保底值(bps)，防止open/close倒挂时阈值为0
     max_orderbook_lag_ms: 500               # 旁路风控新鲜度硬约束：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 谷底反弹策略（平仓确认） ───
