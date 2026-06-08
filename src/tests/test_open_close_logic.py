@@ -1754,6 +1754,25 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(mock_post.call_args.kwargs['json']['dual_side'], 'short')
 
+    def test_real_executor_uses_gate_dual_comp_margin_endpoint(self):
+        from calc.real_executor import ExchangeConfig, RealExecutor
+
+        executor = RealExecutor(ExchangeConfig(gate_base_url='https://gate.test'), {})
+        executor._gate_sign = MagicMock(return_value={})
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = '{}'
+        resp.json.return_value = {}
+        executor._session = MagicMock()
+        executor._session.post.return_value = resp
+
+        result = executor.topup_gate_margin('BANK_USDT', 1.23, dual_side='short')
+
+        self.assertTrue(result['success'])
+        called_url = executor._session.post.call_args.args[0]
+        self.assertIn('/dual_comp/positions/BANK_USDT/margin', called_url)
+        self.assertIn('dual_side=dual_short', called_url)
+
     def test_holding_fee_uses_future_taker_when_open_fallback_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 
