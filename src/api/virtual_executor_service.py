@@ -87,6 +87,7 @@ class MarginTopupRequest(BaseModel):
     """虚拟追加保证金请求体"""
     contract: str
     amount: float
+    dual_side: str = 'short'
 
 
 def _json_default(obj):
@@ -133,6 +134,7 @@ async def margin_topup(req: MarginTopupRequest):
         'message': '虚拟追保成功',
         'contract': req.contract,
         'amount': amount,
+        'dual_side': req.dual_side,
         'virtual': True,
     }
 

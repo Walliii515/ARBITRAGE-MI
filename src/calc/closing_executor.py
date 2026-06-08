@@ -556,7 +556,7 @@ class ClosingExecutor:
         liq_distance = float(liq_distance)
         if liq_distance >= self.margin_topup_pct:
             return None
-        if liq_distance < self.margin_close_threshold_pct:
+        if liq_distance <= 0:
             return None
 
         ba = pos.get('base_asset', '')
@@ -624,7 +624,7 @@ class ClosingExecutor:
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             return None
 
-        exec_result = self.executor_client.topup_margin(contract, topup_amount)
+        exec_result = self.executor_client.topup_margin(contract, topup_amount, dual_side='short')
         success = bool(exec_result.get('success'))
         message = exec_result.get('message') or ('追保成功' if success else '追保失败')
         self._insert_margin_topup_log(

@@ -133,6 +133,7 @@ class MarginTopupRequest(BaseModel):
     """追加保证金请求体"""
     contract: str
     amount: float
+    dual_side: str = 'short'
 
 
 # ───── API 端点 ─────
@@ -166,7 +167,7 @@ async def margin_topup(req: MarginTopupRequest):
         raise HTTPException(status_code=503, detail='成交引擎未初始化')
 
     try:
-        return _executor.topup_gate_margin(req.contract, req.amount)
+        return _executor.topup_gate_margin(req.contract, req.amount, req.dual_side)
     except Exception as e:
         logger.error(f'追加保证金异常: {e}', exc_info=True)
         return {'success': False, 'message': f'追加保证金异常: {str(e)}'}

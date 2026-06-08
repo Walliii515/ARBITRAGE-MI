@@ -1035,7 +1035,7 @@ class RealExecutor:
                 break
         return all_rows
 
-    def topup_gate_margin(self, contract: str, amount: float) -> Dict:
+    def topup_gate_margin(self, contract: str, amount: float, dual_side: str = 'short') -> Dict:
         """
         追加 Gate 逐仓保证金。
 
@@ -1043,12 +1043,15 @@ class RealExecutor:
         """
         contract = str(contract or '').upper()
         change = round(float(amount or 0), 6)
+        dual_side = str(dual_side or 'short').lower()
         if not contract or change <= 0:
             return {'success': False, 'message': f'追加金额无效: contract={contract}, amount={amount}'}
+        if dual_side not in ('long', 'short'):
+            return {'success': False, 'message': f'追加方向无效: dual_side={dual_side}'}
 
         method = 'POST'
         api_path = f'/api/v4/futures/usdt/positions/{contract}/margin'
-        query_string = urlencode({'change': f'{change:.6f}'})
+        query_string = urlencode({'change': f'{change:.6f}', 'dual_side': dual_side})
         headers = self._gate_sign(method, api_path, query_string, '')
         url = f"{self.config.gate_base_url}{api_path}?{query_string}"
 
@@ -1060,8 +1063,14 @@ class RealExecutor:
                     'message': f'Gate追保失败 HTTP {resp.status_code}: {resp.text[:200]}',
                 }
             data = resp.json() if resp.text else {}
-            logger.info(f"Gate 追加保证金成功 | {contract} | amount={change:.6f}")
-            return {'success': True, 'message': 'Gate追保成功', 'data': data, 'amount': change}
+            logger.info(f"Gate 追加保证金成功 | {contract} | side={dual_side} | amount={change:.6f}")
+            return {
+                'success': True,
+                'message': 'Gate追保成功',
+                'data': data,
+                'amount': change,
+                'dual_side': dual_side,
+            }
         except requests.exceptions.Timeout:
             return {'success': False, 'message': f'Gate追保请求超时({self.config.timeout_sec}s)'}
         except requests.exceptions.ConnectionError as e:

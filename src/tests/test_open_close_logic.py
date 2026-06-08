@@ -1709,6 +1709,51 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertAlmostEqual(positions[0]['current_margin'], 60.0)
         self.assertAlmostEqual(positions[0]['liq_price'], 159.5)
 
+    def test_topup_attempts_before_emergency_close(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 15.0
+        ce.margin_close_threshold_pct = 5.0
+        ce.margin_topup_min_gate_available = 50.0
+        ce.executor_client = MagicMock()
+        ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
+        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._insert_margin_topup_log = MagicMock()
+        ce._mark_margin_topup_success = MagicMock()
+
+        pos = {
+            'id': 11,
+            'base_asset': 'BANK',
+            'future_contract': 'BANK_USDT',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'current_future_price': 148.0,
+            'liq_distance_pct': 4.8,
+            'margin_topup_total': 0.0,
+            'margin_topup_count': 0,
+        }
+
+        result = ce._check_and_topup_margin(pos)
+
+        self.assertTrue(result['success'])
+        ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 24.0, dual_side='short')
+
+    def test_executor_client_sends_dual_side_for_gate_topup(self):
+        from calc.executor_client import ExecutorClient
+
+        client = ExecutorClient.__new__(ExecutorClient)
+        client.base_url = 'http://executor'
+        client.timeout = 5
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {'success': True}
+
+        with patch('calc.executor_client.requests.post', return_value=resp) as mock_post:
+            result = client.topup_margin('BANK_USDT', 1.23, dual_side='short')
+
+        self.assertTrue(result['success'])
+        self.assertEqual(mock_post.call_args.kwargs['json']['dual_side'], 'short')
+
     def test_holding_fee_uses_future_taker_when_open_fallback_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 

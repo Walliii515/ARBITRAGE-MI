@@ -135,14 +135,14 @@ class ExecutorClient:
         except Exception as e:
             return {'status': 'error', 'error': str(e)}
 
-    def topup_margin(self, contract: str, amount: float) -> Dict:
+    def topup_margin(self, contract: str, amount: float, dual_side: str = 'short') -> Dict:
         """
         调用成交引擎服务追加 Gate 逐仓保证金。
 
         虚拟成交引擎会模拟成功；真实成交引擎会调用 Gate API。
         """
         url = f'{self.base_url}/api/margin/topup'
-        payload = {'contract': contract, 'amount': amount}
+        payload = {'contract': contract, 'amount': amount, 'dual_side': dual_side}
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
