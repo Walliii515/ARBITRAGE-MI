@@ -551,7 +551,7 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellStyle: (params: any) => {
       const value = params.value as number | null
       if (value == null) return { color: '#909399' }
-      if (value < 0) return { color: '#f56c6c' }
+      if (value > 0) return { color: '#f56c6c' }
       return { color: '#67c23a' }
     },
   },
