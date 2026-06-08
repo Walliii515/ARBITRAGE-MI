@@ -6,7 +6,7 @@
 
 平仓触发条件（按优先级）：
   0. 保证金爆仓风控（距爆仓距离 < 阈值）
-  1. 当前负24h资金费率或历史实际负资金费成本超阈值
+  1. 当前负24h资金费率临近结算/极端恶化，或历史实际负资金费成本超阈值
   2. 资金费次数 >= max_funding_payments
   3. 固定净收益止盈（下单前有最终风控旁路复核）
 """
@@ -67,6 +67,12 @@ class ClosingExecutor:
         )
         self.negative_funding_exit_current_24h_bps = config.get_float(
             'trade.close.negative_funding_exit_current_24h_bps', 21.0
+        )
+        self.negative_funding_exit_current_window_min = config.get_float(
+            'trade.close.negative_funding_exit_current_window_min', 30.0
+        )
+        self.negative_funding_exit_extreme_24h_bps = config.get_float(
+            'trade.close.negative_funding_exit_extreme_24h_bps', 45.0
         )
         self.negative_funding_exit_paid_bps = config.get_float(
             'trade.close.negative_funding_exit_paid_bps', 7.0
@@ -515,15 +521,22 @@ class ClosingExecutor:
         return max(0.0, float(pos.get('funding_rate_sum_bps') or 0.0))
 
     def _check_negative_funding_exit(self, pos: Dict) -> bool:
-        """当前负 24h 费率或历史实际负资金费成本达到阈值时触发风险平仓。"""
+        """负 funding 风险触发：已付成本立即；当前负费率临近结算或极端恶化才触发。"""
         if not self.negative_funding_exit_enabled:
             return False
         current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
+        current_window_min = abs(float(self.negative_funding_exit_current_window_min or 0.0))
+        extreme_threshold = abs(float(self.negative_funding_exit_extreme_24h_bps or 0.0))
         paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
-        return (
-            (current_threshold > 0 and self._negative_current_24h_bps(pos) >= current_threshold)
-            or (paid_threshold > 0 and self._negative_paid_bps(pos) >= paid_threshold)
-        )
+        current_neg = self._negative_current_24h_bps(pos)
+        paid_neg = self._negative_paid_bps(pos)
+        if paid_threshold > 0 and paid_neg >= paid_threshold:
+            return True
+        if extreme_threshold > 0 and current_neg >= extreme_threshold:
+            return True
+        next_min = self._time_to_next_funding_min(pos)
+        near_next_funding = next_min is not None and 0 <= next_min <= current_window_min
+        return current_threshold > 0 and current_neg >= current_threshold and near_next_funding
 
     def _check_margin_liquidation(self, pos: Dict) -> bool:
         """
@@ -1148,6 +1161,8 @@ class ClosingExecutor:
         current_neg = self._negative_current_24h_bps(pos)
         paid_neg = self._negative_paid_bps(pos)
         current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
+        current_window_min = abs(float(self.negative_funding_exit_current_window_min or 0.0))
+        extreme_threshold = abs(float(self.negative_funding_exit_extreme_24h_bps or 0.0))
         paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         next_bps = self._next_funding_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
@@ -1156,7 +1171,8 @@ class ClosingExecutor:
         return (
             f"负资金费风险|当前24h负费{current_neg:.1f}bps"
             f"|已付负费{paid_neg:.1f}bps"
-            f"|阈值(当前{current_threshold:.1f},已付{paid_threshold:.1f})"
+            f"|阈值(当前{current_threshold:.1f}@{current_window_min:.0f}min,"
+            f"极端{extreme_threshold:.1f},已付{paid_threshold:.1f})"
             f"|next={next_text}|距结算{next_min_text}"
         )
 

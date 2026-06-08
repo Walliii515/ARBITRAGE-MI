@@ -190,8 +190,10 @@ trade:
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
     positive_funding_hold_window_min: 60    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
-    negative_funding_exit_enabled: true     # 当前负24h费率或历史实际负资金费成本过高时风险平仓
-    negative_funding_exit_current_24h_bps: 21 # 当前24h负资金费率达到该阈值即进入平仓
+    negative_funding_exit_enabled: true     # 当前负24h费率临近结算/极端恶化，或历史实际负资金费成本过高时风险平仓
+    negative_funding_exit_current_24h_bps: 21 # 当前24h负资金费率达到该阈值且临近结算才进入平仓
+    negative_funding_exit_current_window_min: 30 # 距下一次资金费结算多少分钟内才触发当前负费率平仓
+    negative_funding_exit_extreme_24h_bps: 45 # 当前24h负资金费率达到极端阈值时立即平仓
     negative_funding_exit_paid_bps: 7       # 历史实际已支付负资金费累计达到该阈值即进入平仓
     protective_ioc_enabled: true            # 平仓Gate期货腿使用 reduce_only 保护限价 IOC
     protective_ioc_take_profit_slippage_bps: 5 # 止盈平仓期货买回保护价允许高于旁路VWAP的bps
