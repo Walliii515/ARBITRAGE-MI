@@ -321,7 +321,7 @@ class PositionTracker:
         return {row['position_id']: int(row['cnt'] or 0) for row in cursor.fetchall()}
 
     def _refresh_position_funding_summary(self, cursor, position_ids: List[int]):
-        # funding_rate_sum_bps 专供平仓风控：只累计负 funding_rate_24h 的绝对 bps，正资金费不抵消风险。
+        # funding_rate_sum_bps 专供平仓风控：只累计历史实际支付的负单期资金费 bps，正资金费不抵消风险。
         placeholders = ','.join(['%s'] * len(position_ids))
         cursor.execute(
             f"""
@@ -330,7 +330,7 @@ class PositionTracker:
                        COALESCE(SUM(funding_pnl), 0) AS total_pnl,
                        COALESCE(SUM(
                            CASE
-                               WHEN funding_rate_24h < 0 THEN ABS(funding_rate_24h) * 10000
+                               WHEN funding_rate < 0 THEN ABS(funding_rate) * 10000
                                ELSE 0
                            END
                        ), 0) AS rate_bps

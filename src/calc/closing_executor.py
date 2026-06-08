@@ -6,7 +6,7 @@
 
 平仓触发条件（按优先级）：
   0. 保证金爆仓风控（距爆仓距离 < 阈值）
-  1. 当前/累计负24h资金费率超阈值
+  1. 当前负24h资金费率或历史实际负资金费成本超阈值
   2. 资金费次数 >= max_funding_payments
   3. 固定净收益止盈（下单前有最终风控旁路复核）
 """
@@ -65,8 +65,11 @@ class ClosingExecutor:
         self.negative_funding_exit_enabled = config.get_bool(
             'trade.close.negative_funding_exit_enabled', True
         )
-        self.negative_funding_exit_threshold_24h_bps = config.get_float(
-            'trade.close.negative_funding_exit_threshold_24h_bps', 25.0
+        self.negative_funding_exit_current_24h_bps = config.get_float(
+            'trade.close.negative_funding_exit_current_24h_bps', 21.0
+        )
+        self.negative_funding_exit_paid_bps = config.get_float(
+            'trade.close.negative_funding_exit_paid_bps', 7.0
         )
         self.protective_ioc_enabled = config.get_bool('trade.close.protective_ioc_enabled', True)
         self.protective_ioc_take_profit_slippage_bps = config.get_float(
@@ -508,19 +511,18 @@ class ClosingExecutor:
         rate_bps = float(funding_rate_24h) * 10000.0
         return abs(rate_bps) if rate_bps < 0 else 0.0
 
-    def _negative_cumulative_24h_bps(self, pos: Dict) -> float:
+    def _negative_paid_bps(self, pos: Dict) -> float:
         return max(0.0, float(pos.get('funding_rate_sum_bps') or 0.0))
 
     def _check_negative_funding_exit(self, pos: Dict) -> bool:
-        """当前或累计负 24h 资金费率达到阈值时触发风险平仓。"""
+        """当前负 24h 费率或历史实际负资金费成本达到阈值时触发风险平仓。"""
         if not self.negative_funding_exit_enabled:
             return False
-        threshold = abs(float(self.negative_funding_exit_threshold_24h_bps or 0.0))
-        if threshold <= 0:
-            return False
+        current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
+        paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         return (
-            self._negative_current_24h_bps(pos) >= threshold
-            or self._negative_cumulative_24h_bps(pos) >= threshold
+            (current_threshold > 0 and self._negative_current_24h_bps(pos) >= current_threshold)
+            or (paid_threshold > 0 and self._negative_paid_bps(pos) >= paid_threshold)
         )
 
     def _check_margin_liquidation(self, pos: Dict) -> bool:
@@ -1142,18 +1144,19 @@ class ClosingExecutor:
         return detail
 
     def _build_negative_funding_exit_detail(self, pos: Dict) -> str:
-        """构建负24h资金费风险平仓原因。"""
+        """构建负资金费风险平仓原因。"""
         current_neg = self._negative_current_24h_bps(pos)
-        cumulative_neg = self._negative_cumulative_24h_bps(pos)
-        threshold = abs(float(self.negative_funding_exit_threshold_24h_bps or 0.0))
+        paid_neg = self._negative_paid_bps(pos)
+        current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
+        paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         next_bps = self._next_funding_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
         next_text = 'NA' if next_bps is None else f'{next_bps:+.1f}bps'
         next_min_text = 'NA' if next_min is None else f'{next_min:.1f}min'
         return (
             f"负资金费风险|当前24h负费{current_neg:.1f}bps"
-            f"|累计24h负费{cumulative_neg:.1f}bps"
-            f"|阈值{threshold:.1f}bps"
+            f"|已付负费{paid_neg:.1f}bps"
+            f"|阈值(当前{current_threshold:.1f},已付{paid_threshold:.1f})"
             f"|next={next_text}|距结算{next_min_text}"
         )
 

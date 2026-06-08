@@ -1578,24 +1578,24 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.pos.update({
             'open_spread_bps': 60.0,
             'current_spread_bps': 60.0,
-            'funding_rate_24h': -0.003,  # 24h -30bps
+            'funding_rate_24h': -0.0021,  # 24h -21bps
             'funding_next_apply': (
                 datetime.now() + timedelta(minutes=120)
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
         self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
 
-    def test_negative_funding_exit_triggers_on_cumulative_24h_rate(self):
+    def test_negative_funding_exit_triggers_on_paid_funding_cost(self):
         self.pos.update({
             'funding_rate_24h': 0.001,
-            'funding_rate_sum_bps': 26.0,
+            'funding_rate_sum_bps': 7.0,
         })
         self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
 
     def test_negative_funding_exit_ignores_positive_and_small_negative(self):
         self.pos.update({
-            'funding_rate_24h': -0.0024,  # 24h -24bps
-            'funding_rate_sum_bps': 0.0,
+            'funding_rate_24h': -0.0020,  # 24h -20bps
+            'funding_rate_sum_bps': 6.9,
         })
         self.assertFalse(self.ce._check_negative_funding_exit(self.pos))
 
