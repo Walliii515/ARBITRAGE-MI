@@ -22,6 +22,7 @@ interface CapitalRow {
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
+type HistoryInterval = '1m' | '10m' | '1h'
 type ChartMetric =
   | 'equity_usdt'
   | 'available_usdt'
@@ -37,6 +38,7 @@ const running = ref(false)
 const filterDays = ref(7)
 const selectedMetric = ref<ChartMetric>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
+const selectedInterval = ref<HistoryInterval>('10m')
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -201,13 +203,26 @@ async function fetchCapital() {
     const latest = await latestRes.json()
     latestRows.value = latest.rows || []
 
+    await fetchHistory()
+  } catch (e: any) {
+    showError(e?.message || '获取资金数据失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function fetchHistory() {
+  loading.value = true
+  try {
     const params = new URLSearchParams()
     params.set('days', String(filterDays.value))
+    params.set('exchange', selectedExchange.value)
+    params.set('interval', selectedInterval.value)
     const historyRes = await get(`/api/trading/capital/history?${params.toString()}`)
     const history = await historyRes.json()
     historyRows.value = history.rows || []
   } catch (e: any) {
-    showError(e?.message || '获取资金数据失败')
+    showError(e?.message || '获取资金曲线失败')
   } finally {
     loading.value = false
   }
@@ -243,6 +258,10 @@ onMounted(async () => {
 
 watch([historyRows, selectedMetric, selectedExchange], () => {
   updateChart()
+})
+
+watch([selectedExchange, selectedInterval], () => {
+  fetchHistory()
 })
 
 onBeforeUnmount(() => {
@@ -334,6 +353,15 @@ onBeforeUnmount(() => {
         </el-radio-group>
       </div>
       <div class="metric-selector-row">
+        <el-radio-group
+          v-model="selectedInterval"
+          size="small"
+          class="interval-selector"
+        >
+          <el-radio-button label="1m">1分钟</el-radio-button>
+          <el-radio-button label="10m">10分钟</el-radio-button>
+          <el-radio-button label="1h">1小时</el-radio-button>
+        </el-radio-group>
         <el-radio-group
           v-model="selectedMetric"
           size="small"
@@ -433,10 +461,12 @@ onBeforeUnmount(() => {
 .metric-selector-row {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-bottom: 8px;
 }
 
 .exchange-selector,
+.interval-selector,
 .metric-selector {
   display: flex;
   flex-wrap: wrap;
@@ -479,6 +509,7 @@ onBeforeUnmount(() => {
   }
 
   .exchange-selector,
+  .interval-selector,
   .metric-selector {
     justify-content: flex-start;
   }

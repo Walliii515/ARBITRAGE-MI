@@ -383,6 +383,11 @@ _recon_running = False
 _recon_lock = threading.Lock()
 _capital_running = False
 _capital_lock = threading.Lock()
+_CAPITAL_HISTORY_INTERVALS = {
+    '1m': 60,
+    '10m': 600,
+    '1h': 3600,
+}
 
 
 def _reconciliation_ignore_clause() -> tuple[str, List[Any]]:
@@ -486,7 +491,20 @@ async def run_reconciliation_now():
 async def get_capital_latest():
     """返回最新资金快照汇总。"""
     sql = """
-        SELECT *
+        SELECT
+            id,
+            snapshot_at,
+            exchange,
+            equity_usdt,
+            available_usdt,
+            locked_usdt,
+            position_value_usdt,
+            margin_used_usdt,
+            unrealized_pnl_usdt,
+            realized_pnl_usdt,
+            funding_pnl_usdt,
+            fee_cost_usdt,
+            total_pnl_usdt
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
@@ -506,26 +524,55 @@ async def get_capital_latest():
 async def get_capital_history(
     days: int = Query(7, ge=1, le=90, description="最近N天"),
     exchange: Optional[str] = Query(None, description="交易所过滤(binance/gate/total)"),
+    interval: str = Query('10m', description="采样间隔(1m/10m/1h)"),
 ):
     """返回资金历史曲线数据。"""
-    where = ["snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    bucket_sec = _CAPITAL_HISTORY_INTERVALS.get(interval, _CAPITAL_HISTORY_INTERVALS['10m'])
+    where = [
+        "snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+        "JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'",
+    ]
     params: List[Any] = [days]
-    where.append("JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'")
     if exchange in ('binance', 'gate', 'total'):
         where.append("exchange = %s")
         params.append(exchange)
     where_sql = " AND ".join(where)
+
     sql = f"""
-        SELECT *
-        FROM mi_capital_snapshot
-        WHERE {where_sql}
-        ORDER BY snapshot_at ASC, FIELD(exchange, 'binance', 'gate', 'total')
-        LIMIT 20000
+        SELECT
+            s.id,
+            s.snapshot_at,
+            s.exchange,
+            s.equity_usdt,
+            s.available_usdt,
+            s.locked_usdt,
+            s.position_value_usdt,
+            s.margin_used_usdt,
+            s.unrealized_pnl_usdt,
+            s.realized_pnl_usdt,
+            s.funding_pnl_usdt,
+            s.fee_cost_usdt,
+            s.total_pnl_usdt
+        FROM mi_capital_snapshot s
+        INNER JOIN (
+            SELECT
+                exchange,
+                FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(snapshot_at) / %s) * %s) AS bucket_at,
+                MAX(snapshot_at) AS snapshot_at
+            FROM mi_capital_snapshot
+            WHERE {where_sql}
+            GROUP BY exchange, bucket_at
+        ) latest
+          ON latest.exchange = s.exchange
+         AND latest.snapshot_at = s.snapshot_at
+        WHERE JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.source')) = 'exchange_api'
+        ORDER BY s.snapshot_at ASC, FIELD(s.exchange, 'binance', 'gate', 'total')
+        LIMIT 10000
     """
     with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, params)
+        cursor.execute(sql, [bucket_sec, bucket_sec, *params])
         rows = cursor.fetchall()
-    return {'rows': _serialize_rows(rows)}
+    return {'rows': _serialize_rows(rows), 'interval': interval if interval in _CAPITAL_HISTORY_INTERVALS else '10m'}
 
 
 @router.post('/capital/run')
