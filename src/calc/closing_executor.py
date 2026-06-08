@@ -93,7 +93,7 @@ class ClosingExecutor:
             if str(t).strip().upper() in ('A', 'B', 'C')
         }
         self.future_maker_close_ttl_ms = max(
-            config.get_int('trade.execution.future_maker_close.ttl_ms', 800), 0
+            config.get_int('trade.execution.future_maker_close.ttl_ms', 1000), 0
         )
         self.future_maker_close_price_offset_bps = config.get_float(
             'trade.execution.future_maker_close.price_offset_bps', 0.0

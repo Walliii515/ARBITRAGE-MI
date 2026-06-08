@@ -145,12 +145,13 @@ class TradingExecutorConfig:
     # ─── 执行策略：Gate future maker + Binance spot taker ───
     future_maker_open_enabled: bool = False
     future_maker_open_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
-    future_maker_open_ttl_ms: int = 800
+    future_maker_open_ttl_ms: int = 1000
     future_maker_open_price_offset_bps: float = 0.0
     future_maker_open_fallback_ioc_enabled: bool = True
     future_maker_open_fallback_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
     future_maker_open_fallback_min_buffer_bps: float = 8.0
     future_maker_open_fallback_slippage_bps: float = 5.0
+    future_maker_open_spot_hedge_protective_ioc_enabled: bool = True
 
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
@@ -370,6 +371,9 @@ class TradingExecutor:
         )
         self.future_maker_open_fallback_slippage_bps = float(
             cfg.future_maker_open_fallback_slippage_bps or 0
+        )
+        self.future_maker_open_spot_hedge_protective_ioc_enabled = bool(
+            cfg.future_maker_open_spot_hedge_protective_ioc_enabled
         )
 
         self.capital_required = cfg.capital_required
@@ -2406,6 +2410,13 @@ class TradingExecutor:
                 'maker_fallback_current_basis_bps': round(float(current_basis), 2)
                 if current_basis is not None else None,
                 'maker_fallback_slippage_bps': self.future_maker_open_fallback_slippage_bps,
+            })
+        else:
+            fallback_min_basis = self._fallback_min_open_basis(row, base_asset)
+        if self.future_maker_open_spot_hedge_protective_ioc_enabled:
+            maker_params.update({
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': round(float(fallback_min_basis), 2),
             })
         future_order.update(maker_params)
 

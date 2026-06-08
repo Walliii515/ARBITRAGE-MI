@@ -249,6 +249,8 @@ class TestFutureMakerOpenConfig(unittest.TestCase):
         self.assertEqual(future_order.get('maker_price'), 1.0123)
         self.assertEqual(future_order.get('maker_strategy_tier'), 'B')
         self.assertEqual(future_order.get('maker_taker_reference_price'), 1.01)
+        self.assertTrue(future_order.get('maker_spot_hedge_protective_ioc_enabled'))
+        self.assertIsNotNone(future_order.get('maker_spot_hedge_min_basis_bps'))
 
     def test_mock_channel_keeps_plain_taker_order(self):
         te = make_trading_executor(asset_tier_meta={'ASR': 'B'})
@@ -289,10 +291,77 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(parsed['exec_qty'], 12)
         self.assertEqual(parsed['exec_amount'], 15.0)
 
-    def test_future_maker_execute_hedges_filled_qty_only(self):
+    def test_gate_ioc_zero_fill_is_no_fill_not_data_error(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
         executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        parsed = executor._parse_gate_response(
+            {
+                'id': '123',
+                'status': 'finished',
+                'size': '-10',
+                'left': '-10',
+                'fill_price': '0',
+                'finish_as': 'ioc',
+            },
+            quanto_multiplier=1,
+        )
+
+        self.assertFalse(parsed['success'])
+        self.assertIn('IOC未成交', parsed['reason'])
+        self.assertNotIn('成交数据异常', parsed['reason'])
+
+    def test_binance_spot_protective_ioc_uses_limit_ioc_params(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        class FakeResponse:
+            status_code = 200
+            text = ''
+
+            @staticmethod
+            def json():
+                return {
+                    'symbol': 'ASRUSDT',
+                    'status': 'FILLED',
+                    'executedQty': '3',
+                    'cummulativeQuoteQty': '5.97',
+                    'orderId': 123,
+                    'fills': [{'price': '1.99', 'qty': '3', 'commission': '0', 'commissionAsset': 'BNB'}],
+                }
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_api_secret='secret'),
+            contract_meta={},
+            spot_meta={'ASR': {'step_size': 0.001, 'tick_size': 0.0001}},
+        )
+        executor._session = MagicMock()
+        executor._session.post.return_value = FakeResponse()
+
+        result = executor._place_binance_spot_order({
+            'order_uuid': 'abcdef123456',
+            'base_asset': 'ASR',
+            'trade_direction': 'buy',
+            'quantity_mode': 'base',
+            'target_qty': 3,
+            'protective_price': 1.99999,
+        })
+
+        self.assertTrue(result['success'])
+        params = executor._session.post.call_args.kwargs['params']
+        self.assertEqual(params['type'], 'LIMIT')
+        self.assertEqual(params['timeInForce'], 'IOC')
+        self.assertEqual(params['newOrderRespType'], 'FULL')
+        self.assertEqual(params['price'], '1.9999')
+        self.assertEqual(params['quantity'], '3.0')
+
+    def test_future_maker_execute_hedges_filled_qty_only(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(),
+            contract_meta={},
+            spot_meta={'ASR': {'step_size': 0.001, 'tick_size': 0.0001}},
+        )
         executor._place_gate_futures_order = MagicMock(return_value={
             'success': True,
             'exec_price': 2.0,
@@ -335,6 +404,8 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                 'market_type': 'future',
                 'trade_direction': 'sell',
                 'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
                 'target_qty': 10,
                 'target_amount': 10,
             },
@@ -345,10 +416,13 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(hedge_order['target_qty'], 3.0)
         self.assertEqual(hedge_order['target_amount'], 6.0)
         self.assertEqual(hedge_order['quantity_mode'], 'base')
+        self.assertEqual(hedge_order['order_type'], 'LIMIT_IOC')
+        self.assertAlmostEqual(hedge_order['protective_price'], 2.0 / 1.002)
         self.assertEqual(
             result['execution_stats']['future_maker']['spot_exec_price'],
             1.99,
         )
+        self.assertTrue(result['execution_stats']['future_maker']['spot_protective_ioc'])
 
     def test_future_maker_fallback_ioc_then_spot(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
@@ -417,6 +491,27 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(result['execution_stats']['future_maker']['fallback_attempted'], True)
         self.assertEqual(result['execution_stats']['future_maker']['fallback_filled'], True)
         executor._place_binance_spot_order.assert_called_once()
+
+    def test_future_maker_fallback_ioc_zero_fill_is_normal_no_fill_reason(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'IOC未成交(fill=0, finish_as=ioc)',
+        })
+        result = executor._try_future_maker_fallback_ioc(
+            {
+                'maker_fallback_ioc_enabled': True,
+                'maker_fallback_protective_price': 2.005,
+            },
+            {'success': False, 'reason': 'future maker未成交(fill=0%)'},
+            {'future_maker': {}},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertIn('fallback_ioc未成交', result['reason'])
+        self.assertNotIn('成交数据异常', result['reason'])
 
     def test_future_maker_no_fallback_keeps_rejected(self):
         from calc.real_executor import RealExecutor, ExchangeConfig

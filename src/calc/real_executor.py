@@ -196,6 +196,7 @@ class RealExecutor:
                 return result
             future_result = fallback_result
 
+        maker_stats = stats.setdefault('future_maker', {})
         hedge_order = dict(spot_order)
         future_target_qty = float(future_order.get('target_qty') or 0)
         spot_target_qty = float(spot_order.get('target_qty') or 0)
@@ -203,12 +204,13 @@ class RealExecutor:
         hedge_order['target_qty'] = future_result['exec_qty'] * hedge_ratio
         hedge_order['target_amount'] = future_result['exec_amount']
         hedge_order['quantity_mode'] = 'base'
+        self._apply_spot_hedge_protection(hedge_order, future_order, future_result, maker_stats)
         spot_result = self._place_binance_spot_order(hedge_order)
 
-        maker_stats = stats.setdefault('future_maker', {})
         maker_stats['future_exec_price'] = future_result.get('exec_price')
         if spot_result.get('success'):
             maker_stats['spot_exec_price'] = spot_result.get('exec_price')
+            maker_stats['spot_protective_ioc_filled'] = bool(hedge_order.get('protective_price'))
 
         if spot_result.get('success'):
             future_style = (
@@ -220,11 +222,11 @@ class RealExecutor:
                 'success': True,
                 'spot_order': spot_result,
                 'future_order': future_result,
-                'message': f'成交成功({order_side} {future_style} + spot taker)',
+                'message': f'成交成功({order_side} {future_style} + spot hedge)',
                 'execution_stats': stats,
             })
             logger.info(
-                f"真实成交成功({order_side} {future_style} + spot taker) | {base_asset} | "
+                f"真实成交成功({order_side} {future_style} + spot hedge) | {base_asset} | "
                 f"fill_ratio={maker_stats.get('fill_ratio', 0):.2f} | "
                 f"wait={maker_stats.get('wait_ms', 0):.0f}ms | "
                 f"spot: price={spot_result['exec_price']}, qty={spot_result['exec_qty']} | "
@@ -245,6 +247,38 @@ class RealExecutor:
                 f"期货maker已成交但现货失败: {spot_result.get('reason')}"
             )
         return result
+
+    def _apply_spot_hedge_protection(
+        self,
+        hedge_order: Dict,
+        future_order: Dict,
+        future_result: Dict,
+        maker_stats: Dict,
+    ) -> None:
+        """Future maker 开仓成交后，用真实 future 成交价反推 spot BUY 最高IOC价。"""
+        if not future_order.get('maker_spot_hedge_protective_ioc_enabled'):
+            return
+        if future_order.get('order_side') != 'open':
+            return
+        if hedge_order.get('trade_direction') != 'buy':
+            return
+
+        try:
+            future_exec_price = float(future_result.get('exec_price') or 0)
+            min_basis_bps = float(future_order.get('maker_spot_hedge_min_basis_bps') or 0)
+        except (TypeError, ValueError):
+            return
+        if future_exec_price <= 0:
+            return
+
+        max_spot_price = future_exec_price / (1 + min_basis_bps / 10000.0)
+        if max_spot_price <= 0:
+            return
+        hedge_order['protective_price'] = max_spot_price
+        hedge_order['order_type'] = 'LIMIT_IOC'
+        maker_stats['spot_protective_ioc'] = True
+        maker_stats['spot_protective_price'] = max_spot_price
+        maker_stats['spot_protective_min_basis_bps'] = min_basis_bps
 
     def _try_future_maker_fallback_ioc(
         self,
@@ -289,13 +323,22 @@ class RealExecutor:
             maker_stats['fallback_reason'] = fallback_result.get('reason')
             fallback_result['reason'] = (
                 f"{maker_result.get('reason', 'future maker未成交')}; "
-                f"fallback_ioc未成交: {fallback_result.get('reason', 'unknown')}"
+                f"{self._format_fallback_ioc_fail_reason(fallback_result.get('reason'))}"
             )
             return fallback_result
 
         fallback_stats = fallback_result.setdefault('execution_stats', {})
         fallback_stats['future_maker'] = maker_stats
         return fallback_result
+
+    @staticmethod
+    def _format_fallback_ioc_fail_reason(reason: Optional[str]) -> str:
+        reason = str(reason or 'unknown')
+        if 'IOC未成交' in reason:
+            return f'fallback_ioc未成交: {reason}'
+        if '成交数据异常' in reason and ('price=0' in reason or 'size=0' in reason):
+            return 'fallback_ioc未成交(fill=0)'
+        return f'fallback_ioc失败: {reason}'
 
     # ──────────────────────────────────────────────────────────────────
     # Binance 现货
@@ -318,15 +361,34 @@ class RealExecutor:
 
         # 构造参数
         timestamp = int(time.time() * 1000)
+        order_type = 'LIMIT' if order.get('protective_price') is not None else 'MARKET'
         params = {
             'symbol': symbol,
             'side': side,
-            'type': 'MARKET',
+            'type': order_type,
             'timestamp': timestamp,
             'newClientOrderId': f"arb_{order.get('order_uuid', '')[:8]}_spot",
         }
+        if order_type == 'LIMIT':
+            protective_price = float(order.get('protective_price') or 0)
+            if protective_price <= 0:
+                return {'success': False, 'reason': 'spot保护IOC缺少有效保护价'}
+            price_precision = self._get_spot_price_precision(base_asset)
+            price = truncate_to_precision(protective_price, price_precision)
+            if price is None or price <= 0:
+                return {'success': False, 'reason': f'spot保护IOC保护价无效({protective_price})'}
+            params['price'] = f"{price:.{price_precision}f}"
+            params['timeInForce'] = 'IOC'
+            params['newOrderRespType'] = 'FULL'
 
-        if side == 'BUY' and order.get('quantity_mode') == 'base':
+        if order_type == 'LIMIT':
+            quantity = float(order.get('target_qty', 0))
+            qty_precision = self._get_spot_qty_precision(base_asset)
+            quantity = truncate_to_precision(quantity, qty_precision)
+            if quantity is None or quantity <= 0:
+                return {'success': False, 'reason': f'spot保护IOC数量无效({order.get("target_qty")})'}
+            params['quantity'] = str(quantity)
+        elif side == 'BUY' and order.get('quantity_mode') == 'base':
             quantity = float(order.get('target_qty', 0))
             qty_precision = self._get_spot_qty_precision(base_asset)
             quantity = truncate_to_precision(quantity, qty_precision)
@@ -388,13 +450,18 @@ class RealExecutor:
         实际到账 24.975）。必须减去手续费，否则平仓卖出时会因余额不足被拒。
         """
         status = data.get('status', '')
-        if status != 'FILLED':
+        exec_qty = float(data.get('executedQty', 0))
+        if status != 'FILLED' and exec_qty <= 0:
+            if data.get('timeInForce') == 'IOC' or data.get('type') == 'LIMIT':
+                return {
+                    'success': False,
+                    'reason': f"保护IOC未成交(fill=0,status={status}, orderId={data.get('orderId')})"
+                }
             return {
                 'success': False,
                 'reason': f"订单状态异常: {status}, orderId={data.get('orderId')}"
             }
 
-        exec_qty = float(data.get('executedQty', 0))
         exec_amount = float(data.get('cummulativeQuoteQty', 0))
 
         # 扣除以 base asset 计价的手续费（BUY 时手续费从买到的币中扣除）
@@ -892,10 +959,16 @@ class RealExecutor:
         exec_amount = round(exec_price * exec_qty, 2)
 
         if exec_price == 0 or size == 0:
+            finish_as = str(data.get('finish_as', 'unknown') or 'unknown')
+            if finish_as.lower() in {'ioc', 'cancelled', 'canceled'} or size == 0:
+                return {
+                    'success': False,
+                    'reason': f"IOC未成交(fill=0, finish_as={finish_as})"
+                }
             return {
                 'success': False,
                 'reason': f"成交数据异常: price={exec_price}, size={size}, "
-                         f"finish_as={data.get('finish_as', 'unknown')}"
+                         f"finish_as={finish_as}"
             }
 
         fee_amount = data.get('fee')
@@ -1124,6 +1197,17 @@ class RealExecutor:
             if '.' in step_str:
                 return len(step_str.split('.')[-1].rstrip('0')) or 0
         return 5  # 安全默认值
+
+    def _get_spot_price_precision(self, base_asset: str) -> int:
+        """从 spot_meta 的 tick_size 推导 Binance 限价价格小数位数。"""
+        if base_asset in self.spot_meta:
+            tick_size = self.spot_meta[base_asset].get('tick_size')
+            if tick_size:
+                try:
+                    return self._precision_from_tick_str(str(tick_size))
+                except Exception:
+                    return 8
+        return 8
 
     def reload_meta(self, contract_meta: Dict, spot_meta: Dict = None):
         """热更新元数据（与 VirtualExecutor 保持接口一致）"""

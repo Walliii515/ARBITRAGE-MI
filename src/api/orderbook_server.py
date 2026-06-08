@@ -531,6 +531,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_position_realtime_push())
     asyncio.create_task(_reconciliation_loop())
     asyncio.create_task(_vwap_snapshot_loop())
+    asyncio.create_task(_stale_signal_cleanup_loop())
 
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
     start_daily_schedulers()
@@ -1062,7 +1063,7 @@ def _run_open_position_check_once():
                 execution_drift_cooldown_hour=config.get_float('trade.execution_drift_cooldown.cooldown_hour', 6.0),
                 future_maker_open_enabled=config.get_bool('trade.execution.future_maker_open.enabled', False),
                 future_maker_open_allowed_tiers=config.get('trade.execution.future_maker_open.allowed_tiers', ['A', 'B']),
-                future_maker_open_ttl_ms=config.get_int('trade.execution.future_maker_open.ttl_ms', 800),
+                future_maker_open_ttl_ms=config.get_int('trade.execution.future_maker_open.ttl_ms', 1000),
                 future_maker_open_price_offset_bps=config.get_float(
                     'trade.execution.future_maker_open.price_offset_bps', 0.0
                 ),
@@ -1077,6 +1078,9 @@ def _run_open_position_check_once():
                 ),
                 future_maker_open_fallback_slippage_bps=config.get_float(
                     'trade.execution.future_maker_open.fallback_slippage_bps', 5.0
+                ),
+                future_maker_open_spot_hedge_protective_ioc_enabled=config.get_bool(
+                    'trade.execution.future_maker_open.spot_hedge_protective_ioc_enabled', True
                 ),
                 capital_required=config.get_trade_mode() != 'virtual',
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
@@ -1407,6 +1411,45 @@ async def _vwap_snapshot_loop():
 
         except Exception as e:
             logger.error(f"VWAP快照落库失败: {e}")
+
+
+def _cleanup_stale_monitoring_signals_once() -> int:
+    """Resolve old monitoring signals so UI statistics are not polluted by stale rows."""
+    if not config.get_bool('trade.signal_cleanup.enabled', True):
+        return 0
+    stale_sec = max(config.get_int('trade.signal_cleanup.stale_monitoring_sec', 180), 30)
+    batch_limit = max(config.get_int('trade.signal_cleanup.batch_limit', 500), 1)
+    sql = """
+        UPDATE mi_trade_signal
+        SET status = 'monitor_timeout',
+            resolved_time = NOW(),
+            duration_sec = TIMESTAMPDIFF(SECOND, signal_time, NOW()),
+            exit_reason = CONCAT('stale monitoring cleanup(>', %s, 's)')
+        WHERE status = 'monitoring'
+          AND signal_time < DATE_SUB(NOW(), INTERVAL %s SECOND)
+        ORDER BY signal_time ASC
+        LIMIT %s
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, (stale_sec, stale_sec, batch_limit))
+        return cursor.rowcount or 0
+
+
+async def _stale_signal_cleanup_loop():
+    """Low-frequency cleanup for orphaned monitoring signals."""
+    if not config.get_bool('trade.signal_cleanup.enabled', True):
+        logger.info('交易信号stale monitoring清理已关闭')
+        return
+    interval = max(config.get_int('trade.signal_cleanup.interval_sec', 300), 60)
+    await asyncio.sleep(30)
+    while True:
+        try:
+            cleaned = await asyncio.to_thread(_cleanup_stale_monitoring_signals_once)
+            if cleaned:
+                logger.info(f"清理stale monitoring交易信号: {cleaned}条")
+        except Exception as e:
+            logger.error(f"清理stale monitoring交易信号失败: {e}", exc_info=True)
+        await asyncio.sleep(interval)
 
 
 async def _connectivity_check_loop():
