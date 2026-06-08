@@ -519,6 +519,8 @@ class TradingExecutor:
                 self._annotate_resiliency_row(row)
                 self._record_momentum_sample(base_asset, open_vwap_basis)
                 funding_carry_ready = self._pass_funding_carry_check(base_asset, open_vwap_basis, row)
+                if row.pop('_funding_carry_realtime_rejected', False):
+                    continue
                 momentum_ready = (
                     False if funding_carry_ready
                     else self._pass_momentum_check(base_asset, open_vwap_basis, row)
@@ -575,8 +577,11 @@ class TradingExecutor:
                         ).get('funding_rate_24h')
                 if gate_basis is not None:
                     open_vwap_basis = gate_basis
-                self._annotate_entry_snapshot(row, open_vwap_basis)
                 peak_state = self._peak_state.get(base_asset, {})
+                if peak_state.get('trigger') == 'funding_carry':
+                    self._apply_entry_snapshot_to_row(row, peak_state.get('entry_snapshot') or {})
+                else:
+                    self._annotate_entry_snapshot(row, open_vwap_basis)
                 signal_basis = peak_state.get('signal_basis_bps')
                 row['signal_basis_bps'] = signal_basis
                 row['pre_gate_basis_bps'] = open_vwap_basis
@@ -811,6 +816,11 @@ class TradingExecutor:
         self._apply_entry_snapshot_to_row(row, snapshot)
         return snapshot
 
+    def _clear_funding_carry_candidate(self, row: Dict, basis_bps: float) -> None:
+        row.pop('_funding_carry_candidate', None)
+        row.pop('open_amount_usdt', None)
+        self._annotate_entry_snapshot(row, basis_bps)
+
     def _entry_snapshot(self, base_asset: str, basis_bps: float, row: Optional[Dict] = None) -> Dict:
         """
         统一开仓门槛。
@@ -1035,11 +1045,23 @@ class TradingExecutor:
 
         contract = row.get('contract', '')
         if not self._verify_realtime_funding_rate(base_asset, contract):
+            self._clear_funding_carry_candidate(row, current_basis_bps)
+            if not self._pass_risk_check(row):
+                row['_funding_carry_realtime_rejected'] = True
+            return False
+        if self.executor_client.channel == 'Live' and base_asset not in self._last_realtime_funding_info:
+            self._clear_funding_carry_candidate(row, current_basis_bps)
+            if not self._pass_risk_check(row):
+                row['_funding_carry_realtime_rejected'] = True
+            logger.info(f"Funding Carry 实时费率不可用，放弃本轮 carry | {base_asset}")
             return False
         self._apply_realtime_funding_info(base_asset, row)
 
         snapshot = self._funding_carry_snapshot(base_asset, current_basis_bps, row)
         if not snapshot:
+            self._clear_funding_carry_candidate(row, current_basis_bps)
+            if not self._pass_risk_check(row):
+                row['_funding_carry_realtime_rejected'] = True
             return False
         row['_funding_carry_candidate'] = True
         row['open_amount_usdt'] = self._funding_carry_amount()
@@ -1435,11 +1457,11 @@ class TradingExecutor:
             if self._holding_liq_distance[base_asset] < self.margin_warning_pct:
                 return False
 
-        if not self._pass_account_capital_check():
+        active_amount = self._active_open_amount_usdt(row)
+        if not self._pass_account_capital_check(active_amount):
             return False
 
         # 最小名义价值检查：开仓金额低于交易所最低要求时直接过滤
-        active_amount = self._active_open_amount_usdt(row)
         if base_asset in self.spot_meta:
             min_notional = self.spot_meta[base_asset].get('min_notional')
             if min_notional is not None and active_amount < min_notional:
@@ -1493,7 +1515,7 @@ class TradingExecutor:
         
         return True
 
-    def _pass_account_capital_check(self) -> bool:
+    def _pass_account_capital_check(self, amount_usdt: Optional[float] = None) -> bool:
         """真实资金检查：开仓前确认 Binance/Gate 可用资金足够且快照新鲜。"""
         if not self.capital_required:
             return True
@@ -1504,10 +1526,11 @@ class TradingExecutor:
 
         binance_available = float((self._account_summary.get('binance') or {}).get('available') or 0)
         gate_available = float((self._account_summary.get('gate') or {}).get('available') or 0)
-        spot_required = self.open_amount_usdt * (1 + self._fee_spot_open)
+        amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
+        spot_required = amount * (1 + self._fee_spot_open)
         gate_required = (
-            self.open_amount_usdt / self.capital_gate_leverage
-            + self.open_amount_usdt * self._fee_future_open
+            amount / self.capital_gate_leverage
+            + amount * self._fee_future_open
         )
         return binance_available >= spot_required and gate_available >= gate_required
 
@@ -1985,12 +2008,13 @@ class TradingExecutor:
             age = time.time() - self._account_summary_ts
             if age > self.capital_max_age_sec:
                 return f"资金风控(资金快照过期{age:.0f}s>{self.capital_max_age_sec}s)"
+            active_amount = self._active_open_amount_usdt(row)
             binance_available = float((self._account_summary.get('binance') or {}).get('available') or 0)
             gate_available = float((self._account_summary.get('gate') or {}).get('available') or 0)
-            spot_required = self.open_amount_usdt * (1 + self._fee_spot_open)
+            spot_required = active_amount * (1 + self._fee_spot_open)
             gate_required = (
-                self.open_amount_usdt / self.capital_gate_leverage
-                + self.open_amount_usdt * self._fee_future_open
+                active_amount / self.capital_gate_leverage
+                + active_amount * self._fee_future_open
             )
             if binance_available < spot_required:
                 return f"资金风控(Binance可用{binance_available:.2f}<需{spot_required:.2f}USDT)"
@@ -2397,10 +2421,17 @@ class TradingExecutor:
 
     def _fallback_min_open_basis(self, row: Dict, base_asset: str) -> float:
         """maker 未成交后允许转保护 IOC 的最低 pre-gate 基差。"""
-        entry_snapshot = row.get('_entry_snapshot') or self._entry_snapshot(
-            base_asset,
-            float(row.get('pre_gate_basis_bps') or row.get('open_vwap_basis_bps') or 0.0),
-            row,
+        basis_bps = float(row.get('pre_gate_basis_bps') or row.get('open_vwap_basis_bps') or 0.0)
+        state = self._peak_state.get(base_asset) or {}
+        entry_snapshot = (
+            state.get('entry_snapshot')
+            or row.get('_entry_snapshot')
+            or (
+                self._state_entry_snapshot(base_asset, row, basis_bps)
+                if row.get('_entry_entry_floor_bps') is not None
+                else None
+            )
+            or self._entry_snapshot(base_asset, basis_bps, row)
         )
         entry_floor = float(entry_snapshot.get('entry_floor_bps') or 0.0)
         buffer_bps = max(

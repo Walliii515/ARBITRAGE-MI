@@ -883,6 +883,61 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertEqual(te._peak_state['BANANA']['trigger'], 'funding_carry')
         self.assertEqual(te._peak_state['BANANA']['signal_id'], 123)
 
+    def test_funding_carry_realtime_failure_clears_relaxed_entry_floor(self):
+        te = make_trading_executor(
+            funding_carry_enabled=True,
+            vwap_threshold_meta={'BANANA': {'p20': -18.0}},
+            close_vwap_threshold_meta={'BANANA': {'close_basis_p20': -10.0}},
+            asset_tier_meta={'BANANA': 'B'},
+        )
+        row = self._row('BANANA', -20.0, 0.0030)
+        te._annotate_entry_snapshot(row, -20.0)
+        self.assertIsNotNone(te._annotate_funding_carry_candidate(row, -20.0))
+
+        def fake_verify(base_asset, contract):
+            te._last_realtime_funding_info[base_asset] = {
+                'funding_rate': 0.000333,
+                'funding_rate_24h': 0.0010,
+                'funding_interval': 28800,
+                'funding_next_apply': row['funding_next_apply'],
+                'funding_last_apply': None,
+            }
+            return True
+
+        te._verify_realtime_funding_rate = fake_verify
+
+        self.assertFalse(te._pass_funding_carry_check('BANANA', -20.0, row))
+        self.assertTrue(row.get('_funding_carry_realtime_rejected'))
+        self.assertNotIn('_funding_carry_candidate', row)
+        self.assertGreater(float(row['_entry_entry_floor_bps']), -20.0)
+        self.assertNotIn('BANANA', te._peak_state)
+
+    def test_funding_carry_fallback_uses_carry_entry_floor(self):
+        te = make_trading_executor(
+            funding_carry_enabled=True,
+            vwap_threshold_meta={'BANANA': {'p20': -18.0}},
+            close_vwap_threshold_meta={'BANANA': {'close_basis_p20': -10.0}},
+            asset_tier_meta={'BANANA': 'B'},
+        )
+        row = self._row('BANANA', -20.0, 0.0030)
+        snapshot = te._funding_carry_snapshot('BANANA', -20.0, row)
+        te._peak_state['BANANA'] = {'entry_snapshot': snapshot, 'trigger': 'funding_carry'}
+
+        self.assertAlmostEqual(te._fallback_min_open_basis(row, 'BANANA'), -17.0)
+
+    def test_account_capital_check_uses_channel_amount(self):
+        te = make_trading_executor()
+        te.capital_required = True
+        te.open_amount_usdt = 100.0
+        te._account_summary = {
+            'binance': {'available': 11.0},
+            'gate': {'available': 6.0},
+        }
+        te._account_summary_ts = time.time()
+
+        self.assertTrue(te._pass_account_capital_check(10.0))
+        self.assertFalse(te._pass_account_capital_check(100.0))
+
     def test_rebound_timeout_cooldown_resets_when_basis_moves(self):
         te = make_trading_executor()
         te._start_rebound_timeout_cooldown('BTC', 50.0)
