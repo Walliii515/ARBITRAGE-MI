@@ -168,7 +168,14 @@ class AccountCapitalSnapshotter:
         position_initial_margin = _float(account.get('position_initial_margin'))
         order_margin = _float(account.get('order_margin'))
         margin_used = max(position_margin, isolated_position_margin, position_initial_margin) + order_margin
-        equity = total if total else available + margin_used + unrealized
+        if _has_value(account.get('total')):
+            # Gate futures `total` is wallet balance including isolated margin, but it does
+            # not include unrealized PnL. Add it here so equity matches net account value.
+            equity = total + unrealized
+            equity_formula = 'gate_total_plus_unrealized_pnl'
+        else:
+            equity = available + margin_used + unrealized
+            equity_formula = 'available_plus_margin_plus_unrealized_pnl'
         return {
             'snapshot_at': snapshot_at,
             'exchange': 'gate',
@@ -185,6 +192,8 @@ class AccountCapitalSnapshotter:
             'detail': {
                 'source': 'exchange_api',
                 'account': account,
+                'raw_total_usdt': total,
+                'equity_formula': equity_formula,
                 'pnl_window': pnl.get('window'),
                 'gate_account_book_types': pnl.get('gate_account_book_types'),
             },
@@ -207,6 +216,7 @@ class AccountCapitalSnapshotter:
             'detail': {
                 'source': 'exchange_api',
                 'components': 'binance account/myTrades + gate futures accounts/account_book',
+                'equity_formula': 'binance_equity_plus_gate_equity',
                 'pnl_window': pnl.get('window'),
             },
         }
@@ -346,6 +356,10 @@ def _float(value) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _has_value(value) -> bool:
+    return value is not None and str(value).strip() != ''
 
 
 def _first_float(row: Dict, keys: List[str]) -> float:
