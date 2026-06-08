@@ -408,6 +408,8 @@ const pnlCellStyle = (params: ValueFormatterParams) => {
   return { color: '#e8eaed' }
 }
 
+const feeBpsCellStyle = () => ({ color: '#67c23a' })
+
 /* ───── 列定义 ───── */
 const columnDefs = computed<ColDef<PositionRow>[]>(() => [
   {
@@ -526,6 +528,7 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
     valueFormatter: bpsFormatter,
+    cellStyle: feeBpsCellStyle,
   },
   {
     headerName: '风险缓释(bps)',
@@ -918,7 +921,7 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     spot_open_amount: null,
     floating_pnl_bps: sumField('floating_pnl_bps'),
     floating_pnl_total: floatingPnlTotal,
-    fee_bps: null,
+    fee_bps: sumField('fee_bps'),
     fee_cost: sumField('fee_cost'),
     risk_relief_bps: null,
     funding_pnl_bps: sumField('funding_pnl_bps'),
