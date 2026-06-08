@@ -200,6 +200,7 @@ class PositionTracker:
     def _build_exchange_funding_entries(self, fund_rows: List[Dict], positions: List[Dict]) -> Dict[int, List[Dict]]:
         rate_map = self._load_funding_rate_map(fund_rows)
         by_position: Dict[int, List[Dict]] = {}
+        unmatched: Dict[str, int] = {}
 
         for fund in fund_rows:
             matched = [
@@ -210,10 +211,7 @@ class PositionTracker:
                 and (pos.get('closed_at') is None or pos['closed_at'] > fund['settled_at'])
             ]
             if not matched:
-                logger.warning(
-                    f"Gate资金费未匹配本地持仓 | {fund['contract']} | "
-                    f"{fund['settled_at']} | change={fund['change']}"
-                )
+                unmatched[fund['contract']] = unmatched.get(fund['contract'], 0) + 1
                 continue
 
             weights = [(pos, self._funding_weight(pos)) for pos in matched]
@@ -235,6 +233,10 @@ class PositionTracker:
                     'future_notional': notional,
                     'settled_at': fund['settled_at'],
                 })
+
+        if unmatched:
+            samples = ', '.join(f"{contract}:{count}" for contract, count in sorted(unmatched.items())[:10])
+            logger.info(f"Gate资金费未匹配本地持仓汇总 | contracts={len(unmatched)} | samples={samples}")
 
         for rows in by_position.values():
             rows.sort(key=lambda item: item['settled_at'])
