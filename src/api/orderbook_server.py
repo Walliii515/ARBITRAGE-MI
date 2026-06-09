@@ -104,6 +104,18 @@ def _stop_gate_risk_event_monitor():
     finally:
         _gate_risk_event_monitor = None
 
+
+def _gate_risk_event_monitor_status() -> dict:
+    if not config.get_bool('exchange_risk_monitor.enabled', True):
+        return {'enabled': False, 'connected': False, 'channels': {}}
+    if not _gate_risk_event_monitor:
+        return {'enabled': True, 'connected': False, 'channels': {}, 'last_error': 'not_started'}
+    try:
+        return _gate_risk_event_monitor.get_status()
+    except Exception as e:
+        logger.warning(f'Gate 风险事件监听状态读取失败: {e}', exc_info=True)
+        return {'enabled': True, 'connected': False, 'channels': {}, 'last_error': str(e)[:200]}
+
 _meta_update_time: str = ''  # 上次缓存刷新时间
 
 # 以下参数从 src/config/config.yaml 加载，环境变量可覆盖
@@ -636,7 +648,14 @@ async def service_connections():
         'binance_ws_connected': svc._binance_ws_connected(),
         'gate_ws_latency_ms': svc._calc_gate_data_age_ms(),
         'binance_ws_latency_ms': svc._calc_binance_data_age_ms(),
+        'exchange_risk_monitor': _gate_risk_event_monitor_status(),
     }
+
+
+@app.get('/api/service/exchange-risk-monitor')
+async def exchange_risk_monitor_status():
+    """获取 Gate 私有 ADL/强平事件监听状态（无需认证，用于连接监控）。"""
+    return _gate_risk_event_monitor_status()
 
 
 @app.get('/api/service/diagnostics')

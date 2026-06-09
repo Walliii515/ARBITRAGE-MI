@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, onUnmounted } from 'vue'
+import { computed, ref, shallowRef, onMounted, onUnmounted } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -27,8 +27,27 @@ const {
   binanceWsConnected,
   gateWsLatencyMs,
   binanceWsLatencyMs,
+  exchangeRiskMonitor,
   fetchConnectionStatus,
 } = useConnectionMonitor()
+
+const riskWsConnected = computed(() => !!exchangeRiskMonitor.value?.connected)
+const riskWsEnabled = computed(() => exchangeRiskMonitor.value?.enabled !== false)
+const riskWsChannels = computed(() => exchangeRiskMonitor.value?.channels || {})
+const riskWsAdlStatus = computed(() => riskWsChannels.value['futures.auto_deleverages'] || 'unknown')
+const riskWsLiquidationStatus = computed(() => riskWsChannels.value['futures.liquidates'] || 'unknown')
+const riskWsHealthy = computed(() =>
+  riskWsConnected.value
+  && riskWsAdlStatus.value === 'success'
+  && riskWsLiquidationStatus.value === 'success'
+)
+
+function formatRiskWsStatus(status: string) {
+  if (status === 'success') return '成功'
+  if (status === 'pending') return '订阅中'
+  if (status === 'fail') return '失败'
+  return status || '未知'
+}
 
 /* ───── 复制功能 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
@@ -330,12 +349,33 @@ onUnmounted(() => {
         <span class="ws-badge" :class="{ connected: binanceWsConnected }">
           Binance WS p50: {{ binanceWsConnected ? (binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接') : '未连接' }}
         </span>
+        <span
+          class="ws-badge"
+          :class="{ connected: riskWsHealthy, warning: riskWsEnabled && riskWsConnected && !riskWsHealthy }"
+        >
+          Gate风险WS:
+          {{ !riskWsEnabled ? '关闭' : riskWsConnected ? '已连接' : '未连接' }}
+        </span>
       </div>
 
       <div class="stats-row">
         <span>总数: <b>{{ stats.total }}</b></span>
         <span>Gate接收中: <b class="ok">{{ stats.gateReceiving }}</b></span>
         <span>Binance接收中: <b class="ok">{{ stats.binanceReceiving }}</b></span>
+        <span>
+          ADL订阅:
+          <b :class="{ ok: riskWsAdlStatus === 'success', warn: riskWsAdlStatus !== 'success' }">
+            {{ formatRiskWsStatus(riskWsAdlStatus) }}
+          </b>
+        </span>
+        <span>
+          强平订阅:
+          <b :class="{ ok: riskWsLiquidationStatus === 'success', warn: riskWsLiquidationStatus !== 'success' }">
+            {{ formatRiskWsStatus(riskWsLiquidationStatus) }}
+          </b>
+        </span>
+        <span>风险事件: <b>{{ exchangeRiskMonitor?.event_count ?? 0 }}</b></span>
+        <span>队列: <b>{{ exchangeRiskMonitor?.queue_size ?? 0 }}</b></span>
       </div>
 
       <div class="filter-row">
@@ -449,6 +489,10 @@ onUnmounted(() => {
   background: rgba(103, 194, 58, 0.12);
   color: #67c23a;
 }
+.ws-badge.warning {
+  background: rgba(230, 162, 60, 0.12);
+  color: #e6a23c;
+}
 
 .stats-row {
   display: flex;
@@ -458,6 +502,7 @@ onUnmounted(() => {
 }
 .stats-row b { color: #e0e0e0; }
 .stats-row b.ok { color: #67c23a; }
+.stats-row b.warn { color: #e6a23c; }
 .stats-row b.fail { color: #f56c6c; }
 
 .filter-row {

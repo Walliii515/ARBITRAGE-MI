@@ -15,6 +15,23 @@ export interface ConnectionRow {
   binance_stale_sec: number | null
 }
 
+export interface ExchangeRiskMonitorStatus {
+  enabled: boolean
+  connected: boolean
+  channels: Record<string, string>
+  last_message_at?: number | null
+  last_event_at?: number | null
+  last_close_at?: number | null
+  last_error?: string | null
+  message_count?: number
+  event_count?: number
+  queue_size?: number
+  worker_alive?: boolean
+  ws_thread_alive?: boolean
+  message_age_sec?: number | null
+  event_age_sec?: number | null
+}
+
 export function buildConnectionStats(rows: ConnectionRow[]) {
   const total = rows.length
   const gateSubscribed = rows.filter((r) => r.gate_ws_subscribed).length
@@ -38,6 +55,7 @@ export function useConnectionMonitor() {
   const binanceWsConnected = ref(false)
   const gateWsLatencyMs = ref<number | null>(null)
   const binanceWsLatencyMs = ref<number | null>(null)
+  const exchangeRiskMonitor = ref<ExchangeRiskMonitorStatus | null>(null)
 
   const connectionStats = computed(() => buildConnectionStats(connectionRows.value))
 
@@ -51,6 +69,7 @@ export function useConnectionMonitor() {
     binanceWsConnected.value = data.binance_ws_connected || false
     gateWsLatencyMs.value = data.gate_ws_latency_ms ?? null
     binanceWsLatencyMs.value = data.binance_ws_latency_ms ?? null
+    exchangeRiskMonitor.value = data.exchange_risk_monitor || null
     return data
   }
 
@@ -62,6 +81,7 @@ export function useConnectionMonitor() {
     binanceWsConnected,
     gateWsLatencyMs,
     binanceWsLatencyMs,
+    exchangeRiskMonitor,
     fetchConnectionStatus,
   }
 }

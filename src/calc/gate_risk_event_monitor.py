@@ -127,7 +127,17 @@ class GateRiskEventMonitor:
         self.stop_event = threading.Event()
         self.events: 'queue.Queue[Dict]' = queue.Queue(maxsize=1000)
         self._send_lock = threading.Lock()
+        self._status_lock = threading.Lock()
         self._last_catchup_at = 0.0
+        self._started_at: Optional[float] = None
+        self._connected_at: Optional[float] = None
+        self._last_message_at: Optional[float] = None
+        self._last_event_at: Optional[float] = None
+        self._last_close_at: Optional[float] = None
+        self._last_error: Optional[str] = None
+        self._message_count = 0
+        self._event_count = 0
+        self._subscription_status: Dict[str, str] = {channel: 'pending' for channel in self.cfg.channels}
 
     def start(self):
         if not self.cfg.enabled:
@@ -138,6 +148,9 @@ class GateRiskEventMonitor:
             return
 
         self.stop_event.clear()
+        with self._status_lock:
+            self._started_at = time.time()
+            self._last_error = None
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True, name='gate-risk-worker')
         self.worker_thread.start()
         self._connect()
@@ -184,6 +197,10 @@ class GateRiskEventMonitor:
 
     def _on_open(self, ws):
         self.connected.set()
+        with self._status_lock:
+            self._connected_at = time.time()
+            self._last_error = None
+            self._subscription_status = {channel: 'pending' for channel in self.cfg.channels}
         logger.info('Gate 风险事件 WS 已连接')
         for channel in self.cfg.channels:
             self._subscribe(channel)
@@ -218,6 +235,7 @@ class GateRiskEventMonitor:
         }
 
     def _on_message(self, ws, message: str):
+        self._record_message()
         try:
             data = json.loads(message)
         except json.JSONDecodeError:
@@ -227,6 +245,10 @@ class GateRiskEventMonitor:
         event = data.get('event')
         channel = data.get('channel')
         if event == 'subscribe':
+            result = data.get('result') or {}
+            status = result.get('status') if isinstance(result, dict) else None
+            with self._status_lock:
+                self._subscription_status[str(channel)] = str(status or 'unknown')
             logger.info('Gate 风险事件订阅确认 | channel=%s | result=%s', channel, data.get('result'))
             return
         if channel not in GATE_RISK_CHANNELS:
@@ -235,6 +257,7 @@ class GateRiskEventMonitor:
         for item in self._iter_result_items(data.get('result')):
             normalized = normalize_gate_risk_event(channel, item)
             if normalized:
+                self._record_event()
                 self._enqueue_event(normalized)
 
     def _iter_result_items(self, result) -> Iterable[Dict]:
@@ -259,6 +282,44 @@ class GateRiskEventMonitor:
             return
         self._last_catchup_at = now
         self._enqueue_event({'_catchup': True})
+
+    def _record_message(self):
+        with self._status_lock:
+            self._last_message_at = time.time()
+            self._message_count += 1
+
+    def _record_event(self):
+        with self._status_lock:
+            self._last_event_at = time.time()
+            self._event_count += 1
+
+    def get_status(self) -> Dict:
+        with self._status_lock:
+            status = {
+                'enabled': self.cfg.enabled,
+                'connected': self.connected.is_set(),
+                'ws_url': self.ws_url,
+                'channels': dict(self._subscription_status),
+                'subscribe_all': self.cfg.subscribe_all,
+                'last_message_at': self._last_message_at,
+                'last_event_at': self._last_event_at,
+                'last_close_at': self._last_close_at,
+                'last_error': self._last_error,
+                'message_count': self._message_count,
+                'event_count': self._event_count,
+                'started_at': self._started_at,
+                'connected_at': self._connected_at,
+                'last_catchup_at': self._last_catchup_at or None,
+            }
+        now = time.time()
+        status.update({
+            'queue_size': self.events.qsize(),
+            'worker_alive': bool(self.worker_thread and self.worker_thread.is_alive()),
+            'ws_thread_alive': bool(self.ws_thread and self.ws_thread.is_alive()),
+            'message_age_sec': round(now - status['last_message_at'], 1) if status['last_message_at'] else None,
+            'event_age_sec': round(now - status['last_event_at'], 1) if status['last_event_at'] else None,
+        })
+        return status
 
     def _worker_loop(self):
         while not self.stop_event.is_set():
@@ -373,10 +434,15 @@ class GateRiskEventMonitor:
             cursor.execute(sql, (status, json.dumps(result, ensure_ascii=False, default=str)[:4000], event_id))
 
     def _on_error(self, ws, error):
+        with self._status_lock:
+            self._last_error = str(error)[:300]
         logger.error('Gate 风险事件 WS 错误: %s', error)
 
     def _on_close(self, ws, close_status_code, close_msg):
         self.connected.clear()
+        with self._status_lock:
+            self._last_close_at = time.time()
+            self._last_error = f'closed:{close_status_code}:{close_msg}'[:300]
         logger.warning('Gate 风险事件 WS 关闭: %s - %s', close_status_code, close_msg)
         if not self.stop_event.is_set():
             self._start_reconnect()
