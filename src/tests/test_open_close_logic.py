@@ -492,6 +492,219 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(result['execution_stats']['future_maker']['fallback_filled'], True)
         executor._place_binance_spot_order.assert_called_once()
 
+    def test_future_maker_spot_ioc_failure_retries_market_hedge(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.486,
+            'exec_qty': 21.0,
+            'exec_amount': 10.21,
+            'coverage_ratio': 0,
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': True,
+                    'fill_ratio': 1,
+                    'wait_ms': 300,
+                    'ttl_ms': 1000,
+                }
+            },
+        })
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {'success': False, 'reason': '保护IOC未成交(fill=0,status=EXPIRED)'},
+            {
+                'success': True,
+                'exec_price': 0.485,
+                'exec_qty': 21.0,
+                'exec_amount': 10.18,
+                'coverage_ratio': 0,
+            },
+        ])
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor._place_binance_spot_order.call_count, 2)
+        retry_order = executor._place_binance_spot_order.call_args_list[1].args[0]
+        self.assertNotIn('protective_price', retry_order)
+        self.assertEqual(retry_order['quantity_mode'], 'base')
+        maker = result['execution_stats']['future_maker']
+        self.assertTrue(maker['spot_retry_market_attempted'])
+        self.assertTrue(maker['spot_retry_market_filled'])
+        self.assertEqual(maker['spot_retry_market_price'], 0.485)
+        self.assertFalse(maker.get('future_unwind_attempted', False))
+
+    def test_future_maker_spot_partial_ioc_retries_shortfall_and_merges(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.486,
+            'exec_qty': 21.0,
+            'exec_amount': 10.21,
+            'coverage_ratio': 0,
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': True,
+                    'fill_ratio': 1,
+                    'wait_ms': 300,
+                    'ttl_ms': 1000,
+                }
+            },
+        })
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {
+                'success': True,
+                'exec_price': 0.485,
+                'exec_qty': 10.0,
+                'exec_amount': 4.85,
+                'coverage_ratio': 0,
+                'exchange_order_id': 'spot-a',
+            },
+            {
+                'success': True,
+                'exec_price': 0.487,
+                'exec_qty': 11.0,
+                'exec_amount': 5.357,
+                'coverage_ratio': 0,
+                'exchange_order_id': 'spot-b',
+            },
+        ])
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor._place_binance_spot_order.call_count, 2)
+        retry_order = executor._place_binance_spot_order.call_args_list[1].args[0]
+        self.assertEqual(retry_order['target_qty'], 11.0)
+        self.assertAlmostEqual(result['spot_order']['exec_qty'], 21.0)
+        self.assertEqual(result['spot_order']['exchange_order_id'], 'spot-a,spot-b')
+        maker = result['execution_stats']['future_maker']
+        self.assertEqual(maker['spot_partial_qty'], 10.0)
+        self.assertEqual(maker['spot_shortfall_qty'], 11.0)
+        self.assertTrue(maker['spot_retry_market_filled'])
+
+    def test_future_maker_spot_retry_failure_unwinds_future_leg(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(side_effect=[
+            {
+                'success': True,
+                'exec_price': 0.486,
+                'exec_qty': 21.0,
+                'exec_amount': 10.21,
+                'coverage_ratio': 0,
+                'execution_stats': {
+                    'future_maker': {
+                        'attempted': True,
+                        'filled': True,
+                        'fill_ratio': 1,
+                        'wait_ms': 300,
+                        'ttl_ms': 1000,
+                    }
+                },
+            },
+            {
+                'success': True,
+                'exec_price': 0.484,
+                'exec_qty': 21.0,
+                'exec_amount': 10.16,
+                'coverage_ratio': 0,
+            },
+        ])
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {'success': False, 'reason': '保护IOC未成交(fill=0,status=EXPIRED)'},
+            {'success': False, 'reason': 'Binance 余额不足'},
+        ])
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIn('future已自动撤腿', result['message'])
+        self.assertEqual(executor._place_gate_futures_order.call_count, 2)
+        unwind_order = executor._place_gate_futures_order.call_args_list[1].args[0]
+        self.assertEqual(unwind_order['trade_direction'], 'buy')
+        self.assertEqual(unwind_order['order_side'], 'close')
+        self.assertEqual(unwind_order['target_qty'], 21.0)
+        self.assertNotIn('execution_style', unwind_order)
+        maker = result['execution_stats']['future_maker']
+        self.assertTrue(maker['future_unwind_attempted'])
+        self.assertTrue(maker['future_unwind_filled'])
+
     def test_future_maker_fallback_ioc_zero_fill_is_normal_no_fill_reason(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
