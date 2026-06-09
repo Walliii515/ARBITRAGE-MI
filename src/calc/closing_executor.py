@@ -31,6 +31,15 @@ from calc.order_fee_resolver import build_order_execution_fields
 logger = get_logger(__name__)
 
 
+def _float_or_none(value) -> Optional[float]:
+    if value is None or value == '':
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class ClosingExecutor:
     """平仓执行器（条件判断 + 订单生成 + 持久化，通过 ExecutorClient 调用成交引擎服务）"""
 
@@ -678,7 +687,8 @@ class ClosingExecutor:
         if future_qty <= 0 or open_price <= 0 or current_price <= 0:
             return None
 
-        initial_margin = future_qty * open_price / self.margin_leverage
+        margin_leverage = self._position_future_leverage(pos)
+        initial_margin = future_qty * open_price / margin_leverage
         topup_total = float(pos.get('margin_topup_total') or 0)
         margin_before = initial_margin + topup_total
         target_margin = future_qty * current_price * self.margin_topup_target_ratio
@@ -691,6 +701,7 @@ class ClosingExecutor:
         )
         return {
             'initial_margin': initial_margin,
+            'margin_leverage': margin_leverage,
             'margin_before': margin_before,
             'target_margin': target_margin,
             'topup_amount': topup_amount,
@@ -1498,7 +1509,7 @@ class ClosingExecutor:
             order = order_group[market_key].copy()
             order['position_id'] = position_id
             order['channel'] = self.executor_client.channel
-            order['leverage'] = self._order_leg_leverage(market_key)
+            order['leverage'] = self._order_leg_leverage(market_key, pos)
             # 平仓订单无开仓风控指标，置 None
             order['open_coverage'] = None
             order['open_vwap_basis_bps'] = None
@@ -1578,7 +1589,31 @@ class ClosingExecutor:
                 f"close_spread_bps={close_spread_bps}"
             )
 
-    def _order_leg_leverage(self, market_key: str) -> float:
+    def _position_future_leverage(self, pos: Dict) -> float:
+        leverage = _float_or_none(pos.get('future_open_leverage'))
+        if (leverage is None or leverage <= 0) and pos.get('id') is not None:
+            leverage = self._load_position_future_open_leverage(int(pos.get('id')))
+        if leverage is None or leverage <= 0:
+            leverage = self.margin_leverage
+        return max(float(leverage or 1.0), 1.0)
+
+    def _load_position_future_open_leverage(self, position_id: int) -> Optional[float]:
+        sql = """
+            SELECT leverage
+            FROM mi_trade_order
+            WHERE position_id = %s
+              AND order_side = 'open'
+              AND market_type = 'future'
+              AND status = 'executed'
+            ORDER BY id ASC
+            LIMIT 1
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (position_id,))
+            row = cursor.fetchone()
+        return _float_or_none(row.get('leverage')) if row else None
+
+    def _order_leg_leverage(self, market_key: str, pos: Dict) -> float:
         if market_key == 'future_order':
-            return self.margin_leverage
+            return self._position_future_leverage(pos)
         return 1.0

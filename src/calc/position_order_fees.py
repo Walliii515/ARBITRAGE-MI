@@ -21,6 +21,14 @@ def fetch_position_order_fee_summary(position_ids: List[int]) -> Dict[int, Dict]
                 AS future_open_liquidity_role,
             MAX(CASE WHEN order_side = 'close' AND market_type = 'future' THEN liquidity_role END)
                 AS future_close_liquidity_role,
+            MAX(CASE WHEN order_side = 'open' AND market_type = 'spot' THEN leverage END)
+                AS spot_open_leverage,
+            MAX(CASE WHEN order_side = 'open' AND market_type = 'future' THEN leverage END)
+                AS future_open_leverage,
+            MAX(CASE WHEN order_side = 'close' AND market_type = 'spot' THEN leverage END)
+                AS spot_close_leverage,
+            MAX(CASE WHEN order_side = 'close' AND market_type = 'future' THEN leverage END)
+                AS future_close_leverage,
             SUM(CASE
                 WHEN order_side = 'open' AND market_type = 'spot' THEN fee_amount_usdt
                 ELSE NULL

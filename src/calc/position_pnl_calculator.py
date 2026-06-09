@@ -60,6 +60,13 @@ def _float_or_none(value) -> Optional[float]:
         return None
 
 
+def _position_margin_leverage(pos: Dict, cfg: PnlConfig) -> float:
+    leverage = _float_or_none(pos.get('future_open_leverage'))
+    if leverage is None or leverage <= 0:
+        leverage = cfg.margin_leverage
+    return max(float(leverage or 1.0), 1.0)
+
+
 def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
     future_open_fee = _float_or_none(pos.get('future_open_fee_rate'))
     future_close_fee = _float_or_none(pos.get('future_close_fee_rate'))
@@ -131,7 +138,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         注入了 PnL 字段的持仓列表（同一引用）
     """
     # 保证金风控配置（通过 PnlConfig 注入）
-    margin_leverage = cfg.margin_leverage
     margin_default_mmr = cfg.margin_default_mmr
 
     for pos in positions:
@@ -248,6 +254,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
 
             # ── 保证金风控指标注入（逐仓模式空头爆仓价 + 距爆仓距离）──
             maintenance_rate = c_meta.get('maintenance_rate') or margin_default_mmr
+            margin_leverage = _position_margin_leverage(pos, cfg)
+            pos['margin_leverage'] = margin_leverage
             initial_margin = future_open_price * future_qty / margin_leverage
             topup_total = float(pos.get('margin_topup_total') or 0)
             total_margin = initial_margin + topup_total

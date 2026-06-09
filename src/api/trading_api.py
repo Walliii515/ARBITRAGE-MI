@@ -193,7 +193,17 @@ async def get_position_orders(position_id: int):
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, [position_id])
         rows = cursor.fetchall()
-    return {'orders': _serialize_rows(rows)}
+        cursor.execute(
+            """
+                SELECT *
+                FROM mi_margin_topup_log
+                WHERE position_id = %s
+                ORDER BY id ASC
+            """,
+            [position_id],
+        )
+        topup_rows = cursor.fetchall()
+    return {'orders': _serialize_rows(rows), 'topup_logs': _serialize_rows(topup_rows)}
 
 
 @router.get('/orders/grouped')

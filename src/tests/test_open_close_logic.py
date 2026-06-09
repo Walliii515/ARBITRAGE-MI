@@ -1914,6 +1914,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
             'base_asset': 'BTC',
             'future_open_qty': 1.0,
             'future_open_price': 100.0,
+            'future_open_leverage': 5.0,
             'current_future_price': 130.0,
             'margin_topup_total': 0.0,
         }
@@ -1924,6 +1925,25 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertAlmostEqual(calc['initial_margin'], 20.0)
         self.assertAlmostEqual(calc['target_margin'], 65.0)
         self.assertAlmostEqual(calc['topup_amount'], 45.0)
+
+    def test_topup_amount_uses_position_open_leverage(self):
+        ce = make_closing_executor()
+        pos = {
+            'id': 1,
+            'base_asset': 'BTC',
+            'future_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'future_open_leverage': 2.0,
+            'current_future_price': 130.0,
+            'margin_topup_total': 0.0,
+        }
+
+        calc = ce._calculate_margin_topup_amount(pos)
+
+        self.assertIsNotNone(calc)
+        self.assertAlmostEqual(calc['initial_margin'], 50.0)
+        self.assertAlmostEqual(calc['target_margin'], 65.0)
+        self.assertAlmostEqual(calc['topup_amount'], 15.0)
 
     def test_liq_price_includes_margin_topup_total(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -1961,6 +1981,44 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertAlmostEqual(positions[0]['current_margin'], 60.0)
         self.assertAlmostEqual(positions[0]['liq_price'], 159.5)
 
+    def test_liq_price_uses_position_open_leverage(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'BTC',
+            'spot_open_price': 100.0,
+            'spot_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'future_open_qty': 1.0,
+            'future_open_leverage': 2.0,
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0,
+            'margin_topup_total': 10.0,
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=100.0,
+            spot_open_fee=0,
+            spot_close_fee=0,
+            future_open_fee=0,
+            future_close_fee=0,
+            risk_relief_bps=0,
+            margin_leverage=5.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(
+            positions,
+            {'BTC': {'spot_close_vwap': 130.0, 'future_close_vwap': 130.0}},
+            {'BTC': {'maintenance_rate': 0.005}},
+            cfg,
+        )
+
+        self.assertAlmostEqual(positions[0]['margin_leverage'], 2.0)
+        self.assertAlmostEqual(positions[0]['margin_initial'], 50.0)
+        self.assertAlmostEqual(positions[0]['current_margin'], 60.0)
+        self.assertAlmostEqual(positions[0]['liq_price'], 159.5)
+
     def test_topup_attempts_before_emergency_close(self):
         ce = make_closing_executor()
         ce.margin_topup_pct = 15.0
@@ -1979,6 +2037,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
             'spot_open_qty': 1.0,
             'future_open_qty': 1.0,
             'future_open_price': 100.0,
+            'future_open_leverage': 5.0,
             'current_future_price': 148.0,
             'liq_distance_pct': 4.8,
             'margin_topup_total': 0.0,
