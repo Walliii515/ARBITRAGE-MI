@@ -275,7 +275,9 @@ class Reconciler:
             latest = max(adl_trades, key=lambda t: float(t.get('create_time') or 0))
             event_at = datetime.fromtimestamp(float(latest.get('create_time') or snapshot_at.timestamp()))
             total_close_size = sum(float(t.get('close_size') or 0) for t in adl_trades)
-            total_pnl = sum(float(t.get('pnl') or 0) for t in adl_trades)
+            total_pnl = self._load_gate_pnl_near_event(contract, event_at)
+            if total_pnl is None:
+                total_pnl = sum(float(t.get('pnl') or 0) for t in adl_trades)
             detail = (
                 f"ADL自动减仓|contract={contract}|close_size={total_close_size:g}|"
                 f"missing={missing_contracts:g}|price={latest.get('price')}|pnl={total_pnl:.6f}|"
@@ -299,6 +301,32 @@ class Reconciler:
             ),
         }
 
+    def _load_gate_pnl_near_event(self, contract: str, event_at: datetime) -> Optional[float]:
+        """Gate ADL 的 PnL 通常在 account_book 中，而不是 my_trades 中。"""
+        try:
+            rows = self.executor.fetch_gate_futures_account_book(
+                int((event_at - timedelta(minutes=5)).timestamp()),
+                int((event_at + timedelta(minutes=5)).timestamp()),
+                limit=1000,
+            )
+        except Exception as e:
+            logger.warning(f"Gate ADL PnL 流水查询失败 | {contract} | {e}", exc_info=True)
+            return None
+
+        total = 0.0
+        matched = False
+        for row in rows:
+            row_contract = str(row.get('contract') or row.get('text') or '').upper()
+            row_type = str(row.get('type') or row.get('ctype') or '').lower()
+            if contract.upper() not in row_contract or row_type != 'pnl':
+                continue
+            try:
+                total += float(row.get('change') or row.get('amount') or 0)
+                matched = True
+            except (TypeError, ValueError):
+                continue
+        return total if matched else None
+
     def _mark_positions_exchange_risk(self, base_asset: str, risk: Dict) -> int:
         sql = """
             UPDATE mi_trade_position
@@ -317,6 +345,8 @@ class Reconciler:
                     exchange_risk_status <> %(status)s
                  OR exchange_risk_type <> %(type)s
                  OR exchange_risk_type IS NULL
+                 OR exchange_risk_detail <> %(detail)s
+                 OR exchange_risk_detail IS NULL
               )
         """
         reason = f"交易所仓位风险:{risk.get('type')}|{risk.get('detail')}"
