@@ -262,7 +262,7 @@ margin:
   topup:
     enabled: true
     target_margin_ratio: 0.5
-    max_topup_per_position: 5
+    max_topup_per_position: 99
     max_topup_ratio: 1.0
     min_gate_available: 50
     cooldown_sec: 300

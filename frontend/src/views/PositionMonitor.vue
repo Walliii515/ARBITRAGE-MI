@@ -1355,7 +1355,6 @@ onUnmounted(() => {
         <el-button
           size="small"
           type="primary"
-          style="margin-left: auto;"
           :loading="loading"
           @click="fetchPositions"
         >
