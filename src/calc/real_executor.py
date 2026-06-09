@@ -1045,9 +1045,16 @@ class RealExecutor:
                 'base_asset': contract[:-5],
                 'size': size,
                 'entry_price': item.get('entry_price'),
+                'mark_price': item.get('mark_price'),
+                'liq_price': item.get('liq_price'),
                 'unrealised_pnl': item.get('unrealised_pnl'),
                 'leverage': item.get('leverage'),
                 'margin': item.get('margin'),
+                'initial_margin': item.get('initial_margin'),
+                'maintenance_margin': item.get('maintenance_margin'),
+                'maintenance_rate': item.get('maintenance_rate'),
+                'value': item.get('value'),
+                'update_time': item.get('update_time'),
                 'mode': item.get('mode'),
             })
         return result
