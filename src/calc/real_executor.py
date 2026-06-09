@@ -1079,6 +1079,65 @@ class RealExecutor:
         data = resp.json()
         return data if isinstance(data, list) else []
 
+    def fetch_gate_futures_auto_deleverages(
+        self,
+        contract: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """拉取 Gate USDT 永续 ADL 自动减仓记录，用于 WS 重连补偿。"""
+        return self._fetch_gate_futures_risk_records(
+            api_leaf='auto_deleverages',
+            contract=contract,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+    def fetch_gate_futures_liquidates(
+        self,
+        contract: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """拉取 Gate USDT 永续强平记录，用于 WS 重连补偿。"""
+        return self._fetch_gate_futures_risk_records(
+            api_leaf='liquidates',
+            contract=contract,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+    def _fetch_gate_futures_risk_records(
+        self,
+        api_leaf: str,
+        contract: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        method = 'GET'
+        api_path = f'/api/v4/futures/usdt/{api_leaf}'
+        params = {'limit': min(max(int(limit or 100), 1), 1000)}
+        if contract:
+            params['contract'] = str(contract).upper()
+        if start_time is not None:
+            params['from'] = int(start_time)
+        if end_time is not None:
+            params['to'] = int(end_time)
+        query_string = urlencode(params)
+        headers = self._gate_sign(method, api_path, query_string, '')
+        url = f"{self.config.gate_base_url}{api_path}?{query_string}"
+        resp = self._session.get(url, headers=headers, timeout=self.config.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gate {api_leaf} HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
     def fetch_gate_futures_account(self) -> Dict:
         """拉取 Gate USDT 永续账户资金（只读，资金快照使用）。"""
         method = 'GET'

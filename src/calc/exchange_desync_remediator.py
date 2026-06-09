@@ -2,7 +2,7 @@
 """交易所断腿自动处置。
 
 Gate futures 被 ADL 自动减仓后，本地 holding 仍对应 Binance spot 多头。
-本模块在对账确认 ADL 后，自动卖出对应 spot，关闭本地持仓。
+本模块由实时 Gate 风险事件触发，自动卖出对应 spot，关闭本地持仓。
 """
 import uuid
 from dataclasses import dataclass
@@ -51,6 +51,9 @@ class ExchangeDesyncRemediator:
         base_asset: str,
         missing_contracts: float,
         risk: Dict,
+        *,
+        require_desynced: bool = True,
+        mark_positions: bool = False,
     ) -> Dict:
         base_asset = str(base_asset or '').upper()
         if not self.cfg.enabled:
@@ -60,7 +63,11 @@ class ExchangeDesyncRemediator:
         if missing_contracts <= 0:
             return {'attempted': False, 'reason': 'missing_contracts<=0'}
 
-        positions = self._load_positions_to_remediate(base_asset, missing_contracts)
+        positions = self._load_positions_to_remediate(
+            base_asset,
+            missing_contracts,
+            require_desynced=require_desynced,
+        )
         if not positions:
             return {'attempted': False, 'reason': 'no_matching_holding_positions'}
 
@@ -68,6 +75,9 @@ class ExchangeDesyncRemediator:
         remaining_available = available_qty
         limit = max(int(self.cfg.max_positions_per_run or 1), 1)
         selected_positions = positions[:limit]
+        if mark_positions:
+            self._mark_positions_exchange_risk(selected_positions, risk)
+
         results = []
         for pos in selected_positions:
             target_qty = min(_float(pos.get('spot_open_qty')), remaining_available)
@@ -98,7 +108,14 @@ class ExchangeDesyncRemediator:
             'results': results,
         }
 
-    def _load_positions_to_remediate(self, base_asset: str, missing_contracts: float) -> List[Dict]:
+    def _load_positions_to_remediate(
+        self,
+        base_asset: str,
+        missing_contracts: float,
+        *,
+        require_desynced: bool = True,
+    ) -> List[Dict]:
+        risk_clause = "AND p.exchange_risk_status = 'desynced'" if require_desynced else ""
         sql = """
             SELECT p.*,
                    MAX(CASE WHEN o.order_side = 'open' AND o.market_type = 'future' THEN o.leverage END)
@@ -109,10 +126,10 @@ class ExchangeDesyncRemediator:
              AND o.status = 'executed'
             WHERE p.status = 'holding'
               AND UPPER(p.base_asset) = %s
-              AND p.exchange_risk_status = 'desynced'
+              {risk_clause}
             GROUP BY p.id
             ORDER BY p.opened_at ASC, p.id ASC
-        """
+        """.format(risk_clause=risk_clause)
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, (base_asset,))
             rows = cursor.fetchall()
@@ -358,3 +375,35 @@ class ExchangeDesyncRemediator:
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, {'message': message[:300], 'position_id': position_id})
+
+    def _mark_positions_exchange_risk(self, positions: List[Dict], risk: Dict):
+        ids = [int(row['id']) for row in positions if row.get('id') is not None]
+        if not ids:
+            return
+
+        reason = f"交易所仓位风险:{risk.get('type')}|{risk.get('detail')}"
+        placeholders = ','.join(['%s'] * len(ids))
+        sql = f"""
+            UPDATE mi_trade_position
+            SET exchange_risk_status = 'desynced',
+                exchange_risk_type = %s,
+                exchange_risk_at = %s,
+                exchange_risk_detail = %s,
+                close_reason = CASE
+                    WHEN close_reason IS NULL OR close_reason = '' THEN %s
+                    WHEN close_reason NOT LIKE %s THEN CONCAT(close_reason, '|', %s)
+                    ELSE close_reason
+                END
+            WHERE id IN ({placeholders})
+        """
+        params = [
+            risk.get('type') or 'unknown',
+            risk.get('event_at') or datetime.now(),
+            str(risk.get('detail') or '')[:1000],
+            reason[:500],
+            f"%交易所仓位风险:{risk.get('type')}%",
+            reason[:500],
+            *ids,
+        ]
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, params)

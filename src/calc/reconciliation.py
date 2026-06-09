@@ -11,10 +11,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
-from calc.exchange_desync_remediator import (
-    ExchangeDesyncRemediationConfig,
-    ExchangeDesyncRemediator,
-)
 from calc.real_executor import ExchangeConfig, RealExecutor
 from common.config import config
 from common.database import db_manager
@@ -37,9 +33,6 @@ class ReconciliationConfig:
     ignored_binance_spot_assets: Set[str] = field(default_factory=lambda: {'BNB'})
     mark_exchange_risk: bool = True
     adl_lookback_sec: int = 24 * 3600
-    auto_remediate_desync: ExchangeDesyncRemediationConfig = field(
-        default_factory=ExchangeDesyncRemediationConfig
-    )
 
 
 def normalize_asset_set(values) -> Set[str]:
@@ -107,18 +100,6 @@ def build_default_reconciler() -> 'Reconciler':
         ignored_binance_spot_assets=get_ignored_binance_spot_assets(),
         mark_exchange_risk=config.get_bool('reconciliation.mark_exchange_risk', True),
         adl_lookback_sec=config.get_int('reconciliation.adl_lookback_sec', 24 * 3600),
-        auto_remediate_desync=ExchangeDesyncRemediationConfig(
-            enabled=config.get_bool('reconciliation.auto_remediate_desync.enabled', True),
-            action=str(config.get('reconciliation.auto_remediate_desync.action', 'sell_spot') or 'sell_spot'),
-            max_positions_per_run=config.get_int('reconciliation.auto_remediate_desync.max_positions_per_run', 20),
-            min_spot_qty=config.get_float('reconciliation.auto_remediate_desync.min_spot_qty', 0.0),
-            spot_open_fee=config.get_float('trade.fee.spot_open', 0.00075),
-            spot_close_fee=config.get_float('trade.fee.spot_close', 0.00075),
-            future_open_fee=config.get_float('trade.fee.future_open', 0.0002),
-            future_close_fee=config.get_float('trade.fee.future_close', 0.0002),
-            future_taker_open_fee=config.get_float('trade.fee.future_taker_open', 0.0005),
-            future_taker_close_fee=config.get_float('trade.fee.future_taker_close', 0.0005),
-        ),
     )
     return Reconciler(executor, cfg)
 
@@ -129,9 +110,6 @@ class Reconciler:
     def __init__(self, executor: RealExecutor, cfg: Optional[ReconciliationConfig] = None):
         self.executor = executor
         self.cfg = cfg or ReconciliationConfig()
-        self.desync_remediator: Optional[ExchangeDesyncRemediator] = None
-        if self.cfg.auto_remediate_desync.enabled:
-            self.desync_remediator = ExchangeDesyncRemediator(executor, self.cfg.auto_remediate_desync)
 
     def run_once(self) -> Dict:
         """执行一轮对账并落库，返回本轮摘要。"""
@@ -266,9 +244,6 @@ class Reconciler:
                     "Gate 持仓对账发现断腿风险 | asset=%s | type=%s | local=%s | exchange=%s | marked=%s",
                     base_asset, risk.get('type'), local_value, exchange_value, updated,
                 )
-            remediation = self._auto_remediate_gate_desync(base_asset, local_value, exchange_value, risk)
-            if remediation:
-                row['detail']['remediation'] = remediation
 
     def _detect_gate_desync_risk(
         self,
@@ -337,45 +312,6 @@ class Reconciler:
             'future_close_size': missing_contracts,
             'future_pnl': None,
         }
-
-    def _auto_remediate_gate_desync(
-        self,
-        base_asset: str,
-        local_value: float,
-        exchange_value: float,
-        risk: Dict,
-    ) -> Optional[Dict]:
-        """Gate short 已缺失时自动卖出对应 Binance spot，避免裸多继续暴露。"""
-        if not self.desync_remediator or risk.get('status') != 'desynced':
-            return None
-        if risk.get('type') != 'adl':
-            return {'attempted': False, 'reason': f"risk_type_not_auto:{risk.get('type')}"}
-        missing_contracts = max(0.0, float(local_value or 0) - float(exchange_value or 0))
-        try:
-            result = self.desync_remediator.remediate_gate_short_desync(
-                base_asset=base_asset,
-                missing_contracts=missing_contracts,
-                risk=risk,
-            )
-        except Exception as e:
-            logger.error(
-                "Gate 断腿自动处置异常 | asset=%s | missing=%s | error=%s",
-                base_asset, missing_contracts, e, exc_info=True,
-            )
-            return {'attempted': True, 'success': False, 'reason': f'exception:{str(e)[:160]}'}
-
-        if result.get('attempted'):
-            if result.get('success_count'):
-                logger.warning(
-                    "Gate 断腿自动处置执行 | asset=%s | missing=%s | success=%s | fail=%s",
-                    base_asset, missing_contracts, result.get('success_count'), result.get('failure_count'),
-                )
-            else:
-                logger.error(
-                    "Gate 断腿自动处置未完成 | asset=%s | missing=%s | result=%s",
-                    base_asset, missing_contracts, result,
-                )
-        return result
 
     def _load_gate_pnl_near_event(self, contract: str, event_at: datetime) -> Optional[float]:
         """Gate ADL 的 PnL 通常在 account_book 中，而不是 my_trades 中。"""

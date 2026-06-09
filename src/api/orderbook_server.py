@@ -42,6 +42,7 @@ from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
+from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
@@ -74,6 +75,34 @@ def _orjson_default(obj):
     if isinstance(obj, Decimal):
         return float(obj)
     raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
+
+
+def _start_gate_risk_event_monitor():
+    """启动 Gate 私有 ADL/强平事件监听；失败只告警，不阻塞主服务。"""
+    global _gate_risk_event_monitor
+    if config.get_trade_mode() == 'virtual':
+        logger.info('virtual 模式跳过 Gate 风险事件监听')
+        return
+    if not config.get_bool('exchange_risk_monitor.enabled', True):
+        logger.info('Gate 风险事件监听已关闭')
+        return
+    try:
+        _gate_risk_event_monitor = build_default_gate_risk_event_monitor()
+        _gate_risk_event_monitor.start()
+    except Exception as e:
+        logger.error(f'Gate 风险事件监听启动失败: {e}', exc_info=True)
+
+
+def _stop_gate_risk_event_monitor():
+    global _gate_risk_event_monitor
+    if not _gate_risk_event_monitor:
+        return
+    try:
+        _gate_risk_event_monitor.stop()
+    except Exception as e:
+        logger.warning(f'Gate 风险事件监听关闭异常: {e}', exc_info=True)
+    finally:
+        _gate_risk_event_monitor = None
 
 _meta_update_time: str = ''  # 上次缓存刷新时间
 
@@ -162,6 +191,7 @@ _latest_account_summary_ts: float = 0.0
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
 _closing_executor: Optional['ClosingExecutor'] = None
+_gate_risk_event_monitor = None
 _critical_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-open')
 _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-close')
 
@@ -532,6 +562,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_reconciliation_loop())
     asyncio.create_task(_vwap_snapshot_loop())
     asyncio.create_task(_stale_signal_cleanup_loop())
+    _start_gate_risk_event_monitor()
 
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
     start_daily_schedulers()
@@ -547,6 +578,7 @@ async def lifespan(app: FastAPI):
 
     if svc:
         svc.shutdown()
+    _stop_gate_risk_event_monitor()
     stop_daily_schedulers()
     _critical_open_executor.shutdown(wait=False, cancel_futures=True)
     _critical_close_executor.shutdown(wait=False, cancel_futures=True)

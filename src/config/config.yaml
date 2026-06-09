@@ -293,10 +293,23 @@ reconciliation:
   ignored_binance_spot_assets: [BNB]        # BNB 用作 Binance 手续费抵扣燃料，不参与套利持仓对账
   mark_exchange_risk: true                  # Gate 实仓少于本地持仓时，标记 mi_trade_position.exchange_risk_*
   adl_lookback_sec: 86400                   # 回查 Gate my_trades 识别 auto_deleveraging 的窗口（24小时）
-  auto_remediate_desync:
-    enabled: true                           # 确认 Gate short 被 ADL 自动减仓后，自动卖出对应 Binance spot
-    action: sell_spot                       # 当前只支持卖出裸 spot，不自动补回 Gate short
-    max_positions_per_run: 20               # 单轮对账最多自动处置的本地持仓数
+
+# Gate 私有风险事件监听：实时接收 ADL/强平事件并自动修复 Binance spot 裸腿
+exchange_risk_monitor:
+  enabled: true
+  settle: usdt
+  channels: [futures.auto_deleverages, futures.liquidates]
+  subscribe_all: true
+  reconnect_delay_sec: 3
+  max_reconnect_delay_sec: 60
+  reconnect_jitter_sec: 2
+  connect_timeout_sec: 15
+  rest_catchup_enabled: true                # WS 重连后回查最近事件，补偿断线窗口
+  rest_catchup_lookback_sec: 300
+  auto_remediate:
+    enabled: true
+    action: sell_spot                       # ADL/强平导致 Gate short 缺腿后，自动卖出裸 Binance spot
+    max_positions_per_event: 20
 
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）

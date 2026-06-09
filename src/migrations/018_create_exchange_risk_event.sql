@@ -1,0 +1,30 @@
+-- 交易所实时风险事件：记录 Gate ADL / 强平事件及自动处置结果。
+
+CREATE TABLE IF NOT EXISTS mi_exchange_risk_event (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(160) NOT NULL COMMENT '事件幂等键',
+    exchange VARCHAR(20) NOT NULL COMMENT '交易所',
+    market_type VARCHAR(20) NOT NULL COMMENT '市场类型',
+    risk_type VARCHAR(40) NOT NULL COMMENT 'adl/liquidation/unknown',
+    base_asset VARCHAR(30) NOT NULL COMMENT '标的资产',
+    contract VARCHAR(60) NOT NULL COMMENT '合约',
+    event_at DATETIME(3) NOT NULL COMMENT '交易所事件时间',
+    exchange_order_id VARCHAR(80) NULL COMMENT '交易所订单ID',
+    exchange_trade_id VARCHAR(80) NULL COMMENT '交易所成交ID',
+    side VARCHAR(40) NULL COMMENT '事件方向/文本',
+    size DECIMAL(28,10) NULL COMMENT '事件涉及合约张数',
+    fill_price DECIMAL(28,12) NULL COMMENT '成交/处置价格',
+    entry_price DECIMAL(28,12) NULL COMMENT '原入场价格',
+    mark_price DECIMAL(28,12) NULL COMMENT '标记价格',
+    liq_price DECIMAL(28,12) NULL COMMENT '强平价格',
+    pnl DECIMAL(28,10) NULL COMMENT '事件PnL',
+    raw_json LONGTEXT NULL COMMENT '交易所原始事件JSON',
+    status ENUM('received','remediated','failed','ignored') NOT NULL DEFAULT 'received' COMMENT '事件处理状态',
+    remediation_action VARCHAR(40) NULL COMMENT '自动处置动作',
+    remediation_result LONGTEXT NULL COMMENT '自动处置结果JSON',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_exchange_risk_event_key (event_key),
+    KEY idx_exchange_risk_event_asset (base_asset, risk_type, event_at),
+    KEY idx_exchange_risk_event_status (status, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='交易所ADL/强平风险事件';
