@@ -436,6 +436,10 @@ class RealExecutor:
         except Exception as e:
             return {'success': False, 'reason': f'Binance 异常: {str(e)[:100]}'}
 
+    def place_binance_spot_order(self, order: Dict) -> Dict:
+        """公开的 Binance 现货单腿执行入口，用于交易所断腿自动处置。"""
+        return self._place_binance_spot_order(order)
+
     def _parse_binance_response(self, data: Dict) -> Dict:
         """
         解析 Binance 订单响应
