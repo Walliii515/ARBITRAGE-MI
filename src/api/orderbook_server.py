@@ -40,6 +40,7 @@ from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+from calc.gate_position_risk import attach_gate_position_risk
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
@@ -199,6 +200,8 @@ _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费�
 _asset_tier_meta: Dict[str, str] = {}  # base_asset -> strategy_tier
 _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇总
 _latest_account_summary_ts: float = 0.0
+_gate_position_risk_cache: List[Dict] = []
+_gate_position_risk_cache_ts: float = 0.0
 
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
@@ -1341,6 +1344,27 @@ async def _close_position_loop():
         await loop.run_in_executor(_critical_close_executor, _run_close_position_check_once)
 
 
+def _get_gate_position_risk_snapshot() -> List[Dict]:
+    """读取 Gate 实时仓位风险，短缓存用于持仓监控展示。"""
+    global _gate_position_risk_cache, _gate_position_risk_cache_ts
+    if config.get_trade_mode() == 'virtual':
+        return []
+
+    now = time.time()
+    ttl_sec = max(10, config.get_int('trade.position.gate_risk_cache_sec', 30))
+    if _gate_position_risk_cache and now - _gate_position_risk_cache_ts < ttl_sec:
+        return _gate_position_risk_cache
+
+    try:
+        gate_positions = build_default_reconciler().executor.fetch_gate_futures_positions()
+        _gate_position_risk_cache = gate_positions
+        _gate_position_risk_cache_ts = now
+        return gate_positions
+    except Exception as e:
+        logger.warning(f"Gate持仓风险快照拉取失败: {e}")
+        return _gate_position_risk_cache
+
+
 async def _position_realtime_push():
     """定时推送持仓实时数据（含已平仓，使用平仓 VWAP 作为实时价格）
     注意：funding_history 不在此推送（低频数据），仅通过 REST 初始加载 + 结算后事件推送。
@@ -1377,6 +1401,7 @@ async def _position_realtime_push():
 
             # 计算实时盈亏（已平仓持仓用DB存储的价格，不依赖 close_vwaps）
             calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
+            attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())
             
             # 资金汇总来自交易所真实资金快照（分钟级刷新）
             account_summary = _latest_account_summary

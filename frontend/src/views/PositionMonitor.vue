@@ -77,6 +77,13 @@ interface PositionRow {
   margin_topup_last_at: string | null
   margin_initial: number | null
   current_margin: number | null
+  gate_mark_price: number | null
+  gate_liq_price: number | null
+  gate_position_margin: number | null
+  gate_maintenance_margin: number | null
+  gate_maintenance_margin_rate: number | null
+  gate_position_size: number | null
+  gate_risk_updated_at: string | null
   liq_price: number | null
   liq_distance_pct: number | null
   exchange_risk_status: string | null
@@ -750,6 +757,39 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     valueFormatter: pnlFormatter,
   },
   {
+    headerName: 'Gate维持保证金率',
+    field: 'gate_maintenance_margin_rate',
+    width: 150,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (params: ValueFormatterParams) => {
+      if (params.value == null) return ''
+      return Number(params.value).toFixed(2) + '%'
+    },
+    cellStyle: (params: any) => {
+      const value = params.value as number | null
+      if (value == null) return { color: '#909399' }
+      if (value > 220) return { color: '#67c23a' }
+      if (value > 150) return { color: '#e6a23c' }
+      return { color: '#f56c6c', fontWeight: '700' }
+    },
+    tooltipValueGetter: (params: any) => {
+      const row = params.data as PositionRow | undefined
+      if (!row || row.gate_maintenance_margin_rate == null) return null
+      const parts = [
+        `Gate维持保证金率: ${Number(row.gate_maintenance_margin_rate).toFixed(2)}%`,
+        row.gate_position_margin != null ? `仓位保证金: ${formatAmount(row.gate_position_margin)}` : null,
+        row.gate_maintenance_margin != null ? `维持保证金: ${formatAmount(row.gate_maintenance_margin)}` : null,
+        row.gate_mark_price != null ? `标记价: ${formatDecimal(row.gate_mark_price)}` : null,
+        row.gate_liq_price != null ? `强平价: ${formatDecimal(row.gate_liq_price)}` : null,
+        row.gate_risk_updated_at ? `更新时间: ${row.gate_risk_updated_at}` : null,
+      ].filter(Boolean)
+      return parts.join('\n')
+    },
+  },
+  {
     headerName: '平仓基差(bps)',
     field: 'close_spread_bps',
     width: 120,
@@ -976,6 +1016,13 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     margin_topup_last_at: null,
     margin_initial: sumField('margin_initial'),
     current_margin: sumField('current_margin'),
+    gate_mark_price: null,
+    gate_liq_price: null,
+    gate_position_margin: sumField('gate_position_margin'),
+    gate_maintenance_margin: sumField('gate_maintenance_margin'),
+    gate_maintenance_margin_rate: null,
+    gate_position_size: sumField('gate_position_size'),
+    gate_risk_updated_at: null,
     liq_price: null,
     liq_distance_pct: null,
     exchange_risk_status: null,
