@@ -114,6 +114,7 @@ class ClosingExecutor:
         self.fee_future_close = config.get_float('trade.fee.future_close', 0.00075)
         self.fee_future_taker_open = config.get_float('trade.fee.future_taker_open', self.fee_future_open)
         self.fee_future_taker_close = config.get_float('trade.fee.future_taker_close', self.fee_future_close)
+        self.margin_leverage = max(config.get_float('margin.leverage', 2.0), 1.0)
         # 全部手续费 BPS（正数，用于止盈阈值累加）
         self.fee_full_bps = -calc_full_fee_bps(
             self.fee_spot_open, self.fee_spot_close,
@@ -677,7 +678,7 @@ class ClosingExecutor:
         if future_qty <= 0 or open_price <= 0 or current_price <= 0:
             return None
 
-        initial_margin = future_qty * open_price / max(config.get_float('margin.leverage', 2.0), 1.0)
+        initial_margin = future_qty * open_price / self.margin_leverage
         topup_total = float(pos.get('margin_topup_total') or 0)
         margin_before = initial_margin + topup_total
         target_margin = future_qty * current_price * self.margin_topup_target_ratio
@@ -1475,7 +1476,7 @@ class ClosingExecutor:
         insert_sql = """
             INSERT INTO mi_trade_order (
                 order_uuid, position_id, base_asset, spot_symbol, future_contract,
-                order_side, market_type, trade_direction, status, channel,
+                order_side, market_type, trade_direction, leverage, status, channel,
                 reject_reason, target_qty, target_amount,
                 exec_price, exec_qty, exec_amount, coverage_ratio,
                 open_coverage, open_vwap_basis_bps, risk_relief_bps,
@@ -1484,7 +1485,7 @@ class ClosingExecutor:
             ) VALUES (
                 %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s,
                 %(future_contract)s, %(order_side)s, %(market_type)s,
-                %(trade_direction)s, %(status)s, %(channel)s,
+                %(trade_direction)s, %(leverage)s, %(status)s, %(channel)s,
                 %(reject_reason)s, %(target_qty)s, %(target_amount)s,
                 %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
                 %(open_coverage)s, %(open_vwap_basis_bps)s, %(risk_relief_bps)s,
@@ -1497,6 +1498,7 @@ class ClosingExecutor:
             order = order_group[market_key].copy()
             order['position_id'] = position_id
             order['channel'] = self.executor_client.channel
+            order['leverage'] = self._order_leg_leverage(market_key)
             # 平仓订单无开仓风控指标，置 None
             order['open_coverage'] = None
             order['open_vwap_basis_bps'] = None
@@ -1571,8 +1573,12 @@ class ClosingExecutor:
                     'close_spread_bps':     close_spread_bps,
                     'position_id':          position_id,
                 })
-
             logger.info(
                 f"持仓状态更新为 closed | position_id={position_id} | "
                 f"close_spread_bps={close_spread_bps}"
             )
+
+    def _order_leg_leverage(self, market_key: str) -> float:
+        if market_key == 'future_order':
+            return self.margin_leverage
+        return 1.0

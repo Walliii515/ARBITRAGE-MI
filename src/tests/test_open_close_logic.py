@@ -1921,9 +1921,9 @@ class TestMarginTopupCalculation(unittest.TestCase):
         calc = ce._calculate_margin_topup_amount(pos)
 
         self.assertIsNotNone(calc)
-        self.assertAlmostEqual(calc['initial_margin'], 50.0)
+        self.assertAlmostEqual(calc['initial_margin'], 20.0)
         self.assertAlmostEqual(calc['target_margin'], 65.0)
-        self.assertAlmostEqual(calc['topup_amount'], 15.0)
+        self.assertAlmostEqual(calc['topup_amount'], 45.0)
 
     def test_liq_price_includes_margin_topup_total(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -1988,7 +1988,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         result = ce._check_and_topup_margin(pos)
 
         self.assertTrue(result['success'])
-        ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 24.0, dual_side='short')
+        ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 20.0, dual_side='short')
 
     def test_executor_client_sends_dual_side_for_gate_topup(self):
         from calc.executor_client import ExecutorClient

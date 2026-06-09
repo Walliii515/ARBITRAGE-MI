@@ -2512,14 +2512,14 @@ class TradingExecutor:
         sql = """
             INSERT INTO mi_trade_order (
                 order_uuid, position_id, base_asset, spot_symbol, future_contract, order_side, market_type,
-                trade_direction, status, channel, reject_reason, target_qty, target_amount,
+                trade_direction, leverage, status, channel, reject_reason, target_qty, target_amount,
                 exec_price, exec_qty, exec_amount, coverage_ratio,
                 open_coverage, open_vwap_basis_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps,
                 risk_relief_bps, open_marginal_basis_bps, funding_rate_24h,
                 liquidity_role, fee_rate, fee_amount, fee_amount_usdt, fee_asset, exchange_order_id, executed_at
             ) VALUES (
                 %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
-                %(order_side)s, %(market_type)s, %(trade_direction)s, %(status)s, %(channel)s,
+                %(order_side)s, %(market_type)s, %(trade_direction)s, %(leverage)s, %(status)s, %(channel)s,
                 %(reject_reason)s, %(target_qty)s, %(target_amount)s,
                 %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
                 %(open_coverage)s, %(open_vwap_basis_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s,
@@ -2548,6 +2548,7 @@ class TradingExecutor:
             # 注入渠道和持仓关联
             order['channel'] = self.executor_client.channel
             order['position_id'] = position_id
+            order['leverage'] = self._order_leg_leverage(market_key)
             
             # 更新成交信息
             if exec_result['success']:
@@ -2589,6 +2590,11 @@ class TradingExecutor:
             
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, order)
+
+    def _order_leg_leverage(self, market_key: str) -> float:
+        if market_key == 'future_order':
+            return self.capital_gate_leverage
+        return 1.0
     
     def _create_position(self, order_group: Dict, exec_result: Dict) -> int:
         """创建持仓记录，返回 position_id"""

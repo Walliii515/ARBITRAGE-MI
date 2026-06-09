@@ -24,6 +24,7 @@ interface OrderRow {
   base_asset: string | null
   market_type: string | null
   trade_direction: string | null
+  leverage: number | null
   order_side: string | null
   status: string | null
   channel: string | null
@@ -170,6 +171,12 @@ const channelFormatter = (params: ValueFormatterParams) => {
     Live: '实盘',
   }
   return map[params.value] ?? params.value ?? ''
+}
+
+function formatLeverage(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return ''
+  const n = Number(value)
+  return `${Number.isInteger(n) ? n.toFixed(0) : formatDecimal(n, 2)}x`
 }
 
 /* ───── 列定义 ───── */
@@ -771,6 +778,7 @@ onUnmounted(() => {
         </el-table-column>
         <el-table-column prop="market_type" label="市场" width="70" />
         <el-table-column prop="trade_direction" label="交易方向" width="70" />
+        <el-table-column prop="leverage" label="杠杆" width="70" align="right" :formatter="(row: OrderRow) => formatLeverage(row.leverage)" />
         <el-table-column prop="status" label="状态" width="80">
           <template #default="{ row }">
             <span :style="{ color: row.status === 'executed' ? '#67c23a' : row.status === 'rejected' || row.status === 'failed' ? '#f56c6c' : '#e6a23c' }">
