@@ -1048,6 +1048,33 @@ class RealExecutor:
             })
         return result
 
+    def fetch_gate_futures_my_trades(
+        self,
+        contract: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict]:
+        """拉取 Gate USDT 永续成交历史（只读，对账/ADL 识别使用）。"""
+        method = 'GET'
+        api_path = '/api/v4/futures/usdt/my_trades'
+        params = {'limit': min(max(int(limit or 1000), 1), 1000)}
+        if contract:
+            params['contract'] = str(contract).upper()
+        if start_time is not None:
+            params['from'] = int(start_time)
+        if end_time is not None:
+            params['to'] = int(end_time)
+        query_string = urlencode(params)
+        headers = self._gate_sign(method, api_path, query_string, '')
+        url = f"{self.config.gate_base_url}{api_path}?{query_string}"
+        resp = self._session.get(url, headers=headers, timeout=self.config.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gate my_trades HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
     def fetch_gate_futures_account(self) -> Dict:
         """拉取 Gate USDT 永续账户资金（只读，资金快照使用）。"""
         method = 'GET'

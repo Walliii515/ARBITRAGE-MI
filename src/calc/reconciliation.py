@@ -2,8 +2,8 @@
 """
 基础持仓对账。
 
-本期只读交易所真实持仓，与本地 mi_trade_position 的 holding 聚合值做差，
-并写入 mi_recon_snapshot；不告警、不修复、不触发任何交易动作。
+只读交易所真实持仓，与本地 mi_trade_position 的 holding 聚合值做差，
+写入 mi_recon_snapshot；当 Gate 侧实仓缺失/减少时，识别 ADL 并标记持仓风险。
 """
 import json
 import os
@@ -31,6 +31,8 @@ class ReconciliationConfig:
     retention_days: int = 30
     leverage: int = 2
     ignored_binance_spot_assets: Set[str] = field(default_factory=lambda: {'BNB'})
+    mark_exchange_risk: bool = True
+    adl_lookback_sec: int = 24 * 3600
 
 
 def normalize_asset_set(values) -> Set[str]:
@@ -96,6 +98,8 @@ def build_default_reconciler() -> 'Reconciler':
         retention_days=config.get_int('reconciliation.retention_days', 30),
         leverage=config.get_int('margin.leverage', 2),
         ignored_binance_spot_assets=get_ignored_binance_spot_assets(),
+        mark_exchange_risk=config.get_bool('reconciliation.mark_exchange_risk', True),
+        adl_lookback_sec=config.get_int('reconciliation.adl_lookback_sec', 24 * 3600),
     )
     return Reconciler(executor, cfg)
 
@@ -124,7 +128,10 @@ class Reconciler:
 
         try:
             gate_positions = self.executor.fetch_gate_futures_positions()
-            rows.extend(self._compare_gate(snapshot_at, local_gate, gate_positions))
+            gate_rows = self._compare_gate(snapshot_at, local_gate, gate_positions)
+            if self.cfg.mark_exchange_risk:
+                self._mark_gate_desync_risks(snapshot_at, gate_rows)
+            rows.extend(gate_rows)
         except Exception as e:
             logger.warning(f'Gate 期货对账拉取失败: {e}', exc_info=True)
             rows.append(self._error_row(snapshot_at, 'gate', e))
@@ -213,6 +220,117 @@ class Reconciler:
             )
             for asset in assets
         ]
+
+    def _mark_gate_desync_risks(self, snapshot_at: datetime, rows: List[Dict]):
+        """Gate 实仓小于本地 holding 时标记持仓；ADL 通过 Gate my_trades text 识别。"""
+        for row in rows:
+            if row.get('exchange') != 'gate' or row.get('dimension') != 'position':
+                continue
+            local_value = float(row.get('local_value') or 0)
+            exchange_value = float(row.get('exchange_value') or 0)
+            if local_value <= 0 or exchange_value + GATE_FUTURE_CONTRACT_TOLERANCE >= local_value:
+                continue
+
+            base_asset = str(row.get('base_asset') or '').upper()
+            if not base_asset:
+                continue
+
+            risk = self._detect_gate_desync_risk(base_asset, snapshot_at, local_value, exchange_value)
+            row.setdefault('detail', {})
+            row['detail']['exchange_risk'] = risk
+            updated = self._mark_positions_exchange_risk(base_asset, risk)
+            if updated:
+                logger.warning(
+                    "Gate 持仓对账发现断腿风险 | asset=%s | type=%s | local=%s | exchange=%s | marked=%s",
+                    base_asset, risk.get('type'), local_value, exchange_value, updated,
+                )
+
+    def _detect_gate_desync_risk(
+        self,
+        base_asset: str,
+        snapshot_at: datetime,
+        local_contracts: float,
+        exchange_contracts: float,
+    ) -> Dict:
+        contract = f"{base_asset}_USDT"
+        missing_contracts = max(0.0, local_contracts - exchange_contracts)
+        started_at = snapshot_at - timedelta(seconds=max(int(self.cfg.adl_lookback_sec or 0), 60))
+        adl_trades: List[Dict] = []
+        try:
+            trades = self.executor.fetch_gate_futures_my_trades(
+                contract=contract,
+                start_time=int(started_at.timestamp()),
+                end_time=int(snapshot_at.timestamp()),
+                limit=1000,
+            )
+            for trade in trades:
+                text = str(trade.get('text') or '').lower()
+                close_size = float(trade.get('close_size') or 0)
+                if 'auto_deleveraging' in text and close_size > 0:
+                    adl_trades.append(trade)
+        except Exception as e:
+            logger.warning(f"Gate ADL 成交查询失败 | {contract} | {e}", exc_info=True)
+
+        if adl_trades:
+            latest = max(adl_trades, key=lambda t: float(t.get('create_time') or 0))
+            event_at = datetime.fromtimestamp(float(latest.get('create_time') or snapshot_at.timestamp()))
+            total_close_size = sum(float(t.get('close_size') or 0) for t in adl_trades)
+            total_pnl = sum(float(t.get('pnl') or 0) for t in adl_trades)
+            detail = (
+                f"ADL自动减仓|contract={contract}|close_size={total_close_size:g}|"
+                f"missing={missing_contracts:g}|price={latest.get('price')}|pnl={total_pnl:.6f}|"
+                f"trade_id={latest.get('id')}|order_id={latest.get('order_id')}"
+            )
+            return {
+                'status': 'desynced',
+                'type': 'adl',
+                'event_at': event_at,
+                'detail': detail,
+            }
+
+        risk_type = 'missing_gate_position' if exchange_contracts <= GATE_FUTURE_CONTRACT_TOLERANCE else 'qty_mismatch'
+        return {
+            'status': 'desynced',
+            'type': risk_type,
+            'event_at': snapshot_at,
+            'detail': (
+                f"Gate实仓不匹配|contract={contract}|local={local_contracts:g}|"
+                f"exchange={exchange_contracts:g}|missing={missing_contracts:g}"
+            ),
+        }
+
+    def _mark_positions_exchange_risk(self, base_asset: str, risk: Dict) -> int:
+        sql = """
+            UPDATE mi_trade_position
+            SET exchange_risk_status = %(status)s,
+                exchange_risk_type = %(type)s,
+                exchange_risk_at = %(event_at)s,
+                exchange_risk_detail = %(detail)s,
+                close_reason = CASE
+                    WHEN close_reason IS NULL OR close_reason = '' THEN %(reason)s
+                    WHEN close_reason NOT LIKE %(reason_like)s THEN CONCAT(close_reason, '|', %(reason)s)
+                    ELSE close_reason
+                END
+            WHERE status = 'holding'
+              AND UPPER(base_asset) = %(base_asset)s
+              AND (
+                    exchange_risk_status <> %(status)s
+                 OR exchange_risk_type <> %(type)s
+                 OR exchange_risk_type IS NULL
+              )
+        """
+        reason = f"交易所仓位风险:{risk.get('type')}|{risk.get('detail')}"
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'status': risk.get('status') or 'desynced',
+                'type': risk.get('type') or 'unknown',
+                'event_at': risk.get('event_at') or datetime.now(),
+                'detail': str(risk.get('detail') or '')[:1000],
+                'reason': reason[:500],
+                'reason_like': f"%交易所仓位风险:{risk.get('type')}%",
+                'base_asset': base_asset,
+            })
+            return int(cursor.rowcount or 0)
 
     def _position_row(
         self,

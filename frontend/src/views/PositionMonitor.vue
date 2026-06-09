@@ -79,6 +79,10 @@ interface PositionRow {
   current_margin: number | null
   liq_price: number | null
   liq_distance_pct: number | null
+  exchange_risk_status: string | null
+  exchange_risk_type: string | null
+  exchange_risk_at: string | null
+  exchange_risk_detail: string | null
 }
 
 interface WsPositionMessage {
@@ -400,6 +404,25 @@ const statusCellStyle = (params: ValueFormatterParams) => {
   return { color: '#909399' }
 }
 
+const exchangeRiskFormatter = (params: ValueFormatterParams) => {
+  const row = params.data as PositionRow | undefined
+  if (!row || !row.exchange_risk_status || row.exchange_risk_status === 'normal') return ''
+  const typeMap: Record<string, string> = {
+    adl: 'ADL自动减仓',
+    missing_gate_position: 'Gate缺腿',
+    qty_mismatch: '数量不匹配',
+    unknown: '交易所风险',
+  }
+  return typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status
+}
+
+const exchangeRiskCellStyle = (params: ValueFormatterParams) => {
+  const row = params.data as PositionRow | undefined
+  if (row?.exchange_risk_status === 'desynced') return { color: '#f56c6c', fontWeight: '700' }
+  if (row?.exchange_risk_status === 'resolved') return { color: '#e6a23c', fontWeight: '400' }
+  return { color: '#909399', fontWeight: '400' }
+}
+
 const pnlCellStyle = (params: ValueFormatterParams) => {
   const value = params.value as number | null
   if (value == null) return { color: '#909399' }
@@ -440,6 +463,15 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     width: 80,
     valueFormatter: statusFormatter,
     cellStyle: statusCellStyle,
+  },
+  {
+    headerName: '交易所风险',
+    field: 'exchange_risk_type',
+    width: 130,
+    valueFormatter: exchangeRiskFormatter,
+    cellStyle: exchangeRiskCellStyle,
+    tooltipValueGetter: (params: any) => params.data?.exchange_risk_detail || null,
+    tooltipComponent: LongTextTooltip,
   },
   {
     headerName: '现货开仓VWAP',
@@ -806,6 +838,7 @@ const getRowId = (params: GetRowIdParams<PositionRow>) =>
   String(params.data?.id ?? '')
 
 const getRowClass = (params: any) => {
+  if (params.data?.exchange_risk_status === 'desynced') return 'position-row-exchange-risk'
   const count = Number(params.data?.margin_topup_count || 0)
   return count > 0 ? 'position-row-topup' : ''
 }
@@ -945,6 +978,10 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     current_margin: sumField('current_margin'),
     liq_price: null,
     liq_distance_pct: null,
+    exchange_risk_status: null,
+    exchange_risk_type: null,
+    exchange_risk_at: null,
+    exchange_risk_detail: null,
   }]
 })
 async function fetchPositions() {
@@ -1492,6 +1529,10 @@ onUnmounted(() => {
 
 .orderbook-grid :deep(.position-row-topup) {
   background-color: rgba(230, 162, 60, 0.08);
+}
+
+.orderbook-grid :deep(.position-row-exchange-risk) {
+  background-color: rgba(245, 108, 108, 0.12);
 }
 
 /* 列选择面板 */

@@ -80,6 +80,10 @@ interface PositionRow {
   future_close_amount: number | null
   close_spread_bps: number | null
   close_reason: string | null
+  exchange_risk_status: string | null
+  exchange_risk_type: string | null
+  exchange_risk_at: string | null
+  exchange_risk_detail: string | null
   // 子查询注入字段
   channel: string | null
   order_count: number | null
@@ -199,6 +203,17 @@ function formatLeverage(value: number | null | undefined): string {
   return `${Number.isInteger(n) ? n.toFixed(0) : formatDecimal(n, 2)}x`
 }
 
+function formatExchangeRisk(row: PositionRow | null | undefined): string {
+  if (!row || !row.exchange_risk_status || row.exchange_risk_status === 'normal') return ''
+  const typeMap: Record<string, string> = {
+    adl: 'ADL自动减仓',
+    missing_gate_position: 'Gate缺腿',
+    qty_mismatch: '数量不匹配',
+    unknown: '交易所风险',
+  }
+  return typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status
+}
+
 /* ───── 列定义 ───── */
 const columnDefs = computed((): ColDef[] => [
   {
@@ -234,6 +249,19 @@ const columnDefs = computed((): ColDef[] => [
     cellRenderer: (params: any) => {
       return params.value === 'closed' ? '平仓' : '开仓'
     },
+  },
+  {
+    headerName: '交易所风险',
+    field: 'exchange_risk_type',
+    width: 130,
+    valueFormatter: (params) => formatExchangeRisk(params.data as PositionRow),
+    cellStyle: (params) => {
+      const row = params.data as PositionRow | undefined
+      if (row?.exchange_risk_status === 'desynced') return { color: '#f56c6c', fontWeight: '700' }
+      return { color: '#909399', fontWeight: '400' }
+    },
+    tooltipValueGetter: (params: any) => params.data?.exchange_risk_detail || null,
+    tooltipComponent: LongTextTooltip,
   },
   {
     headerName: '渠道',

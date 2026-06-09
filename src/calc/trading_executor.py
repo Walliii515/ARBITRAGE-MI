@@ -464,6 +464,7 @@ class TradingExecutor:
         # 每轮开始时从 DB 实时刷新持仓数量计数（DB 作为单一真理源），
         # 避免依赖 5s 间隔的 margin_loop 导致计数滞后被高频检查穿透。
         self._refresh_holding_count_from_db()
+        exchange_risk_blocked_assets = self._load_exchange_risk_blocked_assets()
 
         # 启动后首次进入：一次性从 DB 加载所有标的的最近一次成功开仓时间，
         # 之后冷却检查全走内存（无外部插入订单的前提下，单一写入路径在 check_and_open 自身）。
@@ -472,6 +473,13 @@ class TradingExecutor:
         for row in orderbook_rows:
             try:
                 base_asset = row.get('base_asset', '')
+
+                if str(base_asset or '').upper() in exchange_risk_blocked_assets:
+                    reason = '交易所仓位风险(desynced)暂停开仓'
+                    self._resolve_signal(base_asset, 'conditions_lost', reason)
+                    self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
+                    continue
                 
                 # 0. 数据完整性检查：缺少有效盘口数据时跳过
                 if row.get('spot_qty') is None or row.get('open_vwap_basis_bps') is None:
@@ -684,6 +692,27 @@ class TradingExecutor:
                 })
         
         return results
+
+    def _load_exchange_risk_blocked_assets(self) -> Set[str]:
+        """仍处于交易所断腿风险的资产禁止新增开仓。"""
+        sql = """
+            SELECT DISTINCT UPPER(base_asset) AS base_asset
+            FROM mi_trade_position
+            WHERE status = 'holding'
+              AND exchange_risk_status = 'desynced'
+        """
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql)
+                return {
+                    str(row.get('base_asset') or '').upper()
+                    for row in cursor.fetchall()
+                    if row.get('base_asset')
+                }
+        except Exception as e:
+            # 兼容尚未执行迁移的环境；迁移部署后会自动生效。
+            logger.warning(f"读取交易所风险资产失败，跳过开仓风险资产过滤: {e}")
+            return set()
 
     def _annotate_resiliency_row(self, row: Dict) -> None:
         """Attach per-asset contract multiplier for shared depth calculations."""
