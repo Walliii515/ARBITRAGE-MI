@@ -23,6 +23,7 @@ from calc.reconciliation import build_default_reconciler, get_ignored_binance_sp
 from calc.account_capital import build_default_capital_snapshotter
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
+from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 
 logger = get_logger(__name__)
 
@@ -69,9 +70,30 @@ def _format_meta_dt(value) -> str | None:
     return str(value) if value else None
 
 
-def _inject_current_funding_fields(rows: List[Dict[str, Any]]) -> None:
+def _position_pnl_config() -> PnlConfig:
+    return PnlConfig(
+        open_amount_usdt=config.get_float('trade.open.amount_usdt', 10.0),
+        spot_open_fee=config.get_float('trade.fee.spot_open', 0.00075),
+        spot_close_fee=config.get_float('trade.fee.spot_close', 0.00075),
+        future_open_fee=config.get_float('trade.fee.future_open', 0.00075),
+        future_close_fee=config.get_float('trade.fee.future_close', 0.00075),
+        future_taker_open_fee=config.get_float(
+            'trade.fee.future_taker_open',
+            config.get_float('trade.fee.future_open', 0.00075),
+        ),
+        future_taker_close_fee=config.get_float(
+            'trade.fee.future_taker_close',
+            config.get_float('trade.fee.future_close', 0.00075),
+        ),
+        risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
+        margin_leverage=config.get_float('margin.leverage', 2.0),
+        margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
+    )
+
+
+def _inject_current_funding_fields(rows: List[Dict[str, Any]], contract_meta: Optional[Dict[str, Dict]] = None) -> None:
     """持仓列表展示实时合约 funding 元数据，不使用开仓时快照。"""
-    contract_meta = fetch_contract_meta()
+    contract_meta = contract_meta if contract_meta is not None else fetch_contract_meta()
     for row in rows:
         base_asset = row.get('base_asset')
         meta = contract_meta.get(base_asset or '', {})
@@ -354,8 +376,10 @@ async def get_positions(
                 attach_gate_position_risk(rows, gate_positions)
             except Exception as e:
                 logger.warning(f'Gate维持保证金率拉取失败: {e}')
+        contract_meta = fetch_contract_meta()
+        calculate_realtime_pnl(rows, {}, contract_meta, _position_pnl_config())
         serialized = _serialize_rows(rows)
-        _inject_current_funding_fields(serialized)
+        _inject_current_funding_fields(serialized, contract_meta)
         for row in serialized:
             row['funding_history'] = histories.get(row.get('id'), [])
         

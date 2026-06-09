@@ -56,6 +56,8 @@ interface PositionRow {
   floating_pnl_total: number | null
   floating_pnl_bps: number | null
   fee_bps: number | null
+  fee_source: string | null
+  fee_estimated: boolean | null
   risk_relief_bps: number | null
   funding_pnl_bps: number | null
   funding_rate: number | null
@@ -568,6 +570,13 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     headerClass: 'ag-right-aligned-header',
     valueFormatter: bpsFormatter,
     cellStyle: feeBpsCellStyle,
+    tooltipValueGetter: (params: any) => {
+      const source = params.data?.fee_source
+      if (source === 'actual') return '真实手续费'
+      if (source === 'mixed_estimated') return '部分真实，部分按成交额估算'
+      if (source === 'estimated') return '按成交额和费率估算'
+      return ''
+    },
   },
   {
     headerName: '风险缓释(bps)',
@@ -995,6 +1004,8 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     floating_pnl_bps: sumField('floating_pnl_bps'),
     floating_pnl_total: floatingPnlTotal,
     fee_bps: sumField('fee_bps'),
+    fee_source: null,
+    fee_estimated: null,
     fee_cost: sumField('fee_cost'),
     risk_relief_bps: null,
     funding_pnl_bps: sumField('funding_pnl_bps'),
@@ -1355,7 +1366,6 @@ onUnmounted(() => {
         <el-button
           size="small"
           type="primary"
-          style="margin-left: auto;"
           :loading="loading"
           @click="fetchPositions"
         >

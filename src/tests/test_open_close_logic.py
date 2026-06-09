@@ -492,6 +492,219 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(result['execution_stats']['future_maker']['fallback_filled'], True)
         executor._place_binance_spot_order.assert_called_once()
 
+    def test_future_maker_spot_ioc_failure_retries_market_hedge(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.486,
+            'exec_qty': 21.0,
+            'exec_amount': 10.21,
+            'coverage_ratio': 0,
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': True,
+                    'fill_ratio': 1,
+                    'wait_ms': 300,
+                    'ttl_ms': 1000,
+                }
+            },
+        })
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {'success': False, 'reason': '保护IOC未成交(fill=0,status=EXPIRED)'},
+            {
+                'success': True,
+                'exec_price': 0.485,
+                'exec_qty': 21.0,
+                'exec_amount': 10.18,
+                'coverage_ratio': 0,
+            },
+        ])
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor._place_binance_spot_order.call_count, 2)
+        retry_order = executor._place_binance_spot_order.call_args_list[1].args[0]
+        self.assertNotIn('protective_price', retry_order)
+        self.assertEqual(retry_order['quantity_mode'], 'base')
+        maker = result['execution_stats']['future_maker']
+        self.assertTrue(maker['spot_retry_market_attempted'])
+        self.assertTrue(maker['spot_retry_market_filled'])
+        self.assertEqual(maker['spot_retry_market_price'], 0.485)
+        self.assertFalse(maker.get('future_unwind_attempted', False))
+
+    def test_future_maker_spot_partial_ioc_retries_shortfall_and_merges(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.486,
+            'exec_qty': 21.0,
+            'exec_amount': 10.21,
+            'coverage_ratio': 0,
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': True,
+                    'fill_ratio': 1,
+                    'wait_ms': 300,
+                    'ttl_ms': 1000,
+                }
+            },
+        })
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {
+                'success': True,
+                'exec_price': 0.485,
+                'exec_qty': 10.0,
+                'exec_amount': 4.85,
+                'coverage_ratio': 0,
+                'exchange_order_id': 'spot-a',
+            },
+            {
+                'success': True,
+                'exec_price': 0.487,
+                'exec_qty': 11.0,
+                'exec_amount': 5.357,
+                'coverage_ratio': 0,
+                'exchange_order_id': 'spot-b',
+            },
+        ])
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor._place_binance_spot_order.call_count, 2)
+        retry_order = executor._place_binance_spot_order.call_args_list[1].args[0]
+        self.assertEqual(retry_order['target_qty'], 11.0)
+        self.assertAlmostEqual(result['spot_order']['exec_qty'], 21.0)
+        self.assertEqual(result['spot_order']['exchange_order_id'], 'spot-a,spot-b')
+        maker = result['execution_stats']['future_maker']
+        self.assertEqual(maker['spot_partial_qty'], 10.0)
+        self.assertEqual(maker['spot_shortfall_qty'], 11.0)
+        self.assertTrue(maker['spot_retry_market_filled'])
+
+    def test_future_maker_spot_retry_failure_unwinds_future_leg(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(side_effect=[
+            {
+                'success': True,
+                'exec_price': 0.486,
+                'exec_qty': 21.0,
+                'exec_amount': 10.21,
+                'coverage_ratio': 0,
+                'execution_stats': {
+                    'future_maker': {
+                        'attempted': True,
+                        'filled': True,
+                        'fill_ratio': 1,
+                        'wait_ms': 300,
+                        'ttl_ms': 1000,
+                    }
+                },
+            },
+            {
+                'success': True,
+                'exec_price': 0.484,
+                'exec_qty': 21.0,
+                'exec_amount': 10.16,
+                'coverage_ratio': 0,
+            },
+        ])
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {'success': False, 'reason': '保护IOC未成交(fill=0,status=EXPIRED)'},
+            {'success': False, 'reason': 'Binance 余额不足'},
+        ])
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'order_side': 'open',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+            'future_order': {
+                'order_uuid': 'abc',
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_spot_hedge_protective_ioc_enabled': True,
+                'maker_spot_hedge_min_basis_bps': 20.0,
+                'target_qty': 21,
+                'target_amount': 10,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIn('future已自动撤腿', result['message'])
+        self.assertEqual(executor._place_gate_futures_order.call_count, 2)
+        unwind_order = executor._place_gate_futures_order.call_args_list[1].args[0]
+        self.assertEqual(unwind_order['trade_direction'], 'buy')
+        self.assertEqual(unwind_order['order_side'], 'close')
+        self.assertEqual(unwind_order['target_qty'], 21.0)
+        self.assertNotIn('execution_style', unwind_order)
+        maker = result['execution_stats']['future_maker']
+        self.assertTrue(maker['future_unwind_attempted'])
+        self.assertTrue(maker['future_unwind_filled'])
+
     def test_future_maker_fallback_ioc_zero_fill_is_normal_no_fill_reason(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
@@ -2121,6 +2334,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0]['fee_bps'], -12.5)
         self.assertAlmostEqual(positions[0]['fee_cost'], -0.125)
+        self.assertEqual(positions[0]['fee_source'], 'estimated')
 
     def test_holding_fee_uses_future_maker_when_maker_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -2159,6 +2373,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0]['fee_bps'], -9.5)
         self.assertAlmostEqual(positions[0]['fee_cost'], -0.095)
+        self.assertEqual(positions[0]['fee_source'], 'estimated')
 
     def test_holding_fee_prefers_actual_spot_and_future_usdt_amounts(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -2199,6 +2414,77 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0]['fee_bps'], -12.3)
         self.assertAlmostEqual(positions[0]['fee_cost'], -0.0123)
+        self.assertEqual(positions[0]['fee_source'], 'actual')
+
+    def test_holding_fee_estimates_missing_leg_from_order_exec_amount(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'HMSTR',
+            'spot_open_price': 100.0,
+            'spot_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'future_open_qty': 1.0,
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0,
+            'margin_topup_total': 0.0,
+            'spot_open_fee_amount_usdt': 0.0074,
+            'future_open_fee_estimated_usdt': 0.005015,
+            'future_open_fee_estimated_count': 1,
+            'future_open_fee_rate': 0.0005,
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=10.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            future_taker_open_fee=0.0005,
+            future_taker_close_fee=0.0005,
+            risk_relief_bps=0,
+            margin_leverage=2.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(
+            positions,
+            {'HMSTR': {'spot_close_vwap': 100.0, 'future_close_vwap': 100.0}},
+            {'HMSTR': {}},
+            cfg,
+        )
+
+        self.assertAlmostEqual(positions[0]['fee_bps'], -12.41)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.0124)
+        self.assertEqual(positions[0]['fee_source'], 'mixed_estimated')
+
+    def test_holding_fee_present_without_close_vwap(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'HMSTR',
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0.001,
+            'future_open_fee_rate': 0.0005,
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=10.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            risk_relief_bps=0,
+            margin_leverage=2.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(positions, {}, {'HMSTR': {}}, cfg)
+
+        self.assertAlmostEqual(positions[0]['fee_bps'], -12.5)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.0125)
+        self.assertAlmostEqual(positions[0]['funding_pnl_bps'], 1.0)
+        self.assertIsNone(positions[0]['total_pnl'])
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -211,6 +211,52 @@ class RealExecutor:
         if spot_result.get('success'):
             maker_stats['spot_exec_price'] = spot_result.get('exec_price')
             maker_stats['spot_protective_ioc_filled'] = bool(hedge_order.get('protective_price'))
+            shortfall_qty = self._spot_hedge_shortfall(hedge_order, spot_result)
+            if shortfall_qty > 0:
+                maker_stats['spot_partial_qty'] = spot_result.get('exec_qty')
+                maker_stats['spot_shortfall_qty'] = shortfall_qty
+                recovery_order = dict(hedge_order)
+                recovery_order['target_qty'] = shortfall_qty
+                recovery_order['target_amount'] = (
+                    float(future_result.get('exec_price') or 0) * shortfall_qty
+                )
+                recovery_result = self._recover_failed_spot_hedge(
+                    base_asset=base_asset,
+                    order_side=order_side,
+                    hedge_order=recovery_order,
+                    future_order=future_order,
+                    future_result=future_result,
+                    failed_spot_result={
+                        'reason': (
+                            f"spot保护IOC部分成交("
+                            f"filled={spot_result.get('exec_qty')},target={hedge_order.get('target_qty')})"
+                        )
+                    },
+                    maker_stats=maker_stats,
+                    allow_future_unwind=False,
+                )
+                if recovery_result.get('success'):
+                    spot_result = self._merge_spot_hedge_results(spot_result, recovery_result)
+                    maker_stats['spot_exec_price'] = spot_result.get('exec_price')
+                else:
+                    self._neutralize_partial_spot_and_future(
+                        spot_order=hedge_order,
+                        spot_result=spot_result,
+                        future_order=future_order,
+                        future_result=future_result,
+                        maker_stats=maker_stats,
+                    )
+                    spot_result = recovery_result
+        elif future_result.get('success'):
+            spot_result = self._recover_failed_spot_hedge(
+                base_asset=base_asset,
+                order_side=order_side,
+                hedge_order=hedge_order,
+                future_order=future_order,
+                future_result=future_result,
+                failed_spot_result=spot_result,
+                maker_stats=maker_stats,
+            )
 
         if spot_result.get('success'):
             future_style = (
@@ -233,20 +279,212 @@ class RealExecutor:
                 f"future: price={future_result['exec_price']}, qty={future_result['exec_qty']}"
             )
         else:
+            unwind_result = maker_stats.get('future_unwind_result') or {}
+            spot_unwind_safe = (
+                not maker_stats.get('spot_unwind_attempted')
+                or maker_stats.get('spot_unwind_filled')
+            )
+            if maker_stats.get('future_unwind_filled') and spot_unwind_safe:
+                result.update({
+                    'future_order': future_result,
+                    'message': (
+                        f"现货对冲失败，future已自动撤腿: {spot_result.get('reason')} | "
+                        f"future_exec: price={future_result.get('exec_price')}, "
+                        f"qty={future_result.get('exec_qty')} | "
+                        f"unwind: price={unwind_result.get('exec_price')}, "
+                        f"qty={unwind_result.get('exec_qty')}"
+                    ),
+                    'execution_stats': stats,
+                })
+                logger.error(
+                    f"future maker 成交后 spot 对冲失败，已自动撤腿 | {base_asset} | "
+                    f"spot_reason={spot_result.get('reason')} | unwind={unwind_result}"
+                )
+                return result
             result.update({
                 'future_order': future_result,
                 'message': (
-                    f"现货拒单(期货maker已成交,需人工处理): {spot_result.get('reason')} | "
+                    f"现货拒单(期货maker已成交,自动补救失败需人工处理): {spot_result.get('reason')} | "
                     f"future_exec: price={future_result.get('exec_price')}, "
-                    f"qty={future_result.get('exec_qty')}"
+                    f"qty={future_result.get('exec_qty')} | "
+                    f"unwind_reason={unwind_result.get('reason')}"
                 ),
                 'execution_stats': stats,
             })
             logger.critical(
                 f"⚠️ 单边成交风险 | {base_asset} | "
-                f"期货maker已成交但现货失败: {spot_result.get('reason')}"
+                f"期货maker已成交但现货对冲和future撤腿均失败: "
+                f"spot={spot_result.get('reason')} | unwind={unwind_result.get('reason')}"
             )
         return result
+
+    def _recover_failed_spot_hedge(
+        self,
+        base_asset: str,
+        order_side: str,
+        hedge_order: Dict,
+        future_order: Dict,
+        future_result: Dict,
+        failed_spot_result: Dict,
+        maker_stats: Dict,
+        allow_future_unwind: bool = True,
+    ) -> Dict:
+        """
+        Future maker 已成交后，spot 保护 IOC 若未成交，必须立即补救。
+
+        顺序：
+        1. 去掉保护价，用 Binance spot 市价单按已成交 base 数量强制补对冲。
+        2. 若 spot 仍失败，立刻反向下 Gate futures IOC，把刚成交的 future 腿撤回。
+        """
+        original_reason = failed_spot_result.get('reason')
+        market_hedge_order = dict(hedge_order)
+        market_hedge_order.pop('protective_price', None)
+        market_hedge_order.pop('order_type', None)
+        market_hedge_order['quantity_mode'] = 'base'
+        maker_stats['spot_retry_market_attempted'] = True
+
+        retry_result = self._place_binance_spot_order(market_hedge_order)
+        maker_stats['spot_retry_market_filled'] = bool(retry_result.get('success'))
+        maker_stats['spot_retry_market_price'] = retry_result.get('exec_price')
+        maker_stats['spot_retry_market_reason'] = retry_result.get('reason')
+        if retry_result.get('success'):
+            maker_stats['spot_exec_price'] = retry_result.get('exec_price')
+            maker_stats['spot_hedge_recovered'] = True
+            logger.warning(
+                f"future maker 成交后 spot保护IOC失败，已用spot市价补对冲 | {base_asset} | "
+                f"side={order_side} | price={retry_result.get('exec_price')} | "
+                f"qty={retry_result.get('exec_qty')}"
+            )
+            return retry_result
+
+        if not allow_future_unwind:
+            retry_result['reason'] = (
+                f"{original_reason or retry_result.get('reason')}; "
+                f"spot市价补对冲失败: {retry_result.get('reason')}"
+            )
+            return retry_result
+
+        unwind_result = self._unwind_filled_future_leg(
+            future_order=future_order,
+            future_result=future_result,
+        )
+        maker_stats['future_unwind_attempted'] = True
+        maker_stats['future_unwind_filled'] = bool(unwind_result.get('success'))
+        maker_stats['future_unwind_price'] = unwind_result.get('exec_price')
+        maker_stats['future_unwind_qty'] = unwind_result.get('exec_qty')
+        maker_stats['future_unwind_reason'] = unwind_result.get('reason')
+        maker_stats['future_unwind_result'] = unwind_result
+        logger.error(
+            f"future maker 成交后 spot市价补对冲失败，尝试future撤腿 | {base_asset} | "
+            f"spot_reason={retry_result.get('reason')} | unwind={unwind_result}"
+        )
+        retry_result['reason'] = (
+            f"{original_reason or retry_result.get('reason')}; "
+            f"spot市价补对冲失败: {retry_result.get('reason')}"
+        )
+        return retry_result
+
+    def _neutralize_partial_spot_and_future(
+        self,
+        spot_order: Dict,
+        spot_result: Dict,
+        future_order: Dict,
+        future_result: Dict,
+        maker_stats: Dict,
+    ) -> None:
+        """spot 部分成交但剩余补不上时，撤回本轮已经成交的 spot 和 future。"""
+        spot_unwind_result = self._unwind_spot_leg(spot_order, spot_result)
+        maker_stats['spot_unwind_attempted'] = True
+        maker_stats['spot_unwind_filled'] = bool(spot_unwind_result.get('success'))
+        maker_stats['spot_unwind_price'] = spot_unwind_result.get('exec_price')
+        maker_stats['spot_unwind_qty'] = spot_unwind_result.get('exec_qty')
+        maker_stats['spot_unwind_reason'] = spot_unwind_result.get('reason')
+        maker_stats['spot_unwind_result'] = spot_unwind_result
+
+        unwind_result = self._unwind_filled_future_leg(
+            future_order=future_order,
+            future_result=future_result,
+        )
+        maker_stats['future_unwind_attempted'] = True
+        maker_stats['future_unwind_filled'] = bool(unwind_result.get('success'))
+        maker_stats['future_unwind_price'] = unwind_result.get('exec_price')
+        maker_stats['future_unwind_qty'] = unwind_result.get('exec_qty')
+        maker_stats['future_unwind_reason'] = unwind_result.get('reason')
+        maker_stats['future_unwind_result'] = unwind_result
+
+    def _unwind_spot_leg(self, spot_order: Dict, spot_result: Dict) -> Dict:
+        exec_qty = float(spot_result.get('exec_qty') or 0)
+        if exec_qty <= 0:
+            return {'success': True, 'reason': 'spot无成交无需撤腿'}
+        original_direction = spot_order.get('trade_direction')
+        reverse_order = dict(spot_order)
+        reverse_order.pop('protective_price', None)
+        reverse_order.pop('order_type', None)
+        reverse_order['trade_direction'] = 'sell' if original_direction == 'buy' else 'buy'
+        reverse_order['quantity_mode'] = 'base'
+        reverse_order['target_qty'] = exec_qty
+        reverse_order['target_amount'] = spot_result.get('exec_amount')
+        return self._place_binance_spot_order(reverse_order)
+
+    def _spot_hedge_shortfall(self, hedge_order: Dict, spot_result: Dict) -> float:
+        target_qty = float(hedge_order.get('target_qty') or 0)
+        exec_qty = float(spot_result.get('exec_qty') or 0)
+        shortfall = target_qty - exec_qty
+        if shortfall <= 0:
+            return 0.0
+        tolerance = self._spot_hedge_qty_tolerance(hedge_order.get('base_asset'), target_qty)
+        return shortfall if shortfall > tolerance else 0.0
+
+    def _spot_hedge_qty_tolerance(self, base_asset: str, target_qty: float) -> float:
+        step_size = float((self.spot_meta.get(base_asset) or {}).get('step_size') or 0)
+        # BUY 手续费可能从 base 扣除；给 0.2% 容忍，避免为了手续费尘埃反复补单。
+        return max(step_size, abs(float(target_qty or 0)) * 0.002, 1e-12)
+
+    @staticmethod
+    def _merge_spot_hedge_results(first: Dict, second: Dict) -> Dict:
+        qty1 = float(first.get('exec_qty') or 0)
+        qty2 = float(second.get('exec_qty') or 0)
+        amount1 = float(first.get('exec_amount') or 0)
+        amount2 = float(second.get('exec_amount') or 0)
+        total_qty = qty1 + qty2
+        total_amount = amount1 + amount2
+        merged = dict(second)
+        merged['success'] = True
+        merged['exec_qty'] = total_qty
+        merged['exec_amount'] = total_amount
+        merged['exec_price'] = total_amount / total_qty if total_qty > 0 else 0
+        ids = [str(v) for v in (first.get('exchange_order_id'), second.get('exchange_order_id')) if v]
+        if ids:
+            merged['exchange_order_id'] = ','.join(ids)
+        fee1 = first.get('fee_amount_usdt')
+        fee2 = second.get('fee_amount_usdt')
+        if fee1 is not None and fee2 is not None:
+            merged['fee_amount_usdt'] = float(fee1) + float(fee2)
+        return merged
+
+    def _unwind_filled_future_leg(self, future_order: Dict, future_result: Dict) -> Dict:
+        """反向 IOC 撤回已成交的 future 腿，避免留下裸仓。"""
+        exec_qty = float(future_result.get('exec_qty') or 0)
+        if exec_qty <= 0:
+            return {'success': False, 'reason': 'future撤腿数量无效'}
+
+        original_direction = future_order.get('trade_direction')
+        reverse_direction = 'buy' if original_direction == 'sell' else 'sell'
+        original_order_side = future_order.get('order_side')
+        reverse_order_side = 'close' if original_order_side == 'open' else 'open'
+
+        unwind_order = {
+            key: value
+            for key, value in future_order.items()
+            if not str(key).startswith('maker_')
+        }
+        unwind_order.pop('execution_style', None)
+        unwind_order.pop('protective_price', None)
+        unwind_order['trade_direction'] = reverse_direction
+        unwind_order['order_side'] = reverse_order_side
+        unwind_order['target_qty'] = exec_qty
+        unwind_order['target_amount'] = future_result.get('exec_amount')
+        return self._place_gate_futures_order(unwind_order)
 
     def _apply_spot_hedge_protection(
         self,
