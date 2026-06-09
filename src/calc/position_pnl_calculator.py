@@ -77,38 +77,75 @@ def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
     return future_open_fee, future_close_fee
 
 
-def _leg_fee_cost(actual_fee_amount: Optional[float], estimated_fee_rate: float, open_amount_usdt: float) -> float:
-    if actual_fee_amount is not None:
-        return float(actual_fee_amount)
+def _leg_fee_cost(
+    actual_fee_amount: Optional[float],
+    estimated_fee_amount: Optional[float],
+    estimated_fee_rate: float,
+    open_amount_usdt: float,
+) -> float:
+    actual_amount = float(actual_fee_amount) if actual_fee_amount is not None else None
+    estimated_amount = float(estimated_fee_amount) if estimated_fee_amount is not None else None
+    if actual_amount is not None and estimated_amount is not None:
+        return actual_amount + estimated_amount
+    if actual_amount is not None:
+        return actual_amount
+    if estimated_amount is not None:
+        return estimated_amount
     return float(estimated_fee_rate or 0.0) * open_amount_usdt
 
 
 def _fee_cost_from_actual_or_rate(
     actual_spot_fee_amount: Optional[float],
     actual_future_fee_amount: Optional[float],
+    estimated_spot_fee_amount: Optional[float],
+    estimated_future_fee_amount: Optional[float],
     estimated_spot_fee: float,
     estimated_future_fee: float,
     open_amount_usdt: float,
 ) -> Tuple[float, float]:
     total_fee_amount = _leg_fee_cost(
-        actual_spot_fee_amount, estimated_spot_fee, open_amount_usdt
+        actual_spot_fee_amount, estimated_spot_fee_amount, estimated_spot_fee, open_amount_usdt
     ) + _leg_fee_cost(
-        actual_future_fee_amount, estimated_future_fee, open_amount_usdt
+        actual_future_fee_amount, estimated_future_fee_amount, estimated_future_fee, open_amount_usdt
     )
     fee_bps = round(-total_fee_amount / open_amount_usdt * 10000, 2) if open_amount_usdt else 0.0
     fee_cost = round(-total_fee_amount, 4)
     return fee_bps, fee_cost
 
 
-def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float, float, float]:
+def _fee_source_for_leg(pos: Dict, prefix: str) -> str:
+    has_actual = _float_or_none(pos.get(f'{prefix}_fee_amount_usdt')) is not None
+    has_estimated = _float_or_none(pos.get(f'{prefix}_fee_estimated_usdt')) is not None
+    if has_actual and has_estimated:
+        return 'mixed_estimated'
+    if has_actual:
+        return 'actual'
+    return 'estimated'
+
+
+def _combine_fee_sources(sources: List[str]) -> str:
+    if sources and all(source == 'actual' for source in sources):
+        return 'actual'
+    if any(source == 'actual' for source in sources):
+        return 'mixed_estimated'
+    return 'estimated'
+
+
+def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float, float, float, str, str]:
     future_open_fee, future_close_fee = _position_fee_rates(pos, cfg)
     spot_open_actual = _float_or_none(pos.get('spot_open_fee_amount_usdt'))
     future_open_actual = _float_or_none(pos.get('future_open_fee_amount_usdt'))
     spot_close_actual = _float_or_none(pos.get('spot_close_fee_amount_usdt'))
     future_close_actual = _float_or_none(pos.get('future_close_fee_amount_usdt'))
+    spot_open_estimated = _float_or_none(pos.get('spot_open_fee_estimated_usdt'))
+    future_open_estimated = _float_or_none(pos.get('future_open_fee_estimated_usdt'))
+    spot_close_estimated = _float_or_none(pos.get('spot_close_fee_estimated_usdt'))
+    future_close_estimated = _float_or_none(pos.get('future_close_fee_estimated_usdt'))
     open_fee_bps, open_fee_cost = _fee_cost_from_actual_or_rate(
         spot_open_actual,
         future_open_actual,
+        spot_open_estimated,
+        future_open_estimated,
         cfg.spot_open_fee,
         future_open_fee,
         cfg.open_amount_usdt,
@@ -116,11 +153,30 @@ def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float,
     close_fee_bps, close_fee_cost = _fee_cost_from_actual_or_rate(
         spot_close_actual,
         future_close_actual,
+        spot_close_estimated,
+        future_close_estimated,
         cfg.spot_close_fee,
         future_close_fee,
         cfg.open_amount_usdt,
     )
-    return open_fee_bps, open_fee_cost, round(open_fee_bps + close_fee_bps, 2), round(open_fee_cost + close_fee_cost, 4)
+    open_source = _combine_fee_sources([
+        _fee_source_for_leg(pos, 'spot_open'),
+        _fee_source_for_leg(pos, 'future_open'),
+    ])
+    full_source = _combine_fee_sources([
+        _fee_source_for_leg(pos, 'spot_open'),
+        _fee_source_for_leg(pos, 'future_open'),
+        _fee_source_for_leg(pos, 'spot_close'),
+        _fee_source_for_leg(pos, 'future_close'),
+    ])
+    return (
+        open_fee_bps,
+        open_fee_cost,
+        round(open_fee_bps + close_fee_bps, 2),
+        round(open_fee_cost + close_fee_cost, 4),
+        open_source,
+        full_source,
+    )
 
 
 def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
@@ -146,11 +202,23 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
 
         # 注入费率 (bps) - 根据状态区分：持仓中只显示开仓费，已平仓显示全部费
         c_meta = contract_meta.get(ba, {})
-        fee_bps_open, fee_cost_open, fee_bps_full, fee_cost_full = _position_fee_bps_and_cost(pos, cfg)
+        (
+            fee_bps_open,
+            fee_cost_open,
+            fee_bps_full,
+            fee_cost_full,
+            fee_source_open,
+            fee_source_full,
+        ) = _position_fee_bps_and_cost(pos, cfg)
         if pos.get('status') == 'closed':
             pos['fee_bps'] = fee_bps_full
+            pos['fee_cost'] = fee_cost_full
+            pos['fee_source'] = fee_source_full
         else:
             pos['fee_bps'] = fee_bps_open
+            pos['fee_cost'] = fee_cost_open
+            pos['fee_source'] = fee_source_open
+        pos['fee_estimated'] = pos['fee_source'] != 'actual'
 
         # 注入风险缓释 (bps)
         pos['risk_relief_bps'] = cfg.risk_relief_bps
@@ -166,6 +234,11 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         pos['funding_last_apply'] = _format_dt(c_meta.get('funding_last_apply'))
         pos['funding_next_apply'] = _format_dt(c_meta.get('funding_next_apply'))
 
+        funding_pnl, funding_pnl_bps = _calc_funding_bps(
+            pos.get('funding_total_pnl'), cfg.open_amount_usdt
+        )
+        pos['funding_pnl_bps'] = funding_pnl_bps
+
         # ── 已平仓分支：浮动盈亏归零，用实际平仓VWAP锁定已实现盈亏 ──
         if pos.get('status') == 'closed':
             pos['floating_pnl_total'] = 0
@@ -180,12 +253,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['current_spread_bps'] = (
                 float(pos['close_spread_bps']) if pos.get('close_spread_bps') else None
             )
-
-            # 资金费收益
-            funding_pnl, funding_pnl_bps = _calc_funding_bps(
-                pos.get('funding_total_pnl'), cfg.open_amount_usdt
-            )
-            pos['funding_pnl_bps'] = funding_pnl_bps
 
             # 手续费金额 - 已平仓用全部手续费
             fee_cost_usdt = fee_cost_full
@@ -232,12 +299,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             floating_future = (future_open_price - current_future) * future_qty
             pos['floating_pnl_total'] = round(floating_spot + floating_future, 4)
 
-            # 资金费收益
-            funding_pnl, funding_pnl_bps = _calc_funding_bps(
-                pos.get('funding_total_pnl'), cfg.open_amount_usdt
-            )
-            pos['funding_pnl_bps'] = funding_pnl_bps
-
             # 手续费金额 - 持仓中只计开仓手续费
             fee_cost_usdt = fee_cost_open
             pos['fee_cost'] = fee_cost_usdt
@@ -274,8 +335,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['current_spread_bps'] = None
             pos['floating_pnl_total'] = None
             pos['floating_pnl_bps'] = None
-            pos['funding_pnl_bps'] = None
-            pos['fee_cost'] = None
             pos['realized_pnl_bps'] = None
             pos['realized_pnl'] = None
             pos['total_pnl_bps'] = None

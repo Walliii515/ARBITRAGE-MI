@@ -34,17 +34,57 @@ def fetch_position_order_fee_summary(position_ids: List[int]) -> Dict[int, Dict]
                 ELSE NULL
             END) AS spot_open_fee_amount_usdt,
             SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'spot' AND fee_amount_usdt IS NULL
+                    THEN COALESCE(exec_amount, target_amount, 0) * COALESCE(fee_rate, 0)
+                ELSE NULL
+            END) AS spot_open_fee_estimated_usdt,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'spot' AND fee_amount_usdt IS NULL
+                    THEN 1
+                ELSE 0
+            END) AS spot_open_fee_estimated_count,
+            SUM(CASE
                 WHEN order_side = 'open' AND market_type = 'future' THEN fee_amount_usdt
                 ELSE NULL
             END) AS future_open_fee_amount_usdt,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'future' AND fee_amount_usdt IS NULL
+                    THEN COALESCE(exec_amount, target_amount, 0) * COALESCE(fee_rate, 0)
+                ELSE NULL
+            END) AS future_open_fee_estimated_usdt,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'future' AND fee_amount_usdt IS NULL
+                    THEN 1
+                ELSE 0
+            END) AS future_open_fee_estimated_count,
             SUM(CASE
                 WHEN order_side = 'close' AND market_type = 'spot' THEN fee_amount_usdt
                 ELSE NULL
             END) AS spot_close_fee_amount_usdt,
             SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'spot' AND fee_amount_usdt IS NULL
+                    THEN COALESCE(exec_amount, target_amount, 0) * COALESCE(fee_rate, 0)
+                ELSE NULL
+            END) AS spot_close_fee_estimated_usdt,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'spot' AND fee_amount_usdt IS NULL
+                    THEN 1
+                ELSE 0
+            END) AS spot_close_fee_estimated_count,
+            SUM(CASE
                 WHEN order_side = 'close' AND market_type = 'future' THEN fee_amount_usdt
                 ELSE NULL
-            END) AS future_close_fee_amount_usdt
+            END) AS future_close_fee_amount_usdt,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'future' AND fee_amount_usdt IS NULL
+                    THEN COALESCE(exec_amount, target_amount, 0) * COALESCE(fee_rate, 0)
+                ELSE NULL
+            END) AS future_close_fee_estimated_usdt,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'future' AND fee_amount_usdt IS NULL
+                    THEN 1
+                ELSE 0
+            END) AS future_close_fee_estimated_count
         FROM mi_trade_order
         WHERE position_id IN ({placeholders})
           AND status = 'executed'

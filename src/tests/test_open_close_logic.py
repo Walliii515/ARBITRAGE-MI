@@ -2334,6 +2334,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0]['fee_bps'], -12.5)
         self.assertAlmostEqual(positions[0]['fee_cost'], -0.125)
+        self.assertEqual(positions[0]['fee_source'], 'estimated')
 
     def test_holding_fee_uses_future_maker_when_maker_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -2372,6 +2373,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0]['fee_bps'], -9.5)
         self.assertAlmostEqual(positions[0]['fee_cost'], -0.095)
+        self.assertEqual(positions[0]['fee_source'], 'estimated')
 
     def test_holding_fee_prefers_actual_spot_and_future_usdt_amounts(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -2412,6 +2414,77 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0]['fee_bps'], -12.3)
         self.assertAlmostEqual(positions[0]['fee_cost'], -0.0123)
+        self.assertEqual(positions[0]['fee_source'], 'actual')
+
+    def test_holding_fee_estimates_missing_leg_from_order_exec_amount(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'HMSTR',
+            'spot_open_price': 100.0,
+            'spot_open_qty': 1.0,
+            'future_open_price': 100.0,
+            'future_open_qty': 1.0,
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0,
+            'margin_topup_total': 0.0,
+            'spot_open_fee_amount_usdt': 0.0074,
+            'future_open_fee_estimated_usdt': 0.005015,
+            'future_open_fee_estimated_count': 1,
+            'future_open_fee_rate': 0.0005,
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=10.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            future_taker_open_fee=0.0005,
+            future_taker_close_fee=0.0005,
+            risk_relief_bps=0,
+            margin_leverage=2.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(
+            positions,
+            {'HMSTR': {'spot_close_vwap': 100.0, 'future_close_vwap': 100.0}},
+            {'HMSTR': {}},
+            cfg,
+        )
+
+        self.assertAlmostEqual(positions[0]['fee_bps'], -12.41)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.0124)
+        self.assertEqual(positions[0]['fee_source'], 'mixed_estimated')
+
+    def test_holding_fee_present_without_close_vwap(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'HMSTR',
+            'open_spread_bps': 0.0,
+            'funding_total_pnl': 0.001,
+            'future_open_fee_rate': 0.0005,
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=10.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            risk_relief_bps=0,
+            margin_leverage=2.0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(positions, {}, {'HMSTR': {}}, cfg)
+
+        self.assertAlmostEqual(positions[0]['fee_bps'], -12.5)
+        self.assertAlmostEqual(positions[0]['fee_cost'], -0.0125)
+        self.assertAlmostEqual(positions[0]['funding_pnl_bps'], 1.0)
+        self.assertIsNone(positions[0]['total_pnl'])
 
 
 # ══════════════════════════════════════════════════════════════════
