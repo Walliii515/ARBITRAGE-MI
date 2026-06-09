@@ -44,6 +44,8 @@ class GateRiskEventMonitorConfig:
     max_reconnect_delay_sec: float = 60.0
     reconnect_jitter_sec: float = 2.0
     connect_timeout_sec: float = 15.0
+    ping_interval_sec: float = 20.0
+    ping_timeout_sec: float = 10.0
     rest_catchup_enabled: bool = True
     rest_catchup_lookback_sec: int = 300
 
@@ -79,6 +81,8 @@ def build_default_gate_risk_event_monitor() -> 'GateRiskEventMonitor':
         max_reconnect_delay_sec=config.get_float('exchange_risk_monitor.max_reconnect_delay_sec', 60.0),
         reconnect_jitter_sec=config.get_float('exchange_risk_monitor.reconnect_jitter_sec', 2.0),
         connect_timeout_sec=config.get_float('exchange_risk_monitor.connect_timeout_sec', 15.0),
+        ping_interval_sec=config.get_float('exchange_risk_monitor.ping_interval_sec', 20.0),
+        ping_timeout_sec=config.get_float('exchange_risk_monitor.ping_timeout_sec', 10.0),
         rest_catchup_enabled=config.get_bool('exchange_risk_monitor.rest_catchup_enabled', True),
         rest_catchup_lookback_sec=config.get_int('exchange_risk_monitor.rest_catchup_lookback_sec', 300),
     )
@@ -133,6 +137,7 @@ class GateRiskEventMonitor:
         self._connected_at: Optional[float] = None
         self._last_message_at: Optional[float] = None
         self._last_event_at: Optional[float] = None
+        self._last_pong_at: Optional[float] = None
         self._last_close_at: Optional[float] = None
         self._last_error: Optional[str] = None
         self._message_count = 0
@@ -189,8 +194,21 @@ class GateRiskEventMonitor:
             on_message=self._on_message,
             on_error=self._on_error,
             on_close=self._on_close,
+            on_pong=self._on_pong,
         )
-        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True, name='gate-risk-ws')
+        ping_interval = max(float(self.cfg.ping_interval_sec or 0), 0.0)
+        ping_timeout = max(float(self.cfg.ping_timeout_sec or 0), 0.0)
+        if ping_interval > 0 and ping_timeout >= ping_interval:
+            ping_timeout = max(ping_interval / 2, 1.0)
+        self.ws_thread = threading.Thread(
+            target=self.ws.run_forever,
+            kwargs={
+                'ping_interval': ping_interval,
+                'ping_timeout': ping_timeout if ping_interval > 0 else None,
+            },
+            daemon=True,
+            name='gate-risk-ws',
+        )
         self.ws_thread.start()
         if not self.connected.wait(timeout=max(float(self.cfg.connect_timeout_sec or 1), 1.0)):
             logger.error('Gate 风险事件 WS 连接超时: %s', self.ws_url)
@@ -303,6 +321,7 @@ class GateRiskEventMonitor:
                 'subscribe_all': self.cfg.subscribe_all,
                 'last_message_at': self._last_message_at,
                 'last_event_at': self._last_event_at,
+                'last_pong_at': self._last_pong_at,
                 'last_close_at': self._last_close_at,
                 'last_error': self._last_error,
                 'message_count': self._message_count,
@@ -318,6 +337,7 @@ class GateRiskEventMonitor:
             'ws_thread_alive': bool(self.ws_thread and self.ws_thread.is_alive()),
             'message_age_sec': round(now - status['last_message_at'], 1) if status['last_message_at'] else None,
             'event_age_sec': round(now - status['last_event_at'], 1) if status['last_event_at'] else None,
+            'pong_age_sec': round(now - status['last_pong_at'], 1) if status['last_pong_at'] else None,
         })
         return status
 
@@ -437,6 +457,10 @@ class GateRiskEventMonitor:
         with self._status_lock:
             self._last_error = str(error)[:300]
         logger.error('Gate 风险事件 WS 错误: %s', error)
+
+    def _on_pong(self, ws, message):
+        with self._status_lock:
+            self._last_pong_at = time.time()
 
     def _on_close(self, ws, close_status_code, close_msg):
         self.connected.clear()
