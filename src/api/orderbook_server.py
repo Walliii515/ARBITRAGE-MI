@@ -46,7 +46,7 @@ from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
-from calc.reverse_signal_logger import ensure_reverse_signal_table, log_reverse_signals, query_reverse_signals
+from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
@@ -148,11 +148,12 @@ FUTURE_CLOSE_FEE = config.get_float('trade.fee.future_close', 0.00075)
 FUTURE_TAKER_OPEN_FEE = config.get_float('trade.fee.future_taker_open', FUTURE_OPEN_FEE)
 FUTURE_TAKER_CLOSE_FEE = config.get_float('trade.fee.future_taker_close', FUTURE_CLOSE_FEE)
 
-# 反向资金费率策略（short spot + long future）只读机会扫描配置
+# 反向资金费率策略（short spot + long future）独立配置
 REVERSE_BORROW_AUTO_ENABLED = config.get_bool('reverse_arbitrage.binance_margin.enabled', True)
 REVERSE_BORROW_CACHE_TTL_SEC = config.get_float('reverse_arbitrage.binance_margin.cache_ttl_sec', 60.0)
 REVERSE_BORROW_MAX_ASSETS = config.get_int('reverse_arbitrage.binance_margin.max_borrowable_assets_per_refresh', 250)
-REVERSE_SIGNAL_LOG_INTERVAL_SEC = config.get_float('reverse_arbitrage.signal_log_interval_sec', 10.0)
+REVERSE_SIGNAL_ENABLED = config.get_bool('reverse_arbitrage.signal.enabled', True)
+REVERSE_SIGNAL_INTERVAL_SEC = config.get_float('reverse_arbitrage.signal.check_interval_sec', 1.0)
 
 # 富化配置实例（快照推送、开仓检查共用）
 _enrich_cfg = EnrichConfig(
@@ -226,6 +227,7 @@ _gate_position_risk_cache_ts: float = 0.0
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
 _closing_executor: Optional['ClosingExecutor'] = None
+_reverse_signal_monitor: Optional['ReverseSignalMonitor'] = None
 _gate_risk_event_monitor = None
 _critical_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-open')
 _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-close')
@@ -252,23 +254,6 @@ _cached_payload_json: str = ''
 _cached_payload_ts: float = 0.0
 _reverse_borrow_cache: Dict[str, Dict] = {}
 _reverse_borrow_cache_ts: float = 0.0
-_reverse_signal_log_ts: float = 0.0
-
-
-def _json_safe(value):
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, datetime):
-        return value.strftime('%Y-%m-%d %H:%M:%S')
-    return value
-
-
-def _json_safe_row(row: Dict) -> Dict:
-    return {key: _json_safe(value) for key, value in row.items()}
-
-
-def _json_safe_rows(rows: List[Dict]) -> List[Dict]:
-    return [_json_safe_row(row) for row in rows]
 
 
 def _build_binance_margin_borrow_client() -> Optional[BinanceMarginBorrowClient]:
@@ -555,9 +540,8 @@ def build_payload() -> dict:
     }
 
 
-def build_reverse_opportunities_payload() -> dict:
-    """构建反向资金费率套利机会载荷（只读，不触发交易）。"""
-    global _reverse_signal_log_ts
+def _build_reverse_enriched_rows() -> tuple[List[Dict], Dict[str, Dict], str]:
+    """构建反向机会富化行，供页面展示和反向信号监控共用。"""
     rows = _get_merged_rows()
     enrich_snapshot_fields(
         rows, _contract_meta, _spot_meta, _threshold_meta,
@@ -577,10 +561,12 @@ def build_reverse_opportunities_payload() -> dict:
         borrow_meta=borrow_meta,
         reverse_threshold_meta=_reverse_vwap_threshold_meta,
     )
-    now_ts = time.time()
-    if now_ts - _reverse_signal_log_ts >= REVERSE_SIGNAL_LOG_INTERVAL_SEC:
-        log_reverse_signals(rows)
-        _reverse_signal_log_ts = now_ts
+    return rows, borrow_meta, borrow_source
+
+
+def build_reverse_opportunities_payload() -> dict:
+    """构建反向资金费率套利机会载荷（只读，不触发交易）。"""
+    rows, borrow_meta, borrow_source = _build_reverse_enriched_rows()
     return {
         'type': 'reverse_opportunities',
         'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -710,10 +696,6 @@ async def lifespan(app: FastAPI):
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
     _reverse_vwap_threshold_meta = fetch_reverse_vwap_threshold_meta()
-    try:
-        ensure_reverse_signal_table()
-    except Exception as exc:
-        logger.warning(f'反向交易信号表初始化失败: {exc}', exc_info=True)
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_print(
         f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，'
@@ -765,14 +747,16 @@ async def lifespan(app: FastAPI):
                     f'费率p40 {len(_funding_rate_p40_meta)} 条'
                 )
                 # 重置执行器单例，下次循环用新元数据重建
-                global _trading_executor, _closing_executor
+                global _trading_executor, _closing_executor, _reverse_signal_monitor
                 _trading_executor = None
                 _closing_executor = None
+                _reverse_signal_monitor = None
             except Exception as e:
                 logger.error(f'内存缓存刷新失败: {e}')
 
     asyncio.create_task(_refresh_meta_cache_loop())
     asyncio.create_task(_open_position_loop())
+    asyncio.create_task(_reverse_signal_loop())
     asyncio.create_task(_margin_status_loop())
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
@@ -957,30 +941,6 @@ async def orderbook_snapshot():
 @app.get('/api/reverse-arbitrage/opportunities', dependencies=[Depends(verify_token_dependency)])
 async def reverse_arbitrage_opportunities():
     return build_reverse_opportunities_payload()
-
-
-@app.get('/api/reverse-arbitrage/signals', dependencies=[Depends(verify_token_dependency)])
-async def reverse_arbitrage_signals(
-    status: Optional[str] = Query(None),
-    reject_reason: Optional[str] = Query(None),
-    base_asset: Optional[str] = Query(None),
-    days: int = Query(1, ge=1, le=30),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1, le=5000),
-):
-    result = query_reverse_signals(
-        status=status,
-        reject_reason=reject_reason,
-        base_asset=base_asset,
-        days=days,
-        page=page,
-        page_size=page_size,
-    )
-    return {
-        'signals': _json_safe_rows(result.get('signals', [])),
-        'pagination': result.get('pagination', {}),
-        'summary': _json_safe_row(result.get('summary', {})),
-    }
 
 
 @app.post('/api/service/start', dependencies=[Depends(verify_token_dependency)])
@@ -1415,6 +1375,64 @@ def _run_open_position_check_once():
             logger.warning(f"开仓关键路径耗时偏高: {elapsed_ms:.0f}ms")
 
 
+def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
+    """获取反向信号监控器；反向策略独立状态机，不复用正向 TradingExecutor。"""
+    global _reverse_signal_monitor
+    monitor_cfg = ReverseSignalMonitorConfig(
+        open_amount_usdt=OPEN_AMOUNT_USDT,
+        monitor_timeout_sec=config.get_float('reverse_arbitrage.signal.monitor_timeout_sec', 60.0),
+        valley_rebound_pct=config.get_float('reverse_arbitrage.signal.valley_rebound_pct', 0.05),
+        min_rebound_bps=config.get_float('reverse_arbitrage.signal.min_rebound_bps', 2.0),
+        min_monitor_sec=config.get_float('reverse_arbitrage.signal.min_monitor_sec', 1.5),
+        rebound_sustain_sec=config.get_float('reverse_arbitrage.signal.rebound_sustain_sec', 0.4),
+        max_orderbook_lag_ms=config.get_float(
+            'reverse_arbitrage.signal.max_orderbook_lag_ms',
+            config.get_float('trade.open.max_orderbook_lag_ms', 500.0),
+        ),
+        execution_enabled=config.get_bool('reverse_arbitrage.execution.enabled', False),
+    )
+    if _reverse_signal_monitor is None:
+        _reverse_signal_monitor = ReverseSignalMonitor(
+            monitor_cfg,
+            _reverse_cfg,
+            _contract_meta,
+            _spot_meta,
+            _reverse_vwap_threshold_meta,
+        )
+    else:
+        _reverse_signal_monitor.cfg = monitor_cfg
+        _reverse_signal_monitor.update_meta(_contract_meta, _spot_meta, _reverse_vwap_threshold_meta)
+
+    if svc and svc.gate_manager and svc.spot_manager:
+        _reverse_signal_monitor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
+    return _reverse_signal_monitor
+
+
+def _run_reverse_signal_check_once():
+    """反向开仓信号监控关键路径：只入表/监控，不触碰正向开仓状态。"""
+    if not REVERSE_SIGNAL_ENABLED:
+        return
+    if not svc or svc.state != SERVICE_RUNNING:
+        return
+    start = time.monotonic()
+    try:
+        rows, borrow_meta, _borrow_source = _build_reverse_enriched_rows()
+        monitor = _get_reverse_signal_monitor()
+        results = monitor.process_rows(rows, borrow_meta=borrow_meta)
+        if results and event_loop and broadcast_queue:
+            signal_payload = {
+                'type': 'reverse_signal_update',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            asyncio.run_coroutine_threadsafe(broadcast_queue.put(signal_payload), event_loop)
+    except Exception as e:
+        logger.error(f"反向信号监控失败: {e}", exc_info=True)
+    finally:
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        if elapsed_ms > 1000:
+            logger.warning(f"反向信号监控耗时偏高: {elapsed_ms:.0f}ms")
+
+
 async def _open_position_loop():
     """定时检查开仓条件。实际判断在专用线程中串行执行。"""
     interval = config.get_float('trade.open.check_interval_sec', 5)
@@ -1423,6 +1441,16 @@ async def _open_position_loop():
     while True:
         await asyncio.sleep(interval)
         await loop.run_in_executor(_critical_open_executor, _run_open_position_check_once)
+
+
+async def _reverse_signal_loop():
+    """定时检查反向交易信号；独立于正向开仓暂停按钮。"""
+    interval = max(REVERSE_SIGNAL_INTERVAL_SEC, 0.2)
+    loop = asyncio.get_running_loop()
+
+    while True:
+        await asyncio.sleep(interval)
+        await loop.run_in_executor(_critical_open_executor, _run_reverse_signal_check_once)
 
 
 def _run_margin_status_update_once():

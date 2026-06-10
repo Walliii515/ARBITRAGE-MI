@@ -49,6 +49,7 @@ class BinanceMarginBorrowClient:
     def __init__(self, cfg: BinanceMarginBorrowConfig):
         self.cfg = cfg
         self._session = requests.Session()
+        self._time_offset_ms = 0
 
     def _sign(self, query_string: str) -> str:
         return hmac.new(
@@ -57,10 +58,18 @@ class BinanceMarginBorrowClient:
             hashlib.sha256,
         ).hexdigest()
 
-    def _signed_get(self, path: str, params: Dict) -> Dict | List:
+    def _sync_server_time(self) -> None:
+        resp = self._session.get(f'{self.cfg.base_url}/api/v3/time', timeout=self.cfg.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f'Binance server time HTTP {resp.status_code}: {resp.text[:200]}')
+        server_time = int(resp.json().get('serverTime') or 0)
+        if server_time > 0:
+            self._time_offset_ms = server_time - int(time.time() * 1000)
+
+    def _signed_get_once(self, path: str, params: Dict) -> Dict | List:
         payload = dict(params)
         payload.setdefault('recvWindow', self.cfg.recv_window_ms)
-        payload['timestamp'] = int(time.time() * 1000)
+        payload['timestamp'] = int(time.time() * 1000) + self._time_offset_ms
         query_string = urlencode(payload)
         payload['signature'] = self._sign(query_string)
         headers = {'X-MBX-APIKEY': self.cfg.api_key}
@@ -73,6 +82,15 @@ class BinanceMarginBorrowClient:
         if resp.status_code != 200:
             raise RuntimeError(f'Binance margin {path} HTTP {resp.status_code}: {resp.text[:200]}')
         return resp.json()
+
+    def _signed_get(self, path: str, params: Dict) -> Dict | List:
+        try:
+            return self._signed_get_once(path, params)
+        except RuntimeError as exc:
+            if '"code":-1021' not in str(exc) and 'outside of the recvWindow' not in str(exc):
+                raise
+            self._sync_server_time()
+            return self._signed_get_once(path, params)
 
     @staticmethod
     def _chunks(items: List[str], size: int) -> Iterable[List[str]]:

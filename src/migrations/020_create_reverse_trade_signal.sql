@@ -1,36 +1,48 @@
--- 反向套利交易信号日志表
--- 记录 short spot + long future 反向策略每个标的的信号判断结果。
+-- 反向套利交易信号表
+-- 只记录已经通过反向开仓前置条件、进入监控中的机会。
 CREATE TABLE IF NOT EXISTS mi_reverse_trade_signal (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    base_asset VARCHAR(32) NOT NULL,
-    contract VARCHAR(64) DEFAULT NULL,
-    signal_time DATETIME NOT NULL COMMENT '信号首次产生并完成反向开仓逻辑判断的时间',
-    resolved_time DATETIME DEFAULT NULL COMMENT '信号状态结束/切换时间',
-    last_seen_time DATETIME DEFAULT NULL COMMENT '最近一次仍看到同类信号的时间',
-    status ENUM('candidate', 'rejected', 'conditions_lost') NOT NULL COMMENT 'candidate=满足反向开仓观察条件，rejected=未通过反向开仓门槛，conditions_lost=信号消失',
-    reverse_status VARCHAR(64) NOT NULL COMMENT '反向开仓判断状态码',
-    trigger_reason VARCHAR(500) DEFAULT NULL COMMENT '信号产生原因',
-    reject_reason TEXT DEFAULT NULL COMMENT '拒绝/消失原因',
-    funding_rate_24h DECIMAL(18,10) DEFAULT NULL COMMENT '24h funding rate decimal',
-    funding_rate_2h DECIMAL(18,10) DEFAULT NULL COMMENT '2h funding rate decimal',
-    reverse_gross_funding_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_expected_funding_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_basis_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_close_basis_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_p20_edge_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_margin_edge_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_open_coverage DECIMAL(12,8) DEFAULT NULL,
-    reverse_borrow_hourly_rate DECIMAL(18,10) DEFAULT NULL,
-    reverse_borrow_24h_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_borrow_limit DECIMAL(24,8) DEFAULT NULL,
-    reverse_capacity_usdt DECIMAL(24,8) DEFAULT NULL,
-    reverse_open_basis_p20 DECIMAL(12,4) DEFAULT NULL,
-    reverse_close_basis_p20 DECIMAL(12,4) DEFAULT NULL,
-    funding_next_apply DATETIME DEFAULT NULL,
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    base_asset VARCHAR(20) NOT NULL,
+    contract VARCHAR(50) DEFAULT NULL,
+    symbol VARCHAR(50) DEFAULT NULL,
+    status ENUM(
+        'monitoring',
+        'opened',
+        'conditions_lost',
+        'rejected',
+        'gate_rejected',
+        'monitor_timeout'
+    ) NOT NULL DEFAULT 'monitoring',
+    signal_time DATETIME NOT NULL COMMENT '进入反向开仓监控的时间',
+    resolved_time DATETIME DEFAULT NULL COMMENT '信号结束时间',
+    duration_sec INT DEFAULT NULL COMMENT '监控持续时长(秒)',
+    trigger_type VARCHAR(32) DEFAULT NULL COMMENT '触发方式: valley_rebound/manual',
+    reject_reason TEXT DEFAULT NULL COMMENT '结束/拒绝/观察原因',
+    order_uuid VARCHAR(64) DEFAULT NULL COMMENT '反向开仓订单UUID(预留)',
+
+    funding_rate_24h DECIMAL(18,10) DEFAULT NULL COMMENT '入表时24h资金费率',
+    reverse_open_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '入表时反向开仓基差',
+    signal_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '信号基差快照',
+    valley_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '监控期间最低反向开仓基差',
+    rebound_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '触发反弹时基差',
+    pre_gate_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '旁路风控重算基差',
+    actual_basis_bps DECIMAL(10,2) DEFAULT NULL COMMENT '实际成交基差(预留)',
+    reverse_open_basis_p20 DECIMAL(10,2) DEFAULT NULL,
+    reverse_close_basis_p20 DECIMAL(10,2) DEFAULT NULL,
+    margin_edge_bps DECIMAL(10,2) DEFAULT NULL COMMENT '入表时边际盈亏',
+
+    borrow_hourly_rate DECIMAL(18,10) DEFAULT NULL,
+    borrow_24h_bps DECIMAL(10,2) DEFAULT NULL,
+    borrow_limit DECIMAL(24,8) DEFAULT NULL,
+    borrow_capacity_usdt DECIMAL(18,2) DEFAULT NULL,
+    open_coverage DECIMAL(10,4) DEFAULT NULL,
+    capacity_usdt DECIMAL(18,2) DEFAULT NULL,
+    open_amount_usdt DECIMAL(18,2) DEFAULT NULL,
+
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_signal_time (signal_time),
-    INDEX idx_base_asset_time (base_asset, signal_time),
-    INDEX idx_status_time (status, signal_time),
-    INDEX idx_active_asset (base_asset, resolved_time)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='反向套利交易信号日志';
+
+    INDEX idx_reverse_signal_time (signal_time),
+    INDEX idx_reverse_status_time (status, signal_time),
+    INDEX idx_reverse_asset_status (base_asset, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='反向套利交易信号';
