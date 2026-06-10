@@ -2280,6 +2280,39 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertTrue(result['success'])
         ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 15.0, dual_side='short')
 
+    def test_topup_contract_cooldown_blocks_duplicate_local_positions(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 2000.0
+        ce.margin_topup_target_rate_pct = 3000.0
+        ce.margin_topup_min_gate_available = 0.0
+        ce.margin_topup_max_ratio = 0.0
+        ce.executor_client = MagicMock()
+        ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
+        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._insert_margin_topup_log = MagicMock()
+        ce._mark_margin_topup_success = MagicMock()
+
+        base_pos = {
+            'base_asset': 'TUT',
+            'future_contract': 'TUT_USDT',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'gate_position_margin': 10.0,
+            'gate_maintenance_margin': 1.0,
+            'gate_maintenance_margin_rate': 1000.0,
+            'margin_topup_total': 0.0,
+            'margin_topup_count': 0,
+        }
+        first = dict(base_pos, id=11)
+        second = dict(base_pos, id=12)
+
+        result = ce._check_and_topup_margin(first)
+        duplicate = ce._check_and_topup_margin(second)
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(duplicate)
+        ce.executor_client.topup_margin.assert_called_once()
+
     def test_executor_client_sends_dual_side_for_gate_topup(self):
         from calc.executor_client import ExecutorClient
 

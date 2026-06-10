@@ -139,6 +139,7 @@ class ClosingExecutor:
         self.close_cooldown_sec = config.get_int('trade.close.cooldown_sec', 60)
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
         self._margin_topup_attempt_cooldown: Dict[int, datetime] = {}
+        self._margin_topup_contract_cooldown: Dict[str, datetime] = {}
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
@@ -597,7 +598,7 @@ class ClosingExecutor:
         contract = pos.get('future_contract') or f"{ba}_USDT"
         if topup_contracts_this_run is not None and contract in topup_contracts_this_run:
             return None
-        if self._in_margin_topup_cooldown(position_id):
+        if self._in_margin_topup_cooldown(position_id) or self._in_margin_topup_contract_cooldown(contract):
             return None
 
         hedge_balanced = self._is_hedge_balanced(pos)
@@ -605,6 +606,7 @@ class ClosingExecutor:
             message = '现货/期货数量不平衡，跳过自动追保'
             self._insert_margin_topup_log(pos, 0, 0, 0, margin_rate, None, None, False, False, message)
             self._set_margin_topup_cooldown(position_id)
+            self._set_margin_topup_contract_cooldown(contract)
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             return None
 
@@ -644,6 +646,7 @@ class ClosingExecutor:
                 margin_rate, calc['margin_rate_after'], None, True, False, message
             )
             self._set_margin_topup_cooldown(position_id)
+            self._set_margin_topup_contract_cooldown(contract)
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             if topup_contracts_this_run is not None:
                 topup_contracts_this_run.add(contract)
@@ -658,6 +661,7 @@ class ClosingExecutor:
                 margin_rate, calc['margin_rate_after'], gate_available, True, False, message
             )
             self._set_margin_topup_cooldown(position_id)
+            self._set_margin_topup_contract_cooldown(contract)
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             if topup_contracts_this_run is not None:
                 topup_contracts_this_run.add(contract)
@@ -674,6 +678,7 @@ class ClosingExecutor:
             topup_contracts_this_run.add(contract)
         if not success:
             self._set_margin_topup_cooldown(position_id)
+            self._set_margin_topup_contract_cooldown(contract)
             logger.warning(
                 f"自动追保失败 | {ba} | position_id={position_id} | "
                 f"amount={topup_amount:.6f} | {message}"
@@ -681,6 +686,7 @@ class ClosingExecutor:
             return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
 
         self._mark_margin_topup_success(position_id, topup_amount)
+        self._set_margin_topup_contract_cooldown(contract)
         logger.info(
             f"自动追保成功 | {ba} | position_id={position_id} | amount={topup_amount:.6f} | "
             f"margin={calc['margin_before']:.6f}->{calc['margin_before'] + topup_amount:.6f} | "
@@ -706,6 +712,18 @@ class ClosingExecutor:
     def _set_margin_topup_cooldown(self, position_id: int):
         if position_id:
             self._margin_topup_attempt_cooldown[position_id] = datetime.now()
+
+    def _in_margin_topup_contract_cooldown(self, contract: str) -> bool:
+        if not contract:
+            return False
+        last_attempt = self._margin_topup_contract_cooldown.get(str(contract).upper())
+        if not last_attempt:
+            return False
+        return (datetime.now() - last_attempt).total_seconds() < self.margin_topup_cooldown_sec
+
+    def _set_margin_topup_contract_cooldown(self, contract: str):
+        if contract:
+            self._margin_topup_contract_cooldown[str(contract).upper()] = datetime.now()
 
     def _calculate_margin_topup_amount(self, pos: Dict) -> Optional[Dict]:
         """按 Gate 聚合仓位口径，计算补到目标 保证金/维持保证金 比例所需金额。"""
