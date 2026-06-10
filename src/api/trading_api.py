@@ -1138,9 +1138,12 @@ async def get_reverse_signals(
     summary_data = _serialize_row(summary_row) if summary_row else {}
     total_count = int(summary_data.get('total') or 0)
     opened_count = int(summary_data.get('opened') or 0)
+    signal_rows = _serialize_rows(rows)
+    for row in signal_rows:
+        row.pop('funding_rate_2h', None)
 
     return {
-        'signals': _serialize_rows(rows),
+        'signals': signal_rows,
         'pagination': {
             'page': page,
             'page_size': page_size,

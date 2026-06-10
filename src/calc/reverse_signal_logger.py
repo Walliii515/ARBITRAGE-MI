@@ -27,7 +27,6 @@ CREATE TABLE IF NOT EXISTS mi_reverse_trade_signal (
     trigger_reason VARCHAR(500) DEFAULT NULL,
     reject_reason TEXT DEFAULT NULL,
     funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
-    funding_rate_2h DECIMAL(18,10) DEFAULT NULL,
     reverse_gross_funding_bps DECIMAL(12,4) DEFAULT NULL,
     reverse_expected_funding_bps DECIMAL(12,4) DEFAULT NULL,
     reverse_basis_bps DECIMAL(12,4) DEFAULT NULL,
@@ -106,11 +105,6 @@ def _as_float(value):
         return None
 
 
-def _funding_2h_rate(row: Dict) -> Optional[float]:
-    rate_24h = _as_float(row.get('funding_rate_24h'))
-    return rate_24h / 12.0 if rate_24h is not None else None
-
-
 def _signal_values(row: Dict, scan_time: datetime) -> Dict:
     reverse_status = str(row.get('reverse_status') or 'missing_margin_edge')
     trigger_reason, reject_reason = reverse_signal_reason(row)
@@ -123,7 +117,6 @@ def _signal_values(row: Dict, scan_time: datetime) -> Dict:
         'reject_reason': reject_reason,
         'scan_time': scan_time,
         'funding_rate_24h': _as_float(row.get('funding_rate_24h')),
-        'funding_rate_2h': _funding_2h_rate(row),
         'reverse_gross_funding_bps': _as_float(row.get('reverse_gross_funding_bps')),
         'reverse_expected_funding_bps': _as_float(row.get('reverse_expected_funding_bps')),
         'reverse_basis_bps': _as_float(row.get('reverse_basis_bps')),
@@ -151,7 +144,7 @@ def _insert_signal(cursor, values: Dict) -> None:
     sql = """
         INSERT INTO mi_reverse_trade_signal (
             base_asset, contract, signal_time, last_seen_time, status, reverse_status,
-            trigger_reason, reject_reason, funding_rate_24h, funding_rate_2h,
+            trigger_reason, reject_reason, funding_rate_24h,
             reverse_gross_funding_bps, reverse_expected_funding_bps,
             reverse_basis_bps, reverse_close_basis_bps, reverse_p20_edge_bps,
             reverse_margin_edge_bps, reverse_open_coverage,
@@ -160,7 +153,7 @@ def _insert_signal(cursor, values: Dict) -> None:
             funding_next_apply
         ) VALUES (
             %(base_asset)s, %(contract)s, %(scan_time)s, %(scan_time)s, %(status)s, %(reverse_status)s,
-            %(trigger_reason)s, %(reject_reason)s, %(funding_rate_24h)s, %(funding_rate_2h)s,
+            %(trigger_reason)s, %(reject_reason)s, %(funding_rate_24h)s,
             %(reverse_gross_funding_bps)s, %(reverse_expected_funding_bps)s,
             %(reverse_basis_bps)s, %(reverse_close_basis_bps)s, %(reverse_p20_edge_bps)s,
             %(reverse_margin_edge_bps)s, %(reverse_open_coverage)s,
@@ -180,7 +173,6 @@ def _update_active_signal(cursor, signal_id: int, values: Dict) -> None:
             trigger_reason = %(trigger_reason)s,
             reject_reason = %(reject_reason)s,
             funding_rate_24h = %(funding_rate_24h)s,
-            funding_rate_2h = %(funding_rate_2h)s,
             reverse_gross_funding_bps = %(reverse_gross_funding_bps)s,
             reverse_expected_funding_bps = %(reverse_expected_funding_bps)s,
             reverse_basis_bps = %(reverse_basis_bps)s,
