@@ -565,6 +565,20 @@ class ReverseSignalMonitor:
         if 'reverse_status' in columns:
             cursor.execute("ALTER TABLE mi_reverse_trade_signal MODIFY COLUMN reverse_status VARCHAR(64) DEFAULT NULL")
 
+        cursor.execute(
+            """
+            ALTER TABLE mi_reverse_trade_signal
+            MODIFY COLUMN status ENUM(
+                'candidate',
+                'monitoring',
+                'opened',
+                'conditions_lost',
+                'rejected',
+                'gate_rejected',
+                'monitor_timeout'
+            ) NOT NULL DEFAULT 'monitoring'
+            """
+        )
         cursor.execute("UPDATE mi_reverse_trade_signal SET status = 'monitoring' WHERE status = 'candidate'")
         cursor.execute(
             """
