@@ -55,7 +55,7 @@ const assetFilterVisible = ref(false)
 const filterNegativeFunding = ref(true)
 const filterBasis = ref(true)
 const filterCoverage = ref(true)
-const filterBorrowReady = ref(false)
+const filterBorrowReady = ref(true)
 const columnVisibilities = ref<ColumnVisibility[]>([])
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
@@ -110,10 +110,14 @@ function bpsFormatter(params: ValueFormatterParams) {
 function statusLabel(status: string | null | undefined): string {
   switch (status) {
     case 'candidate': return '候选'
+    case 'missing_open_data': return '缺盘口'
+    case 'funding_too_low': return '费率不足'
     case 'missing_borrow_data': return '待接借币'
     case 'borrow_unavailable': return '不可借'
+    case 'borrow_capacity_low': return '额度不足'
     case 'edge_too_low': return '收益不足'
     case 'basis_too_wide': return '基差过宽'
+    case 'basis_above_entry': return '基差未达标'
     case 'depth_too_thin': return '深度不足'
     case 'missing_edge': return '缺少收益'
     default: return '未知'
@@ -124,8 +128,11 @@ function statusType(status: string | null | undefined): 'success' | 'warning' | 
   switch (status) {
     case 'candidate': return 'success'
     case 'missing_borrow_data': return 'warning'
+    case 'funding_too_low':
     case 'edge_too_low':
     case 'basis_too_wide':
+    case 'basis_above_entry':
+    case 'borrow_capacity_low':
     case 'depth_too_thin':
       return 'danger'
     default:
@@ -191,28 +198,22 @@ async function fetchOpportunities() {
 
 function negativeFundingFilter(params: { data?: OrderBookRow }) {
   if (!filterNegativeFunding.value) return true
-  const row = params.data
-  if (!row || row.funding_rate_24h == null) return true
-  return Number(row.funding_rate_24h) < 0
+  return params.data?.reverse_funding_pass === true
 }
 
 function basisFilter(params: { data?: OrderBookRow }) {
   if (!filterBasis.value) return true
-  const basis = params.data?.reverse_basis_bps
-  if (basis == null) return true
-  return Number(basis) <= maxBasisExposureBps.value
+  return params.data?.reverse_basis_pass === true
 }
 
 function coverageFilter(params: { data?: OrderBookRow }) {
   if (!filterCoverage.value) return true
-  const coverage = params.data?.reverse_open_coverage
-  if (coverage == null) return true
-  return Number(coverage) <= orderbookCoverageThreshold.value
+  return params.data?.reverse_coverage_pass === true
 }
 
 function borrowReadyFilter(params: { data?: OrderBookRow }) {
   if (!filterBorrowReady.value) return true
-  return params.data?.reverse_borrow_data_missing !== true && params.data?.reverse_borrowable !== false
+  return params.data?.reverse_borrow_pass === true
 }
 
 function assetFilter(params: { data?: OrderBookRow }) {
@@ -349,6 +350,16 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
     cellStyle: (params) => Number(params.value ?? 0) > 0 ? { color: '#67c23a' } : { color: '#909399' },
   },
   {
+    headerName: '预期Funding(bps)',
+    field: 'reverse_expected_funding_bps',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+    cellStyle: (params) => Number(params.value ?? 0) > 0 ? { color: '#67c23a' } : { color: '#909399' },
+  },
+  {
     headerName: '反向开仓基差(bps)',
     field: 'reverse_basis_bps',
     width: 145,
@@ -361,6 +372,21 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
       if (value == null) return { color: '#909399' }
       if (value <= 0) return { color: '#67c23a' }
       return value <= maxBasisExposureBps.value ? { color: '#e6a23c' } : { color: '#f56c6c' }
+    },
+  },
+  {
+    headerName: '反向开仓上限(bps)',
+    field: 'reverse_entry_ceiling_bps',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+    cellStyle: (params) => {
+      const ceiling = params.value as number | null
+      const basis = params.data?.reverse_basis_bps as number | null | undefined
+      if (ceiling == null || basis == null) return { color: '#909399' }
+      return basis <= ceiling ? { color: '#67c23a' } : { color: '#f56c6c' }
     },
   },
   {
@@ -478,7 +504,7 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
     valueFormatter: (p) => formatUsdt(p.value as number | null),
   },
   {
-    headerName: '反向净收益(bps)',
+    headerName: '预期净收益(bps)',
     field: 'reverse_net_edge_bps',
     width: 135,
     type: 'numericColumn',
@@ -596,7 +622,7 @@ onUnmounted(() => {
         </span>
         <span v-if="borrowCacheAgeSec != null" class="status-item">借币缓存：{{ borrowCacheAgeSec }}s</span>
         <span class="status-item">净收益阈值：{{ minNetEdgeBps }} bps</span>
-        <span class="status-item">基差阈值：{{ maxBasisExposureBps }} bps</span>
+        <span class="status-item">硬基差上限：{{ maxBasisExposureBps }} bps</span>
         <span class="status-item">滑点缓冲：{{ slippageBufferBps }} bps</span>
         <el-button size="small" :loading="loading" :icon="Refresh" circle @click="fetchOpportunities" />
       </div>
