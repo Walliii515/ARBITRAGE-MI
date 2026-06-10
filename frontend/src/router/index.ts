@@ -28,8 +28,17 @@ const router = createRouter({
     },
     {
       path: '/reverse-arbitrage',
-      name: 'reverse-arbitrage',
+      redirect: '/reverse-arbitrage/orderbook',
+    },
+    {
+      path: '/reverse-arbitrage/orderbook',
+      name: 'reverse-arbitrage-orderbook',
       component: () => import('../views/ReverseArbitrage.vue'),
+    },
+    {
+      path: '/reverse-arbitrage/signals',
+      name: 'reverse-arbitrage-signals',
+      component: () => import('../views/ReverseTradeSignals.vue'),
     },
     {
       path: '/positions',

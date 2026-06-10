@@ -201,9 +201,13 @@ function toggleMenu() {
             <el-icon><TrendCharts /></el-icon>
             <span>反向套利</span>
           </template>
-          <el-menu-item index="/reverse-arbitrage">
-            <el-icon><TrendCharts /></el-icon>
-            <template #title>机会扫描</template>
+          <el-menu-item index="/reverse-arbitrage/orderbook">
+            <el-icon><Monitor /></el-icon>
+            <template #title>订单簿监控</template>
+          </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/signals">
+            <el-icon><Stopwatch /></el-icon>
+            <template #title>交易信号</template>
           </el-menu-item>
         </el-sub-menu>
 
