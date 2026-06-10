@@ -105,7 +105,14 @@ class BinanceMarginBorrowClient:
         max_borrowable_assets: int = 20,
     ) -> Dict[str, Dict]:
         """批量构建反向策略需要的借币元数据。"""
-        clean_assets = sorted({str(asset or '').strip().upper() for asset in assets if str(asset or '').strip()})
+        clean_assets: List[str] = []
+        seen = set()
+        for asset in assets:
+            clean_asset = str(asset or '').strip().upper()
+            if not clean_asset or clean_asset in seen:
+                continue
+            seen.add(clean_asset)
+            clean_assets.append(clean_asset)
         hourly_rates = self.get_next_hourly_interest_rates(clean_assets, is_isolated=False)
         result: Dict[str, Dict] = {
             asset: {

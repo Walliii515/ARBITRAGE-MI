@@ -28,9 +28,6 @@ def test_reverse_opportunity_net_edge_with_borrow_rate():
         future_open_fee=0.0002,
         future_close_fee=0.0002,
         orderbook_coverage_threshold=0.6,
-        min_net_edge_bps=20,
-        max_basis_exposure_bps=50,
-        slippage_buffer_bps=10,
     )
     contract_meta = {'HOME': {'funding_rate_24h': -0.051, 'quanto_multiplier': 1}}
     borrow_meta = {
@@ -40,24 +37,31 @@ def test_reverse_opportunity_net_edge_with_borrow_rate():
             'borrow_limit': 170000,
         }
     }
+    reverse_threshold_meta = {
+        'HOME': {
+            'reverse_open_basis_p20': -20,
+            'reverse_close_basis_p20': -10,
+        }
+    }
 
-    enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta)
+    enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
 
     assert row['reverse_gross_funding_bps'] == 510
     assert row['reverse_borrow_24h_bps'] == 23.8705
     assert row['reverse_basis_bps'] == 0
     assert row['reverse_borrow_capacity_usdt'] == 4843.3
     assert row['reverse_expected_funding_bps'] == 255
-    assert row['reverse_entry_ceiling_bps'] == 50
+    assert row['reverse_p20_edge_bps'] == -20
+    assert row['reverse_fee_bps'] == 19
+    assert row['reverse_margin_edge_bps'] == pytest.approx(192.1295)
     assert row['reverse_funding_pass'] is True
     assert row['reverse_borrow_pass'] is True
-    assert row['reverse_basis_pass'] is True
+    assert row['reverse_margin_edge_pass'] is True
     assert row['reverse_coverage_pass'] is True
     assert row['reverse_status'] == 'candidate'
-    assert row['reverse_net_edge_bps'] > 200
 
 
-def test_reverse_basis_must_pass_entry_ceiling_even_when_edge_is_positive():
+def test_reverse_margin_edge_must_be_non_negative():
     row = {
         'base_asset': 'ABC',
         'contract': 'ABC_USDT',
@@ -81,9 +85,6 @@ def test_reverse_basis_must_pass_entry_ceiling_even_when_edge_is_positive():
         future_open_fee=0.0002,
         future_close_fee=0.0002,
         orderbook_coverage_threshold=0.6,
-        min_net_edge_bps=20,
-        max_basis_exposure_bps=50,
-        slippage_buffer_bps=10,
     )
     contract_meta = {'ABC': {'funding_rate_24h': -0.02, 'quanto_multiplier': 1}}
     borrow_meta = {
@@ -93,15 +94,20 @@ def test_reverse_basis_must_pass_entry_ceiling_even_when_edge_is_positive():
             'borrow_limit': 100000,
         }
     }
-    reverse_threshold_meta = {'ABC': {'reverse_open_basis_p20': -20}}
+    reverse_threshold_meta = {
+        'ABC': {
+            'reverse_open_basis_p20': -100,
+            'reverse_close_basis_p20': -90,
+        }
+    }
 
     enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
 
     assert row['reverse_basis_bps'] == pytest.approx(-5)
-    assert row['reverse_net_edge_bps'] > cfg.min_net_edge_bps
-    assert row['reverse_entry_ceiling_bps'] == -10
-    assert row['reverse_basis_pass'] is False
-    assert row['reverse_status'] == 'basis_above_entry'
+    assert row['reverse_p20_edge_bps'] == -100
+    assert row['reverse_margin_edge_bps'] == pytest.approx(-14)
+    assert row['reverse_margin_edge_pass'] is False
+    assert row['reverse_status'] == 'margin_edge_too_low'
 
 
 def test_binance_margin_borrow_client_maps_interest_and_borrow_limit(monkeypatch):

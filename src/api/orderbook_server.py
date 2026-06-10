@@ -148,12 +148,9 @@ FUTURE_TAKER_OPEN_FEE = config.get_float('trade.fee.future_taker_open', FUTURE_O
 FUTURE_TAKER_CLOSE_FEE = config.get_float('trade.fee.future_taker_close', FUTURE_CLOSE_FEE)
 
 # 反向资金费率策略（short spot + long future）只读机会扫描配置
-REVERSE_MIN_NET_EDGE_BPS = config.get_float('reverse_arbitrage.min_net_edge_bps', 20.0)
-REVERSE_MAX_BASIS_EXPOSURE_BPS = config.get_float('reverse_arbitrage.max_basis_exposure_bps', 50.0)
-REVERSE_SLIPPAGE_BUFFER_BPS = config.get_float('reverse_arbitrage.slippage_buffer_bps', 10.0)
 REVERSE_BORROW_AUTO_ENABLED = config.get_bool('reverse_arbitrage.binance_margin.enabled', True)
 REVERSE_BORROW_CACHE_TTL_SEC = config.get_float('reverse_arbitrage.binance_margin.cache_ttl_sec', 60.0)
-REVERSE_BORROW_MAX_ASSETS = config.get_int('reverse_arbitrage.binance_margin.max_borrowable_assets_per_refresh', 20)
+REVERSE_BORROW_MAX_ASSETS = config.get_int('reverse_arbitrage.binance_margin.max_borrowable_assets_per_refresh', 250)
 
 # 富化配置实例（快照推送、开仓检查共用）
 _enrich_cfg = EnrichConfig(
@@ -196,13 +193,7 @@ _reverse_cfg = ReverseArbitrageConfig(
     future_open_fee=FUTURE_OPEN_FEE,
     future_close_fee=FUTURE_CLOSE_FEE,
     orderbook_coverage_threshold=ORDERBOOK_COVERAGE_THRESHOLD,
-    min_net_edge_bps=REVERSE_MIN_NET_EDGE_BPS,
-    max_basis_exposure_bps=REVERSE_MAX_BASIS_EXPOSURE_BPS,
-    slippage_buffer_bps=REVERSE_SLIPPAGE_BUFFER_BPS,
     funding_capture_ratio=config.get_float('reverse_arbitrage.funding_capture_ratio', 0.5),
-    strong_funding_24h_bps=config.get_float('reverse_arbitrage.strong_funding_24h_bps', 50.0),
-    funding_discount_ratio=config.get_float('reverse_arbitrage.funding_discount_ratio', 0.2),
-    max_funding_discount_bps=config.get_float('reverse_arbitrage.max_funding_discount_bps', 10.0),
 )
 
 # 服务生命周期管理器（在 lifespan 中初始化）
@@ -571,9 +562,7 @@ def build_reverse_opportunities_payload() -> dict:
         'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'open_amount_usdt': OPEN_AMOUNT_USDT,
         'orderbook_coverage_threshold': ORDERBOOK_COVERAGE_THRESHOLD,
-        'reverse_min_net_edge_bps': REVERSE_MIN_NET_EDGE_BPS,
-        'reverse_max_basis_exposure_bps': REVERSE_MAX_BASIS_EXPOSURE_BPS,
-        'reverse_slippage_buffer_bps': REVERSE_SLIPPAGE_BUFFER_BPS,
+        'reverse_margin_edge_threshold_bps': 0,
         'borrow_data_available': bool(borrow_meta),
         'borrow_data_source': borrow_source,
         'borrow_cache_age_sec': (
