@@ -165,42 +165,60 @@ function toggleMenu() {
         text-color="#9aa0a6"
         active-text-color="#2196f3"
       >
-        <el-menu-item index="/">
-          <el-icon><Monitor /></el-icon>
-          <template #title>订单簿监控</template>
-        </el-menu-item>
-        <el-menu-item index="/signals">
-          <el-icon><Stopwatch /></el-icon>
-          <template #title>交易信号</template>
-        </el-menu-item>
-        <el-menu-item index="/orders">
-          <el-icon><List /></el-icon>
-          <template #title>订单管理</template>
-        </el-menu-item>
-        <el-menu-item index="/positions">
-          <el-icon><TrendCharts /></el-icon>
-          <template #title>持仓监控</template>
-        </el-menu-item>
-        <el-menu-item index="/capital">
-          <el-icon><TrendCharts /></el-icon>
-          <template #title>资金监控</template>
-        </el-menu-item>
-        <el-menu-item index="/reconciliation">
-          <el-icon><DataAnalysis /></el-icon>
-          <template #title>持仓对账</template>
-        </el-menu-item>
-        <el-menu-item index="/connections">
-          <el-icon><Connection /></el-icon>
-          <template #title>连接状态</template>
-        </el-menu-item>
+        <el-sub-menu index="forward-arbitrage">
+          <template #title>
+            <el-icon><Monitor /></el-icon>
+            <span>正向套利</span>
+          </template>
+          <el-menu-item index="/">
+            <el-icon><Monitor /></el-icon>
+            <template #title>订单簿监控</template>
+          </el-menu-item>
+          <el-menu-item index="/signals">
+            <el-icon><Stopwatch /></el-icon>
+            <template #title>交易信号</template>
+          </el-menu-item>
+          <el-menu-item index="/orders">
+            <el-icon><List /></el-icon>
+            <template #title>订单管理</template>
+          </el-menu-item>
+          <el-menu-item index="/positions">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title>持仓监控</template>
+          </el-menu-item>
+          <el-menu-item index="/capital">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title>资金监控</template>
+          </el-menu-item>
+          <el-menu-item index="/reconciliation">
+            <el-icon><DataAnalysis /></el-icon>
+            <template #title>持仓对账</template>
+          </el-menu-item>
+        </el-sub-menu>
+
+        <el-sub-menu index="reverse-arbitrage-group">
+          <template #title>
+            <el-icon><TrendCharts /></el-icon>
+            <span>反向套利</span>
+          </template>
+          <el-menu-item index="/reverse-arbitrage">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title>机会扫描</template>
+          </el-menu-item>
+        </el-sub-menu>
+
         <el-sub-menu index="settings">
           <template #title>
             <el-icon><Setting /></el-icon>
-            <span>参数设置</span>
+            <span>设置</span>
           </template>
           <el-menu-item index="/settings/threshold">
             <el-icon><DataAnalysis /></el-icon>
             <template #title>VWAP基差阈值设置</template>
+          </el-menu-item>
+          <el-menu-item index="/connections">
+            <el-icon><Connection /></el-icon>
+            <template #title>连接状态</template>
           </el-menu-item>
         </el-sub-menu>
       </el-menu>

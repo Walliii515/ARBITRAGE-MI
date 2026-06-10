@@ -27,6 +27,11 @@ const router = createRouter({
       component: () => import('../views/TradeSignals.vue'),
     },
     {
+      path: '/reverse-arbitrage',
+      name: 'reverse-arbitrage',
+      component: () => import('../views/ReverseArbitrage.vue'),
+    },
+    {
       path: '/positions',
       name: 'positions',
       component: () => import('../views/PositionMonitor.vue'),

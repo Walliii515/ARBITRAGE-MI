@@ -27,7 +27,8 @@ class BinanceSpotOrderBookWS:
     WS_STREAM_URL = "wss://data-stream.binance.vision/stream"
 
     def __init__(self, level: int = 5, speed: str = '100ms',
-                 reconnect_enabled=True, reconnect_delay=3, max_reconnect_delay=60):
+                 reconnect_enabled=True, reconnect_delay=3, max_reconnect_delay=60,
+                 connect_timeout=10):
         """
         初始化 WebSocket 客户端
 
@@ -37,6 +38,7 @@ class BinanceSpotOrderBookWS:
             reconnect_enabled: 是否启用自动重连
             reconnect_delay: 初始重连延迟（秒）
             max_reconnect_delay: 最大重连延迟（秒），指数退避上限
+            connect_timeout: 建连等待时间（秒）
         """
         self.level = level
         self.speed = speed
@@ -52,6 +54,7 @@ class BinanceSpotOrderBookWS:
         self._reconnect_enabled = reconnect_enabled
         self._reconnect_delay = reconnect_delay
         self._max_reconnect_delay = max_reconnect_delay
+        self._connect_timeout = max(1.0, float(connect_timeout or 10))
         self._should_reconnect = False  # 区分主动断开 vs 意外断连
         self._reconnect_thread: Optional[threading.Thread] = None
         self._init_symbols: Optional[List[str]] = None  # 重连时用于重建组合流 URL
@@ -98,7 +101,7 @@ class BinanceSpotOrderBookWS:
         self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
         self.ws_thread.start()
 
-        if self._connected_event.wait(timeout=10):
+        if self._connected_event.wait(timeout=self._connect_timeout):
             if symbols:
                 log_print(f"✓ WebSocket 已连接，订阅 {len(symbols)} 个交易对的 Partial Depth Stream")
             else:
@@ -343,7 +346,7 @@ class BinanceSpotOrderBookWS:
                 self.ws_thread.start()
 
                 # 等待连接建立
-                if self._connected_event.wait(timeout=10):
+                if self._connected_event.wait(timeout=self._connect_timeout):
                     logger.info(f'Binance WS 重连成功（第 {attempt} 次尝试）')
                     log_print(f'✓ Binance WS 自动重连成功')
                     return

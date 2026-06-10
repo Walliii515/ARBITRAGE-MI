@@ -73,6 +73,33 @@ export interface OrderBookRow {
   entry_expected_edge_bps?: number | null
   /** 平仓基差阈值参考(bps)，后端按标的下发 */
   close_vwap_threshold_bps?: number | null
+  /** 反向策略：short spot + long future */
+  reverse_strategy?: string | null
+  reverse_spot_open_vwap?: number | null
+  reverse_future_open_vwap?: number | null
+  reverse_basis_bps?: number | null
+  reverse_spot_close_vwap?: number | null
+  reverse_future_close_vwap?: number | null
+  reverse_close_basis_bps?: number | null
+  reverse_open_basis_p20?: number | null
+  reverse_close_basis_p20?: number | null
+  reverse_open_coverage?: number | null
+  reverse_spot_open_coverage?: number | null
+  reverse_future_open_coverage?: number | null
+  reverse_gross_funding_bps?: number | null
+  reverse_borrow_hourly_rate?: number | null
+  reverse_borrow_24h_bps?: number | null
+  reverse_borrow_limit?: number | null
+  reverse_borrowable?: boolean | null
+  reverse_borrow_data_missing?: boolean | null
+  reverse_borrow_capacity_usdt?: number | null
+  reverse_depth_capacity_usdt?: number | null
+  reverse_capacity_usdt?: number | null
+  reverse_fee_bps?: number | null
+  reverse_slippage_buffer_bps?: number | null
+  reverse_basis_penalty_bps?: number | null
+  reverse_net_edge_bps?: number | null
+  reverse_status?: string | null
   [key: string]: string | number | boolean | null | undefined
 }
 
