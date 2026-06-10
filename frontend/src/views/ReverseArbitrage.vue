@@ -21,9 +21,7 @@ interface ReversePayload {
   server_time?: string
   rows?: OrderBookRow[]
   orderbook_coverage_threshold?: number
-  reverse_min_net_edge_bps?: number
-  reverse_max_basis_exposure_bps?: number
-  reverse_slippage_buffer_bps?: number
+  reverse_margin_edge_threshold_bps?: number
   borrow_data_available?: boolean
   borrow_data_source?: string
   borrow_cache_age_sec?: number | null
@@ -46,14 +44,12 @@ const loading = ref(false)
 const borrowDataAvailable = ref(false)
 const borrowDataSource = ref('none')
 const borrowCacheAgeSec = ref<number | null>(null)
-const minNetEdgeBps = ref(20)
-const maxBasisExposureBps = ref(50)
+const marginEdgeThresholdBps = ref(0)
 const orderbookCoverageThreshold = ref(0.6)
-const slippageBufferBps = ref(10)
 const assetFilterKeyword = ref('')
 const assetFilterVisible = ref(false)
 const filterNegativeFunding = ref(true)
-const filterBasis = ref(true)
+const filterMarginEdge = ref(true)
 const filterCoverage = ref(true)
 const filterBorrowReady = ref(true)
 const columnVisibilities = ref<ColumnVisibility[]>([])
@@ -115,11 +111,9 @@ function statusLabel(status: string | null | undefined): string {
     case 'missing_borrow_data': return '待接借币'
     case 'borrow_unavailable': return '不可借'
     case 'borrow_capacity_low': return '额度不足'
-    case 'edge_too_low': return '收益不足'
-    case 'basis_too_wide': return '基差过宽'
-    case 'basis_above_entry': return '基差未达标'
+    case 'margin_edge_too_low': return '边际亏损'
     case 'depth_too_thin': return '深度不足'
-    case 'missing_edge': return '缺少收益'
+    case 'missing_margin_edge': return '缺少边际'
     default: return '未知'
   }
 }
@@ -129,9 +123,7 @@ function statusType(status: string | null | undefined): 'success' | 'warning' | 
     case 'candidate': return 'success'
     case 'missing_borrow_data': return 'warning'
     case 'funding_too_low':
-    case 'edge_too_low':
-    case 'basis_too_wide':
-    case 'basis_above_entry':
+    case 'margin_edge_too_low':
     case 'borrow_capacity_low':
     case 'depth_too_thin':
       return 'danger'
@@ -184,10 +176,8 @@ async function fetchOpportunities() {
     borrowDataAvailable.value = !!data.borrow_data_available
     borrowDataSource.value = data.borrow_data_source ?? 'none'
     borrowCacheAgeSec.value = data.borrow_cache_age_sec ?? null
-    if (data.reverse_min_net_edge_bps != null) minNetEdgeBps.value = data.reverse_min_net_edge_bps
-    if (data.reverse_max_basis_exposure_bps != null) maxBasisExposureBps.value = data.reverse_max_basis_exposure_bps
+    if (data.reverse_margin_edge_threshold_bps != null) marginEdgeThresholdBps.value = data.reverse_margin_edge_threshold_bps
     if (data.orderbook_coverage_threshold != null) orderbookCoverageThreshold.value = data.orderbook_coverage_threshold
-    if (data.reverse_slippage_buffer_bps != null) slippageBufferBps.value = data.reverse_slippage_buffer_bps
     applyRows(data.rows ?? [], data.server_time)
   } catch {
     showError('反向机会加载失败')
@@ -201,9 +191,9 @@ function negativeFundingFilter(params: { data?: OrderBookRow }) {
   return params.data?.reverse_funding_pass === true
 }
 
-function basisFilter(params: { data?: OrderBookRow }) {
-  if (!filterBasis.value) return true
-  return params.data?.reverse_basis_pass === true
+function marginEdgeFilter(params: { data?: OrderBookRow }) {
+  if (!filterMarginEdge.value) return true
+  return params.data?.reverse_margin_edge_pass === true
 }
 
 function coverageFilter(params: { data?: OrderBookRow }) {
@@ -226,7 +216,7 @@ function assetFilter(params: { data?: OrderBookRow }) {
 function combinedFilter(params: { data?: OrderBookRow }) {
   return (
     negativeFundingFilter(params) &&
-    basisFilter(params) &&
+    marginEdgeFilter(params) &&
     coverageFilter(params) &&
     borrowReadyFilter(params) &&
     assetFilter(params)
@@ -323,7 +313,7 @@ async function loadColumnState() {
 }
 
 const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
-  { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90, sort: 'asc' },
+  { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90 },
   {
     headerName: '24h资金费率',
     field: 'funding_rate_24h',
@@ -371,22 +361,7 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
       const value = params.value as number | null
       if (value == null) return { color: '#909399' }
       if (value <= 0) return { color: '#67c23a' }
-      return value <= maxBasisExposureBps.value ? { color: '#e6a23c' } : { color: '#f56c6c' }
-    },
-  },
-  {
-    headerName: '反向开仓上限(bps)',
-    field: 'reverse_entry_ceiling_bps',
-    width: 150,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: bpsFormatter,
-    cellStyle: (params) => {
-      const ceiling = params.value as number | null
-      const basis = params.data?.reverse_basis_bps as number | null | undefined
-      if (ceiling == null || basis == null) return { color: '#909399' }
-      return basis <= ceiling ? { color: '#67c23a' } : { color: '#f56c6c' }
+      return { color: '#e6a23c' }
     },
   },
   {
@@ -433,6 +408,29 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
       const basis = params.data?.reverse_close_basis_bps as number | null | undefined
       if (threshold == null || basis == null) return { color: '#909399' }
       return basis >= threshold ? { color: '#67c23a' } : { color: '#909399' }
+    },
+  },
+  {
+    headerName: '边际P20(bps)',
+    field: 'reverse_p20_edge_bps',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '边际盈亏(bps)',
+    field: 'reverse_margin_edge_bps',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+    cellStyle: (params) => {
+      const value = params.value as number | null
+      if (value == null) return { color: '#909399' }
+      return value >= marginEdgeThresholdBps.value ? { color: '#67c23a' } : { color: '#f56c6c' }
     },
   },
   {
@@ -502,20 +500,6 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
     valueFormatter: (p) => formatUsdt(p.value as number | null),
-  },
-  {
-    headerName: '预期净收益(bps)',
-    field: 'reverse_net_edge_bps',
-    width: 135,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: bpsFormatter,
-    cellStyle: (params) => {
-      const value = params.value as number | null
-      if (value == null) return { color: '#909399' }
-      return value >= minNetEdgeBps.value ? { color: '#67c23a' } : { color: '#f56c6c' }
-    },
   },
   {
     headerName: '状态',
@@ -591,7 +575,7 @@ function restartTimer() {
 }
 
 watch(
-  [filterNegativeFunding, filterBasis, filterCoverage, filterBorrowReady, assetFilterKeyword],
+  [filterNegativeFunding, filterMarginEdge, filterCoverage, filterBorrowReady, assetFilterKeyword],
   () => {
     gridApi?.onFilterChanged()
     refreshDisplayedRowCount()
@@ -621,9 +605,8 @@ onUnmounted(() => {
           </el-tag>
         </span>
         <span v-if="borrowCacheAgeSec != null" class="status-item">借币缓存：{{ borrowCacheAgeSec }}s</span>
-        <span class="status-item">净收益阈值：{{ minNetEdgeBps }} bps</span>
-        <span class="status-item">硬基差上限：{{ maxBasisExposureBps }} bps</span>
-        <span class="status-item">滑点缓冲：{{ slippageBufferBps }} bps</span>
+        <span class="status-item">边际盈亏阈值：{{ marginEdgeThresholdBps }} bps</span>
+        <span class="status-item">盘口覆盖阈值：{{ (orderbookCoverageThreshold * 100).toFixed(1) }}%</span>
         <el-button size="small" :loading="loading" :icon="Refresh" circle @click="fetchOpportunities" />
       </div>
     </el-card>
@@ -664,7 +647,7 @@ onUnmounted(() => {
             </div>
             <div class="filter-group">
               <el-switch v-model="filterNegativeFunding" inline-prompt active-text="负费率" inactive-text="负费率" />
-              <el-switch v-model="filterBasis" inline-prompt active-text="基差" inactive-text="基差" />
+              <el-switch v-model="filterMarginEdge" inline-prompt active-text="边际盈亏" inactive-text="边际盈亏" />
               <el-switch v-model="filterCoverage" inline-prompt active-text="盘口" inactive-text="盘口" />
               <el-switch v-model="filterBorrowReady" inline-prompt active-text="借币" inactive-text="借币" />
             </div>
@@ -701,7 +684,7 @@ onUnmounted(() => {
           :locale-text="localeText"
           :header-height="32"
           :row-height="32"
-          :isExternalFilterPresent="() => filterNegativeFunding || filterBasis || filterCoverage || filterBorrowReady || !!assetFilterKeyword"
+          :isExternalFilterPresent="() => filterNegativeFunding || filterMarginEdge || filterCoverage || filterBorrowReady || !!assetFilterKeyword"
           :doesExternalFilterPass="combinedFilter"
           @grid-ready="onGridReady"
           @model-updated="refreshDisplayedRowCount"

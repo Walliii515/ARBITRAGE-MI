@@ -1066,3 +1066,89 @@ async def get_signals(
             'latest_signal_time': latest_signal_time,
         }
     }
+
+
+@router.get('/reverse-signals')
+async def get_reverse_signals(
+    status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected/gate_rejected/monitor_timeout"),
+    base_asset: Optional[str] = Query(None, description="标的资产过滤"),
+    days: int = Query(3, ge=1, le=30, description="最近N天"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
+):
+    """查询反向套利交易信号（后端分页）。"""
+    where = ["signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    aliased_where = ["s.signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    params: List = [days]
+    if status:
+        where.append("status = %s")
+        aliased_where.append("s.status = %s")
+        params.append(status)
+    if base_asset:
+        where.append("base_asset LIKE %s")
+        aliased_where.append("s.base_asset LIKE %s")
+        params.append(f"%{base_asset}%")
+    where_sql = " AND ".join(where)
+    aliased_where_sql = " AND ".join(aliased_where)
+
+    count_sql = f"SELECT COUNT(*) AS total FROM mi_reverse_trade_signal WHERE {where_sql}"
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(count_sql, params)
+        total_row = cursor.fetchone()
+        total = int(total_row['total'] if total_row else 0)
+
+    offset = (page - 1) * page_size
+    sql = f"""
+        SELECT s.*, COALESCE(b.strategy_tier, 'C') AS strategy_tier
+        FROM mi_reverse_trade_signal s
+        LEFT JOIN mi_base_asset b
+          ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))
+        WHERE {aliased_where_sql}
+        ORDER BY s.signal_time DESC
+        LIMIT %s OFFSET %s
+    """
+    page_params = list(params)
+    page_params.extend([page_size, offset])
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, page_params)
+        rows = cursor.fetchall()
+
+    summary_sql = f"""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'monitoring' THEN 1 ELSE 0 END) AS monitoring,
+            SUM(CASE WHEN status = 'opened' THEN 1 ELSE 0 END) AS opened,
+            SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END) AS conditions_lost,
+            SUM(CASE WHEN status IN ('rejected', 'gate_rejected') THEN 1 ELSE 0 END) AS rejected,
+            SUM(CASE WHEN status = 'monitor_timeout' THEN 1 ELSE 0 END) AS monitor_timeout,
+            MAX(signal_time) AS latest_signal_time
+        FROM mi_reverse_trade_signal
+        WHERE {where_sql}
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(summary_sql, params)
+        summary_row = cursor.fetchone()
+
+    summary_data = _serialize_row(summary_row) if summary_row else {}
+    total_count = int(summary_data.get('total') or 0)
+    opened_count = int(summary_data.get('opened') or 0)
+
+    return {
+        'signals': _serialize_rows(rows),
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total': total,
+            'total_pages': (total + page_size - 1) // page_size,
+        },
+        'summary': {
+            'total': total_count,
+            'monitoring': int(summary_data.get('monitoring') or 0),
+            'opened': opened_count,
+            'conditions_lost': int(summary_data.get('conditions_lost') or 0),
+            'rejected': int(summary_data.get('rejected') or 0),
+            'monitor_timeout': int(summary_data.get('monitor_timeout') or 0),
+            'conversion_rate': round(opened_count / total_count * 100, 1) if total_count > 0 else 0,
+            'latest_signal_time': summary_data.get('latest_signal_time'),
+        },
+    }

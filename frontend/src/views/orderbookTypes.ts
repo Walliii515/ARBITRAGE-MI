@@ -83,10 +83,7 @@ export interface OrderBookRow {
   reverse_close_basis_bps?: number | null
   reverse_open_basis_p20?: number | null
   reverse_close_basis_p20?: number | null
-  reverse_carry_ceiling_bps?: number | null
-  reverse_timing_ceiling_bps?: number | null
-  reverse_entry_ceiling_bps?: number | null
-  reverse_funding_discount_bps?: number | null
+  reverse_p20_edge_bps?: number | null
   reverse_open_coverage?: number | null
   reverse_spot_open_coverage?: number | null
   reverse_future_open_coverage?: number | null
@@ -105,9 +102,8 @@ export interface OrderBookRow {
   reverse_capacity_usdt?: number | null
   reverse_coverage_pass?: boolean | null
   reverse_fee_bps?: number | null
-  reverse_slippage_buffer_bps?: number | null
-  reverse_net_edge_bps?: number | null
-  reverse_basis_pass?: boolean | null
+  reverse_margin_edge_bps?: number | null
+  reverse_margin_edge_pass?: boolean | null
   reverse_open_data_missing?: boolean | null
   reverse_status?: string | null
   [key: string]: string | number | boolean | null | undefined

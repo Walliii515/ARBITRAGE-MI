@@ -1,42 +1,63 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
-import type { ColDef, GridApi, GridReadyEvent } from 'ag-grid-community'
-import { Refresh } from '@element-plus/icons-vue'
+import type { ColDef, GridApi, GridReadyEvent, ValueFormatterParams } from 'ag-grid-community'
+import { Refresh, Search } from '@element-plus/icons-vue'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
-import type { OrderBookRow } from './orderbookTypes'
-
-interface ReversePayload {
-  server_time?: string
-  rows?: OrderBookRow[]
-  reverse_min_net_edge_bps?: number
-  reverse_max_basis_exposure_bps?: number
-  reverse_slippage_buffer_bps?: number
-  borrow_data_source?: string
-}
 
 interface ReverseSignalRow {
-  id: string
-  contract: string
+  id: number
   base_asset: string
-  signal_time: string
+  contract: string | null
+  symbol: string | null
   status: string
+  signal_time: string
+  resolved_time: string | null
+  duration_sec: number | null
+  trigger_type: string | null
+  reject_reason: string | null
+  order_uuid: string | null
   funding_rate_24h: number | null
-  reverse_gross_funding_bps: number | null
-  reverse_expected_funding_bps: number | null
-  reverse_borrow_24h_bps: number | null
-  reverse_basis_bps: number | null
-  reverse_entry_ceiling_bps: number | null
+  reverse_open_basis_bps: number | null
+  signal_basis_bps: number | null
+  valley_basis_bps: number | null
+  rebound_basis_bps: number | null
+  pre_gate_basis_bps: number | null
+  actual_basis_bps: number | null
   reverse_open_basis_p20: number | null
-  reverse_close_basis_bps: number | null
   reverse_close_basis_p20: number | null
-  reverse_open_coverage: number | null
-  reverse_capacity_usdt: number | null
-  reverse_net_edge_bps: number | null
-  funding_next_apply: string | null
+  margin_edge_bps: number | null
+  borrow_hourly_rate: number | null
+  borrow_24h_bps: number | null
+  borrow_limit: number | null
+  borrow_capacity_usdt: number | null
+  open_coverage: number | null
+  capacity_usdt: number | null
+  open_amount_usdt: number | null
+  strategy_tier?: string | null
+}
+
+interface ReverseSignalsResponse {
+  signals?: ReverseSignalRow[]
+  pagination?: {
+    page: number
+    page_size: number
+    total: number
+    total_pages: number
+  }
+  summary?: {
+    total: number
+    monitoring: number
+    opened: number
+    conditions_lost: number
+    rejected: number
+    monitor_timeout: number
+    conversion_rate: number
+    latest_signal_time: string | null
+  }
 }
 
 interface ColumnVisibility {
@@ -45,48 +66,39 @@ interface ColumnVisibility {
   visible: boolean
 }
 
-interface Summary {
-  total: number
-  candidate: number
-  missingBorrow: number
-  rejected: number
-  latestSignalTime: string
-}
-
 const PAGE_KEY = 'reverse_arbitrage_signals'
 
 const gridApi = shallowRef<GridApi<ReverseSignalRow> | null>(null)
 const rowData = shallowRef<ReverseSignalRow[]>([])
 const loading = ref(false)
-const lastUpdate = ref('--')
-const minNetEdgeBps = ref(20)
-const maxBasisExposureBps = ref(50)
-const slippageBufferBps = ref(10)
-const borrowDataSource = ref('none')
-const filterStatus = ref('')
-const filterAsset = ref('')
+const statusFilter = ref('')
+const assetKeyword = ref('')
+const days = ref(3)
+const page = ref(1)
+const pageSize = ref(100)
+const total = ref(0)
+const totalPages = ref(0)
 const columnVisibilities = ref<ColumnVisibility[]>([])
+const summary = ref({
+  total: 0,
+  monitoring: 0,
+  opened: 0,
+  conditions_lost: 0,
+  rejected: 0,
+  monitor_timeout: 0,
+  conversion_rate: 0,
+  latest_signal_time: null as string | null,
+})
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
-const summary = computed<Summary>(() => {
-  const rows = rowData.value
-  const candidate = rows.filter((row) => row.status === 'candidate').length
-  const missingBorrow = rows.filter((row) => row.status === 'missing_borrow_data').length
-  return {
-    total: rows.length,
-    candidate,
-    missingBorrow,
-    rejected: rows.length - candidate - missingBorrow,
-    latestSignalTime: lastUpdate.value,
-  }
-})
-
-const assetOptions = computed(() => {
-  const assets = new Set(rowData.value.map((row) => row.base_asset).filter(Boolean))
-  return Array.from(assets).sort()
+const pageInfo = computed(() => {
+  if (total.value <= 0) return '0 / 0'
+  const start = (page.value - 1) * pageSize.value + 1
+  const end = Math.min(page.value * pageSize.value, total.value)
+  return `${start}-${end} / ${total.value}`
 })
 
 function formatBps(value: number | null | undefined): string {
@@ -99,91 +111,105 @@ function formatUsdt(value: number | null | undefined): string {
     : Number(value).toLocaleString('en-US', { maximumFractionDigits: 2 })
 }
 
-function percentFormatter(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(Number(value)) ? '' : `${(Number(value) * 100).toFixed(4)}%`
+function percentFormatter(params: ValueFormatterParams) {
+  return params.value == null || !Number.isFinite(Number(params.value))
+    ? ''
+    : `${(Number(params.value) * 100).toFixed(4)}%`
 }
 
-function formatTime(timeStr: string | null | undefined): string {
-  if (!timeStr) return '--'
-  if (timeStr.includes(' ')) return timeStr.split(' ')[1] || timeStr
-  return timeStr
+function rateFormatter(params: ValueFormatterParams) {
+  return params.value == null || !Number.isFinite(Number(params.value))
+    ? ''
+    : `${(Number(params.value) * 100).toFixed(6)}%`
+}
+
+function coverageFormatter(params: ValueFormatterParams) {
+  return params.value == null || !Number.isFinite(Number(params.value))
+    ? ''
+    : `${(Number(params.value) * 100).toFixed(1)}%`
+}
+
+function durationFormatter(params: ValueFormatterParams) {
+  const value = Number(params.value)
+  if (!Number.isFinite(value)) return ''
+  if (value < 60) return `${Math.round(value)}s`
+  const min = Math.floor(value / 60)
+  const sec = Math.round(value % 60)
+  return `${min}m ${sec}s`
 }
 
 function statusLabel(status: string | null | undefined): string {
   switch (status) {
-    case 'candidate': return '候选'
-    case 'missing_open_data': return '缺盘口'
-    case 'funding_too_low': return '费率不足'
-    case 'missing_borrow_data': return '待接借币'
-    case 'borrow_unavailable': return '不可借'
-    case 'borrow_capacity_low': return '额度不足'
-    case 'edge_too_low': return '收益不足'
-    case 'basis_too_wide': return '基差过宽'
-    case 'basis_above_entry': return '基差未达标'
-    case 'depth_too_thin': return '深度不足'
-    case 'missing_edge': return '缺少收益'
+    case 'monitoring': return '监控中'
+    case 'opened': return '已开仓'
+    case 'conditions_lost': return '条件丢失'
+    case 'monitor_timeout': return '监控超时'
+    case 'gate_rejected': return '风控拒绝'
+    case 'rejected': return '执行失败'
     default: return '未知'
   }
 }
 
+function triggerLabel(trigger: string | null | undefined): string {
+  switch (trigger) {
+    case 'valley_rebound': return '触底反弹'
+    case 'manual': return '手动'
+    default: return ''
+  }
+}
+
 const statusClassMap: Record<string, string> = {
-  candidate: 'reverse-signal-success',
-  missing_borrow_data: 'reverse-signal-warning',
-  missing_open_data: 'reverse-signal-danger',
-  funding_too_low: 'reverse-signal-danger',
-  borrow_unavailable: 'reverse-signal-danger',
-  borrow_capacity_low: 'reverse-signal-danger',
-  edge_too_low: 'reverse-signal-danger',
-  basis_too_wide: 'reverse-signal-danger',
-  basis_above_entry: 'reverse-signal-danger',
-  depth_too_thin: 'reverse-signal-danger',
+  monitoring: 'reverse-signal-info',
+  opened: 'reverse-signal-success',
+  conditions_lost: 'reverse-signal-warning',
+  monitor_timeout: 'reverse-signal-warning',
+  gate_rejected: 'reverse-signal-danger',
+  rejected: 'reverse-signal-danger',
 }
 
-function mapRows(rows: unknown, serverTime: string): ReverseSignalRow[] {
-  if (!Array.isArray(rows)) return []
-  return rows
-    .filter((raw): raw is OrderBookRow => !!raw && typeof raw === 'object')
-    .filter((row) => typeof row.contract === 'string' && !!row.contract)
-    .map((row) => ({
-      id: row.contract,
-      contract: row.contract,
-      base_asset: row.base_asset,
-      signal_time: serverTime,
-      status: row.reverse_status || 'missing_edge',
-      funding_rate_24h: row.funding_rate_24h ?? null,
-      reverse_gross_funding_bps: row.reverse_gross_funding_bps ?? null,
-      reverse_expected_funding_bps: row.reverse_expected_funding_bps ?? null,
-      reverse_borrow_24h_bps: row.reverse_borrow_24h_bps ?? null,
-      reverse_basis_bps: row.reverse_basis_bps ?? null,
-      reverse_entry_ceiling_bps: row.reverse_entry_ceiling_bps ?? null,
-      reverse_open_basis_p20: row.reverse_open_basis_p20 ?? null,
-      reverse_close_basis_bps: row.reverse_close_basis_bps ?? null,
-      reverse_close_basis_p20: row.reverse_close_basis_p20 ?? null,
-      reverse_open_coverage: row.reverse_open_coverage ?? null,
-      reverse_capacity_usdt: row.reverse_capacity_usdt ?? null,
-      reverse_net_edge_bps: row.reverse_net_edge_bps ?? null,
-      funding_next_apply: row.funding_next_apply ?? null,
-    }))
-    .sort((a, b) => Number(b.reverse_net_edge_bps ?? -Infinity) - Number(a.reverse_net_edge_bps ?? -Infinity))
+function statusRenderer(params: { value?: string }) {
+  const span = document.createElement('span')
+  span.textContent = statusLabel(params.value)
+  span.className = `reverse-signal-status ${statusClassMap[params.value || ''] || 'reverse-signal-info'}`
+  return span
 }
 
-async function fetchSignals() {
+function triggerRenderer(params: { value?: string | null }) {
+  return triggerLabel(params.value)
+}
+
+async function fetchSignals(resetPage = false) {
   if (loading.value) return
+  if (resetPage) page.value = 1
   loading.value = true
   try {
-    const res = await get('/api/reverse-arbitrage/opportunities')
-    const data: ReversePayload = await res.json()
+    const query = new URLSearchParams({
+      days: String(days.value),
+      page: String(page.value),
+      page_size: String(pageSize.value),
+    })
+    if (statusFilter.value) query.set('status', statusFilter.value)
+    if (assetKeyword.value.trim()) query.set('base_asset', assetKeyword.value.trim())
+
+    const res = await get(`/api/trading/reverse-signals?${query.toString()}`)
+    const data: ReverseSignalsResponse = await res.json()
     if (!res.ok) {
       showError('反向信号加载失败')
       return
     }
-    const serverTime = data.server_time || new Date().toLocaleString()
-    lastUpdate.value = serverTime
-    borrowDataSource.value = data.borrow_data_source || 'none'
-    if (data.reverse_min_net_edge_bps != null) minNetEdgeBps.value = data.reverse_min_net_edge_bps
-    if (data.reverse_max_basis_exposure_bps != null) maxBasisExposureBps.value = data.reverse_max_basis_exposure_bps
-    if (data.reverse_slippage_buffer_bps != null) slippageBufferBps.value = data.reverse_slippage_buffer_bps
-    rowData.value = mapRows(data.rows ?? [], serverTime)
+    rowData.value = Array.isArray(data.signals) ? data.signals : []
+    total.value = Number(data.pagination?.total ?? rowData.value.length)
+    totalPages.value = Number(data.pagination?.total_pages ?? 1)
+    summary.value = {
+      total: Number(data.summary?.total ?? 0),
+      monitoring: Number(data.summary?.monitoring ?? 0),
+      opened: Number(data.summary?.opened ?? 0),
+      conditions_lost: Number(data.summary?.conditions_lost ?? 0),
+      rejected: Number(data.summary?.rejected ?? 0),
+      monitor_timeout: Number(data.summary?.monitor_timeout ?? 0),
+      conversion_rate: Number(data.summary?.conversion_rate ?? 0),
+      latest_signal_time: data.summary?.latest_signal_time ?? null,
+    }
   } catch {
     showError('反向信号加载失败')
   } finally {
@@ -191,21 +217,21 @@ async function fetchSignals() {
   }
 }
 
-function setStatusFilter(status: string) {
-  filterStatus.value = status
-  gridApi.value?.onFilterChanged()
+function setStatus(status: string) {
+  statusFilter.value = status
+  fetchSignals(true)
 }
 
-function externalFilterPresent() {
-  return !!filterStatus.value || !!filterAsset.value
+function prevPage() {
+  if (page.value <= 1) return
+  page.value -= 1
+  fetchSignals()
 }
 
-function externalFilterPass(params: { data?: ReverseSignalRow }) {
-  const row = params.data
-  if (!row) return true
-  if (filterStatus.value && row.status !== filterStatus.value) return false
-  if (filterAsset.value && row.base_asset !== filterAsset.value) return false
-  return true
+function nextPage() {
+  if (page.value >= totalPages.value) return
+  page.value += 1
+  fetchSignals()
 }
 
 function refreshColumnVisibilities() {
@@ -259,126 +285,145 @@ async function loadColumnState() {
 }
 
 const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
-  { headerName: '标的资产', field: 'base_asset', width: 100, pinned: 'left' },
-  { headerName: '信号时间', field: 'signal_time', width: 165 },
+  { headerName: '标的资产', field: 'base_asset', width: 95, pinned: 'left' },
   {
     headerName: '状态',
     field: 'status',
+    width: 110,
+    cellRenderer: statusRenderer,
+  },
+  {
+    headerName: '信号时间',
+    field: 'signal_time',
+    width: 165,
+    sort: 'desc',
+  },
+  {
+    headerName: '持续时长',
+    field: 'duration_sec',
     width: 105,
-    cellRenderer: (params: { value?: string }) => {
-      const span = document.createElement('span')
-      span.textContent = statusLabel(params.value)
-      span.className = `reverse-signal-status ${statusClassMap[params.value || ''] || 'reverse-signal-info'}`
-      return span
-    },
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: durationFormatter,
+  },
+  {
+    headerName: '触发方式',
+    field: 'trigger_type',
+    width: 110,
+    cellRenderer: triggerRenderer,
   },
   {
     headerName: '24h资金费率',
     field: 'funding_rate_24h',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => percentFormatter(p.value as number | null),
-  },
-  {
-    headerName: '可收Funding(bps)',
-    field: 'reverse_gross_funding_bps',
-    width: 135,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value as number | null),
-  },
-  {
-    headerName: '预期Funding(bps)',
-    field: 'reverse_expected_funding_bps',
-    width: 135,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value as number | null),
-  },
-  {
-    headerName: '借币24h成本(bps)',
-    field: 'reverse_borrow_24h_bps',
-    width: 140,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value as number | null),
-  },
-  {
-    headerName: '反向开仓基差(bps)',
-    field: 'reverse_basis_bps',
-    width: 150,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value as number | null),
-  },
-  {
-    headerName: '反向开仓上限(bps)',
-    field: 'reverse_entry_ceiling_bps',
-    width: 150,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value as number | null),
-  },
-  {
-    headerName: '反向开仓P20(bps)',
-    field: 'reverse_open_basis_p20',
-    width: 145,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value as number | null),
-  },
-  {
-    headerName: '开仓盘口覆盖',
-    field: 'reverse_open_coverage',
     width: 125,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => p.value == null ? '' : `${(Number(p.value) * 100).toFixed(1)}%`,
+    valueFormatter: percentFormatter,
   },
   {
-    headerName: '反向平仓基差(bps)',
-    field: 'reverse_close_basis_bps',
-    width: 150,
+    headerName: '边际盈亏(bps)',
+    field: 'margin_edge_bps',
+    width: 130,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => formatBps(p.value as number | null),
   },
   {
-    headerName: '反向平仓P20(bps)',
+    headerName: '入场基差(bps)',
+    field: 'signal_basis_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
+    headerName: '低点基差(bps)',
+    field: 'valley_basis_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
+    headerName: '反弹基差(bps)',
+    field: 'rebound_basis_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
+    headerName: '旁路基差(bps)',
+    field: 'pre_gate_basis_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
+    headerName: '开仓P20(bps)',
+    field: 'reverse_open_basis_p20',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
+    headerName: '平仓P20(bps)',
     field: 'reverse_close_basis_p20',
-    width: 145,
+    width: 120,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => formatBps(p.value as number | null),
   },
   {
-    headerName: '预期净收益(bps)',
-    field: 'reverse_net_edge_bps',
+    headerName: '借币小时利率',
+    field: 'borrow_hourly_rate',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: rateFormatter,
+  },
+  {
+    headerName: '借币24h成本(bps)',
+    field: 'borrow_24h_bps',
     width: 140,
-    sort: 'desc',
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => formatBps(p.value as number | null),
-    cellStyle: (params) => Number(params.value ?? -Infinity) >= minNetEdgeBps.value
-      ? { color: '#67c23a' }
-      : { color: '#f56c6c' },
   },
   {
-    headerName: '可做名义USDT',
-    field: 'reverse_capacity_usdt',
+    headerName: '借币额度USDT',
+    field: 'borrow_capacity_usdt',
     width: 130,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => formatUsdt(p.value as number | null),
   },
-  { headerName: '下次支付时间', field: 'funding_next_apply', width: 160 },
+  {
+    headerName: '盘口覆盖',
+    field: 'open_coverage',
+    width: 105,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: coverageFormatter,
+  },
+  {
+    headerName: '拒绝/结束原因',
+    field: 'reject_reason',
+    width: 260,
+    tooltipField: 'reject_reason',
+  },
+  { headerName: '订单UUID', field: 'order_uuid', width: 170 },
 ])
 
 const defaultColDef: ColDef = {
   sortable: true,
   resizable: true,
   filter: true,
+  enableRowGroup: false,
+  enablePivot: false,
+  enableValue: false,
 }
 
 function onGridReady(event: GridReadyEvent<ReverseSignalRow>) {
@@ -389,7 +434,7 @@ function onGridReady(event: GridReadyEvent<ReverseSignalRow>) {
 
 onMounted(() => {
   fetchSignals()
-  refreshTimer = setInterval(fetchSignals, 3000)
+  refreshTimer = setInterval(() => fetchSignals(), 5000)
 })
 
 onUnmounted(() => {
@@ -405,62 +450,69 @@ onUnmounted(() => {
         <span class="summary-value">{{ summary.total }}</span>
       </span>
       <span class="summary-item">
-        <span class="summary-label">候选</span>
-        <span class="summary-value summary-success">{{ summary.candidate }}</span>
+        <span class="summary-label">监控中</span>
+        <span class="summary-value summary-info">{{ summary.monitoring }}</span>
       </span>
       <span class="summary-item">
-        <span class="summary-label">待接借币</span>
-        <span class="summary-value summary-warning">{{ summary.missingBorrow }}</span>
+        <span class="summary-label">已开仓</span>
+        <span class="summary-value summary-success">{{ summary.opened }}</span>
       </span>
       <span class="summary-item">
-        <span class="summary-label">未通过</span>
+        <span class="summary-label">条件丢失</span>
+        <span class="summary-value summary-warning">{{ summary.conditions_lost }}</span>
+      </span>
+      <span class="summary-item">
+        <span class="summary-label">风控/执行拒绝</span>
         <span class="summary-value summary-danger">{{ summary.rejected }}</span>
       </span>
       <span class="summary-item">
-        <span class="summary-label">最近更新</span>
-        <span class="summary-value">{{ formatTime(summary.latestSignalTime) }}</span>
+        <span class="summary-label">监控超时</span>
+        <span class="summary-value summary-warning">{{ summary.monitor_timeout }}</span>
       </span>
       <span class="summary-item">
-        <span class="summary-label">借币数据</span>
-        <span class="summary-value">{{ borrowDataSource }}</span>
-      </span>
-      <span class="summary-item">
-        <span class="summary-label">净收益阈值</span>
-        <span class="summary-value">{{ minNetEdgeBps }} bps</span>
-      </span>
-      <span class="summary-item">
-        <span class="summary-label">硬基差上限</span>
-        <span class="summary-value">{{ maxBasisExposureBps }} bps</span>
-      </span>
-      <span class="summary-item">
-        <span class="summary-label">滑点缓冲</span>
-        <span class="summary-value">{{ slippageBufferBps }} bps</span>
+        <span class="summary-label">最近信号</span>
+        <span class="summary-value">{{ summary.latest_signal_time || '--' }}</span>
       </span>
     </div>
 
     <div class="filter-bar">
       <el-button-group size="small">
-        <el-button :type="filterStatus === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部</el-button>
-        <el-button :type="filterStatus === 'candidate' ? 'primary' : 'default'" @click="setStatusFilter('candidate')">候选</el-button>
-        <el-button :type="filterStatus === 'funding_too_low' ? 'primary' : 'default'" @click="setStatusFilter('funding_too_low')">费率不足</el-button>
-        <el-button :type="filterStatus === 'missing_borrow_data' ? 'primary' : 'default'" @click="setStatusFilter('missing_borrow_data')">待接借币</el-button>
-        <el-button :type="filterStatus === 'edge_too_low' ? 'primary' : 'default'" @click="setStatusFilter('edge_too_low')">收益不足</el-button>
-        <el-button :type="filterStatus === 'basis_above_entry' ? 'primary' : 'default'" @click="setStatusFilter('basis_above_entry')">基差未达标</el-button>
-        <el-button :type="filterStatus === 'basis_too_wide' ? 'primary' : 'default'" @click="setStatusFilter('basis_too_wide')">基差过宽</el-button>
-        <el-button :type="filterStatus === 'depth_too_thin' ? 'primary' : 'default'" @click="setStatusFilter('depth_too_thin')">深度不足</el-button>
+        <el-button :type="statusFilter === '' ? 'primary' : 'default'" @click="setStatus('')">全部</el-button>
+        <el-button :type="statusFilter === 'monitoring' ? 'primary' : 'default'" @click="setStatus('monitoring')">监控中</el-button>
+        <el-button :type="statusFilter === 'opened' ? 'primary' : 'default'" @click="setStatus('opened')">已开仓</el-button>
+        <el-button :type="statusFilter === 'conditions_lost' ? 'primary' : 'default'" @click="setStatus('conditions_lost')">条件丢失</el-button>
+        <el-button :type="statusFilter === 'gate_rejected' ? 'primary' : 'default'" @click="setStatus('gate_rejected')">风控拒绝</el-button>
+        <el-button :type="statusFilter === 'monitor_timeout' ? 'primary' : 'default'" @click="setStatus('monitor_timeout')">监控超时</el-button>
       </el-button-group>
-      <el-select
-        v-model="filterAsset"
+      <el-input
+        v-model="assetKeyword"
+        :prefix-icon="Search"
         placeholder="标的资产"
         size="small"
-        filterable
         clearable
         style="width: 150px"
-        @change="gridApi?.onFilterChanged()"
-      >
-        <el-option v-for="asset in assetOptions" :key="asset" :label="asset" :value="asset" />
+        @change="fetchSignals(true)"
+        @clear="fetchSignals(true)"
+      />
+      <el-select v-model="days" size="small" style="width: 110px" @change="fetchSignals(true)">
+        <el-option :value="1" label="最近1天" />
+        <el-option :value="3" label="最近3天" />
+        <el-option :value="7" label="最近7天" />
+        <el-option :value="14" label="最近14天" />
+        <el-option :value="30" label="最近30天" />
+      </el-select>
+      <el-select v-model="pageSize" size="small" style="width: 100px" @change="fetchSignals(true)">
+        <el-option :value="50" label="50条" />
+        <el-option :value="100" label="100条" />
+        <el-option :value="200" label="200条" />
+        <el-option :value="500" label="500条" />
       </el-select>
       <el-button size="small" :icon="Refresh" :loading="loading" @click="fetchSignals">刷新</el-button>
+      <div class="pager">
+        <el-button size="small" :disabled="page <= 1" @click="prevPage">上一页</el-button>
+        <span class="page-info">{{ pageInfo }}</span>
+        <el-button size="small" :disabled="page >= totalPages" @click="nextPage">下一页</el-button>
+      </div>
       <div class="column-actions">
         <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
           <template #reference>
@@ -487,10 +539,9 @@ onUnmounted(() => {
         :columnDefs="columnDefs"
         :defaultColDef="defaultColDef"
         :getRowId="(params: any) => String(params.data.id)"
-        :isExternalFilterPresent="externalFilterPresent"
-        :doesExternalFilterPass="externalFilterPass"
         :header-height="32"
         :row-height="32"
+        :tooltip-show-delay="300"
         @grid-ready="onGridReady"
         style="width: 100%; height: 100%"
       />
@@ -510,7 +561,8 @@ onUnmounted(() => {
 .summary-bar,
 .filter-bar,
 .column-actions,
-.summary-item {
+.summary-item,
+.pager {
   display: flex;
   align-items: center;
 }
@@ -552,9 +604,25 @@ onUnmounted(() => {
   color: #f56c6c;
 }
 
+.summary-info {
+  color: #409eff;
+}
+
 .filter-bar {
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.pager {
+  gap: 8px;
+}
+
+.page-info {
+  min-width: 92px;
+  text-align: center;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .column-actions {
@@ -613,8 +681,8 @@ onUnmounted(() => {
 }
 
 :deep(.reverse-signal-info) {
-  color: #909399;
-  border-color: rgba(144, 147, 153, 0.35);
-  background: rgba(144, 147, 153, 0.08);
+  color: #409eff;
+  border-color: rgba(64, 158, 255, 0.35);
+  background: rgba(64, 158, 255, 0.08);
 }
 </style>

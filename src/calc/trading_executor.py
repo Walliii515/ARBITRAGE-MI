@@ -42,6 +42,7 @@ class TradingExecutorConfig:
     cooldown_sec: int = 3600
     min_funding_rate_bps: float = -6.0
     open_amount_usdt: float = 5.0
+    max_total_positions: int = 45
     max_positions_per_asset: int = 1
     reject_cooldown_sec: int = 300
     # 旁路风控新鲜度硬约束：本地接收最近一次 WS 盘口与当前下单时刻的允许最大延迟（毫秒）
@@ -231,6 +232,8 @@ class TradingExecutor:
         # 持仓距爆仓距离缓存: base_asset -> liq_distance_pct
         self._holding_liq_distance: Dict[str, float] = {}
         self._holding_count: Dict[str, int] = {}  # base_asset -> 持仓中仓位数量
+        self._holding_total_count: int = 0
+        self.max_total_positions = max(int(cfg.max_total_positions or 0), 0)
         self.max_positions_per_asset = cfg.max_positions_per_asset
 
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
@@ -445,6 +448,7 @@ class TradingExecutor:
                 cursor.execute(sql)
                 rows = cursor.fetchall()
             self._holding_count = {r['base_asset']: int(r['cnt']) for r in rows if r.get('base_asset')}
+            self._holding_total_count = sum(self._holding_count.values())
         except Exception as e:
             # 查询失败时保留旧计数（保守策略：宁可拦截过多也不绕过上限）
             logger.error(f"刷新 _holding_count 失败，沿用旧计数: {e}")
@@ -673,12 +677,14 @@ class TradingExecutor:
                 if exec_result['success']:
                     # 立即递增持仓计数 + 写入冷却时间，避免下一轮（0.5s后）穿透上限/冷却检查
                     self._holding_count[base_asset] = self._holding_count.get(base_asset, 0) + 1
+                    self._holding_total_count += 1
                     self._last_open_time[base_asset] = datetime.now()
                     logger.info(
                         f"开仓成功 | {base_asset} | "
                         f"spot_vwap={exec_result['spot_order']['exec_price']} | "
                         f"future_vwap={exec_result['future_order']['exec_price']} | "
-                        f"holding_count={self._holding_count[base_asset]}/{self.max_positions_per_asset}"
+                        f"holding_count={self._holding_count[base_asset]}/{self.max_positions_per_asset} | "
+                        f"total_holding={self._holding_total_count}/{self.max_total_positions or '∞'}"
                     )
                 else:
                     logger.warning(f"开仓拒单 | {base_asset} | reason={exec_result['message']}")
@@ -1481,6 +1487,10 @@ class TradingExecutor:
         """
         base_asset = row.get('base_asset', '')
 
+        # 全局持仓数上限检查：保留可用资金 buffer 给 future 追保/极端行情。
+        if self.max_total_positions > 0 and self._holding_total_count >= self.max_total_positions:
+            return False
+
         # 同标的持仓数上限检查：防止同一波收敛行情中连续开仓
         if self._holding_count.get(base_asset, 0) >= self.max_positions_per_asset:
             return False
@@ -2028,6 +2038,15 @@ class TradingExecutor:
     def _get_risk_fail_reason(self, row: Dict) -> str:
         """识别风控失败的具体原因（用于信号日志）"""
         base_asset = row.get('base_asset', '')
+
+        if self.max_total_positions > 0 and self._holding_total_count >= self.max_total_positions:
+            return f"总持仓数上限({self._holding_total_count}/{self.max_total_positions})"
+
+        if self._holding_count.get(base_asset, 0) >= self.max_positions_per_asset:
+            return (
+                f"同标的持仓数上限"
+                f"({self._holding_count.get(base_asset, 0)}/{self.max_positions_per_asset})"
+            )
 
         # 保证金风控检查
         if base_asset in self._holding_liq_distance:

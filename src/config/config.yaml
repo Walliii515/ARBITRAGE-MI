@@ -56,6 +56,7 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
+    max_total_positions: 45                 # 全局最大持仓数，保留资金buffer给future追保
     max_positions_per_asset: 7              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
@@ -293,6 +294,29 @@ reconciliation:
   ignored_binance_spot_assets: [BNB]        # BNB 用作 Binance 手续费抵扣燃料，不参与套利持仓对账
   mark_exchange_risk: true                  # Gate 实仓少于本地持仓时，标记 mi_trade_position.exchange_risk_*
   adl_lookback_sec: 86400                   # 回查 Gate my_trades 识别 auto_deleveraging 的窗口（24小时）
+
+# 反向资金费率套利（short spot + long future）
+# 当前只做机会扫描 + 交易信号监控，不真实下单；正向策略配置不复用这里的状态。
+reverse_arbitrage:
+  funding_capture_ratio: 0.5                # 边际盈亏中计入24h负费率的权重
+  signal:
+    enabled: true
+    check_interval_sec: 1.0
+    monitor_timeout_sec: 60
+    valley_rebound_pct: 0.05                # 基差触底后，按跌幅比例反弹确认
+    min_rebound_bps: 2.0                    # 反弹确认的最小bps，避免低基数时过敏
+    min_monitor_sec: 1.5
+    rebound_sustain_sec: 0.4
+    max_orderbook_lag_ms: 500
+  execution:
+    enabled: false                          # 反向执行器接入前保持关闭
+  binance_margin:
+    enabled: true
+    cache_ttl_sec: 60
+    max_borrowable_assets_per_refresh: 250
+    timeout_sec: 10
+    recv_window_ms: 10000
+  borrow_overrides: {}
 
 # Gate 私有风险事件监听：实时接收 ADL/强平事件并自动修复 Binance spot 裸腿
 exchange_risk_monitor:

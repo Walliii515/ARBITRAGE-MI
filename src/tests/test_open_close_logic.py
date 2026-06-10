@@ -81,6 +81,8 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           rebound_allowed_tiers=None,
                           funding_entry_enabled=True,
                           funding_carry_enabled=False,
+                          max_total_positions=45,
+                          max_positions_per_asset=1,
                           contract_meta=None,
                           spot_meta=None):
     """构造独立的 TradingExecutor 实例（不依赖 DB / API）"""
@@ -100,6 +102,8 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         rebound_allowed_tiers=rebound_allowed_tiers or ['A', 'B'],
         funding_entry_enabled=funding_entry_enabled,
         funding_carry_enabled=funding_carry_enabled,
+        max_total_positions=max_total_positions,
+        max_positions_per_asset=max_positions_per_asset,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
@@ -1109,6 +1113,20 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertAlmostEqual(snapshot['entry_floor_bps'], 16.9, places=1)
         self.assertFalse(te._pass_risk_check(self._row('ALLO', 10.0, 0.008646)))
         self.assertTrue(te._pass_risk_check(self._row('ALLO', 20.0, 0.008646)))
+
+    def test_global_position_limit_blocks_new_open(self):
+        te = make_trading_executor(
+            max_total_positions=2,
+            max_positions_per_asset=99,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te._holding_total_count = 2
+
+        row = self._row('ALLO', 50.0, 0.008646)
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertEqual(te._get_risk_fail_reason(row), '总持仓数上限(2/2)')
 
     def test_low_funding_negative_p20_requires_positive_carry_floor(self):
         te = make_trading_executor(

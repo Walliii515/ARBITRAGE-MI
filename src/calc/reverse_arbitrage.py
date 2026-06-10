@@ -23,13 +23,7 @@ class ReverseArbitrageConfig:
     future_open_fee: float
     future_close_fee: float
     orderbook_coverage_threshold: float
-    min_net_edge_bps: float = 20.0
-    max_basis_exposure_bps: float = 50.0
-    slippage_buffer_bps: float = 10.0
     funding_capture_ratio: float = 0.5
-    strong_funding_24h_bps: float = 50.0
-    funding_discount_ratio: float = 0.2
-    max_funding_discount_bps: float = 10.0
 
 
 def _as_float(value) -> Optional[float]:
@@ -72,18 +66,11 @@ def _reverse_status(row: Dict, cfg: ReverseArbitrageConfig) -> str:
     if not row.get('reverse_coverage_pass'):
         return 'depth_too_thin'
 
-    net_edge = row.get('reverse_net_edge_bps')
-    basis = row.get('reverse_basis_bps')
-    entry_ceiling = row.get('reverse_entry_ceiling_bps')
-
-    if net_edge is None or entry_ceiling is None or basis is None:
-        return 'missing_edge'
-    if net_edge < cfg.min_net_edge_bps:
-        return 'edge_too_low'
-    if basis is not None and basis > cfg.max_basis_exposure_bps:
-        return 'basis_too_wide'
-    if basis > entry_ceiling:
-        return 'basis_above_entry'
+    margin_edge = row.get('reverse_margin_edge_bps')
+    if margin_edge is None:
+        return 'missing_margin_edge'
+    if not row.get('reverse_margin_edge_pass'):
+        return 'margin_edge_too_low'
     return 'candidate'
 
 
@@ -97,7 +84,7 @@ def enrich_reverse_opportunities(
     """为反向机会页面富化行数据（就地修改 rows）。"""
     borrow_meta = borrow_meta or {}
     reverse_threshold_meta = reverse_threshold_meta or {}
-    full_fee_bps = -calc_full_fee_bps(
+    fee_cost_bps = -calc_full_fee_bps(
         cfg.spot_open_fee,
         cfg.spot_close_fee,
         cfg.future_open_fee,
@@ -173,7 +160,7 @@ def enrich_reverse_opportunities(
         borrow_hourly_rate = _as_float(b_meta.get('hourly_interest_rate'))
         borrow_limit = _as_float(b_meta.get('borrow_limit'))
         borrowable = b_meta.get('borrowable')
-        borrow_data_missing = not bool(b_meta)
+        borrow_data_missing = not bool(b_meta) or borrow_hourly_rate is None or borrow_limit is None
         borrow_24h_bps = borrow_hourly_rate * 24.0 * 10000.0 if borrow_hourly_rate is not None else None
 
         spot_price = _as_float(row.get('spot_price_bid_1')) or _as_float(row.get('spot_price_ask_1'))
@@ -193,57 +180,32 @@ def enrich_reverse_opportunities(
         reverse_capacity_usdt = min(capacity_candidates) if capacity_candidates else None
         borrow_pass = (
             not borrow_data_missing
-            and borrowable is not False
+            and borrowable is True
             and borrow_24h_bps is not None
-            and (borrow_capacity_usdt is None or borrow_capacity_usdt >= cfg.open_amount_usdt)
+            and borrow_capacity_usdt is not None
+            and borrow_capacity_usdt >= cfg.open_amount_usdt
         )
         coverage = row.get('reverse_open_coverage')
         coverage_pass = coverage is not None and float(coverage) <= cfg.orderbook_coverage_threshold
 
         basis_bps = row.get('reverse_basis_bps')
-        reverse_open_p20 = threshold_meta.get('reverse_open_basis_p20')
-        funding_discount_bps = min(
-            cfg.max_funding_discount_bps,
-            max(0.0, gross_funding_bps) * cfg.funding_discount_ratio,
+        reverse_open_p20 = _as_float(threshold_meta.get('reverse_open_basis_p20'))
+        reverse_close_p20 = _as_float(threshold_meta.get('reverse_close_basis_p20'))
+        reverse_p20_edge_bps = (
+            min(reverse_open_p20, reverse_close_p20)
+            if reverse_open_p20 is not None and reverse_close_p20 is not None
+            else None
         )
-        carry_ceiling_bps = None
-        timing_ceiling_bps = None
-        entry_ceiling_bps = None
-        if borrow_24h_bps is not None:
-            carry_ceiling_bps = (
+        margin_edge_bps = None
+        if borrow_24h_bps is not None and basis_bps is not None and reverse_p20_edge_bps is not None:
+            margin_edge_bps = (
                 expected_funding_bps
-                - borrow_24h_bps
-                - full_fee_bps
-                - cfg.slippage_buffer_bps
-                - cfg.min_net_edge_bps
-            )
-        if reverse_open_p20 is not None:
-            timing_ceiling_bps = float(reverse_open_p20) + funding_discount_bps
-        ceiling_candidates = [
-            x for x in (carry_ceiling_bps, timing_ceiling_bps, cfg.max_basis_exposure_bps) if x is not None
-        ]
-        if ceiling_candidates:
-            entry_ceiling_bps = min(ceiling_candidates)
-            if gross_funding_bps < cfg.strong_funding_24h_bps and reverse_open_p20 is not None:
-                entry_ceiling_bps = min(entry_ceiling_bps, float(reverse_open_p20))
-
-        net_edge_bps = None
-        if borrow_24h_bps is not None and basis_bps is not None:
-            net_edge_bps = (
-                expected_funding_bps
+                + reverse_p20_edge_bps
                 - float(basis_bps)
                 - borrow_24h_bps
-                - full_fee_bps
-                - cfg.slippage_buffer_bps
+                - fee_cost_bps
             )
-        edge_pass = net_edge_bps is not None and net_edge_bps >= cfg.min_net_edge_bps
-        basis_pass = (
-            basis_bps is not None
-            and entry_ceiling_bps is not None
-            and float(basis_bps) <= entry_ceiling_bps
-            and float(basis_bps) <= cfg.max_basis_exposure_bps
-            and edge_pass
-        )
+        margin_edge_pass = margin_edge_bps is not None and margin_edge_bps >= 0
 
         row.update({
             'reverse_strategy': 'short_spot_long_future',
@@ -262,15 +224,11 @@ def enrich_reverse_opportunities(
             'reverse_depth_capacity_usdt': round(depth_capacity_usdt, 2) if depth_capacity_usdt is not None else None,
             'reverse_capacity_usdt': round(reverse_capacity_usdt, 2) if reverse_capacity_usdt is not None else None,
             'reverse_coverage_pass': coverage_pass,
-            'reverse_fee_bps': round(full_fee_bps, 4),
-            'reverse_slippage_buffer_bps': cfg.slippage_buffer_bps,
-            'reverse_carry_ceiling_bps': round(carry_ceiling_bps, 4) if carry_ceiling_bps is not None else None,
-            'reverse_timing_ceiling_bps': round(timing_ceiling_bps, 4) if timing_ceiling_bps is not None else None,
-            'reverse_funding_discount_bps': round(funding_discount_bps, 4),
-            'reverse_entry_ceiling_bps': round(entry_ceiling_bps, 4) if entry_ceiling_bps is not None else None,
-            'reverse_net_edge_bps': round(net_edge_bps, 4) if net_edge_bps is not None else None,
-            'reverse_basis_pass': basis_pass,
+            'reverse_fee_bps': round(fee_cost_bps, 4),
+            'reverse_p20_edge_bps': round(reverse_p20_edge_bps, 4) if reverse_p20_edge_bps is not None else None,
+            'reverse_margin_edge_bps': round(margin_edge_bps, 4) if margin_edge_bps is not None else None,
+            'reverse_margin_edge_pass': margin_edge_pass,
             'reverse_open_basis_p20': reverse_open_p20,
-            'reverse_close_basis_p20': threshold_meta.get('reverse_close_basis_p20'),
+            'reverse_close_basis_p20': reverse_close_p20,
         })
         row['reverse_status'] = _reverse_status(row, cfg)
