@@ -132,6 +132,10 @@ class ReverseSignalMonitor:
                 return {'base_asset': base_asset, 'status': 'monitoring', 'created': True}
 
         duration_sec = int((now - state['start_time']).total_seconds())
+        if state.get('signal_basis_bps') is None:
+            state['signal_basis_bps'] = current_basis
+        if state.get('valley_basis_bps') is None:
+            state['valley_basis_bps'] = current_basis
         valley = float(state.get('valley_basis_bps', current_basis))
         if current_basis < valley:
             valley = current_basis
