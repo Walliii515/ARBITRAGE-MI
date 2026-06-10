@@ -2138,26 +2138,25 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 class TestMarginTopupCalculation(unittest.TestCase):
     """自动追保核心公式。"""
 
-    def test_topup_amount_targets_half_current_future_notional(self):
+    def test_topup_amount_targets_gate_margin_maintenance_rate(self):
         ce = make_closing_executor()
+        ce.margin_topup_target_rate_pct = 3000.0
         pos = {
             'id': 1,
             'base_asset': 'BTC',
-            'future_open_qty': 1.0,
-            'future_open_price': 100.0,
-            'future_open_leverage': 5.0,
-            'current_future_price': 130.0,
-            'margin_topup_total': 0.0,
+            'gate_position_margin': 28.0,
+            'gate_maintenance_margin': 2.0,
         }
 
         calc = ce._calculate_margin_topup_amount(pos)
 
         self.assertIsNotNone(calc)
-        self.assertAlmostEqual(calc['initial_margin'], 20.0)
-        self.assertAlmostEqual(calc['target_margin'], 65.0)
-        self.assertAlmostEqual(calc['topup_amount'], 45.0)
+        self.assertAlmostEqual(calc['margin_before'], 28.0)
+        self.assertAlmostEqual(calc['target_margin'], 60.0)
+        self.assertAlmostEqual(calc['topup_amount'], 32.0)
+        self.assertAlmostEqual(calc['margin_rate_after'], 3000.0)
 
-    def test_topup_amount_uses_position_open_leverage(self):
+    def test_topup_amount_returns_none_without_gate_margin_fields(self):
         ce = make_closing_executor()
         pos = {
             'id': 1,
@@ -2171,10 +2170,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         calc = ce._calculate_margin_topup_amount(pos)
 
-        self.assertIsNotNone(calc)
-        self.assertAlmostEqual(calc['initial_margin'], 50.0)
-        self.assertAlmostEqual(calc['target_margin'], 65.0)
-        self.assertAlmostEqual(calc['topup_amount'], 15.0)
+        self.assertIsNone(calc)
 
     def test_liq_price_includes_margin_topup_total(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -2252,9 +2248,11 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
     def test_topup_attempts_before_emergency_close(self):
         ce = make_closing_executor()
-        ce.margin_topup_pct = 15.0
-        ce.margin_close_threshold_pct = 5.0
+        ce.margin_topup_pct = 2000.0
+        ce.margin_close_threshold_pct = 120.0
+        ce.margin_topup_target_rate_pct = 3000.0
         ce.margin_topup_min_gate_available = 50.0
+        ce.margin_topup_max_ratio = 0.0
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
         ce._get_latest_gate_available = MagicMock(return_value=100.0)
@@ -2270,7 +2268,9 @@ class TestMarginTopupCalculation(unittest.TestCase):
             'future_open_price': 100.0,
             'future_open_leverage': 5.0,
             'current_future_price': 148.0,
-            'liq_distance_pct': 4.8,
+            'gate_position_margin': 15.0,
+            'gate_maintenance_margin': 1.0,
+            'gate_maintenance_margin_rate': 1500.0,
             'margin_topup_total': 0.0,
             'margin_topup_count': 0,
         }
@@ -2278,7 +2278,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         result = ce._check_and_topup_margin(pos)
 
         self.assertTrue(result['success'])
-        ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 20.0, dual_side='short')
+        ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 15.0, dual_side='short')
 
     def test_executor_client_sends_dual_side_for_gate_topup(self):
         from calc.executor_client import ExecutorClient

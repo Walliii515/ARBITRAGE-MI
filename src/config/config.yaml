@@ -253,18 +253,18 @@ margin:
   leverage: 5
   # 默认维持保证金率（当合约表无数据时的回退值）
   default_maintenance_rate: 0.005
-  # 距爆仓预警阈值(%):低于此值时禁止该标的新开仓 + 前端告警
-  warning_pct: 15
-  # 距爆仓自动追加保证金阈值(%)：低于该值时先尝试追保
-  topup_pct: 15
-  # 距爆仓平仓阈值(%)：低于此值进入紧急区，追保失败/不可追保才触发两端同时平仓
-  close_threshold_pct: 5
-  # 自动追加保证金策略：补到当前期货名义价值 50% 的保证金水平
+  # 保证金/维持保证金预警阈值(%): 低于此值时禁止该标的新开仓
+  warning_pct: 2000
+  # 保证金/维持保证金自动追加阈值(%): 低于此值时先尝试追保
+  topup_pct: 2000
+  # 保证金/维持保证金紧急平仓阈值(%): 低于此值且追保失败/不可追保才触发两端同时平仓
+  close_threshold_pct: 120
+  # 自动追加保证金策略：补到目标 保证金/维持保证金 比例
   topup:
     enabled: true
-    target_margin_ratio: 0.5
+    target_maintenance_margin_rate_pct: 3000
     max_topup_per_position: 99
-    max_topup_ratio: 1.0
+    max_topup_ratio: 0
     min_gate_available: 50
     cooldown_sec: 300
     min_amount_usdt: 0.1

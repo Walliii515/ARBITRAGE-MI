@@ -856,8 +856,8 @@ onUnmounted(() => {
         <el-table-column prop="margin_before_usdt" label="追加前保证金" width="120" align="right" :formatter="(row: TopupRow) => formatAmount(row.margin_before_usdt)" />
         <el-table-column prop="target_margin_usdt" label="目标保证金" width="110" align="right" :formatter="(row: TopupRow) => formatAmount(row.target_margin_usdt)" />
         <el-table-column prop="gate_available_before" label="Gate可用" width="100" align="right" :formatter="(row: TopupRow) => formatAmount(row.gate_available_before)" />
-        <el-table-column prop="liq_distance_before" label="追保前距离" width="105" align="right" :formatter="(row: TopupRow) => formatPercentValue(row.liq_distance_before)" />
-        <el-table-column prop="liq_distance_after" label="预计后距离" width="105" align="right" :formatter="(row: TopupRow) => formatPercentValue(row.liq_distance_after)" />
+        <el-table-column prop="liq_distance_before" label="追保前比例" width="105" align="right" :formatter="(row: TopupRow) => formatPercentValue(row.liq_distance_before)" />
+        <el-table-column prop="liq_distance_after" label="预计后比例" width="105" align="right" :formatter="(row: TopupRow) => formatPercentValue(row.liq_distance_after)" />
         <el-table-column prop="success" label="结果" width="80">
           <template #default="{ row }">
             <span :style="{ color: row.success ? '#67c23a' : '#f56c6c' }">

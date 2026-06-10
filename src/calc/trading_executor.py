@@ -227,10 +227,10 @@ class TradingExecutor:
         self._last_realtime_rate_bps: Dict[str, float] = {}
         self._last_realtime_funding_info: Dict[str, Dict] = {}
 
-        # 保证金风控：距爆仓距离低于此值时禁止开仓
+        # 保证金风控：保证金/维持保证金低于此值时禁止开仓
         self.margin_warning_pct = cfg.margin_warning_pct
-        # 持仓距爆仓距离缓存: base_asset -> liq_distance_pct
-        self._holding_liq_distance: Dict[str, float] = {}
+        # 持仓 Gate 保证金/维持保证金缓存: base_asset -> min(gate_maintenance_margin_rate)
+        self._holding_margin_rate: Dict[str, float] = {}
         self._holding_count: Dict[str, int] = {}  # base_asset -> 持仓中仓位数量
         self._holding_total_count: int = 0
         self.max_total_positions = max(int(cfg.max_total_positions or 0), 0)
@@ -404,27 +404,28 @@ class TradingExecutor:
 
     def update_holding_margin_status(self, positions: List[Dict]):
         """
-        更新持仓的距爆仓距离缓存（由 _margin_status_loop 每 5s 调用一次）
+        更新持仓的 Gate 保证金/维持保证金缓存（由 _margin_status_loop 每 5s 调用一次）
 
         注意：本方法不再维护 self._holding_count。
         持仓数量计数由 _refresh_holding_count_from_db() 在每轮 check_and_open 开始时
         从 DB 实时刷新，避免 5s 刷新窗口被高频开仓循环（0.5s）穿透。
 
         Args:
-            positions: 已由 calculate_realtime_pnl 富化的持仓列表（含 liq_distance_pct）
+            positions: 已由 calculate_realtime_pnl 和 attach_gate_position_risk 富化的持仓列表
         """
-        self._holding_liq_distance.clear()
+        self._holding_margin_rate.clear()
         for pos in positions:
             if pos.get('status') != 'holding':
                 continue
             ba = pos.get('base_asset', '')
             if not ba:
                 continue
-            liq_dist = pos.get('liq_distance_pct')
-            if liq_dist is not None:
-                # 同一标的多个仓位时，取最小距爆仓距离（最危险的）
-                if ba not in self._holding_liq_distance or liq_dist < self._holding_liq_distance[ba]:
-                    self._holding_liq_distance[ba] = liq_dist
+            margin_rate = pos.get('gate_maintenance_margin_rate')
+            if margin_rate is not None:
+                margin_rate = float(margin_rate)
+                # 同一标的多个仓位时，取最小保证金/维持保证金比例（最危险的）
+                if ba not in self._holding_margin_rate or margin_rate < self._holding_margin_rate[ba]:
+                    self._holding_margin_rate[ba] = margin_rate
 
     def _refresh_holding_count_from_db(self):
         """
@@ -1479,7 +1480,7 @@ class TradingExecutor:
     def _pass_risk_check(self, row: Dict) -> bool:
         """
         风控规则检查:
-        0. 保证金风控: 该标的现有持仓距爆仓距离 < warning_pct 时禁止开仓
+        0. 保证金风控: 该标的现有持仓 保证金/维持保证金 < warning_pct 时禁止开仓
         1. 资金费率 >= 下限(min_funding_rate_bps)
         2. 开仓盘口覆盖 <= 阈值
         3. 开仓基差 >= funding-adjusted entry_floor
@@ -1495,9 +1496,9 @@ class TradingExecutor:
         if self._holding_count.get(base_asset, 0) >= self.max_positions_per_asset:
             return False
 
-        # 保证金风控检查：该标的现有持仓已接近爆仓时禁止加仓
-        if base_asset in self._holding_liq_distance:
-            if self._holding_liq_distance[base_asset] < self.margin_warning_pct:
+        # 保证金风控检查：该标的现有持仓保证金/维持保证金比例过低时禁止加仓
+        if base_asset in self._holding_margin_rate:
+            if self._holding_margin_rate[base_asset] < self.margin_warning_pct:
                 return False
 
         active_amount = self._active_open_amount_usdt(row)
@@ -2049,10 +2050,13 @@ class TradingExecutor:
             )
 
         # 保证金风控检查
-        if base_asset in self._holding_liq_distance:
-            liq_dist = self._holding_liq_distance[base_asset]
-            if liq_dist < self.margin_warning_pct:
-                return f"保证金风控(距爆仓{liq_dist:.1f}%<{self.margin_warning_pct:.1f}%)"
+        if base_asset in self._holding_margin_rate:
+            margin_rate = self._holding_margin_rate[base_asset]
+            if margin_rate < self.margin_warning_pct:
+                return (
+                    f"保证金风控(保证金/维持保证金"
+                    f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
+                )
 
         if self.capital_required:
             if not self._account_summary or not self._account_summary_ts:

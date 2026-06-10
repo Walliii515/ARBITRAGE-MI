@@ -1483,6 +1483,7 @@ def _run_margin_status_update_once():
                     'future_close_vwap': float(_future_cv),
                 }
         calculate_realtime_pnl(_margin_positions, _margin_close_vwaps, _contract_meta, _pnl_cfg)
+        attach_gate_position_risk(_margin_positions, _get_gate_position_risk_snapshot())
         _trading_executor.update_holding_margin_status(_margin_positions)
     except Exception as e:
         logger.warning(f"保证金状态更新失败(不影响开仓): {e}", exc_info=True)
@@ -1569,6 +1570,7 @@ def _run_close_position_check_once():
             return
 
         calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
+        attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())
 
         global _closing_executor
         if _closing_executor is None:

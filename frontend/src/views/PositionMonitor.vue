@@ -86,8 +86,6 @@ interface PositionRow {
   gate_maintenance_margin_rate: number | null
   gate_position_size: number | null
   gate_risk_updated_at: string | null
-  liq_price: number | null
-  liq_distance_pct: number | null
   exchange_risk_status: string | null
   exchange_risk_type: string | null
   exchange_risk_at: string | null
@@ -766,9 +764,9 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     valueFormatter: pnlFormatter,
   },
   {
-    headerName: 'Gate维持保证金率',
+    headerName: '保证金/维持保证金',
     field: 'gate_maintenance_margin_rate',
-    width: 150,
+    width: 155,
     type: 'numericColumn',
     enableCellChangeFlash: true,
     cellClass: 'ag-right-aligned-cell',
@@ -780,15 +778,16 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
 	    cellStyle: (params: any) => {
 	      const value = params.value as number | null
 	      if (value == null) return { color: '#909399', fontWeight: '400' }
-	      if (value > 220) return { color: '#67c23a', fontWeight: '400' }
-	      if (value > 150) return { color: '#e6a23c', fontWeight: '400' }
+	      if (value >= 3000) return { color: '#67c23a', fontWeight: '400' }
+	      if (value >= 2000) return { color: '#95d475', fontWeight: '400' }
+	      if (value >= 120) return { color: '#e6a23c', fontWeight: '400' }
 	      return { color: '#f56c6c', fontWeight: '700' }
 	    },
     tooltipValueGetter: (params: any) => {
       const row = params.data as PositionRow | undefined
       if (!row || row.gate_maintenance_margin_rate == null) return null
       const parts = [
-        `Gate维持保证金率: ${Number(row.gate_maintenance_margin_rate).toFixed(2)}%`,
+        `保证金/维持保证金: ${Number(row.gate_maintenance_margin_rate).toFixed(2)}%`,
         row.gate_position_margin != null ? `仓位保证金: ${formatAmount(row.gate_position_margin)}` : null,
         row.gate_maintenance_margin != null ? `维持保证金: ${formatAmount(row.gate_maintenance_margin)}` : null,
         row.gate_mark_price != null ? `标记价: ${formatDecimal(row.gate_mark_price)}` : null,
@@ -806,36 +805,6 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
     valueFormatter: bpsFormatter,
-  },
-  {
-    headerName: '爆仓价',
-    field: 'liq_price',
-    width: 110,
-    type: 'numericColumn',
-    enableCellChangeFlash: true,
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: priceFormatter,
-  },
-  {
-    headerName: '距爆仓(%)',
-    field: 'liq_distance_pct',
-    width: 110,
-    type: 'numericColumn',
-    enableCellChangeFlash: true,
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: (params: ValueFormatterParams) => {
-      if (params.value == null) return ''
-      return Number(params.value).toFixed(2) + '%'
-    },
-    cellStyle: (params: any) => {
-      const value = params.value as number | null
-      if (value == null) return { color: '#909399' }
-      if (value > 8) return { color: '#67c23a' }       // > warning_pct: 绿色(安全)
-      if (value > 5) return { color: '#e6a23c' }       // warning ~ close: 橙色(警告)
-      return { color: '#f56c6c' }                       // < close_threshold: 红色(危险)
-    },
   },
   {
     headerName: '开仓原因',
@@ -1034,8 +1003,6 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     gate_maintenance_margin_rate: null,
     gate_position_size: sumField('gate_position_size'),
     gate_risk_updated_at: null,
-    liq_price: null,
-    liq_distance_pct: null,
     exchange_risk_status: null,
     exchange_risk_type: null,
     exchange_risk_at: null,
