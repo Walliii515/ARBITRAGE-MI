@@ -315,25 +315,11 @@ async function loadColumnState() {
 const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
   { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90 },
   {
-    headerName: '2h资金费率',
-    field: 'reverse_funding_2h_rate',
-    width: 120,
-    sort: 'asc',
-    sortIndex: 0,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: percentFormatter,
-    cellStyle: (params) => {
-      const value = params.value as number | null
-      if (value == null) return { color: '#909399' }
-      return value < 0 ? { color: '#f56c6c' } : { color: '#67c23a' }
-    },
-  },
-  {
     headerName: '24h资金费率',
     field: 'funding_rate_24h',
     width: 120,
+    sort: 'asc',
+    sortIndex: 0,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
@@ -579,7 +565,7 @@ const getRowId = (params: GetRowIdParams<OrderBookRow>) => String(params.data?.c
 function applyDefaultSort() {
   gridApi?.applyColumnState({
     defaultState: { sort: null },
-    state: [{ colId: 'reverse_funding_2h_rate', sort: 'asc', sortIndex: 0 }],
+    state: [{ colId: 'funding_rate_24h', sort: 'asc', sortIndex: 0 }],
   })
 }
 

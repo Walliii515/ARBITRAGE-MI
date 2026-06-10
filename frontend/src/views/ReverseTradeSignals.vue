@@ -17,7 +17,6 @@ interface ReverseSignalRow {
   status: 'candidate' | 'rejected' | 'conditions_lost' | string
   reverse_status: string
   reject_reason: string | null
-  funding_rate_2h: number | null
   reverse_expected_funding_bps: number | null
   reverse_basis_bps: number | null
   reverse_p20_edge_bps: number | null
@@ -295,14 +294,6 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     field: 'reverse_status',
     width: 115,
     valueFormatter: (p: ValueFormatterParams<ReverseSignalRow>) => reverseStatusLabel(p.value as string),
-  },
-  {
-    headerName: '2h资金费率',
-    field: 'funding_rate_2h',
-    width: 115,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatPercent(p.value, 4),
   },
   {
     headerName: '预期Funding(bps)',
