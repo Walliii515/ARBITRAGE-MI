@@ -20,6 +20,20 @@ from common.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _as_bool(value) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'true', '1', 'yes', 'y'}:
+            return True
+        if normalized in {'false', '0', 'no', 'n'}:
+            return False
+    return bool(value)
+
+
 @dataclass
 class BinanceMarginBorrowConfig:
     base_url: str
@@ -86,6 +100,29 @@ class BinanceMarginBorrowClient:
                     result[asset] = float(rate)
         return result
 
+    def get_cross_margin_fee_data(self) -> Dict[str, Dict]:
+        """查询 cross margin fee 页面同源数据，返回 coin -> fee/limit。"""
+        data = self._signed_get('/sapi/v1/margin/crossMarginData', {})
+        if not isinstance(data, list):
+            return {}
+
+        result: Dict[str, Dict] = {}
+        for item in data:
+            asset = str(item.get('coin') or '').upper()
+            if not asset:
+                continue
+            daily_interest = item.get('dailyInterest')
+            yearly_interest = item.get('yearlyInterest')
+            borrow_limit = item.get('borrowLimit')
+            result[asset] = {
+                'borrowable': _as_bool(item.get('borrowable')),
+                'daily_interest_rate': float(daily_interest) if daily_interest is not None else None,
+                'yearly_interest_rate': float(yearly_interest) if yearly_interest is not None else None,
+                'borrow_limit': float(borrow_limit) if borrow_limit is not None else None,
+                'transfer_in': item.get('transferIn'),
+            }
+        return result
+
     def get_max_borrowable(self, asset: str, isolated_symbol: Optional[str] = None) -> Dict:
         """查询当前账号某资产最大可借额度。"""
         params = {'asset': asset.upper()}
@@ -114,11 +151,28 @@ class BinanceMarginBorrowClient:
             seen.add(clean_asset)
             clean_assets.append(clean_asset)
         hourly_rates = self.get_next_hourly_interest_rates(clean_assets, is_isolated=False)
+        try:
+            fee_data = self.get_cross_margin_fee_data()
+        except Exception as exc:
+            logger.warning(f'Binance crossMarginData 查询失败 | {exc}')
+            fee_data = {}
+
         result: Dict[str, Dict] = {
             asset: {
-                'borrowable': asset in hourly_rates,
-                'hourly_interest_rate': hourly_rates.get(asset),
-                'borrow_limit': None,
+                'borrowable': fee_data.get(asset, {}).get('borrowable', asset in hourly_rates),
+                'hourly_interest_rate': (
+                    hourly_rates.get(asset)
+                    if hourly_rates.get(asset) is not None
+                    else (
+                        fee_data.get(asset, {}).get('daily_interest_rate') / 24.0
+                        if fee_data.get(asset, {}).get('daily_interest_rate') is not None
+                        else None
+                    )
+                ),
+                'daily_interest_rate': fee_data.get(asset, {}).get('daily_interest_rate'),
+                'yearly_interest_rate': fee_data.get(asset, {}).get('yearly_interest_rate'),
+                'borrow_limit': fee_data.get(asset, {}).get('borrow_limit'),
+                'transfer_in': fee_data.get(asset, {}).get('transfer_in'),
             }
             for asset in clean_assets
         }
@@ -132,8 +186,11 @@ class BinanceMarginBorrowClient:
             amount = borrowable.get('amount')
             limit = borrowable.get('borrowLimit')
             result.setdefault(asset, {})
-            result[asset]['borrowable'] = (amount or 0) > 0
-            result[asset]['borrow_limit'] = amount if amount is not None else limit
+            result[asset]['max_borrowable_amount'] = amount
             result[asset]['account_borrow_limit'] = limit
+            if result[asset].get('borrow_limit') is None:
+                result[asset]['borrow_limit'] = limit
+            if result[asset].get('borrowable') is None:
+                result[asset]['borrowable'] = (amount or 0) > 0
 
         return result

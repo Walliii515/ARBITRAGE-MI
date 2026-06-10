@@ -121,6 +121,14 @@ def test_binance_margin_borrow_client_maps_interest_and_borrow_limit(monkeypatch
         if path.endswith('next-hourly-interest-rate'):
             assert params['assets'] == 'HOME'
             return [{'asset': 'HOME', 'nextHourlyInterestRate': '0.0000994603'}]
+        if path.endswith('crossMarginData'):
+            return [{
+                'coin': 'HOME',
+                'borrowable': True,
+                'dailyInterest': '0.0023870472',
+                'yearlyInterest': '0.8713',
+                'borrowLimit': '170000',
+            }]
         if path.endswith('maxBorrowable'):
             assert params['asset'] == 'HOME'
             return {'amount': '170000', 'borrowLimit': '200000'}
@@ -133,4 +141,37 @@ def test_binance_margin_borrow_client_maps_interest_and_borrow_limit(monkeypatch
     assert meta['HOME']['borrowable'] is True
     assert meta['HOME']['hourly_interest_rate'] == 0.0000994603
     assert meta['HOME']['borrow_limit'] == 170000
+    assert meta['HOME']['account_borrow_limit'] == 200000
+
+
+def test_binance_margin_borrow_client_uses_fee_data_borrow_limit_when_amount_is_zero(monkeypatch):
+    client = BinanceMarginBorrowClient(BinanceMarginBorrowConfig(
+        base_url='https://example.test',
+        api_key='key',
+        api_secret='secret',
+    ))
+
+    def fake_signed_get(path, params):
+        if path.endswith('next-hourly-interest-rate'):
+            return [{'asset': 'HOME', 'nextHourlyInterestRate': '0.0000994603'}]
+        if path.endswith('crossMarginData'):
+            return [{
+                'coin': 'HOME',
+                'borrowable': True,
+                'dailyInterest': '0.0023870472',
+                'yearlyInterest': '0.8713',
+                'borrowLimit': '170000',
+            }]
+        if path.endswith('maxBorrowable'):
+            return {'amount': '0', 'borrowLimit': '200000'}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(client, '_signed_get', fake_signed_get)
+
+    meta = client.get_cross_margin_borrow_meta(['HOME'])
+
+    assert meta['HOME']['borrowable'] is True
+    assert meta['HOME']['hourly_interest_rate'] == 0.0000994603
+    assert meta['HOME']['borrow_limit'] == 170000
+    assert meta['HOME']['max_borrowable_amount'] == 0
     assert meta['HOME']['account_borrow_limit'] == 200000

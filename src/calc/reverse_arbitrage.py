@@ -159,6 +159,7 @@ def enrich_reverse_opportunities(
 
         borrow_hourly_rate = _as_float(b_meta.get('hourly_interest_rate'))
         borrow_limit = _as_float(b_meta.get('borrow_limit'))
+        max_borrowable_amount = _as_float(b_meta.get('max_borrowable_amount'))
         borrowable = b_meta.get('borrowable')
         borrow_data_missing = not bool(b_meta) or borrow_hourly_rate is None or borrow_limit is None
         borrow_24h_bps = borrow_hourly_rate * 24.0 * 10000.0 if borrow_hourly_rate is not None else None
@@ -217,6 +218,7 @@ def enrich_reverse_opportunities(
             'reverse_borrow_hourly_rate': borrow_hourly_rate,
             'reverse_borrow_24h_bps': round(borrow_24h_bps, 4) if borrow_24h_bps is not None else None,
             'reverse_borrow_limit': borrow_limit,
+            'reverse_max_borrowable_amount': max_borrowable_amount,
             'reverse_borrowable': borrowable,
             'reverse_borrow_data_missing': borrow_data_missing,
             'reverse_borrow_pass': borrow_pass,

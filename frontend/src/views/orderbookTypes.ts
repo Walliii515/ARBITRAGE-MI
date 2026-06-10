@@ -94,6 +94,7 @@ export interface OrderBookRow {
   reverse_borrow_hourly_rate?: number | null
   reverse_borrow_24h_bps?: number | null
   reverse_borrow_limit?: number | null
+  reverse_max_borrowable_amount?: number | null
   reverse_borrowable?: boolean | null
   reverse_borrow_data_missing?: boolean | null
   reverse_borrow_pass?: boolean | null
