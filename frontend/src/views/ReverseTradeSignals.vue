@@ -26,8 +26,10 @@ interface ReverseSignalRow {
   status: string
   funding_rate_24h: number | null
   reverse_gross_funding_bps: number | null
+  reverse_expected_funding_bps: number | null
   reverse_borrow_24h_bps: number | null
   reverse_basis_bps: number | null
+  reverse_entry_ceiling_bps: number | null
   reverse_open_basis_p20: number | null
   reverse_close_basis_bps: number | null
   reverse_close_basis_p20: number | null
@@ -110,10 +112,14 @@ function formatTime(timeStr: string | null | undefined): string {
 function statusLabel(status: string | null | undefined): string {
   switch (status) {
     case 'candidate': return '候选'
+    case 'missing_open_data': return '缺盘口'
+    case 'funding_too_low': return '费率不足'
     case 'missing_borrow_data': return '待接借币'
     case 'borrow_unavailable': return '不可借'
+    case 'borrow_capacity_low': return '额度不足'
     case 'edge_too_low': return '收益不足'
     case 'basis_too_wide': return '基差过宽'
+    case 'basis_above_entry': return '基差未达标'
     case 'depth_too_thin': return '深度不足'
     case 'missing_edge': return '缺少收益'
     default: return '未知'
@@ -123,9 +129,13 @@ function statusLabel(status: string | null | undefined): string {
 const statusClassMap: Record<string, string> = {
   candidate: 'reverse-signal-success',
   missing_borrow_data: 'reverse-signal-warning',
+  missing_open_data: 'reverse-signal-danger',
+  funding_too_low: 'reverse-signal-danger',
   borrow_unavailable: 'reverse-signal-danger',
+  borrow_capacity_low: 'reverse-signal-danger',
   edge_too_low: 'reverse-signal-danger',
   basis_too_wide: 'reverse-signal-danger',
+  basis_above_entry: 'reverse-signal-danger',
   depth_too_thin: 'reverse-signal-danger',
 }
 
@@ -142,8 +152,10 @@ function mapRows(rows: unknown, serverTime: string): ReverseSignalRow[] {
       status: row.reverse_status || 'missing_edge',
       funding_rate_24h: row.funding_rate_24h ?? null,
       reverse_gross_funding_bps: row.reverse_gross_funding_bps ?? null,
+      reverse_expected_funding_bps: row.reverse_expected_funding_bps ?? null,
       reverse_borrow_24h_bps: row.reverse_borrow_24h_bps ?? null,
       reverse_basis_bps: row.reverse_basis_bps ?? null,
+      reverse_entry_ceiling_bps: row.reverse_entry_ceiling_bps ?? null,
       reverse_open_basis_p20: row.reverse_open_basis_p20 ?? null,
       reverse_close_basis_bps: row.reverse_close_basis_bps ?? null,
       reverse_close_basis_p20: row.reverse_close_basis_p20 ?? null,
@@ -277,6 +289,14 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     valueFormatter: (p) => formatBps(p.value as number | null),
   },
   {
+    headerName: '预期Funding(bps)',
+    field: 'reverse_expected_funding_bps',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
     headerName: '借币24h成本(bps)',
     field: 'reverse_borrow_24h_bps',
     width: 140,
@@ -287,6 +307,14 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
   {
     headerName: '反向开仓基差(bps)',
     field: 'reverse_basis_bps',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatBps(p.value as number | null),
+  },
+  {
+    headerName: '反向开仓上限(bps)',
+    field: 'reverse_entry_ceiling_bps',
     width: 150,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
@@ -325,7 +353,7 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     valueFormatter: (p) => formatBps(p.value as number | null),
   },
   {
-    headerName: '反向净收益(bps)',
+    headerName: '预期净收益(bps)',
     field: 'reverse_net_edge_bps',
     width: 140,
     sort: 'desc',
@@ -401,7 +429,7 @@ onUnmounted(() => {
         <span class="summary-value">{{ minNetEdgeBps }} bps</span>
       </span>
       <span class="summary-item">
-        <span class="summary-label">基差阈值</span>
+        <span class="summary-label">硬基差上限</span>
         <span class="summary-value">{{ maxBasisExposureBps }} bps</span>
       </span>
       <span class="summary-item">
@@ -414,8 +442,10 @@ onUnmounted(() => {
       <el-button-group size="small">
         <el-button :type="filterStatus === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部</el-button>
         <el-button :type="filterStatus === 'candidate' ? 'primary' : 'default'" @click="setStatusFilter('candidate')">候选</el-button>
+        <el-button :type="filterStatus === 'funding_too_low' ? 'primary' : 'default'" @click="setStatusFilter('funding_too_low')">费率不足</el-button>
         <el-button :type="filterStatus === 'missing_borrow_data' ? 'primary' : 'default'" @click="setStatusFilter('missing_borrow_data')">待接借币</el-button>
         <el-button :type="filterStatus === 'edge_too_low' ? 'primary' : 'default'" @click="setStatusFilter('edge_too_low')">收益不足</el-button>
+        <el-button :type="filterStatus === 'basis_above_entry' ? 'primary' : 'default'" @click="setStatusFilter('basis_above_entry')">基差未达标</el-button>
         <el-button :type="filterStatus === 'basis_too_wide' ? 'primary' : 'default'" @click="setStatusFilter('basis_too_wide')">基差过宽</el-button>
         <el-button :type="filterStatus === 'depth_too_thin' ? 'primary' : 'default'" @click="setStatusFilter('depth_too_thin')">深度不足</el-button>
       </el-button-group>

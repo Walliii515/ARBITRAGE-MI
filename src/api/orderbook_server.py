@@ -199,6 +199,10 @@ _reverse_cfg = ReverseArbitrageConfig(
     min_net_edge_bps=REVERSE_MIN_NET_EDGE_BPS,
     max_basis_exposure_bps=REVERSE_MAX_BASIS_EXPOSURE_BPS,
     slippage_buffer_bps=REVERSE_SLIPPAGE_BUFFER_BPS,
+    funding_capture_ratio=config.get_float('reverse_arbitrage.funding_capture_ratio', 0.5),
+    strong_funding_24h_bps=config.get_float('reverse_arbitrage.strong_funding_24h_bps', 50.0),
+    funding_discount_ratio=config.get_float('reverse_arbitrage.funding_discount_ratio', 0.2),
+    max_funding_discount_bps=config.get_float('reverse_arbitrage.max_funding_discount_bps', 10.0),
 )
 
 # 服务生命周期管理器（在 lifespan 中初始化）
