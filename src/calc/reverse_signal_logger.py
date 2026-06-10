@@ -321,9 +321,9 @@ def query_reverse_signals(
             f"""
             SELECT
                 COUNT(*) AS total,
-                SUM(CASE WHEN status = 'candidate' THEN 1 ELSE 0 END) AS candidate,
-                SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-                SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END) AS conditions_lost,
+                COALESCE(SUM(CASE WHEN status = 'candidate' THEN 1 ELSE 0 END), 0) AS candidate,
+                COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected,
+                COALESCE(SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END), 0) AS conditions_lost,
                 MAX(signal_time) AS latest_signal_time
             FROM mi_reverse_trade_signal
             WHERE {where_sql}
