@@ -91,7 +91,11 @@ class ReverseSignalMonitor:
 
         for base_asset in list(self._states):
             if base_asset not in candidate_by_asset:
-                self._resolve_signal(base_asset, 'conditions_lost', '反向开仓前置条件丢失')
+                self._resolve_signal(
+                    base_asset,
+                    'conditions_lost',
+                    self._build_state_reason(base_asset, '反向开仓前置条件丢失'),
+                )
                 results.append({'base_asset': base_asset, 'status': 'conditions_lost'})
 
         for base_asset, row in candidate_by_asset.items():
@@ -130,6 +134,8 @@ class ReverseSignalMonitor:
                     'rebound_since': None,
                     'ready_notified': False,
                     'entry_trigger_type': entry_trigger_type,
+                    'last_row': dict(row),
+                    'last_basis_bps': current_basis,
                 }
                 self._states[base_asset] = state
                 logger.info(
@@ -144,6 +150,8 @@ class ReverseSignalMonitor:
                 }
         else:
             state.setdefault('entry_trigger_type', entry_trigger_type)
+            state['last_row'] = dict(row)
+            state['last_basis_bps'] = current_basis
 
         duration_sec = int((now - state['start_time']).total_seconds())
         if state.get('signal_basis_bps') is None:
@@ -162,7 +170,15 @@ class ReverseSignalMonitor:
             self._resolve_signal(
                 base_asset,
                 'monitor_timeout',
-                f'反向开仓监控超时(>{self.cfg.monitor_timeout_sec:.0f}s)',
+                self._build_signal_reason(
+                    row,
+                    current_basis,
+                    valley,
+                    duration_sec,
+                    trigger_type=state.get('entry_trigger_type') or entry_trigger_type,
+                    phase='监控超时',
+                    extra=f'超时>{self.cfg.monitor_timeout_sec:.0f}s',
+                ),
                 exit_basis_bps=current_basis,
             )
             return {'base_asset': base_asset, 'status': 'monitor_timeout'}
@@ -200,7 +216,16 @@ class ReverseSignalMonitor:
             self._resolve_signal(
                 base_asset,
                 'gate_rejected',
-                reason,
+                self._build_signal_reason(
+                    row,
+                    current_basis,
+                    state.get('valley_basis_bps'),
+                    duration_sec,
+                    trigger_type='valley_rebound',
+                    phase='旁路拒绝',
+                    extra=reason,
+                    pre_gate_basis=pre_gate_basis,
+                ),
                 exit_basis_bps=current_basis,
                 trigger_type='valley_rebound',
                 pre_gate_basis_bps=pre_gate_basis,
@@ -240,7 +265,16 @@ class ReverseSignalMonitor:
             self._resolve_signal(
                 base_asset,
                 'gate_rejected',
-                reason,
+                self._build_signal_reason(
+                    row,
+                    current_basis,
+                    state.get('valley_basis_bps'),
+                    duration_sec,
+                    trigger_type='funding_carry',
+                    phase='旁路拒绝',
+                    extra=reason,
+                    pre_gate_basis=pre_gate_basis,
+                ),
                 exit_basis_bps=current_basis,
                 trigger_type='funding_carry',
                 pre_gate_basis_bps=pre_gate_basis,
@@ -279,7 +313,7 @@ class ReverseSignalMonitor:
             gate_ob = self._gate_manager.get_orderbook(contract)
             spot_ob = self._spot_manager.get_orderbook(symbol)
             if not gate_ob or not spot_ob:
-                return False, None, f'盘口不可用(gate={gate_ob is not None}, spot={spot_ob is not None})'
+                return False, None, f'盘口不可用(gate={gate_ob is not None},spot={spot_ob is not None})'
 
             now_ts = time.time()
             gate_local_ts = float(getattr(gate_ob, 'last_update_time', 0) or 0)
@@ -288,7 +322,7 @@ class ReverseSignalMonitor:
             spot_lag_ms = (now_ts - spot_local_ts) * 1000.0 if spot_local_ts > 0 else float('inf')
             if gate_lag_ms > self.cfg.max_orderbook_lag_ms or spot_lag_ms > self.cfg.max_orderbook_lag_ms:
                 return False, None, (
-                    f'行情滞后(gate_lag={gate_lag_ms:.0f}ms, spot_lag={spot_lag_ms:.0f}ms, '
+                    f'行情滞后(gate_lag={gate_lag_ms:.0f}ms,spot_lag={spot_lag_ms:.0f}ms,'
                     f'max={self.cfg.max_orderbook_lag_ms:.0f}ms)'
                 )
 
@@ -299,7 +333,7 @@ class ReverseSignalMonitor:
             skew_ms = abs(gate_local_ts - spot_local_ts) * 1000.0
             if skew_ms > self.cfg.max_orderbook_lag_ms:
                 return False, None, (
-                    f'跨所盘口不同步(skew={skew_ms:.0f}ms, max={self.cfg.max_orderbook_lag_ms:.0f}ms)'
+                    f'跨所盘口不同步(skew={skew_ms:.0f}ms,max={self.cfg.max_orderbook_lag_ms:.0f}ms)'
                 )
 
             merged = merge_orderbook_records([gate_ob.to_dict_row()], [spot_ob.to_dict_row()])
@@ -366,10 +400,27 @@ class ReverseSignalMonitor:
         """
         params = self._signal_params(row, basis_bps, now)
         params['trigger_type'] = trigger_type
+        entry_reason = self._build_signal_reason(
+            row,
+            basis_bps,
+            basis_bps,
+            0,
+            trigger_type=trigger_type or self._entry_trigger_type(row),
+            phase='进入监控',
+        )
         try:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, params)
-                return cursor.lastrowid
+                signal_id = cursor.lastrowid
+                cursor.execute(
+                    """
+                    UPDATE mi_reverse_trade_signal
+                    SET reject_reason = %s
+                    WHERE id = %s
+                    """,
+                    (entry_reason, signal_id),
+                )
+                return signal_id
         except Exception as exc:
             logger.error(f'反向信号创建失败 | {base_asset}: {exc}', exc_info=True)
             return None
@@ -405,6 +456,9 @@ class ReverseSignalMonitor:
             'duration_sec': duration_sec,
             'valley': round(valley_basis, 2),
         })
+        state['last_row'] = dict(row)
+        state['last_basis_bps'] = current_basis
+        state['valley_basis_bps'] = valley_basis
         try:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, params)
@@ -432,9 +486,27 @@ class ReverseSignalMonitor:
             WHERE id = %(id)s AND status = 'monitoring'
         """
         if trigger_type == 'funding_carry':
-            reason = 'FundingCarry与旁路风控已通过；反向执行器未启用，继续保持监控'
+            reason = self._build_signal_reason(
+                state.get('last_row') or {},
+                rebound_basis,
+                state.get('valley_basis_bps'),
+                duration_sec,
+                trigger_type=trigger_type,
+                phase='旁路通过',
+                extra='反向执行器未启用，仅记录可开仓观察态',
+                pre_gate_basis=pre_gate_basis,
+            )
         else:
-            reason = '触底反弹与旁路风控已通过；反向执行器未启用，继续保持监控'
+            reason = self._build_signal_reason(
+                state.get('last_row') or {},
+                rebound_basis,
+                state.get('valley_basis_bps'),
+                duration_sec,
+                trigger_type=trigger_type,
+                phase='触底反弹通过',
+                extra='反向执行器未启用，仅记录可开仓观察态',
+                pre_gate_basis=pre_gate_basis,
+            )
         try:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, {
@@ -577,6 +649,148 @@ class ReverseSignalMonitor:
             'capacity_usdt': self._round_or_none(row.get('reverse_capacity_usdt')),
             'open_amount_usdt': self.cfg.open_amount_usdt,
         }
+
+    def _build_state_reason(self, base_asset: str, phase: str) -> str:
+        state = self._states.get(base_asset) or {}
+        row = state.get('last_row') or {}
+        current_basis = self._as_float(state.get('last_basis_bps'))
+        if current_basis is None:
+            current_basis = self._as_float(row.get('reverse_basis_bps'))
+        valley_basis = self._as_float(state.get('valley_basis_bps'))
+        start_time = state.get('start_time') or datetime.now()
+        duration_sec = int((datetime.now() - start_time).total_seconds())
+        return self._build_signal_reason(
+            row,
+            current_basis,
+            valley_basis,
+            duration_sec,
+            trigger_type=state.get('entry_trigger_type') or row.get('_reverse_entry_trigger_type'),
+            phase=phase,
+        )
+
+    def _build_signal_reason(
+        self,
+        row: Dict,
+        current_basis: Optional[float],
+        valley_basis: Optional[float],
+        duration_sec: int,
+        trigger_type: Optional[str],
+        phase: str,
+        extra: Optional[str] = None,
+        pre_gate_basis: Optional[float] = None,
+    ) -> str:
+        base_asset = self._base_asset(row)
+        parts = [phase]
+        if trigger_type:
+            parts.append(f"触发={trigger_type}")
+        if base_asset:
+            parts.append(f"标的={base_asset}")
+        parts.append(f"持续={duration_sec}s")
+
+        signal_basis = self._as_float(row.get('signal_basis_bps'))
+        basis_parts = []
+        if signal_basis is not None:
+            basis_parts.append(f"signal={signal_basis:.2f}")
+        if current_basis is not None:
+            basis_parts.append(f"current={float(current_basis):.2f}")
+        if valley_basis is not None:
+            basis_parts.append(f"valley={float(valley_basis):.2f}")
+        if pre_gate_basis is not None:
+            basis_parts.append(f"pre_gate={float(pre_gate_basis):.2f}")
+        if basis_parts:
+            parts.append(f"基差({','.join(basis_parts)}bps)")
+
+        open_p20 = self._as_float(row.get('reverse_open_basis_p20'))
+        close_p20 = self._as_float(row.get('reverse_close_basis_p20'))
+        p20_edge = self._as_float(row.get('reverse_p20_edge_bps'))
+        p20_parts = []
+        if open_p20 is not None:
+            p20_parts.append(f"openP20={open_p20:.2f}")
+        if close_p20 is not None:
+            p20_parts.append(f"closeP20={close_p20:.2f}")
+        if p20_edge is not None:
+            p20_parts.append(f"edgeP20={p20_edge:.2f}")
+        if p20_parts:
+            parts.append(f"P20({','.join(p20_parts)}bps)")
+
+        funding_rate = self._as_float(row.get('funding_rate_24h'))
+        gross_funding = self._as_float(row.get('reverse_gross_funding_bps'))
+        expected_funding = self._as_float(row.get('reverse_expected_funding_bps'))
+        funding_parts = []
+        if funding_rate is not None:
+            funding_parts.append(f"24h={funding_rate * 100:.4f}%")
+        if gross_funding is not None:
+            funding_parts.append(f"可收={gross_funding:.2f}bps")
+        if expected_funding is not None:
+            funding_parts.append(f"预期={expected_funding:.2f}bps")
+        if funding_parts:
+            parts.append(f"funding({','.join(funding_parts)})")
+
+        margin_edge = self._as_float(row.get('reverse_margin_edge_bps'))
+        borrow_24h = self._as_float(row.get('reverse_borrow_24h_bps'))
+        fee_bps = self._as_float(row.get('reverse_fee_bps'))
+        edge_parts = []
+        if margin_edge is not None:
+            edge_parts.append(f"边际={margin_edge:.2f}bps")
+        if borrow_24h is not None:
+            edge_parts.append(f"借币24h={borrow_24h:.2f}bps")
+        if fee_bps is not None:
+            edge_parts.append(f"手续费={fee_bps:.2f}bps")
+        if edge_parts:
+            parts.append(f"收益({','.join(edge_parts)})")
+
+        borrow_hourly = self._as_float(row.get('reverse_borrow_hourly_rate'))
+        borrow_limit = self._as_float(row.get('reverse_borrow_limit'))
+        borrow_capacity = self._as_float(row.get('reverse_borrow_capacity_usdt'))
+        capacity = self._as_float(row.get('reverse_capacity_usdt'))
+        borrow_parts = []
+        if borrow_hourly is not None:
+            borrow_parts.append(f"小时={borrow_hourly * 100:.6f}%")
+        if borrow_limit is not None:
+            borrow_parts.append(f"额度={borrow_limit:.4g}")
+        if borrow_capacity is not None:
+            borrow_parts.append(f"额度USDT={borrow_capacity:.2f}")
+        if capacity is not None:
+            borrow_parts.append(f"可做={capacity:.2f}U")
+        if borrow_parts:
+            parts.append(f"借币({','.join(borrow_parts)})")
+
+        coverage = self._as_float(row.get('reverse_open_coverage'))
+        spot_coverage = self._as_float(row.get('reverse_spot_open_coverage'))
+        future_coverage = self._as_float(row.get('reverse_future_open_coverage'))
+        coverage_parts = []
+        if coverage is not None:
+            coverage_parts.append(f"max={coverage * 100:.2f}%")
+        if spot_coverage is not None:
+            coverage_parts.append(f"spot={spot_coverage * 100:.2f}%")
+        if future_coverage is not None:
+            coverage_parts.append(f"future={future_coverage * 100:.2f}%")
+        if coverage_parts:
+            parts.append(f"盘口覆盖({','.join(coverage_parts)})")
+
+        if trigger_type == 'funding_carry' or row.get('reverse_funding_carry_pass') is True:
+            carry_parts = []
+            next_min = self._as_float(row.get('reverse_funding_carry_next_min'))
+            ceiling = self._as_float(row.get('reverse_funding_carry_basis_ceiling_bps'))
+            min_24h = self._as_float(row.get('reverse_funding_carry_min_24h_bps'))
+            min_edge = self._as_float(row.get('reverse_funding_carry_min_margin_edge_bps'))
+            relax = self._as_float(row.get('reverse_funding_carry_basis_relax_bps'))
+            if next_min is not None:
+                carry_parts.append(f"距结算={next_min:.1f}min")
+            if ceiling is not None:
+                carry_parts.append(f"基差上限={ceiling:.2f}bps")
+            if min_24h is not None:
+                carry_parts.append(f"min24h={min_24h:.1f}bps")
+            if min_edge is not None:
+                carry_parts.append(f"minEdge={min_edge:.1f}bps")
+            if relax is not None:
+                carry_parts.append(f"放宽={relax:.1f}bps")
+            if carry_parts:
+                parts.append(f"FundingCarry({','.join(carry_parts)})")
+
+        if extra:
+            parts.append(f"原因={extra}")
+        return '|'.join(parts)
 
     def _ensure_table(self) -> None:
         if self._table_ready:

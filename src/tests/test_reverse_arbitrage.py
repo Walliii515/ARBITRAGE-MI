@@ -2,6 +2,7 @@ import pytest
 from datetime import datetime, timedelta
 
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
+from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
 
 
@@ -168,6 +169,68 @@ def test_reverse_funding_carry_requires_margin_edge_threshold():
     assert row['reverse_gross_funding_bps'] == 90
     assert row['reverse_margin_edge_bps'] < 50
     assert row['reverse_funding_carry_pass'] is False
+
+
+def test_reverse_signal_reason_contains_replay_context():
+    monitor = ReverseSignalMonitor(
+        ReverseSignalMonitorConfig(open_amount_usdt=10),
+        ReverseArbitrageConfig(
+            open_amount_usdt=10,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            orderbook_coverage_threshold=0.6,
+        ),
+        {},
+        {},
+        {},
+    )
+    row = {
+        'base_asset': 'HOME',
+        'funding_rate_24h': -0.051,
+        'reverse_gross_funding_bps': 510,
+        'reverse_expected_funding_bps': 255,
+        'reverse_basis_bps': -12.3,
+        'reverse_open_basis_p20': -20,
+        'reverse_close_basis_p20': -10,
+        'reverse_p20_edge_bps': -20,
+        'reverse_margin_edge_bps': 192.13,
+        'reverse_borrow_hourly_rate': 0.0000994603,
+        'reverse_borrow_24h_bps': 23.87,
+        'reverse_borrow_limit': 170000,
+        'reverse_borrow_capacity_usdt': 4843.3,
+        'reverse_capacity_usdt': 10,
+        'reverse_open_coverage': 0.012,
+        'reverse_spot_open_coverage': 0.01,
+        'reverse_future_open_coverage': 0.012,
+        'reverse_funding_carry_pass': True,
+        'reverse_funding_carry_next_min': 30,
+        'reverse_funding_carry_basis_ceiling_bps': 10,
+        'reverse_funding_carry_min_24h_bps': 80,
+        'reverse_funding_carry_min_margin_edge_bps': 50,
+        'reverse_funding_carry_basis_relax_bps': 30,
+    }
+
+    reason = monitor._build_signal_reason(
+        row,
+        current_basis=-12.3,
+        valley_basis=-18.0,
+        duration_sec=9,
+        trigger_type='funding_carry',
+        phase='旁路拒绝',
+        extra='行情滞后(gate_lag=800ms,spot_lag=100ms,max=500ms)',
+        pre_gate_basis=-11.8,
+    )
+
+    assert '触发=funding_carry' in reason
+    assert '基差(' in reason
+    assert 'funding(' in reason
+    assert '收益(' in reason
+    assert '借币(' in reason
+    assert '盘口覆盖(' in reason
+    assert 'FundingCarry(' in reason
+    assert '行情滞后' in reason
 
 
 def test_reverse_margin_edge_must_be_non_negative():
