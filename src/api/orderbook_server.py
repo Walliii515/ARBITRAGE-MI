@@ -45,8 +45,10 @@ from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
+from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
+from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
 
 setup_logging()
 logger = get_logger(__name__)
@@ -145,6 +147,14 @@ FUTURE_CLOSE_FEE = config.get_float('trade.fee.future_close', 0.00075)
 FUTURE_TAKER_OPEN_FEE = config.get_float('trade.fee.future_taker_open', FUTURE_OPEN_FEE)
 FUTURE_TAKER_CLOSE_FEE = config.get_float('trade.fee.future_taker_close', FUTURE_CLOSE_FEE)
 
+# 反向资金费率策略（short spot + long future）只读机会扫描配置
+REVERSE_MIN_NET_EDGE_BPS = config.get_float('reverse_arbitrage.min_net_edge_bps', 20.0)
+REVERSE_MAX_BASIS_EXPOSURE_BPS = config.get_float('reverse_arbitrage.max_basis_exposure_bps', 50.0)
+REVERSE_SLIPPAGE_BUFFER_BPS = config.get_float('reverse_arbitrage.slippage_buffer_bps', 10.0)
+REVERSE_BORROW_AUTO_ENABLED = config.get_bool('reverse_arbitrage.binance_margin.enabled', True)
+REVERSE_BORROW_CACHE_TTL_SEC = config.get_float('reverse_arbitrage.binance_margin.cache_ttl_sec', 60.0)
+REVERSE_BORROW_MAX_ASSETS = config.get_int('reverse_arbitrage.binance_margin.max_borrowable_assets_per_refresh', 20)
+
 # 富化配置实例（快照推送、开仓检查共用）
 _enrich_cfg = EnrichConfig(
     open_amount_usdt=OPEN_AMOUNT_USDT,
@@ -179,6 +189,18 @@ _pnl_cfg = PnlConfig(
     margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
 )
 
+_reverse_cfg = ReverseArbitrageConfig(
+    open_amount_usdt=OPEN_AMOUNT_USDT,
+    spot_open_fee=SPOT_OPEN_FEE,
+    spot_close_fee=SPOT_CLOSE_FEE,
+    future_open_fee=FUTURE_OPEN_FEE,
+    future_close_fee=FUTURE_CLOSE_FEE,
+    orderbook_coverage_threshold=ORDERBOOK_COVERAGE_THRESHOLD,
+    min_net_edge_bps=REVERSE_MIN_NET_EDGE_BPS,
+    max_basis_exposure_bps=REVERSE_MAX_BASIS_EXPOSURE_BPS,
+    slippage_buffer_bps=REVERSE_SLIPPAGE_BUFFER_BPS,
+)
+
 # 服务生命周期管理器（在 lifespan 中初始化）
 svc: Optional[OrderBookDataClient] = None
 
@@ -196,6 +218,7 @@ _spot_meta: Dict[str, Dict] = {}
 _threshold_meta: Dict[str, float] = {}
 _vwap_threshold_meta: Dict[str, float] = {}  # base_asset -> threshold_bps
 _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p10..p40}
+_reverse_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {reverse_open_basis_p20, reverse_close_basis_p20}
 _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费率(止盈用)
 _asset_tier_meta: Dict[str, str] = {}  # base_asset -> strategy_tier
 _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇总
@@ -230,6 +253,88 @@ TRADING_SCAN_CACHE_SEC = config.get_float('orderbook.trading_scan_cache_sec', 1.
 # 完整广播 payload 缓存（预序列化 JSON 字符串，避免多客户端重复序列化）
 _cached_payload_json: str = ''
 _cached_payload_ts: float = 0.0
+_reverse_borrow_cache: Dict[str, Dict] = {}
+_reverse_borrow_cache_ts: float = 0.0
+
+
+def _build_binance_margin_borrow_client() -> Optional[BinanceMarginBorrowClient]:
+    if not REVERSE_BORROW_AUTO_ENABLED:
+        return None
+
+    trade_mode = config.get_trade_mode()
+    api_key = os.getenv('BINANCE_API_KEY', '') if trade_mode == 'live' else os.getenv('BINANCE_TESTNET_API_KEY', '')
+    api_secret = os.getenv('BINANCE_API_SECRET', '') if trade_mode == 'live' else os.getenv('BINANCE_TESTNET_API_SECRET', '')
+    if not api_key or not api_secret:
+        return None
+
+    base_url = config.get_str(
+        'reverse_arbitrage.binance_margin.base_url',
+        'https://api1.binance.com' if trade_mode == 'live' else 'https://testnet.binance.vision',
+    ).rstrip('/')
+    return BinanceMarginBorrowClient(BinanceMarginBorrowConfig(
+        base_url=base_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        timeout_sec=config.get_int('reverse_arbitrage.binance_margin.timeout_sec', 10),
+        recv_window_ms=config.get_int('reverse_arbitrage.binance_margin.recv_window_ms', 5000),
+    ))
+
+
+def _get_reverse_borrow_meta_from_config() -> Dict[str, Dict]:
+    """读取手工借币数据覆盖表，后续可替换为 Binance Margin API 缓存。"""
+    raw = config.get('reverse_arbitrage.borrow_overrides', {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+
+    result: Dict[str, Dict] = {}
+    for asset, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        base_asset = _normalize_base_asset(asset)
+        hourly_rate = item.get('hourly_interest_rate')
+        if hourly_rate is None and item.get('hourly_interest_percent') is not None:
+            hourly_rate = float(item.get('hourly_interest_percent')) / 100.0
+        result[base_asset] = {
+            'borrowable': item.get('borrowable', True),
+            'hourly_interest_rate': float(hourly_rate) if hourly_rate is not None else None,
+            'borrow_limit': float(item['borrow_limit']) if item.get('borrow_limit') is not None else None,
+        }
+    return result
+
+
+def _get_reverse_borrow_meta(assets: List[str]) -> tuple[Dict[str, Dict], str]:
+    """获取反向策略借币数据，优先自动刷新，失败时叠加手工覆盖。"""
+    global _reverse_borrow_cache, _reverse_borrow_cache_ts
+
+    overrides = _get_reverse_borrow_meta_from_config()
+    clean_assets = sorted({_normalize_base_asset(asset) for asset in assets if _normalize_base_asset(asset)})
+    if not clean_assets:
+        return overrides, 'config' if overrides else 'none'
+
+    client = _build_binance_margin_borrow_client()
+    now = time.time()
+    missing_assets = set(clean_assets) - set(_reverse_borrow_cache)
+    if client and (
+        not _reverse_borrow_cache
+        or missing_assets
+        or now - _reverse_borrow_cache_ts >= REVERSE_BORROW_CACHE_TTL_SEC
+    ):
+        try:
+            _reverse_borrow_cache = client.get_cross_margin_borrow_meta(
+                clean_assets,
+                max_borrowable_assets=REVERSE_BORROW_MAX_ASSETS,
+            )
+            _reverse_borrow_cache_ts = now
+        except Exception as exc:
+            logger.warning(f'Binance Margin 借币数据刷新失败: {exc}')
+
+    merged = dict(_reverse_borrow_cache)
+    merged.update(overrides)
+    if _reverse_borrow_cache:
+        return merged, 'binance_margin'
+    if overrides:
+        return merged, 'config'
+    return {}, 'none'
 
 
 def _normalize_base_asset(value) -> str:
@@ -379,6 +484,34 @@ def fetch_close_vwap_threshold_meta() -> Dict[str, Dict]:
         return {}
 
 
+def fetch_reverse_vwap_threshold_meta() -> Dict[str, Dict]:
+    """从 mi_vwap_basis_threshold 加载反向套利 open/close p20 阈值。"""
+    sql = """
+        SELECT base_asset, reverse_open_basis_p20, reverse_close_basis_p20
+        FROM mi_vwap_basis_threshold
+        WHERE calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)
+          AND (reverse_open_basis_p20 IS NOT NULL OR reverse_close_basis_p20 IS NOT NULL)
+    """
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            result: Dict[str, Dict] = {}
+            for row in rows:
+                entry = {}
+                if row.get('reverse_open_basis_p20') is not None:
+                    entry['reverse_open_basis_p20'] = float(row['reverse_open_basis_p20'])
+                if row.get('reverse_close_basis_p20') is not None:
+                    entry['reverse_close_basis_p20'] = float(row['reverse_close_basis_p20'])
+                if entry:
+                    result[_normalize_base_asset(row['base_asset'])] = entry
+            logger.info(f'已加载反向VWAP基差阈值 {len(result)} 条 (open/close p20)')
+            return result
+    except Exception as e:
+        logger.error(f'加载反向VWAP基差阈值失败: {e}', exc_info=True)
+        return {}
+
+
 def build_payload() -> dict:
     """构建 WebSocket 推送载荷（Gate + Binance 合并宽表，附带开仓金额）"""
     rows = _get_merged_rows()
@@ -402,6 +535,48 @@ def build_payload() -> dict:
         'open_vwap_basis_threshold_bps': OPEN_VWAP_BASIS_THRESHOLD_BPS,
         'min_spot_volume_24h_usdt': MIN_SPOT_VOLUME_24H_USDT,
         'min_future_volume_24h_usdt': MIN_FUTURE_VOLUME_24H_USDT,
+        'gate_ws_latency_ms': svc._calc_gate_data_age_ms() if svc else None,
+        'binance_ws_latency_ms': svc._calc_binance_data_age_ms() if svc else None,
+        'rows': rows,
+    }
+
+
+def build_reverse_opportunities_payload() -> dict:
+    """构建反向资金费率套利机会载荷（只读，不触发交易）。"""
+    rows = _get_merged_rows()
+    enrich_snapshot_fields(
+        rows, _contract_meta, _spot_meta, _threshold_meta,
+        _vwap_threshold_meta, _enrich_cfg, _meta_update_time,
+        _close_vwap_threshold_meta
+    )
+    negative_assets = [
+        row.get('base_asset')
+        for row in rows
+        if row.get('funding_rate_24h') is not None and float(row.get('funding_rate_24h') or 0) < 0
+    ]
+    borrow_meta, borrow_source = _get_reverse_borrow_meta(negative_assets)
+    enrich_reverse_opportunities(
+        rows,
+        _contract_meta,
+        _reverse_cfg,
+        borrow_meta=borrow_meta,
+        reverse_threshold_meta=_reverse_vwap_threshold_meta,
+    )
+    return {
+        'type': 'reverse_opportunities',
+        'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'open_amount_usdt': OPEN_AMOUNT_USDT,
+        'orderbook_coverage_threshold': ORDERBOOK_COVERAGE_THRESHOLD,
+        'reverse_min_net_edge_bps': REVERSE_MIN_NET_EDGE_BPS,
+        'reverse_max_basis_exposure_bps': REVERSE_MAX_BASIS_EXPOSURE_BPS,
+        'reverse_slippage_buffer_bps': REVERSE_SLIPPAGE_BUFFER_BPS,
+        'borrow_data_available': bool(borrow_meta),
+        'borrow_data_source': borrow_source,
+        'borrow_cache_age_sec': (
+            round(time.time() - _reverse_borrow_cache_ts, 1)
+            if _reverse_borrow_cache_ts > 0
+            else None
+        ),
         'gate_ws_latency_ms': svc._calc_gate_data_age_ms() if svc else None,
         'binance_ws_latency_ms': svc._calc_binance_data_age_ms() if svc else None,
         'rows': rows,
@@ -510,18 +685,20 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(broadcast_worker())
 
     global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
-    global _close_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
+    global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
     _contract_meta = fetch_contract_meta()
     _spot_meta = fetch_spot_meta()
     _asset_tier_meta = fetch_asset_tier_meta()
     _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
+    _reverse_vwap_threshold_meta = fetch_reverse_vwap_threshold_meta()
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_print(
         f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，'
         f'标的分层 {len(_asset_tier_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，'
         f'VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条，'
+        f'反向阈値 {len(_reverse_vwap_threshold_meta)} 条，'
         f'费率p40 {len(_funding_rate_p40_meta)} 条'
     )
 
@@ -542,7 +719,7 @@ async def lifespan(app: FastAPI):
                 logger.info(f'开始定时刷新内存缓存 (间隔: {min_interval} 分钟)...')
                 # 刷新内存缓存
                 global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
-                global _close_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
+                global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
                 _contract_meta = fetch_contract_meta()
                 _spot_meta = fetch_spot_meta()
                 _asset_tier_meta = fetch_asset_tier_meta()
@@ -553,11 +730,17 @@ async def lifespan(app: FastAPI):
                     _close_vwap_threshold_meta = new_close_meta
                 else:
                     logger.warning(f'平仓VWAP基差阈值刷新结果为空，保留旧缓存（{len(_close_vwap_threshold_meta)} 条）')
+                new_reverse_meta = fetch_reverse_vwap_threshold_meta()
+                if new_reverse_meta:
+                    _reverse_vwap_threshold_meta = new_reverse_meta
+                else:
+                    logger.warning(f'反向VWAP基差阈值刷新结果为空，保留旧缓存（{len(_reverse_vwap_threshold_meta)} 条）')
                 _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 logger.info(
                     f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, '
                     f'标的分层 {len(_asset_tier_meta)} 条, 阈値 {len(_threshold_meta)} 条, '
                     f'VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, '
+                    f'反向阈値 {len(_reverse_vwap_threshold_meta)} 条, '
                     f'费率p40 {len(_funding_rate_p40_meta)} 条'
                 )
                 # 重置执行器单例，下次循环用新元数据重建
@@ -748,6 +931,11 @@ async def retry_all_failed():
 @app.get('/api/orderbook/snapshot', dependencies=[Depends(verify_token_dependency)])
 async def orderbook_snapshot():
     return build_payload()
+
+
+@app.get('/api/reverse-arbitrage/opportunities', dependencies=[Depends(verify_token_dependency)])
+async def reverse_arbitrage_opportunities():
+    return build_reverse_opportunities_payload()
 
 
 @app.post('/api/service/start', dependencies=[Depends(verify_token_dependency)])

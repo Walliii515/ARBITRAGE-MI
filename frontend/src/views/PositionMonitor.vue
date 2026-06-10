@@ -777,13 +777,13 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
       if (params.value == null) return ''
       return Number(params.value).toFixed(2) + '%'
     },
-    cellStyle: (params: any) => {
-      const value = params.value as number | null
-      if (value == null) return { color: '#909399' }
-      if (value > 220) return { color: '#67c23a' }
-      if (value > 150) return { color: '#e6a23c' }
-      return { color: '#f56c6c', fontWeight: '700' }
-    },
+	    cellStyle: (params: any) => {
+	      const value = params.value as number | null
+	      if (value == null) return { color: '#909399', fontWeight: '400' }
+	      if (value > 220) return { color: '#67c23a', fontWeight: '400' }
+	      if (value > 150) return { color: '#e6a23c', fontWeight: '400' }
+	      return { color: '#f56c6c', fontWeight: '700' }
+	    },
     tooltipValueGetter: (params: any) => {
       const row = params.data as PositionRow | undefined
       if (!row || row.gate_maintenance_margin_rate == null) return null

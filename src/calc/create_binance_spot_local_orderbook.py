@@ -40,6 +40,10 @@ def get_orderbook_stale_timeout() -> float:
     return max(1.0, config.get_float('orderbook.stale_timeout_sec', 30.0))
 
 
+def get_binance_ws_connect_timeout() -> float:
+    return max(1.0, config.get_float('orderbook.binance_ws_connect_timeout_sec', 10.0))
+
+
 def _json_safe_scalar(val):
     """转为 JSON 可序列化的原生标量（NaN/Inf → None）"""
     if val is None:
@@ -147,7 +151,11 @@ class OrderBookManager:
         self._broadcast_callbacks: List[Callable[[], None]] = []
 
     def _build_ws_client(self, symbols: Optional[List[str]] = None) -> BinanceSpotOrderBookWS:
-        client = BinanceSpotOrderBookWS(level=LEVEL, speed=get_binance_ws_speed())
+        client = BinanceSpotOrderBookWS(
+            level=LEVEL,
+            speed=get_binance_ws_speed(),
+            connect_timeout=get_binance_ws_connect_timeout(),
+        )
 
         def on_update(symbol, update_data):
             orderbook = self.orderbooks.get(symbol)

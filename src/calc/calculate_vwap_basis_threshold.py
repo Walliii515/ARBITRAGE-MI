@@ -166,6 +166,24 @@ def compute_close_statistics(values: list) -> dict:
     }
 
 
+def compute_reverse_thresholds(open_values: list, close_values: list) -> dict:
+    """
+    计算反向策略 p20 阈值。
+
+    反向开仓 = spot bid + future ask，对应现有 close_vwap_basis_bps，基差越低越有利。
+    反向平仓 = spot ask + future bid，对应现有 open_vwap_basis_bps，基差越高越有利。
+    """
+    result = {
+        'reverse_open_basis_p20': None,
+        'reverse_close_basis_p20': None,
+    }
+    if len(close_values) >= 10:
+        result['reverse_open_basis_p20'] = round(calculate_percentile(sorted(close_values), 20), 4)
+    if len(open_values) >= 10:
+        result['reverse_close_basis_p20'] = round(calculate_percentile(sorted(open_values), 80), 4)
+    return result
+
+
 def run_analysis(
     lookback_days: int,
     coverage_filter: float = 1.0,
@@ -216,6 +234,7 @@ def run_analysis(
             open_basis_p1, open_basis_p2, open_basis_p3, open_basis_p5, open_basis_p10, open_basis_p20,
             close_basis_max, close_basis_min,
             close_basis_p1, close_basis_p2, close_basis_p3, close_basis_p5, close_basis_p10, close_basis_p20,
+            reverse_open_basis_p20, reverse_close_basis_p20,
             updated_at
         ) VALUES (
             %(base_asset)s, %(calc_date)s,
@@ -223,6 +242,7 @@ def run_analysis(
             %(open_basis_p1)s, %(open_basis_p2)s, %(open_basis_p3)s, %(open_basis_p5)s, %(open_basis_p10)s, %(open_basis_p20)s,
             %(close_basis_max)s, %(close_basis_min)s,
             %(close_basis_p1)s, %(close_basis_p2)s, %(close_basis_p3)s, %(close_basis_p5)s, %(close_basis_p10)s, %(close_basis_p20)s,
+            %(reverse_open_basis_p20)s, %(reverse_close_basis_p20)s,
             NOW()
         ) ON DUPLICATE KEY UPDATE
             open_basis_max = VALUES(open_basis_max),
@@ -241,6 +261,8 @@ def run_analysis(
             close_basis_p5 = VALUES(close_basis_p5),
             close_basis_p10 = VALUES(close_basis_p10),
             close_basis_p20 = VALUES(close_basis_p20),
+            reverse_open_basis_p20 = VALUES(reverse_open_basis_p20),
+            reverse_close_basis_p20 = VALUES(reverse_close_basis_p20),
             updated_at = NOW()
     """
 
@@ -249,6 +271,7 @@ def run_analysis(
         'open_basis_p1', 'open_basis_p2', 'open_basis_p3', 'open_basis_p5', 'open_basis_p10', 'open_basis_p20',
         'close_basis_max', 'close_basis_min',
         'close_basis_p1', 'close_basis_p2', 'close_basis_p3', 'close_basis_p5', 'close_basis_p10', 'close_basis_p20',
+        'reverse_open_basis_p20', 'reverse_close_basis_p20',
     ]
 
     # 2. 逐标的查询 + 计算 + 写入
@@ -303,6 +326,8 @@ def run_analysis(
                 result.update(compute_close_statistics(close_values))
             else:
                 result['_close_sample_count'] = len(close_values)
+
+            result.update(compute_reverse_thresholds(open_values, close_values))
 
             # 补齐缺失 key
             for key in all_keys:

@@ -351,6 +351,7 @@ class ServiceLifecycleManager:
               AND g.status = 'trading'
               AND s.status = 'TRADING'
               AND s.is_spot_trading_allowed = 1
+              AND UPPER(TRIM(b.base_asset)) REGEXP '^[A-Z0-9]+$'
               AND COALESCE(g.volume_24h_settle, 0) >= %s
               AND COALESCE(s.quote_volume, 0) >= %s
             ORDER BY g.funding_rate_24h DESC, g.volume_24h_settle DESC, s.quote_volume DESC
