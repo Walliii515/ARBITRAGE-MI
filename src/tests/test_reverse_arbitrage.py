@@ -47,6 +47,7 @@ def test_reverse_opportunity_net_edge_with_borrow_rate():
     enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
 
     assert row['reverse_gross_funding_bps'] == 510
+    assert row['reverse_funding_2h_rate'] == pytest.approx(-0.051 / 12)
     assert row['reverse_borrow_24h_bps'] == 23.8705
     assert row['reverse_basis_bps'] == 0
     assert row['reverse_borrow_capacity_usdt'] == 4843.3

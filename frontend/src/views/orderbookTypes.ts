@@ -87,6 +87,7 @@ export interface OrderBookRow {
   reverse_open_coverage?: number | null
   reverse_spot_open_coverage?: number | null
   reverse_future_open_coverage?: number | null
+  reverse_funding_2h_rate?: number | null
   reverse_gross_funding_bps?: number | null
   reverse_expected_funding_bps?: number | null
   reverse_funding_capture_ratio?: number | null

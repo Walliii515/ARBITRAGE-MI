@@ -153,6 +153,7 @@ def enrich_reverse_opportunities(
             )
 
         funding_rate_24h = _as_float(c_meta.get('funding_rate_24h'))
+        funding_rate_2h = funding_rate_24h / 12.0 if funding_rate_24h is not None else None
         gross_funding_bps = abs(funding_rate_24h) * 10000.0 if funding_rate_24h is not None and funding_rate_24h < 0 else 0.0
         expected_funding_bps = gross_funding_bps * cfg.funding_capture_ratio
         funding_pass = gross_funding_bps > 0
@@ -212,6 +213,7 @@ def enrich_reverse_opportunities(
             'reverse_strategy': 'short_spot_long_future',
             'reverse_open_data_missing': open_data_missing,
             'reverse_gross_funding_bps': round(gross_funding_bps, 4),
+            'reverse_funding_2h_rate': funding_rate_2h,
             'reverse_expected_funding_bps': round(expected_funding_bps, 4),
             'reverse_funding_capture_ratio': cfg.funding_capture_ratio,
             'reverse_funding_pass': funding_pass,

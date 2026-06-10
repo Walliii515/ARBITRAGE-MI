@@ -46,6 +46,7 @@ from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
+from calc.reverse_signal_logger import ensure_reverse_signal_table, log_reverse_signals, query_reverse_signals
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
@@ -151,6 +152,7 @@ FUTURE_TAKER_CLOSE_FEE = config.get_float('trade.fee.future_taker_close', FUTURE
 REVERSE_BORROW_AUTO_ENABLED = config.get_bool('reverse_arbitrage.binance_margin.enabled', True)
 REVERSE_BORROW_CACHE_TTL_SEC = config.get_float('reverse_arbitrage.binance_margin.cache_ttl_sec', 60.0)
 REVERSE_BORROW_MAX_ASSETS = config.get_int('reverse_arbitrage.binance_margin.max_borrowable_assets_per_refresh', 250)
+REVERSE_SIGNAL_LOG_INTERVAL_SEC = config.get_float('reverse_arbitrage.signal_log_interval_sec', 10.0)
 
 # 富化配置实例（快照推送、开仓检查共用）
 _enrich_cfg = EnrichConfig(
@@ -250,6 +252,23 @@ _cached_payload_json: str = ''
 _cached_payload_ts: float = 0.0
 _reverse_borrow_cache: Dict[str, Dict] = {}
 _reverse_borrow_cache_ts: float = 0.0
+_reverse_signal_log_ts: float = 0.0
+
+
+def _json_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+    return value
+
+
+def _json_safe_row(row: Dict) -> Dict:
+    return {key: _json_safe(value) for key, value in row.items()}
+
+
+def _json_safe_rows(rows: List[Dict]) -> List[Dict]:
+    return [_json_safe_row(row) for row in rows]
 
 
 def _build_binance_margin_borrow_client() -> Optional[BinanceMarginBorrowClient]:
@@ -538,6 +557,7 @@ def build_payload() -> dict:
 
 def build_reverse_opportunities_payload() -> dict:
     """构建反向资金费率套利机会载荷（只读，不触发交易）。"""
+    global _reverse_signal_log_ts
     rows = _get_merged_rows()
     enrich_snapshot_fields(
         rows, _contract_meta, _spot_meta, _threshold_meta,
@@ -557,6 +577,10 @@ def build_reverse_opportunities_payload() -> dict:
         borrow_meta=borrow_meta,
         reverse_threshold_meta=_reverse_vwap_threshold_meta,
     )
+    now_ts = time.time()
+    if now_ts - _reverse_signal_log_ts >= REVERSE_SIGNAL_LOG_INTERVAL_SEC:
+        log_reverse_signals(rows)
+        _reverse_signal_log_ts = now_ts
     return {
         'type': 'reverse_opportunities',
         'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -686,6 +710,10 @@ async def lifespan(app: FastAPI):
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
     _reverse_vwap_threshold_meta = fetch_reverse_vwap_threshold_meta()
+    try:
+        ensure_reverse_signal_table()
+    except Exception as exc:
+        logger.warning(f'反向交易信号表初始化失败: {exc}', exc_info=True)
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_print(
         f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，'
@@ -929,6 +957,30 @@ async def orderbook_snapshot():
 @app.get('/api/reverse-arbitrage/opportunities', dependencies=[Depends(verify_token_dependency)])
 async def reverse_arbitrage_opportunities():
     return build_reverse_opportunities_payload()
+
+
+@app.get('/api/reverse-arbitrage/signals', dependencies=[Depends(verify_token_dependency)])
+async def reverse_arbitrage_signals(
+    status: Optional[str] = Query(None),
+    reject_reason: Optional[str] = Query(None),
+    base_asset: Optional[str] = Query(None),
+    days: int = Query(1, ge=1, le=30),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=5000),
+):
+    result = query_reverse_signals(
+        status=status,
+        reject_reason=reject_reason,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
+    return {
+        'signals': _json_safe_rows(result.get('signals', [])),
+        'pagination': result.get('pagination', {}),
+        'summary': _json_safe_row(result.get('summary', {})),
+    }
 
 
 @app.post('/api/service/start', dependencies=[Depends(verify_token_dependency)])
