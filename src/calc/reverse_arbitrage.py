@@ -9,6 +9,7 @@
 本模块只负责只读机会富化，不触碰正向开仓/平仓状态机。
 """
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from calc.orderbook_enricher import LEVEL, calc_full_fee_bps, calc_vwap, calc_vwap_basis_bps
@@ -24,6 +25,11 @@ class ReverseArbitrageConfig:
     future_close_fee: float
     orderbook_coverage_threshold: float
     funding_capture_ratio: float = 0.5
+    funding_carry_enabled: bool = False
+    funding_carry_min_24h_bps: float = 80.0
+    funding_carry_max_next_funding_min: float = 60.0
+    funding_carry_min_margin_edge_bps: float = 50.0
+    funding_carry_basis_relax_bps: float = 30.0
 
 
 def _as_float(value) -> Optional[float]:
@@ -33,6 +39,43 @@ def _as_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _minutes_until(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        target = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        numeric = _as_float(text)
+        if numeric is not None:
+            if numeric > 10_000_000_000:
+                numeric = numeric / 1000.0
+            try:
+                target = datetime.fromtimestamp(numeric)
+            except (OverflowError, OSError, ValueError):
+                return None
+        else:
+            normalized = text.replace('T', ' ').replace('Z', '')
+            if '+' in normalized:
+                normalized = normalized.split('+', 1)[0].strip()
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+                try:
+                    target = datetime.strptime(normalized[:19], fmt)
+                    break
+                except ValueError:
+                    target = None
+            if target is None:
+                try:
+                    target = datetime.fromisoformat(text)
+                except ValueError:
+                    return None
+    if target.tzinfo is not None:
+        target = target.replace(tzinfo=None)
+    return (target - datetime.now()).total_seconds() / 60.0
 
 
 def _side_total_value(row: Dict, market: str, side: str, qty_multiplier: float = 1.0) -> float:
@@ -153,7 +196,6 @@ def enrich_reverse_opportunities(
             )
 
         funding_rate_24h = _as_float(c_meta.get('funding_rate_24h'))
-        funding_rate_2h = funding_rate_24h / 12.0 if funding_rate_24h is not None else None
         gross_funding_bps = abs(funding_rate_24h) * 10000.0 if funding_rate_24h is not None and funding_rate_24h < 0 else 0.0
         expected_funding_bps = gross_funding_bps * cfg.funding_capture_ratio
         funding_pass = gross_funding_bps > 0
@@ -208,12 +250,33 @@ def enrich_reverse_opportunities(
                 - fee_cost_bps
             )
         margin_edge_pass = margin_edge_bps is not None and margin_edge_bps >= 0
+        next_funding_min = _minutes_until(row.get('funding_next_apply') or c_meta.get('funding_next_apply'))
+        funding_carry_basis_ceiling_bps = (
+            reverse_p20_edge_bps + cfg.funding_carry_basis_relax_bps
+            if reverse_p20_edge_bps is not None
+            else None
+        )
+        funding_carry_pass = (
+            bool(cfg.funding_carry_enabled)
+            and not open_data_missing
+            and funding_pass
+            and not borrow_data_missing
+            and borrow_pass
+            and coverage_pass
+            and gross_funding_bps >= cfg.funding_carry_min_24h_bps
+            and next_funding_min is not None
+            and 0 <= next_funding_min <= cfg.funding_carry_max_next_funding_min
+            and margin_edge_bps is not None
+            and margin_edge_bps >= cfg.funding_carry_min_margin_edge_bps
+            and basis_bps is not None
+            and funding_carry_basis_ceiling_bps is not None
+            and float(basis_bps) <= funding_carry_basis_ceiling_bps
+        )
 
         row.update({
             'reverse_strategy': 'short_spot_long_future',
             'reverse_open_data_missing': open_data_missing,
             'reverse_gross_funding_bps': round(gross_funding_bps, 4),
-            'reverse_funding_2h_rate': funding_rate_2h,
             'reverse_expected_funding_bps': round(expected_funding_bps, 4),
             'reverse_funding_capture_ratio': cfg.funding_capture_ratio,
             'reverse_funding_pass': funding_pass,
@@ -234,5 +297,15 @@ def enrich_reverse_opportunities(
             'reverse_margin_edge_pass': margin_edge_pass,
             'reverse_open_basis_p20': reverse_open_p20,
             'reverse_close_basis_p20': reverse_close_p20,
+            'reverse_funding_carry_pass': funding_carry_pass,
+            'reverse_funding_carry_next_min': round(next_funding_min, 4) if next_funding_min is not None else None,
+            'reverse_funding_carry_basis_ceiling_bps': (
+                round(funding_carry_basis_ceiling_bps, 4)
+                if funding_carry_basis_ceiling_bps is not None
+                else None
+            ),
+            'reverse_funding_carry_min_24h_bps': cfg.funding_carry_min_24h_bps,
+            'reverse_funding_carry_min_margin_edge_bps': cfg.funding_carry_min_margin_edge_bps,
+            'reverse_funding_carry_basis_relax_bps': cfg.funding_carry_basis_relax_bps,
         })
         row['reverse_status'] = _reverse_status(row, cfg)

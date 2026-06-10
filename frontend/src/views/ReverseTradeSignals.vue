@@ -152,6 +152,7 @@ function statusLabel(status: string | null | undefined): string {
 
 function triggerLabel(trigger: string | null | undefined): string {
   switch (trigger) {
+    case 'funding_carry': return 'FundingCarry'
     case 'valley_rebound': return '触底反弹'
     case 'manual': return '手动'
     default: return ''

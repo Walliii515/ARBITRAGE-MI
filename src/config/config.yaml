@@ -299,6 +299,12 @@ reconciliation:
 # 当前只做机会扫描 + 交易信号监控，不真实下单；正向策略配置不复用这里的状态。
 reverse_arbitrage:
   funding_capture_ratio: 0.5                # 边际盈亏中计入24h负费率的权重
+  funding_carry:
+    enabled: true
+    min_24h_bps: 80                         # 可收24h负费率绝对值 >= 80bps
+    max_next_funding_min: 60                # 距离下次资金费结算 <= 60分钟
+    min_margin_edge_bps: 50                 # 边际盈亏至少 50bps
+    basis_relax_bps: 30                     # reverse_basis <= min(开仓P20, 平仓P20) + 30bps
   signal:
     enabled: true
     check_interval_sec: 1.0

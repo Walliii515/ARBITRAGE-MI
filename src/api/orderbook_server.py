@@ -197,6 +197,17 @@ _reverse_cfg = ReverseArbitrageConfig(
     future_close_fee=FUTURE_CLOSE_FEE,
     orderbook_coverage_threshold=ORDERBOOK_COVERAGE_THRESHOLD,
     funding_capture_ratio=config.get_float('reverse_arbitrage.funding_capture_ratio', 0.5),
+    funding_carry_enabled=config.get_bool('reverse_arbitrage.funding_carry.enabled', True),
+    funding_carry_min_24h_bps=config.get_float('reverse_arbitrage.funding_carry.min_24h_bps', 80.0),
+    funding_carry_max_next_funding_min=config.get_float(
+        'reverse_arbitrage.funding_carry.max_next_funding_min',
+        60.0,
+    ),
+    funding_carry_min_margin_edge_bps=config.get_float(
+        'reverse_arbitrage.funding_carry.min_margin_edge_bps',
+        50.0,
+    ),
+    funding_carry_basis_relax_bps=config.get_float('reverse_arbitrage.funding_carry.basis_relax_bps', 30.0),
 )
 
 # 服务生命周期管理器（在 lifespan 中初始化）
@@ -573,6 +584,13 @@ def build_reverse_opportunities_payload() -> dict:
         'open_amount_usdt': OPEN_AMOUNT_USDT,
         'orderbook_coverage_threshold': ORDERBOOK_COVERAGE_THRESHOLD,
         'reverse_margin_edge_threshold_bps': 0,
+        'reverse_funding_carry': {
+            'enabled': _reverse_cfg.funding_carry_enabled,
+            'min_24h_bps': _reverse_cfg.funding_carry_min_24h_bps,
+            'max_next_funding_min': _reverse_cfg.funding_carry_max_next_funding_min,
+            'min_margin_edge_bps': _reverse_cfg.funding_carry_min_margin_edge_bps,
+            'basis_relax_bps': _reverse_cfg.funding_carry_basis_relax_bps,
+        },
         'borrow_data_available': bool(borrow_meta),
         'borrow_data_source': borrow_source,
         'borrow_cache_age_sec': (

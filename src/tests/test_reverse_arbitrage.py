@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timedelta
 
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
@@ -47,7 +48,6 @@ def test_reverse_opportunity_net_edge_with_borrow_rate():
     enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
 
     assert row['reverse_gross_funding_bps'] == 510
-    assert row['reverse_funding_2h_rate'] == pytest.approx(-0.051 / 12)
     assert row['reverse_borrow_24h_bps'] == 23.8705
     assert row['reverse_basis_bps'] == 0
     assert row['reverse_borrow_capacity_usdt'] == 4843.3
@@ -60,6 +60,114 @@ def test_reverse_opportunity_net_edge_with_borrow_rate():
     assert row['reverse_margin_edge_pass'] is True
     assert row['reverse_coverage_pass'] is True
     assert row['reverse_status'] == 'candidate'
+    assert row['reverse_funding_carry_pass'] is False
+
+
+def test_reverse_funding_carry_uses_configured_thresholds():
+    row = {
+        'base_asset': 'HOME',
+        'contract': 'HOME_USDT',
+        'funding_next_apply': (datetime.now() + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S'),
+        'spot_qty': 1000,
+        'future_qty': 1000,
+        'spot_price_bid_1': 0.02849,
+        'spot_volume_bid_1': 200000,
+        'future_price_ask_1': 0.02849,
+        'future_volume_ask_1': 200000,
+    }
+    for i in range(2, 21):
+        row[f'spot_price_bid_{i}'] = 0.02849
+        row[f'spot_volume_bid_{i}'] = 0
+        row[f'future_price_ask_{i}'] = 0.02849
+        row[f'future_volume_ask_{i}'] = 0
+
+    cfg = ReverseArbitrageConfig(
+        open_amount_usdt=28.49,
+        spot_open_fee=0.00075,
+        spot_close_fee=0.00075,
+        future_open_fee=0.0002,
+        future_close_fee=0.0002,
+        orderbook_coverage_threshold=0.6,
+        funding_carry_enabled=True,
+        funding_carry_min_24h_bps=80,
+        funding_carry_max_next_funding_min=60,
+        funding_carry_min_margin_edge_bps=50,
+        funding_carry_basis_relax_bps=30,
+    )
+    contract_meta = {'HOME': {'funding_rate_24h': -0.051, 'quanto_multiplier': 1}}
+    borrow_meta = {
+        'HOME': {
+            'borrowable': True,
+            'hourly_interest_rate': 0.0000994603,
+            'borrow_limit': 170000,
+        }
+    }
+    reverse_threshold_meta = {
+        'HOME': {
+            'reverse_open_basis_p20': -20,
+            'reverse_close_basis_p20': -10,
+        }
+    }
+
+    enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
+
+    assert row['reverse_funding_carry_pass'] is True
+    assert row['reverse_funding_carry_next_min'] == pytest.approx(30, abs=0.1)
+    assert row['reverse_funding_carry_basis_ceiling_bps'] == 10
+    assert row['reverse_margin_edge_bps'] >= 50
+
+
+def test_reverse_funding_carry_requires_margin_edge_threshold():
+    row = {
+        'base_asset': 'ABC',
+        'contract': 'ABC_USDT',
+        'funding_next_apply': (datetime.now() + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S'),
+        'spot_qty': 100,
+        'future_qty': 100,
+        'spot_price_bid_1': 1.0,
+        'spot_volume_bid_1': 100000,
+        'future_price_ask_1': 1.0,
+        'future_volume_ask_1': 100000,
+    }
+    for i in range(2, 21):
+        row[f'spot_price_bid_{i}'] = 1.0
+        row[f'spot_volume_bid_{i}'] = 0
+        row[f'future_price_ask_{i}'] = 1.0
+        row[f'future_volume_ask_{i}'] = 0
+
+    cfg = ReverseArbitrageConfig(
+        open_amount_usdt=100,
+        spot_open_fee=0.00075,
+        spot_close_fee=0.00075,
+        future_open_fee=0.0002,
+        future_close_fee=0.0002,
+        orderbook_coverage_threshold=0.6,
+        funding_carry_enabled=True,
+        funding_carry_min_24h_bps=80,
+        funding_carry_max_next_funding_min=60,
+        funding_carry_min_margin_edge_bps=50,
+        funding_carry_basis_relax_bps=30,
+    )
+    contract_meta = {'ABC': {'funding_rate_24h': -0.009, 'quanto_multiplier': 1}}
+    borrow_meta = {
+        'ABC': {
+            'borrowable': True,
+            'hourly_interest_rate': 0,
+            'borrow_limit': 100000,
+        }
+    }
+    reverse_threshold_meta = {
+        'ABC': {
+            'reverse_open_basis_p20': 0,
+            'reverse_close_basis_p20': 0,
+        }
+    }
+
+    enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
+
+    assert row['reverse_gross_funding_bps'] == 90
+    assert row['reverse_margin_edge_bps'] < 50
+    assert row['reverse_funding_carry_pass'] is False
 
 
 def test_reverse_margin_edge_must_be_non_negative():

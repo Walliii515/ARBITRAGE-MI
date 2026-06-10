@@ -22,6 +22,13 @@ interface ReversePayload {
   rows?: OrderBookRow[]
   orderbook_coverage_threshold?: number
   reverse_margin_edge_threshold_bps?: number
+  reverse_funding_carry?: {
+    enabled?: boolean
+    min_24h_bps?: number
+    max_next_funding_min?: number
+    min_margin_edge_bps?: number
+    basis_relax_bps?: number
+  }
   borrow_data_available?: boolean
   borrow_data_source?: string
   borrow_cache_age_sec?: number | null
@@ -46,6 +53,13 @@ const borrowDataSource = ref('none')
 const borrowCacheAgeSec = ref<number | null>(null)
 const marginEdgeThresholdBps = ref(0)
 const orderbookCoverageThreshold = ref(0.6)
+const fundingCarryConfig = ref({
+  enabled: false,
+  min24hBps: 80,
+  maxNextFundingMin: 60,
+  minMarginEdgeBps: 50,
+  basisRelaxBps: 30,
+})
 const assetFilterKeyword = ref('')
 const assetFilterVisible = ref(false)
 const filterNegativeFunding = ref(true)
@@ -178,6 +192,15 @@ async function fetchOpportunities() {
     borrowCacheAgeSec.value = data.borrow_cache_age_sec ?? null
     if (data.reverse_margin_edge_threshold_bps != null) marginEdgeThresholdBps.value = data.reverse_margin_edge_threshold_bps
     if (data.orderbook_coverage_threshold != null) orderbookCoverageThreshold.value = data.orderbook_coverage_threshold
+    if (data.reverse_funding_carry) {
+      fundingCarryConfig.value = {
+        enabled: !!data.reverse_funding_carry.enabled,
+        min24hBps: Number(data.reverse_funding_carry.min_24h_bps ?? 80),
+        maxNextFundingMin: Number(data.reverse_funding_carry.max_next_funding_min ?? 60),
+        minMarginEdgeBps: Number(data.reverse_funding_carry.min_margin_edge_bps ?? 50),
+        basisRelaxBps: Number(data.reverse_funding_carry.basis_relax_bps ?? 30),
+      }
+    }
     applyRows(data.rows ?? [], data.server_time)
   } catch {
     showError('反向机会加载失败')
@@ -435,6 +458,50 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => [
     },
   },
   {
+    headerName: 'Carry入口',
+    field: 'reverse_funding_carry_pass',
+    width: 100,
+    cellRenderer: (params: { value?: boolean | null }) => {
+      const span = document.createElement('span')
+      span.textContent = params.value === true ? '满足' : '—'
+      span.className = params.value === true
+        ? 'reverse-status reverse-status-success'
+        : 'reverse-status reverse-status-info'
+      return span
+    },
+  },
+  {
+    headerName: '距资金费(min)',
+    field: 'reverse_funding_carry_next_min',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toFixed(1),
+    cellStyle: (params) => {
+      const value = params.value as number | null
+      if (value == null) return { color: '#909399' }
+      return value >= 0 && value <= fundingCarryConfig.value.maxNextFundingMin
+        ? { color: '#67c23a' }
+        : { color: '#909399' }
+    },
+  },
+  {
+    headerName: 'Carry上限(bps)',
+    field: 'reverse_funding_carry_basis_ceiling_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+    cellStyle: (params) => {
+      const ceiling = params.value as number | null
+      const basis = params.data?.reverse_basis_bps as number | null | undefined
+      if (ceiling == null || basis == null) return { color: '#909399' }
+      return basis <= ceiling ? { color: '#67c23a' } : { color: '#909399' }
+    },
+  },
+  {
     headerName: '开仓盘口覆盖',
     field: 'reverse_open_coverage',
     width: 115,
@@ -614,6 +681,13 @@ onUnmounted(() => {
         </span>
         <span v-if="borrowCacheAgeSec != null" class="status-item">借币缓存：{{ borrowCacheAgeSec }}s</span>
         <span class="status-item">边际盈亏阈值：{{ marginEdgeThresholdBps }} bps</span>
+        <span class="status-item">FundingCarry：
+          {{ fundingCarryConfig.enabled ? '开' : '关' }} /
+          {{ fundingCarryConfig.min24hBps }}bps /
+          {{ fundingCarryConfig.maxNextFundingMin }}min /
+          边际{{ fundingCarryConfig.minMarginEdgeBps }}bps /
+          放宽{{ fundingCarryConfig.basisRelaxBps }}bps
+        </span>
         <span class="status-item">盘口覆盖阈值：{{ (orderbookCoverageThreshold * 100).toFixed(1) }}%</span>
         <el-button size="small" :loading="loading" :icon="Refresh" circle @click="fetchOpportunities" />
       </div>

@@ -87,11 +87,16 @@ export interface OrderBookRow {
   reverse_open_coverage?: number | null
   reverse_spot_open_coverage?: number | null
   reverse_future_open_coverage?: number | null
-  reverse_funding_2h_rate?: number | null
   reverse_gross_funding_bps?: number | null
   reverse_expected_funding_bps?: number | null
   reverse_funding_capture_ratio?: number | null
   reverse_funding_pass?: boolean | null
+  reverse_funding_carry_pass?: boolean | null
+  reverse_funding_carry_next_min?: number | null
+  reverse_funding_carry_basis_ceiling_bps?: number | null
+  reverse_funding_carry_min_24h_bps?: number | null
+  reverse_funding_carry_min_margin_edge_bps?: number | null
+  reverse_funding_carry_basis_relax_bps?: number | null
   reverse_borrow_hourly_rate?: number | null
   reverse_borrow_24h_bps?: number | null
   reverse_borrow_limit?: number | null

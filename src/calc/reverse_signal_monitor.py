@@ -84,7 +84,9 @@ class ReverseSignalMonitor:
             base_asset = self._base_asset(row)
             if not base_asset:
                 continue
-            if row.get('reverse_status') == 'candidate':
+            entry_trigger_type = self._entry_trigger_type(row)
+            if entry_trigger_type:
+                row['_reverse_entry_trigger_type'] = entry_trigger_type
                 candidate_by_asset[base_asset] = row
 
         for base_asset in list(self._states):
@@ -109,10 +111,11 @@ class ReverseSignalMonitor:
         current_basis = self._as_float(row.get('reverse_basis_bps'))
         if current_basis is None:
             return None
+        entry_trigger_type = row.get('_reverse_entry_trigger_type') or self._entry_trigger_type(row) or 'valley_rebound'
 
         state = self._states.get(base_asset)
         if not state:
-            signal_id = self._create_signal(row, current_basis, now)
+            signal_id = self._create_signal(row, current_basis, now, entry_trigger_type)
             if not signal_id:
                 return None
             if base_asset in self._states:
@@ -126,10 +129,21 @@ class ReverseSignalMonitor:
                     'valley_basis_bps': current_basis,
                     'rebound_since': None,
                     'ready_notified': False,
+                    'entry_trigger_type': entry_trigger_type,
                 }
                 self._states[base_asset] = state
-                logger.info(f'反向信号进入监控 | {base_asset} | basis={current_basis:.2f}bps')
-                return {'base_asset': base_asset, 'status': 'monitoring', 'created': True}
+                logger.info(
+                    f'反向信号进入监控 | {base_asset} | trigger={entry_trigger_type} | '
+                    f'basis={current_basis:.2f}bps'
+                )
+                return {
+                    'base_asset': base_asset,
+                    'status': 'monitoring',
+                    'created': True,
+                    'trigger_type': entry_trigger_type,
+                }
+        else:
+            state.setdefault('entry_trigger_type', entry_trigger_type)
 
         duration_sec = int((now - state['start_time']).total_seconds())
         if state.get('signal_basis_bps') is None:
@@ -156,6 +170,9 @@ class ReverseSignalMonitor:
         if duration_sec < self.cfg.min_monitor_sec:
             return None
 
+        if state.get('entry_trigger_type') == 'funding_carry':
+            return self._process_funding_carry_ready(base_asset, row, borrow_meta, current_basis, duration_sec)
+
         required_rebound = self._required_rebound_bps(state, valley)
         rebound_bps = current_basis - valley
         if rebound_bps < required_rebound:
@@ -173,7 +190,12 @@ class ReverseSignalMonitor:
         if state.get('ready_notified'):
             return None
 
-        passed, pre_gate_basis, reason = self._pre_execution_gate(base_asset, row, borrow_meta)
+        passed, pre_gate_basis, reason = self._pre_execution_gate(
+            base_asset,
+            row,
+            borrow_meta,
+            trigger_type='valley_rebound',
+        )
         if not passed:
             self._resolve_signal(
                 base_asset,
@@ -187,8 +209,53 @@ class ReverseSignalMonitor:
             return {'base_asset': base_asset, 'status': 'gate_rejected', 'reason': reason}
 
         state['ready_notified'] = True
-        self._mark_ready_to_open(base_asset, current_basis, pre_gate_basis, duration_sec)
+        self._mark_ready_to_open(
+            base_asset,
+            current_basis,
+            pre_gate_basis,
+            duration_sec,
+            trigger_type='valley_rebound',
+        )
         return {'base_asset': base_asset, 'status': 'monitoring', 'trigger_type': 'valley_rebound'}
+
+    def _process_funding_carry_ready(
+        self,
+        base_asset: str,
+        row: Dict,
+        borrow_meta: Dict[str, Dict],
+        current_basis: float,
+        duration_sec: int,
+    ) -> Optional[Dict]:
+        state = self._states.get(base_asset)
+        if not state or state.get('ready_notified'):
+            return None
+
+        passed, pre_gate_basis, reason = self._pre_execution_gate(
+            base_asset,
+            row,
+            borrow_meta,
+            trigger_type='funding_carry',
+        )
+        if not passed:
+            self._resolve_signal(
+                base_asset,
+                'gate_rejected',
+                reason,
+                exit_basis_bps=current_basis,
+                trigger_type='funding_carry',
+                pre_gate_basis_bps=pre_gate_basis,
+            )
+            return {'base_asset': base_asset, 'status': 'gate_rejected', 'reason': reason}
+
+        state['ready_notified'] = True
+        self._mark_ready_to_open(
+            base_asset,
+            current_basis,
+            pre_gate_basis,
+            duration_sec,
+            trigger_type='funding_carry',
+        )
+        return {'base_asset': base_asset, 'status': 'monitoring', 'trigger_type': 'funding_carry'}
 
     def _required_rebound_bps(self, state: Dict, valley_basis: float) -> float:
         signal_basis = float(state.get('signal_basis_bps', valley_basis))
@@ -201,6 +268,7 @@ class ReverseSignalMonitor:
         base_asset: str,
         row: Dict,
         borrow_meta: Dict[str, Dict],
+        trigger_type: Optional[str] = None,
     ) -> Tuple[bool, Optional[float], str]:
         if not self._gate_manager or not self._spot_manager:
             return True, self._as_float(row.get('reverse_basis_bps')), ''
@@ -253,7 +321,10 @@ class ReverseSignalMonitor:
             )
             check = check_rows[0]
             pre_gate_basis = self._as_float(check.get('reverse_basis_bps'))
-            if check.get('reverse_status') != 'candidate':
+            if trigger_type == 'funding_carry':
+                if check.get('reverse_funding_carry_pass') is not True:
+                    return False, pre_gate_basis, 'FundingCarry旁路复核失败(实时条件不满足)'
+            elif check.get('reverse_status') != 'candidate':
                 return False, pre_gate_basis, f"旁路复核失败({check.get('reverse_status') or 'unknown'})"
 
             if not self.cfg.execution_enabled:
@@ -264,7 +335,13 @@ class ReverseSignalMonitor:
             logger.warning(f'反向开仓旁路异常 | {base_asset}: {exc}', exc_info=True)
             return False, None, f'旁路异常({str(exc)[:120]})'
 
-    def _create_signal(self, row: Dict, basis_bps: float, now: datetime) -> Optional[int]:
+    def _create_signal(
+        self,
+        row: Dict,
+        basis_bps: float,
+        now: datetime,
+        trigger_type: Optional[str] = None,
+    ) -> Optional[int]:
         base_asset = self._base_asset(row)
         active_id = self._find_active_signal_id(base_asset)
         if active_id:
@@ -273,12 +350,14 @@ class ReverseSignalMonitor:
         sql = """
             INSERT INTO mi_reverse_trade_signal (
                 base_asset, contract, symbol, status, signal_time, duration_sec,
+                trigger_type,
                 funding_rate_24h, reverse_open_basis_bps, signal_basis_bps, valley_basis_bps,
                 reverse_open_basis_p20, reverse_close_basis_p20, margin_edge_bps,
                 borrow_hourly_rate, borrow_24h_bps, borrow_limit, borrow_capacity_usdt,
                 open_coverage, capacity_usdt, open_amount_usdt
             ) VALUES (
                 %(base_asset)s, %(contract)s, %(symbol)s, 'monitoring', %(signal_time)s, 0,
+                %(trigger_type)s,
                 %(funding_rate_24h)s, %(basis)s, %(basis)s, %(basis)s,
                 %(reverse_open_basis_p20)s, %(reverse_close_basis_p20)s, %(margin_edge_bps)s,
                 %(borrow_hourly_rate)s, %(borrow_24h_bps)s, %(borrow_limit)s, %(borrow_capacity_usdt)s,
@@ -286,6 +365,7 @@ class ReverseSignalMonitor:
             )
         """
         params = self._signal_params(row, basis_bps, now)
+        params['trigger_type'] = trigger_type
         try:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, params)
@@ -337,6 +417,7 @@ class ReverseSignalMonitor:
         rebound_basis: float,
         pre_gate_basis: Optional[float],
         duration_sec: int,
+        trigger_type: str,
     ) -> None:
         state = self._states.get(base_asset)
         if not state:
@@ -344,17 +425,21 @@ class ReverseSignalMonitor:
         sql = """
             UPDATE mi_reverse_trade_signal
             SET duration_sec = %(duration_sec)s,
-                trigger_type = 'valley_rebound',
+                trigger_type = %(trigger_type)s,
                 rebound_basis_bps = %(rebound_basis)s,
                 pre_gate_basis_bps = %(pre_gate_basis)s,
                 reject_reason = %(reason)s
             WHERE id = %(id)s AND status = 'monitoring'
         """
-        reason = '触底反弹与旁路风控已通过；反向执行器未启用，继续保持监控'
+        if trigger_type == 'funding_carry':
+            reason = 'FundingCarry与旁路风控已通过；反向执行器未启用，继续保持监控'
+        else:
+            reason = '触底反弹与旁路风控已通过；反向执行器未启用，继续保持监控'
         try:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, {
                     'duration_sec': duration_sec,
+                    'trigger_type': trigger_type,
                     'rebound_basis': round(rebound_basis, 2),
                     'pre_gate_basis': round(pre_gate_basis, 2) if pre_gate_basis is not None else None,
                     'reason': reason,
@@ -378,6 +463,7 @@ class ReverseSignalMonitor:
             return
         now = datetime.now()
         duration_sec = int((now - state['start_time']).total_seconds())
+        effective_trigger_type = trigger_type or state.get('entry_trigger_type')
         sql = """
             UPDATE mi_reverse_trade_signal
             SET status = %(status)s,
@@ -396,7 +482,7 @@ class ReverseSignalMonitor:
                     'status': status,
                     'resolved_time': now,
                     'duration_sec': duration_sec,
-                    'trigger_type': trigger_type,
+                    'trigger_type': effective_trigger_type,
                     'reason': reason,
                     'exit_basis': round(exit_basis_bps, 2) if exit_basis_bps is not None else None,
                     'rebound_basis': round(rebound_basis_bps, 2) if rebound_basis_bps is not None else None,
@@ -412,7 +498,8 @@ class ReverseSignalMonitor:
             return
         cutoff = datetime.now() - timedelta(seconds=max(self.cfg.monitor_timeout_sec * 2, 120))
         sql = """
-            SELECT id, base_asset, signal_time, signal_basis_bps, valley_basis_bps, trigger_type
+            SELECT id, base_asset, signal_time, signal_basis_bps, valley_basis_bps,
+                   trigger_type, pre_gate_basis_bps
             FROM mi_reverse_trade_signal
             WHERE status = 'monitoring'
               AND signal_time >= %s
@@ -434,14 +521,16 @@ class ReverseSignalMonitor:
                     'signal_basis_bps': self._as_float(row.get('signal_basis_bps')),
                     'valley_basis_bps': self._as_float(row.get('valley_basis_bps')),
                     'rebound_since': None,
-                    'ready_notified': row.get('trigger_type') == 'valley_rebound',
+                    'ready_notified': row.get('pre_gate_basis_bps') is not None,
+                    'entry_trigger_type': row.get('trigger_type') or 'valley_rebound',
                 }
         except Exception as exc:
             logger.warning(f'反向活跃信号加载失败: {exc}')
 
     def _find_active_signal_id(self, base_asset: str) -> Optional[int]:
         sql = """
-            SELECT id, signal_time, signal_basis_bps, valley_basis_bps, trigger_type
+            SELECT id, signal_time, signal_basis_bps, valley_basis_bps,
+                   trigger_type, pre_gate_basis_bps
             FROM mi_reverse_trade_signal
             WHERE base_asset = %s AND status = 'monitoring'
             ORDER BY signal_time DESC
@@ -461,7 +550,8 @@ class ReverseSignalMonitor:
                 'signal_basis_bps': self._as_float(row.get('signal_basis_bps')),
                 'valley_basis_bps': self._as_float(row.get('valley_basis_bps')),
                 'rebound_since': None,
-                'ready_notified': row.get('trigger_type') == 'valley_rebound',
+                'ready_notified': row.get('pre_gate_basis_bps') is not None,
+                'entry_trigger_type': row.get('trigger_type') or 'valley_rebound',
             }
             return row.get('id')
         except Exception as exc:
@@ -601,6 +691,14 @@ class ReverseSignalMonitor:
     @staticmethod
     def _base_asset(row: Dict) -> str:
         return str(row.get('base_asset') or '').strip().upper()
+
+    @staticmethod
+    def _entry_trigger_type(row: Dict) -> Optional[str]:
+        if row.get('reverse_funding_carry_pass') is True:
+            return 'funding_carry'
+        if row.get('reverse_status') == 'candidate':
+            return 'valley_rebound'
+        return None
 
     @staticmethod
     def _as_float(value) -> Optional[float]:
