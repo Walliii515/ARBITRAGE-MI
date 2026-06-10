@@ -254,15 +254,15 @@ margin:
   # 默认维持保证金率（当合约表无数据时的回退值）
   default_maintenance_rate: 0.005
   # 保证金/维持保证金预警阈值(%): 低于此值时禁止该标的新开仓
-  warning_pct: 2000
+  warning_pct: 250
   # 保证金/维持保证金自动追加阈值(%): 低于此值时先尝试追保
-  topup_pct: 2000
+  topup_pct: 250
   # 保证金/维持保证金紧急平仓阈值(%): 低于此值且追保失败/不可追保才触发两端同时平仓
-  close_threshold_pct: 120
+  close_threshold_pct: 150
   # 自动追加保证金策略：补到目标 保证金/维持保证金 比例
   topup:
     enabled: true
-    target_maintenance_margin_rate_pct: 3000
+    target_maintenance_margin_rate_pct: 300
     max_topup_per_position: 99
     max_topup_ratio: 0
     min_gate_available: 50
