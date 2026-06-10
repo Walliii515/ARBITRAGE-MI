@@ -1077,8 +1077,14 @@ async def get_reverse_signals(
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
     """查询反向套利交易信号（后端分页）。"""
-    where = ["signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
-    aliased_where = ["s.signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    where = [
+        "signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+        "signal_basis_bps IS NOT NULL",
+    ]
+    aliased_where = [
+        "s.signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+        "s.signal_basis_bps IS NOT NULL",
+    ]
     params: List = [days]
     if status:
         where.append("status = %s")
