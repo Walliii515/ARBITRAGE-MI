@@ -12,30 +12,20 @@ import { showError, showSuccess } from '../utils/message'
 interface ReverseSignalRow {
   id: number
   base_asset: string
-  contract: string | null
   signal_time: string
   resolved_time: string | null
-  last_seen_time: string | null
   status: 'candidate' | 'rejected' | 'conditions_lost' | string
   reverse_status: string
-  trigger_reason: string | null
   reject_reason: string | null
-  funding_rate_24h: number | null
   funding_rate_2h: number | null
-  reverse_gross_funding_bps: number | null
   reverse_expected_funding_bps: number | null
   reverse_basis_bps: number | null
-  reverse_close_basis_bps: number | null
   reverse_p20_edge_bps: number | null
   reverse_margin_edge_bps: number | null
   reverse_open_coverage: number | null
-  reverse_borrow_hourly_rate: number | null
   reverse_borrow_24h_bps: number | null
   reverse_borrow_limit: number | null
   reverse_capacity_usdt: number | null
-  reverse_open_basis_p20: number | null
-  reverse_close_basis_p20: number | null
-  funding_next_apply: string | null
 }
 
 interface ReverseSignalSummary {
@@ -292,7 +282,6 @@ function onGridReady(event: GridReadyEvent<ReverseSignalRow>) {
 
 const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
   { headerName: '标的资产', field: 'base_asset', width: 105, pinned: 'left' },
-  { headerName: '合约', field: 'contract', width: 120, pinned: 'left' },
   { headerName: '信号时间', field: 'signal_time', width: 165, sort: 'desc', sortIndex: 0 },
   {
     headerName: '状态',
@@ -314,22 +303,6 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => formatPercent(p.value, 4),
-  },
-  {
-    headerName: '24h资金费率',
-    field: 'funding_rate_24h',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatPercent(p.value, 4),
-  },
-  {
-    headerName: '可收Funding(bps)',
-    field: 'reverse_gross_funding_bps',
-    width: 135,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value),
   },
   {
     headerName: '预期Funding(bps)',
@@ -356,30 +329,6 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     valueFormatter: (p) => formatBps(p.value),
   },
   {
-    headerName: '平仓基差(bps)',
-    field: 'reverse_close_basis_bps',
-    width: 125,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value),
-  },
-  {
-    headerName: '开仓P20(bps)',
-    field: 'reverse_open_basis_p20',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value),
-  },
-  {
-    headerName: '平仓P20(bps)',
-    field: 'reverse_close_basis_p20',
-    width: 120,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatBps(p.value),
-  },
-  {
     headerName: '边际P20(bps)',
     field: 'reverse_p20_edge_bps',
     width: 120,
@@ -394,14 +343,6 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => p.value == null ? '' : `${(Number(p.value) * 100).toFixed(1)}%`,
-  },
-  {
-    headerName: '借币小时利率',
-    field: 'reverse_borrow_hourly_rate',
-    width: 125,
-    type: 'numericColumn',
-    cellClass: 'ag-right-aligned-cell',
-    valueFormatter: (p) => formatPercent(p.value, 6),
   },
   {
     headerName: '借币24h成本(bps)',
@@ -428,22 +369,13 @@ const columnDefs = ref<ColDef<ReverseSignalRow>[]>([
     valueFormatter: (p) => formatUsdt(p.value),
   },
   {
-    headerName: '触发原因',
-    field: 'trigger_reason',
-    width: 320,
-    tooltipField: 'trigger_reason',
-    tooltipComponent: LongTextTooltip,
-  },
-  {
     headerName: '拒绝/结束原因',
     field: 'reject_reason',
     width: 260,
     tooltipField: 'reject_reason',
     tooltipComponent: LongTextTooltip,
   },
-  { headerName: '最后命中时间', field: 'last_seen_time', width: 165 },
   { headerName: '结束时间', field: 'resolved_time', width: 165 },
-  { headerName: '下次支付时间', field: 'funding_next_apply', width: 165 },
 ])
 
 const defaultColDef: ColDef = {
