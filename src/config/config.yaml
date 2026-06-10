@@ -56,6 +56,7 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
+    max_total_positions: 45                 # 全局最大持仓数，保留资金buffer给future追保
     max_positions_per_asset: 7              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）

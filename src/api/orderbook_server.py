@@ -968,7 +968,11 @@ async def resume_open():
 @app.get('/api/trading/open/status')
 async def open_status():
     """查询开仓暂停状态（无需认证）"""
-    return {'open_paused': _open_paused}
+    return {
+        'open_paused': _open_paused,
+        'max_total_positions': config.get_int('trade.open.max_total_positions', 45),
+        'max_positions_per_asset': config.get_int('trade.open.max_positions_per_asset', 1),
+    }
 
 
 @app.post('/api/trading/positions/{position_id}/manual-close', dependencies=[Depends(verify_token_dependency)])
@@ -1213,6 +1217,7 @@ def _run_open_position_check_once():
                 cooldown_sec=config.get_int('trade.open.cooldown_sec', 3600),
                 min_funding_rate_bps=config.get_float('trade.open.min_funding_rate_bps', -6.0),
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
+                max_total_positions=config.get_int('trade.open.max_total_positions', 45),
                 max_positions_per_asset=config.get_int('trade.open.max_positions_per_asset', 1),
                 reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 300),
                 max_orderbook_lag_ms=config.get_float('trade.open.max_orderbook_lag_ms', 1000.0),
