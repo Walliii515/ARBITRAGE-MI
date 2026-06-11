@@ -565,14 +565,18 @@ class ClosingExecutor:
         return margin_rate < self.margin_close_threshold_pct
 
     def _maintenance_margin_rate(self, pos: Dict) -> Optional[float]:
-        """Gate 聚合仓位口径：仓位保证金 / 维持保证金 * 100，越高越安全。"""
+        """Gate 聚合仓位口径：仓位权益 / 维持保证金 * 100，越高越安全。"""
         value = pos.get('gate_maintenance_margin_rate')
         if value is not None:
             try:
                 return float(value)
             except (TypeError, ValueError):
                 return None
-        margin = _float_or_none(pos.get('gate_position_margin'))
+        margin = _float_or_none(pos.get('gate_position_margin_equity'))
+        if margin is None:
+            raw_margin = _float_or_none(pos.get('gate_position_margin'))
+            unrealised_pnl = _float_or_none(pos.get('gate_unrealised_pnl')) or 0.0
+            margin = raw_margin + unrealised_pnl if raw_margin is not None else None
         maintenance = _float_or_none(pos.get('gate_maintenance_margin'))
         if margin is None or maintenance is None or maintenance <= 0:
             return None
@@ -726,19 +730,23 @@ class ClosingExecutor:
             self._margin_topup_contract_cooldown[str(contract).upper()] = datetime.now()
 
     def _calculate_margin_topup_amount(self, pos: Dict) -> Optional[Dict]:
-        """按 Gate 聚合仓位口径，计算补到目标 保证金/维持保证金 比例所需金额。"""
-        margin_before = _float_or_none(pos.get('gate_position_margin'))
+        """按 Gate 页面 MMR 口径，计算补到目标 仓位权益/维持保证金 比例所需金额。"""
+        raw_margin = _float_or_none(pos.get('gate_position_margin'))
+        margin_before = _float_or_none(pos.get('gate_position_margin_equity'))
+        if margin_before is None:
+            unrealised_pnl = _float_or_none(pos.get('gate_unrealised_pnl')) or 0.0
+            margin_before = raw_margin + unrealised_pnl if raw_margin is not None else None
         maintenance_margin = _float_or_none(pos.get('gate_maintenance_margin'))
         if margin_before is None or maintenance_margin is None or maintenance_margin <= 0:
             return None
 
-        target_margin = maintenance_margin * max(self.margin_topup_target_rate_pct, 0) / 100
-        topup_amount = max(0.0, target_margin - margin_before)
+        target_margin_equity = maintenance_margin * max(self.margin_topup_target_rate_pct, 0) / 100
+        topup_amount = max(0.0, target_margin_equity - margin_before)
         margin_rate_after = (margin_before + topup_amount) / maintenance_margin * 100
         return {
-            'initial_margin': margin_before,
+            'initial_margin': raw_margin if raw_margin is not None else margin_before,
             'margin_before': margin_before,
-            'target_margin': target_margin,
+            'target_margin': target_margin_equity,
             'topup_amount': topup_amount,
             'margin_rate_after': margin_rate_after,
         }

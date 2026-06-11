@@ -5,6 +5,10 @@ Gate 合约仓位风险字段富化。
 Gate 的强平预警邮件使用合约聚合仓位口径；本地 mi_trade_position
 可能把同一合约拆成多条持仓，因此这里按 Gate contract 将同一风险值
 贴到所有本地持仓行。
+
+Gate 页面展示的 MMR 口径是 仓位权益 / 维持保证金，其中仓位权益等于
+逐仓保证金加未实现盈亏。只用 margin / maintenance_margin 会在浮亏时
+高估安全度，导致系统晚于交易所预警。
 """
 from datetime import datetime
 from typing import Dict, Iterable, List
@@ -25,12 +29,16 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
             continue
 
         margin = _float(gate_pos.get('margin'))
+        unrealised_pnl = _float(gate_pos.get('unrealised_pnl'))
+        margin_equity = margin + unrealised_pnl
         maintenance_margin = _float(gate_pos.get('maintenance_margin'))
-        rate = margin / maintenance_margin * 100 if maintenance_margin > 0 else None
+        rate = margin_equity / maintenance_margin * 100 if maintenance_margin > 0 else None
 
         pos['gate_mark_price'] = _float_or_none(gate_pos.get('mark_price'))
         pos['gate_liq_price'] = _float_or_none(gate_pos.get('liq_price'))
         pos['gate_position_margin'] = margin
+        pos['gate_position_margin_equity'] = margin_equity
+        pos['gate_unrealised_pnl'] = unrealised_pnl
         pos['gate_maintenance_margin'] = maintenance_margin
         pos['gate_maintenance_margin_rate'] = round(rate, 2) if rate is not None else None
         pos['gate_position_size'] = _float_or_none(gate_pos.get('size'))
@@ -56,6 +64,8 @@ def _clear_gate_risk_fields(pos: Dict) -> None:
     pos['gate_mark_price'] = None
     pos['gate_liq_price'] = None
     pos['gate_position_margin'] = None
+    pos['gate_position_margin_equity'] = None
+    pos['gate_unrealised_pnl'] = None
     pos['gate_maintenance_margin'] = None
     pos['gate_maintenance_margin_rate'] = None
     pos['gate_position_size'] = None

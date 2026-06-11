@@ -2135,6 +2135,34 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertGreater(kwargs['future_protective_price'], 100.0)
 
 
+class TestGatePositionRiskEnrichment(unittest.TestCase):
+    """Gate 仓位风险口径应与交易所 MMR 展示一致。"""
+
+    def test_maintenance_margin_rate_includes_unrealised_pnl(self):
+        from calc.gate_position_risk import attach_gate_position_risk
+
+        positions = [{
+            'status': 'holding',
+            'future_contract': 'HMSTR_USDT',
+        }]
+        gate_positions = [{
+            'contract': 'HMSTR_USDT',
+            'size': '-2054',
+            'margin': '13.11702499',
+            'unrealised_pnl': '-5.42',
+            'maintenance_margin': '1.15885139',
+            'mark_price': '0.0002719',
+            'liq_price': '0.000302',
+        }]
+
+        attach_gate_position_risk(positions, gate_positions)
+
+        self.assertAlmostEqual(positions[0]['gate_position_margin'], 13.11702499)
+        self.assertAlmostEqual(positions[0]['gate_unrealised_pnl'], -5.42)
+        self.assertAlmostEqual(positions[0]['gate_position_margin_equity'], 7.69702499)
+        self.assertAlmostEqual(positions[0]['gate_maintenance_margin_rate'], 664.19)
+
+
 class TestMarginTopupCalculation(unittest.TestCase):
     """自动追保核心公式。"""
 
@@ -2145,15 +2173,16 @@ class TestMarginTopupCalculation(unittest.TestCase):
             'id': 1,
             'base_asset': 'BTC',
             'gate_position_margin': 28.0,
+            'gate_unrealised_pnl': -10.0,
             'gate_maintenance_margin': 2.0,
         }
 
         calc = ce._calculate_margin_topup_amount(pos)
 
         self.assertIsNotNone(calc)
-        self.assertAlmostEqual(calc['margin_before'], 28.0)
+        self.assertAlmostEqual(calc['margin_before'], 18.0)
         self.assertAlmostEqual(calc['target_margin'], 60.0)
-        self.assertAlmostEqual(calc['topup_amount'], 32.0)
+        self.assertAlmostEqual(calc['topup_amount'], 42.0)
         self.assertAlmostEqual(calc['margin_rate_after'], 3000.0)
 
     def test_topup_amount_returns_none_without_gate_margin_fields(self):

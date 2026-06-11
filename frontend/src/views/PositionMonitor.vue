@@ -7,6 +7,7 @@ import type {
   GridApi,
   GridReadyEvent,
   ValueFormatterParams,
+  ValueGetterParams,
 } from 'ag-grid-community'
 import { ElPopover } from 'element-plus'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -82,6 +83,8 @@ interface PositionRow {
   gate_mark_price: number | null
   gate_liq_price: number | null
   gate_position_margin: number | null
+  gate_position_margin_equity: number | null
+  gate_unrealised_pnl: number | null
   gate_maintenance_margin: number | null
   gate_maintenance_margin_rate: number | null
   gate_position_size: number | null
@@ -751,6 +754,11 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     enableCellChangeFlash: true,
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
+    valueGetter: (params: ValueGetterParams<PositionRow>) => {
+      const row = params.data
+      if (!row) return null
+      return row.gate_position_margin ?? row.current_margin
+    },
     valueFormatter: pnlFormatter,
   },
   {
@@ -778,9 +786,9 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
 	    cellStyle: (params: any) => {
 	      const value = params.value as number | null
 	      if (value == null) return { color: '#909399', fontWeight: '400' }
-	      if (value >= 3000) return { color: '#67c23a', fontWeight: '400' }
-	      if (value >= 2000) return { color: '#95d475', fontWeight: '400' }
-	      if (value >= 120) return { color: '#e6a23c', fontWeight: '400' }
+	      if (value >= 350) return { color: '#67c23a', fontWeight: '400' }
+	      if (value >= 250) return { color: '#95d475', fontWeight: '400' }
+	      if (value >= 150) return { color: '#e6a23c', fontWeight: '400' }
 	      return { color: '#f56c6c', fontWeight: '700' }
 	    },
     tooltipValueGetter: (params: any) => {
@@ -789,6 +797,8 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
       const parts = [
         `保证金/维持保证金: ${Number(row.gate_maintenance_margin_rate).toFixed(2)}%`,
         row.gate_position_margin != null ? `仓位保证金: ${formatAmount(row.gate_position_margin)}` : null,
+        row.gate_unrealised_pnl != null ? `未实现盈亏: ${formatAmount(row.gate_unrealised_pnl)}` : null,
+        row.gate_position_margin_equity != null ? `仓位权益: ${formatAmount(row.gate_position_margin_equity)}` : null,
         row.gate_maintenance_margin != null ? `维持保证金: ${formatAmount(row.gate_maintenance_margin)}` : null,
         row.gate_mark_price != null ? `标记价: ${formatDecimal(row.gate_mark_price)}` : null,
         row.gate_liq_price != null ? `强平价: ${formatDecimal(row.gate_liq_price)}` : null,
@@ -995,10 +1005,15 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     margin_topup_total: sumField('margin_topup_total'),
     margin_topup_last_at: null,
     margin_initial: sumField('margin_initial'),
-    current_margin: sumField('current_margin'),
+    current_margin: rows.reduce((sum, row) => {
+      const value = row.gate_position_margin ?? row.current_margin
+      return sum + (typeof value === 'number' ? value : 0)
+    }, 0),
     gate_mark_price: null,
     gate_liq_price: null,
     gate_position_margin: sumField('gate_position_margin'),
+    gate_position_margin_equity: sumField('gate_position_margin_equity'),
+    gate_unrealised_pnl: sumField('gate_unrealised_pnl'),
     gate_maintenance_margin: sumField('gate_maintenance_margin'),
     gate_maintenance_margin_rate: null,
     gate_position_size: sumField('gate_position_size'),
