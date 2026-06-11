@@ -314,6 +314,29 @@ reverse_arbitrage:
     max_orderbook_lag_ms: 500
   execution:
     enabled: false                          # 反向执行器接入前保持关闭
+    dry_run: true                           # 真实执行实现前默认只做演练/记录
+    max_positions_per_asset: 1
+    min_open_amount_usdt: 0                 # 0 表示第一版不做“有多少开多少”
+    allow_partial_borrow_capacity: false    # 借币额度不足时不开仓
+    reject_cooldown_sec: 300
+    execution_drift_cooldown_sec: 21600
+  close:
+    enabled: false                          # 反向平仓执行器接入前保持关闭
+    fixed_take_profit_bps: 20
+    peak_retrace_pct: 0.05                  # 反向平仓基差见顶后回落确认
+    monitor_timeout_sec: 60
+    max_orderbook_lag_ms: 500
+    orderbook_coverage_threshold: 0.6
+  risk:
+    funding_positive_exit_enabled: true     # funding 转正后按风险退出评估
+    funding_positive_exit_current_24h_bps: 21
+    funding_positive_exit_current_window_min: 30
+    funding_positive_exit_extreme_24h_bps: 45
+    borrow_hourly_rate_warn_bps: 2
+    cross_margin_min_margin_level: 2.0
+  reconciliation:
+    enabled: false                          # 反向对账实现前保持关闭
+    interval_sec: 300
   binance_margin:
     enabled: true
     cache_ttl_sec: 60

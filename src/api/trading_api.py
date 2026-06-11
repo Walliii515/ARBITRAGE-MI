@@ -24,6 +24,7 @@ from calc.account_capital import build_default_capital_snapshotter
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+from calc.reverse_trade_store import list_reverse_orders, list_reverse_positions
 
 logger = get_logger(__name__)
 
@@ -1159,5 +1160,67 @@ async def get_reverse_signals(
             'monitor_timeout': int(summary_data.get('monitor_timeout') or 0),
             'conversion_rate': round(opened_count / total_count * 100, 1) if total_count > 0 else 0,
             'latest_signal_time': summary_data.get('latest_signal_time'),
+        },
+    }
+
+
+@router.get('/reverse-positions')
+async def get_reverse_positions(
+    status: Optional[str] = Query(None, description="状态过滤: holding/closing/closed/risk/desynced"),
+    base_asset: Optional[str] = Query(None, description="标的资产过滤"),
+    days: int = Query(30, ge=1, le=365, description="最近N天"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
+):
+    """查询反向套利持仓（独立于正向 mi_trade_position）。"""
+    result = list_reverse_positions(
+        status=status,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
+    return {
+        'positions': _serialize_rows(result.rows),
+        'pagination': {
+            'page': result.page,
+            'page_size': result.page_size,
+            'total': result.total,
+            'total_pages': result.total_pages,
+        },
+    }
+
+
+@router.get('/reverse-orders')
+async def get_reverse_orders(
+    position_id: Optional[int] = Query(None, description="反向持仓ID过滤"),
+    order_uuid: Optional[str] = Query(None, description="订单组UUID过滤"),
+    order_side: Optional[str] = Query(None, description="方向过滤: open/close/repay/unwind"),
+    status: Optional[str] = Query(None, description="状态过滤"),
+    market_type: Optional[str] = Query(None, description="市场过滤: margin_spot/future/margin_repay"),
+    base_asset: Optional[str] = Query(None, description="标的资产过滤"),
+    days: int = Query(30, ge=1, le=365, description="最近N天"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
+):
+    """查询反向套利订单（独立于正向 mi_trade_order）。"""
+    result = list_reverse_orders(
+        position_id=position_id,
+        order_uuid=order_uuid,
+        order_side=order_side,
+        status=status,
+        market_type=market_type,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
+    return {
+        'orders': _serialize_rows(result.rows),
+        'pagination': {
+            'page': result.page,
+            'page_size': result.page_size,
+            'total': result.total,
+            'total_pages': result.total_pages,
         },
     }
