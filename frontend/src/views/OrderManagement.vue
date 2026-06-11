@@ -582,7 +582,7 @@ async function handleManualClose(positionId: number) {
     if (data.success) {
       showSuccess(`平仓成功: ${data.base_asset}`)
     } else {
-      showError(`平仓失败: ${data.message || '未知错误'}`)
+      showError(`平仓失败: ${data.message || data.detail || '未知错误'}`)
     }
   } catch (e: any) {
     // 处理 HTTP 错误状态码

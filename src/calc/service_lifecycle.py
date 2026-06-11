@@ -32,6 +32,27 @@ CONN_SUCCESS = 'success'
 CONN_FAILED = 'failed'
 
 
+def merge_contracts_with_forced_holdings(selected: List[str], holdings: List[str]) -> Tuple[List[str], List[str]]:
+    """把持仓合约强制并入订阅列表，保持原有顺序并去重。"""
+    merged: List[str] = []
+    seen = set()
+    selected_set = {(contract or '').strip().upper() for contract in selected if (contract or '').strip()}
+    forced: List[str] = []
+    forced_seen = set()
+    for contract in selected + holdings:
+        value = (contract or '').strip().upper()
+        if not value or value in seen:
+            continue
+        merged.append(value)
+        seen.add(value)
+    for contract in holdings:
+        value = (contract or '').strip().upper()
+        if value and value not in selected_set and value not in forced_seen:
+            forced.append(value)
+            forced_seen.add(value)
+    return merged, forced
+
+
 class ServiceLifecycleManager:
     """WS 服务生命周期管理器"""
 
@@ -376,6 +397,8 @@ class ServiceLifecycleManager:
                     for row in rows
                     if row.get('base_asset') and row['base_asset'].strip()
                 ]
+                holding_contracts = self._fetch_holding_contracts()
+                contracts, forced_holdings = merge_contracts_with_forced_holdings(contracts, holding_contracts)
                 tier_counts: Dict[str, int] = {}
                 for row in rows:
                     tier = row.get('strategy_tier') or 'C'
@@ -384,12 +407,45 @@ class ServiceLifecycleManager:
                     f"从数据库筛选到 {len(contracts)} 个订阅合约"
                     f"（tiers={allowed_tiers}, tier_counts={tier_counts}, "
                     f"max={max_contracts}, min_spot_vol={min_spot_volume}, "
-                    f"min_future_vol={min_future_volume}, funding_filter=runtime）: {contracts}"
+                    f"min_future_vol={min_future_volume}, funding_filter=runtime, "
+                    f"forced_holdings={forced_holdings}）: {contracts}"
                 )
                 return contracts
         except Exception as e:
             logger.error(f"从数据库获取合约列表失败: {e}，使用默认合约", exc_info=True)
             return ['BTC_USDT', 'ETH_USDT']
+
+    def _fetch_holding_contracts(self) -> List[str]:
+        """持仓中的合约必须保留订阅，保证手动/自动平仓随时有盘口。"""
+        settle_suffix = self._settle.upper()
+        sql = """
+            SELECT DISTINCT
+                COALESCE(NULLIF(TRIM(p.future_contract), ''), CONCAT(UPPER(TRIM(p.base_asset)), %s)) AS contract
+            FROM mi_trade_position p
+            LEFT JOIN mi_gate_future_contracts g
+                ON g.name = COALESCE(NULLIF(TRIM(p.future_contract), ''), CONCAT(UPPER(TRIM(p.base_asset)), %s))
+            LEFT JOIN mi_binance_spot_info s
+                ON s.symbol = CONCAT(UPPER(TRIM(p.base_asset)), %s)
+            WHERE p.status = 'holding'
+              AND p.base_asset IS NOT NULL
+              AND TRIM(p.base_asset) <> ''
+              AND UPPER(TRIM(p.base_asset)) REGEXP '^[A-Z0-9]+$'
+              AND COALESCE(g.status, 'trading') = 'trading'
+              AND COALESCE(s.status, 'TRADING') = 'TRADING'
+              AND COALESCE(s.is_spot_trading_allowed, 1) = 1
+        """
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, (f'_{settle_suffix}', f'_{settle_suffix}', settle_suffix))
+                rows = cursor.fetchall()
+            return [
+                row['contract'].strip().upper()
+                for row in rows
+                if row.get('contract') and row['contract'].strip()
+            ]
+        except Exception as e:
+            logger.warning(f"查询持仓强制订阅合约失败: {e}", exc_info=True)
+            return []
 
     def _get_asset_strategy_tier(self, base_asset: str) -> Optional[str]:
         sql = """
@@ -409,7 +465,7 @@ class ServiceLifecycleManager:
 
     # ───── 手动重试 ─────
 
-    def retry_contract(self, base_asset: str) -> Tuple[bool, str]:
+    def retry_contract(self, base_asset: str, force: bool = False) -> Tuple[bool, str]:
         """
         手动重试单个标的：重新订阅 Gate OBU + Binance WS
 
@@ -430,7 +486,7 @@ class ServiceLifecycleManager:
         symbol = f"{ba}USDT"
         tier = self._get_asset_strategy_tier(ba)
         allowed_tiers = self._allowed_strategy_tiers()
-        if tier not in allowed_tiers:
+        if not force and tier not in allowed_tiers:
             return False, f'{ba} strategy_tier={tier or "NA"} 不在订阅白名单 {allowed_tiers}，不订阅'
 
         # 1. Gate OBU 订阅
@@ -476,8 +532,9 @@ class ServiceLifecycleManager:
         except Exception as e:
             logger.warning(f'重试 {symbol} Binance订阅失败（非关键）: {e}')
 
-        log_print(f'✓ 手动重试 {ba} 成功')
-        return True, f'{ba} 初始化成功'
+        suffix = '（持仓强制订阅）' if force else ''
+        log_print(f'✓ 手动重试 {ba} 成功{suffix}')
+        return True, f'{ba} 初始化成功{suffix}'
 
     # ───── 内部：启停实现 ─────
 

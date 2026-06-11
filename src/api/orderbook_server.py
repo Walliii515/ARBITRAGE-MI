@@ -1005,6 +1005,45 @@ async def open_status():
     }
 
 
+def _find_orderbook_row_by_base_asset(base_asset: str) -> Optional[Dict]:
+    ba = (base_asset or '').strip().upper()
+    if not ba:
+        return None
+    for row in _get_merged_rows():
+        if (row.get('base_asset') or '').strip().upper() == ba:
+            return row
+    return None
+
+
+async def _ensure_orderbook_row_for_close(base_asset: str) -> Dict:
+    """手动平仓前确保持仓标的有盘口；缺失时强制补订阅后短暂等待。"""
+    ba = (base_asset or '').strip().upper()
+    orderbook_row = _find_orderbook_row_by_base_asset(ba)
+    if orderbook_row:
+        return orderbook_row
+
+    if not svc:
+        raise HTTPException(status_code=503, detail='服务未初始化，无法执行平仓')
+
+    loop = asyncio.get_running_loop()
+    try:
+        ok, message = await loop.run_in_executor(None, svc.retry_contract, ba, True)
+    except Exception as e:
+        logger.warning(f'手动平仓补订阅 {ba} 失败: {e}', exc_info=True)
+        raise HTTPException(status_code=503, detail=f'标的 {ba} 无盘口数据，补订阅失败: {e}')
+
+    if not ok:
+        raise HTTPException(status_code=503, detail=f'标的 {ba} 无盘口数据，补订阅失败: {message}')
+
+    for _ in range(6):
+        await asyncio.sleep(0.5)
+        orderbook_row = _find_orderbook_row_by_base_asset(ba)
+        if orderbook_row:
+            return orderbook_row
+
+    raise HTTPException(status_code=503, detail=f'标的 {ba} 已补订阅但暂未收到完整盘口，无法执行平仓: {message}')
+
+
 @app.post('/api/trading/positions/{position_id}/manual-close', dependencies=[Depends(verify_token_dependency)])
 async def manual_close_position(position_id: int):
     """手动一键平仓：跳过条件检查，直接对指定持仓执行平仓"""
@@ -1030,16 +1069,8 @@ async def manual_close_position(position_id: int):
     if not svc._gate_ws_connected() or not svc._binance_ws_connected():
         raise HTTPException(status_code=503, detail='WebSocket 未连接，无法获取实时盘口数据')
 
-    # 3. 获取该标的的最新盘口数据
-    merged_rows = _get_merged_rows()
-    orderbook_row = None
-    for row in merged_rows:
-        if row.get('base_asset') == ba:
-            orderbook_row = row
-            break
-
-    if not orderbook_row:
-        raise HTTPException(status_code=503, detail=f'标的 {ba} 无盘口数据，无法执行平仓')
+    # 3. 获取该标的的最新盘口数据；持仓标的缺订阅时先强制补订阅。
+    orderbook_row = await _ensure_orderbook_row_for_close(ba)
 
     # 4. 复用 ClosingExecutor 执行平仓；放入平仓专用线程，与自动平仓串行。
     def _manual_close_in_critical_thread():
