@@ -245,7 +245,8 @@ _critical_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='
 _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-close')
 
 # ───── 开仓暂停开关 ─────
-_open_paused: bool = True                    # 服务启动默认暂停开仓，需人工恢复；平仓不受影响
+_open_paused: bool = True                    # 正向开仓启动默认暂停，需人工恢复；平仓不受影响
+_reverse_open_paused: bool = False           # 反向开仓独立控制，默认保持运行
 
 # ───── 交易链路连通性熔断 ─────
 # 仅实盘模式下启用：Binance + Gate 任一不通即禁止交易
@@ -981,29 +982,58 @@ async def service_stop():
 
 @app.post('/api/trading/open/pause', dependencies=[Depends(verify_token_dependency)])
 async def pause_open():
-    """暂停开仓（平仓不受影响）"""
+    """暂停正向开仓（平仓不受影响）"""
     global _open_paused
     _open_paused = True
-    logger.info('⏸ 开仓已暂停（手动操作）')
+    logger.info('⏸ 正向开仓已暂停（手动操作）')
     return {'ok': True, 'open_paused': True}
 
 
 @app.post('/api/trading/open/resume', dependencies=[Depends(verify_token_dependency)])
 async def resume_open():
-    """恢复开仓"""
+    """恢复正向开仓"""
     global _open_paused
     _open_paused = False
-    logger.info('▶ 开仓已恢复（手动操作）')
+    logger.info('▶ 正向开仓已恢复（手动操作）')
     return {'ok': True, 'open_paused': False}
 
 
 @app.get('/api/trading/open/status')
 async def open_status():
-    """查询开仓暂停状态（无需认证）"""
+    """查询正向开仓暂停状态（无需认证）"""
     return {
         'open_paused': _open_paused,
+        'reverse_open_paused': _reverse_open_paused,
         'max_total_positions': config.get_int('trade.open.max_total_positions', 45),
         'max_positions_per_asset': config.get_int('trade.open.max_positions_per_asset', 1),
+    }
+
+
+@app.post('/api/trading/reverse-open/pause', dependencies=[Depends(verify_token_dependency)])
+async def pause_reverse_open():
+    """暂停反向开仓/反向信号监控（正向不受影响）"""
+    global _reverse_open_paused
+    _reverse_open_paused = True
+    logger.info('⏸ 反向开仓已暂停（手动操作）')
+    return {'ok': True, 'reverse_open_paused': True}
+
+
+@app.post('/api/trading/reverse-open/resume', dependencies=[Depends(verify_token_dependency)])
+async def resume_reverse_open():
+    """恢复反向开仓/反向信号监控"""
+    global _reverse_open_paused
+    _reverse_open_paused = False
+    logger.info('▶ 反向开仓已恢复（手动操作）')
+    return {'ok': True, 'reverse_open_paused': False}
+
+
+@app.get('/api/trading/reverse-open/status')
+async def reverse_open_status():
+    """查询反向开仓暂停状态（无需认证）"""
+    return {
+        'reverse_open_paused': _reverse_open_paused,
+        'max_total_positions': config.get_int('reverse_arbitrage.execution.max_total_positions', 10),
+        'max_positions_per_asset': config.get_int('reverse_arbitrage.execution.max_positions_per_asset', 1),
     }
 
 
@@ -1282,7 +1312,7 @@ def _run_open_position_check_once():
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
                 max_total_positions=config.get_int('trade.open.max_total_positions', 45),
                 max_positions_per_asset=config.get_int('trade.open.max_positions_per_asset', 1),
-                reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 300),
+                reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 60),
                 max_orderbook_lag_ms=config.get_float('trade.open.max_orderbook_lag_ms', 1000.0),
                 fee_spot_open=config.get_float('trade.fee.spot_open', 0.00075),
                 fee_spot_close=config.get_float('trade.fee.spot_close', 0.00075),
@@ -1301,6 +1331,7 @@ def _run_open_position_check_once():
                 min_future_volume_24h_usdt=config.get_float('trade.filter.min_future_volume_24h_usdt', 0),
                 peak_pullback_pct=config.get_float('trade.peak_pullback.pullback_pct', 0.10),
                 peak_monitor_timeout_sec=config.get_int('trade.peak_pullback.monitor_timeout_sec', 60),
+                peak_timeout_cooldown_sec=config.get_int('trade.peak_pullback.timeout_cooldown_sec', 10),
                 sustain_sec=config.get_float('trade.peak_pullback.sustain_sec', 5.0),
                 margin_warning_pct=config.get_float('margin.warning_pct', 8.0),
                 risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
@@ -1353,16 +1384,16 @@ def _run_open_position_check_once():
                 ),
                 funding_carry_amount_usdt=config.get_float('trade.funding_carry_open.amount_usdt', 0.0),
                 rebound_timeout_cooldown_enabled=config.get_bool('trade.rebound_timeout_cooldown.enabled', True),
-                rebound_timeout_cooldown_sec=config.get_int('trade.rebound_timeout_cooldown.cooldown_sec', 45),
+                rebound_timeout_cooldown_sec=config.get_int('trade.rebound_timeout_cooldown.cooldown_sec', 60),
                 rebound_timeout_basis_change_reset_bps=config.get_float('trade.rebound_timeout_cooldown.basis_change_reset_bps', 5.0),
                 asset_noise_cooldown_enabled=config.get_bool('trade.asset_noise_cooldown.enabled', True),
                 asset_noise_lookback_min=config.get_int('trade.asset_noise_cooldown.lookback_min', 60),
                 asset_noise_max_signals=config.get_int('trade.asset_noise_cooldown.max_signals', 100),
                 asset_noise_min_opened=config.get_int('trade.asset_noise_cooldown.min_opened', 1),
-                asset_noise_cooldown_min=config.get_int('trade.asset_noise_cooldown.cooldown_min', 30),
+                asset_noise_cooldown_min=config.get_int('trade.asset_noise_cooldown.cooldown_min', 10),
                 execution_drift_cooldown_enabled=config.get_bool('trade.execution_drift_cooldown.enabled', True),
                 execution_drift_max_bps=config.get_float('trade.execution_drift_cooldown.max_drift_bps', 40.0),
-                execution_drift_cooldown_hour=config.get_float('trade.execution_drift_cooldown.cooldown_hour', 6.0),
+                execution_drift_cooldown_hour=config.get_float('trade.execution_drift_cooldown.cooldown_hour', 0.5),
                 future_maker_open_enabled=config.get_bool('trade.execution.future_maker_open.enabled', False),
                 future_maker_open_allowed_tiers=config.get('trade.execution.future_maker_open.allowed_tiers', ['A', 'B']),
                 future_maker_open_ttl_ms=config.get_int('trade.execution.future_maker_open.ttl_ms', 1000),
@@ -1441,6 +1472,22 @@ def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
         ),
         execution_enabled=config.get_bool('reverse_arbitrage.execution.enabled', False),
         max_total_positions=config.get_int('reverse_arbitrage.execution.max_total_positions', 10),
+        monitor_timeout_cooldown_sec=config.get_int(
+            'reverse_arbitrage.signal.monitor_timeout_cooldown_sec', 10
+        ),
+        reject_cooldown_sec=config.get_int('reverse_arbitrage.signal.reject_cooldown_sec', 60),
+        asset_noise_lookback_min=config.get_int(
+            'reverse_arbitrage.signal.asset_noise_lookback_min', 60
+        ),
+        asset_noise_max_signals=config.get_int(
+            'reverse_arbitrage.signal.asset_noise_max_signals', 100
+        ),
+        asset_noise_min_opened=config.get_int(
+            'reverse_arbitrage.signal.asset_noise_min_opened', 1
+        ),
+        asset_noise_cooldown_min=config.get_int(
+            'reverse_arbitrage.signal.asset_noise_cooldown_min', 10
+        ),
     )
     if _reverse_signal_monitor is None:
         _reverse_signal_monitor = ReverseSignalMonitor(
@@ -1464,6 +1511,8 @@ def _run_reverse_signal_check_once():
     if not REVERSE_SIGNAL_ENABLED:
         return
     if not svc or svc.state != SERVICE_RUNNING:
+        return
+    if _reverse_open_paused:
         return
     start = time.monotonic()
     try:

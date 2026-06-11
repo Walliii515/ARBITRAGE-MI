@@ -232,6 +232,34 @@ def test_reverse_signal_reason_contains_replay_context():
     assert 'FundingCarry(' in reason
     assert '行情滞后' in reason
 
+
+def test_reverse_signal_cooldowns_block_new_signals():
+    monitor = ReverseSignalMonitor(
+        ReverseSignalMonitorConfig(open_amount_usdt=10),
+        ReverseArbitrageConfig(
+            open_amount_usdt=10,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            orderbook_coverage_threshold=0.6,
+        ),
+        {},
+        {},
+        {},
+    )
+
+    monitor._start_monitor_timeout_cooldown('AI')
+    assert monitor._pass_new_signal_cooldowns('AI') is False
+    monitor._monitor_timeout_cooldown_until['AI'] = datetime.now() - timedelta(seconds=1)
+    assert monitor._pass_new_signal_cooldowns('AI') is True
+
+    monitor._start_reject_cooldown('AI', '行情滞后')
+    assert monitor._pass_new_signal_cooldowns('AI') is False
+    monitor._reject_cooldown_until['AI'] = datetime.now() - timedelta(seconds=1)
+    assert monitor._pass_new_signal_cooldowns('AI') is True
+
+
 def test_reverse_execution_capacity_rejects_when_position_limit_reached(monkeypatch):
     class FakeCursor:
         def execute(self, sql, params=None):
@@ -273,7 +301,6 @@ def test_reverse_execution_capacity_rejects_when_position_limit_reached(monkeypa
 
     assert ok is False
     assert '反向持仓数已达上限(10/10)' in reason
-
 
 
 def test_reverse_margin_edge_must_be_non_negative():

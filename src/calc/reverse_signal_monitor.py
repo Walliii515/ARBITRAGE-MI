@@ -8,6 +8,7 @@
 - 当前不真实下单，只在触底反弹和旁路风控通过后标记为可开仓观察态。
 """
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +33,12 @@ class ReverseSignalMonitorConfig:
     max_orderbook_lag_ms: float = 500.0
     execution_enabled: bool = False
     max_total_positions: int = 10
+    monitor_timeout_cooldown_sec: int = 10
+    reject_cooldown_sec: int = 60
+    asset_noise_lookback_min: int = 60
+    asset_noise_max_signals: int = 100
+    asset_noise_min_opened: int = 1
+    asset_noise_cooldown_min: int = 10
 
 
 class ReverseSignalMonitor:
@@ -56,6 +63,10 @@ class ReverseSignalMonitor:
         self._gate_manager = None
         self._spot_manager = None
         self._states: Dict[str, Dict] = {}
+        self._monitor_timeout_cooldown_until: Dict[str, datetime] = {}
+        self._reject_cooldown_until: Dict[str, datetime] = {}
+        self._asset_noise_events: Dict[str, deque] = {}
+        self._asset_noise_cooldown_until: Dict[str, datetime] = {}
         self._table_ready = False
 
     def update_meta(
@@ -120,6 +131,8 @@ class ReverseSignalMonitor:
 
         state = self._states.get(base_asset)
         if not state:
+            if not self._pass_new_signal_cooldowns(base_asset):
+                return None
             signal_id = self._create_signal(row, current_basis, now, entry_trigger_type)
             if not signal_id:
                 return None
@@ -297,6 +310,92 @@ class ReverseSignalMonitor:
         drop_bps = abs(signal_basis - valley_basis)
         pct_rebound = max(drop_bps * self.cfg.valley_rebound_pct, 0.0)
         return max(pct_rebound, self.cfg.min_rebound_bps)
+
+    def _pass_new_signal_cooldowns(self, base_asset: str) -> bool:
+        now = datetime.now()
+        if self._pass_until_cooldown(
+            self._monitor_timeout_cooldown_until,
+            base_asset,
+            now,
+            '反向监控超时冷却',
+        ) is False:
+            return False
+        if self._pass_until_cooldown(
+            self._reject_cooldown_until,
+            base_asset,
+            now,
+            '反向拒绝冷却',
+        ) is False:
+            return False
+        if self._pass_until_cooldown(
+            self._asset_noise_cooldown_until,
+            base_asset,
+            now,
+            '反向信号降噪冷却',
+        ) is False:
+            return False
+        return True
+
+    @staticmethod
+    def _pass_until_cooldown(
+        store: Dict[str, datetime],
+        base_asset: str,
+        now: datetime,
+        label: str,
+    ) -> bool:
+        until = store.get(base_asset)
+        if until is None:
+            return True
+        if now >= until:
+            store.pop(base_asset, None)
+            logger.info(f'{label}解除 | {base_asset}')
+            return True
+        return False
+
+    def _start_monitor_timeout_cooldown(self, base_asset: str) -> None:
+        cooldown_sec = int(self.cfg.monitor_timeout_cooldown_sec or 0)
+        if cooldown_sec <= 0:
+            return
+        self._monitor_timeout_cooldown_until[base_asset] = (
+            datetime.now() + timedelta(seconds=cooldown_sec)
+        )
+        logger.info(f'反向监控超时冷却启动 | {base_asset} | cooldown={cooldown_sec}s')
+
+    def _start_reject_cooldown(self, base_asset: str, reason: Optional[str] = None) -> None:
+        cooldown_sec = int(self.cfg.reject_cooldown_sec or 0)
+        if cooldown_sec <= 0:
+            return
+        self._reject_cooldown_until[base_asset] = datetime.now() + timedelta(seconds=cooldown_sec)
+        logger.info(
+            f'反向拒绝冷却启动 | {base_asset} | cooldown={cooldown_sec}s | '
+            f'reason={(reason or "")[:80]}'
+        )
+
+    def _record_noise_event(self, base_asset: str, status: str) -> None:
+        if not base_asset or self.cfg.asset_noise_max_signals <= 0:
+            return
+        now = datetime.now()
+        events = self._asset_noise_events.setdefault(base_asset, deque())
+        events.append((now, status))
+        cutoff = now - timedelta(minutes=int(self.cfg.asset_noise_lookback_min or 60))
+        while events and events[0][0] < cutoff:
+            events.popleft()
+
+        total = len(events)
+        opened = sum(1 for _, s in events if s == 'opened')
+        if total >= int(self.cfg.asset_noise_max_signals) and opened < int(self.cfg.asset_noise_min_opened):
+            cooldown_min = int(self.cfg.asset_noise_cooldown_min or 0)
+            if cooldown_min <= 0:
+                return
+            until = now + timedelta(minutes=cooldown_min)
+            prev = self._asset_noise_cooldown_until.get(base_asset)
+            if prev is None or until > prev:
+                self._asset_noise_cooldown_until[base_asset] = until
+                logger.info(
+                    f'反向信号降噪冷却启动 | {base_asset} | '
+                    f'近{self.cfg.asset_noise_lookback_min}min信号{total}个/'
+                    f'开仓{opened}个 | 冷却{cooldown_min}min'
+                )
 
     def _pre_execution_gate(
         self,
@@ -596,6 +695,11 @@ class ReverseSignalMonitor:
                 })
         except Exception as exc:
             logger.error(f'反向信号结束失败 | {base_asset}: {exc}', exc_info=True)
+        if status == 'monitor_timeout':
+            self._start_monitor_timeout_cooldown(base_asset)
+        elif status in {'rejected', 'gate_rejected'}:
+            self._start_reject_cooldown(base_asset, reason)
+        self._record_noise_event(base_asset, status)
         self._states.pop(base_asset, None)
 
     def _load_active_states(self) -> None:

@@ -1274,6 +1274,19 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_rebound_timeout_cooldown('BTC', 51.0))
         self.assertTrue(te._pass_rebound_timeout_cooldown('BTC', 55.0))
 
+    def test_peak_timeout_cooldown_only_starts_for_timeout_trigger(self):
+        te = make_trading_executor()
+        te._peak_state['AI'] = {'trigger': 'timeout'}
+        te._maybe_start_peak_timeout_cooldown('AI', 96.0, '行情滞后')
+
+        self.assertFalse(te._pass_peak_timeout_cooldown('AI'))
+        te._peak_timeout_cooldown['AI'] = datetime.now() - timedelta(seconds=1)
+        self.assertTrue(te._pass_peak_timeout_cooldown('AI'))
+
+        te._peak_state['HEI'] = {'trigger': 'pullback'}
+        te._maybe_start_peak_timeout_cooldown('HEI', 50.0, '行情滞后')
+        self.assertTrue(te._pass_peak_timeout_cooldown('HEI'))
+
     def test_execution_drift_cooldown_starts_after_bad_fill(self):
         te = make_trading_executor()
         te._maybe_start_execution_drift_cooldown(
@@ -2468,6 +2481,33 @@ class TestMarginTopupCalculation(unittest.TestCase):
         called_url = executor._session.post.call_args.args[0]
         self.assertIn('/dual_comp/positions/BANK_USDT/margin', called_url)
         self.assertIn('dual_side=dual_short', called_url)
+
+    def test_real_executor_falls_back_to_single_mode_margin_endpoint(self):
+        from calc.real_executor import ExchangeConfig, RealExecutor
+
+        executor = RealExecutor(ExchangeConfig(gate_base_url='https://gate.test'), {})
+        executor._gate_sign = MagicMock(return_value={})
+        dual_resp = MagicMock()
+        dual_resp.status_code = 400
+        dual_resp.text = '{"label":"INVALID_ARGUMENT","message":"dual_side is set while not in dual-mode"}'
+        single_resp = MagicMock()
+        single_resp.status_code = 200
+        single_resp.text = '{}'
+        single_resp.json.return_value = {}
+        executor._session = MagicMock()
+        executor._session.post.side_effect = [dual_resp, single_resp]
+
+        result = executor.topup_gate_margin('BANK_USDT', 1.23, dual_side='short')
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['mode'], 'single')
+        self.assertEqual(executor._session.post.call_count, 2)
+        first_url = executor._session.post.call_args_list[0].args[0]
+        second_url = executor._session.post.call_args_list[1].args[0]
+        self.assertIn('/dual_comp/positions/BANK_USDT/margin', first_url)
+        self.assertIn('dual_side=dual_short', first_url)
+        self.assertIn('/positions/BANK_USDT/margin', second_url)
+        self.assertNotIn('dual_side=', second_url)
 
     def test_holding_fee_uses_future_taker_when_open_fallback_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl

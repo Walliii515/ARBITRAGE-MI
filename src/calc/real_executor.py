@@ -1447,7 +1447,9 @@ class RealExecutor:
         """
         追加 Gate 逐仓保证金。
 
-        API: POST /api/v4/futures/usdt/positions/{contract}/margin?change=...
+        API:
+        - dual mode: POST /api/v4/futures/usdt/dual_comp/positions/{contract}/margin?change=...&dual_side=...
+        - single mode: POST /api/v4/futures/usdt/positions/{contract}/margin?change=...
         """
         contract = str(contract or '').upper()
         change = round(float(amount or 0), 6)
@@ -1461,27 +1463,31 @@ class RealExecutor:
         if dual_side not in ('dual_long', 'dual_short'):
             return {'success': False, 'message': f'追加方向无效: dual_side={dual_side}'}
 
-        method = 'POST'
-        api_path = f'/api/v4/futures/usdt/dual_comp/positions/{contract}/margin'
-        query_string = urlencode({'change': f'{change:.6f}', 'dual_side': dual_side})
-        headers = self._gate_sign(method, api_path, query_string, '')
-        url = f"{self.config.gate_base_url}{api_path}?{query_string}"
-
         try:
-            resp = self._session.post(url, headers=headers, timeout=self.config.timeout_sec)
+            resp, mode = self._post_gate_margin_topup(contract, change, dual_side)
+            if (
+                resp.status_code == 400
+                and 'dual_side is set while not in dual-mode' in (resp.text or '')
+            ):
+                logger.warning(
+                    f"Gate 追加保证金切换为单向持仓接口 | {contract} | "
+                    f"side={dual_side} | amount={change:.6f} | reason={resp.text[:120]}"
+                )
+                resp, mode = self._post_gate_margin_topup(contract, change, None)
             if resp.status_code not in (200, 201):
                 return {
                     'success': False,
                     'message': f'Gate追保失败 HTTP {resp.status_code}: {resp.text[:200]}',
                 }
             data = resp.json() if resp.text else {}
-            logger.info(f"Gate 追加保证金成功 | {contract} | side={dual_side} | amount={change:.6f}")
+            logger.info(f"Gate 追加保证金成功 | {contract} | mode={mode} | side={dual_side} | amount={change:.6f}")
             return {
                 'success': True,
                 'message': 'Gate追保成功',
                 'data': data,
                 'amount': change,
                 'dual_side': dual_side,
+                'mode': mode,
             }
         except requests.exceptions.Timeout:
             return {'success': False, 'message': f'Gate追保请求超时({self.config.timeout_sec}s)'}
@@ -1490,6 +1496,20 @@ class RealExecutor:
         except Exception as e:
             logger.error(f"Gate 追加保证金异常 | {contract} | {e}", exc_info=True)
             return {'success': False, 'message': f'Gate追保异常: {str(e)[:100]}'}
+
+    def _post_gate_margin_topup(self, contract: str, change: float, dual_side: Optional[str]):
+        if dual_side:
+            api_path = f'/api/v4/futures/usdt/dual_comp/positions/{contract}/margin'
+            query_string = urlencode({'change': f'{change:.6f}', 'dual_side': dual_side})
+            mode = 'dual'
+        else:
+            api_path = f'/api/v4/futures/usdt/positions/{contract}/margin'
+            query_string = urlencode({'change': f'{change:.6f}'})
+            mode = 'single'
+        headers = self._gate_sign('POST', api_path, query_string, '')
+        url = f"{self.config.gate_base_url}{api_path}?{query_string}"
+        resp = self._session.post(url, headers=headers, timeout=self.config.timeout_sec)
+        return resp, mode
 
     # ──────────────────────────────────────────────────────────────────
     # 辅助方法

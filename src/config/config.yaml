@@ -55,7 +55,7 @@ trade:
     amount_usdt: 10                        # 单笔开仓金额（USDT）
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
-    reject_cooldown_sec: 300                # 被交易所拒单后冷却（秒），避免重复提交失败订单
+    reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
     max_total_positions: 45                 # 全局最大持仓数，保留资金buffer给future追保
     max_positions_per_asset: 7              # 同标的最大持仓数
     # max_positions_per_asset: 1              # 同标的最大持仓数
@@ -79,6 +79,7 @@ trade:
     pullback_pct: 0.05                      # 从峰值回落百分比(5%)确认开仓
     sustain_sec: 1.5                        # 峰值监控最低持续秒数（过滤脉冲信号），从大于P20开始计算，防止1秒内迅速拉升回调的信号
     monitor_timeout_sec: 60                 # 监控超时（秒），基差长期不回落时转为 timeout 直开候选，继续走盘口恢复和旁路风控
+    timeout_cooldown_sec: 10                # timeout直开候选失败后短冷却，避免行情滞后时反复刷同标的
 
   # ─── 动量开仓通道 ───
   # 用于高流动性标的在“超阈值 + 上升期 + 盘口好”时直接进入最终旁路，不等待回调。
@@ -152,7 +153,7 @@ trade:
   # ─── 信号降噪 / 执行质量冷却 ───
   rebound_timeout_cooldown:
     enabled: true
-    cooldown_sec: 45                        # 回弹等待超时后短冷却，防止同一状态反复刷信号
+    cooldown_sec: 60                        # 回弹等待超时后短冷却，防止同一状态反复刷信号
     basis_change_reset_bps: 5               # 若基差相对超时点变化足够大，提前解除冷却
 
   asset_noise_cooldown:
@@ -160,7 +161,7 @@ trade:
     lookback_min: 60                        # 单标的近 60 分钟信号过密且不开仓，则临时降噪
     max_signals: 100
     min_opened: 1
-    cooldown_min: 30
+    cooldown_min: 10
 
   signal_cleanup:
     enabled: true
@@ -171,7 +172,7 @@ trade:
   execution_drift_cooldown:
     enabled: true
     max_drift_bps: 40                       # pre_gate_basis - actual_basis 超过该值，视为执行质量异常
-    cooldown_hour: 6
+    cooldown_hour: 0.5
 
   # ─── 开仓盘口恢复确认 ───
   # 当开仓信号已经完成“峰值回落”确认后，系统不会立刻下单，而是进入最多 3.0 秒的盘口恢复观察期；
@@ -307,11 +308,17 @@ reverse_arbitrage:
     enabled: true
     check_interval_sec: 1.0
     monitor_timeout_sec: 60
+    monitor_timeout_cooldown_sec: 10
     valley_rebound_pct: 0.05                # 基差触底后，按跌幅比例反弹确认
     min_rebound_bps: 2.0                    # 反弹确认的最小bps，避免低基数时过敏
     min_monitor_sec: 1.5
     rebound_sustain_sec: 0.4
     max_orderbook_lag_ms: 500
+    reject_cooldown_sec: 60
+    asset_noise_lookback_min: 60
+    asset_noise_max_signals: 100
+    asset_noise_min_opened: 1
+    asset_noise_cooldown_min: 10
   execution:
     enabled: true                           # 反向执行器开关；下单链路仍走反向独立实现，不复用正向执行器
     dry_run: true                           # 真实执行实现前默认只做演练/记录
@@ -319,8 +326,8 @@ reverse_arbitrage:
     max_positions_per_asset: 1
     min_open_amount_usdt: 0                 # 0 表示第一版不做“有多少开多少”
     allow_partial_borrow_capacity: false    # 借币额度不足时不开仓
-    reject_cooldown_sec: 300
-    execution_drift_cooldown_sec: 21600
+    reject_cooldown_sec: 60
+    execution_drift_cooldown_sec: 1800
   close:
     enabled: false                          # 反向平仓执行器接入前保持关闭
     fixed_take_profit_bps: 20

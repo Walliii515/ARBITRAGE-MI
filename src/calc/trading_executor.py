@@ -44,7 +44,7 @@ class TradingExecutorConfig:
     open_amount_usdt: float = 5.0
     max_total_positions: int = 45
     max_positions_per_asset: int = 1
-    reject_cooldown_sec: int = 300
+    reject_cooldown_sec: int = 60
     # 旁路风控新鲜度硬约束：本地接收最近一次 WS 盘口与当前下单时刻的允许最大延迟（毫秒）
     # 阐释：update_time(交易所时间戳) 不可靠，只以本地 last_update_time 判定“现在距上次收到行情多久”
     max_orderbook_lag_ms: float = 200.0
@@ -67,6 +67,7 @@ class TradingExecutorConfig:
     # ─── 峰值回落 + sustain 确认（开仓回落通道） ───
     peak_pullback_pct: float = 0.10
     peak_monitor_timeout_sec: int = 60
+    peak_timeout_cooldown_sec: int = 10
     sustain_sec: float = 5.0                # 峰值监控最低持续秒数（过滤脉冲信号）
 
     # ─── 保证金风控 ───
@@ -131,16 +132,16 @@ class TradingExecutorConfig:
 
     # ─── 信号降噪 / 执行质量冷却 ───
     rebound_timeout_cooldown_enabled: bool = True
-    rebound_timeout_cooldown_sec: int = 45
+    rebound_timeout_cooldown_sec: int = 60
     rebound_timeout_basis_change_reset_bps: float = 5.0
     asset_noise_cooldown_enabled: bool = True
     asset_noise_lookback_min: int = 60
     asset_noise_max_signals: int = 100
     asset_noise_min_opened: int = 1
-    asset_noise_cooldown_min: int = 30
+    asset_noise_cooldown_min: int = 10
     execution_drift_cooldown_enabled: bool = True
     execution_drift_max_bps: float = 40.0
-    execution_drift_cooldown_hour: float = 6.0
+    execution_drift_cooldown_hour: float = 0.5
 
     # ─── 执行策略：Gate future maker + Binance spot taker ───
     future_maker_open_enabled: bool = False
@@ -218,8 +219,10 @@ class TradingExecutor:
         # 峰值回落 + sustain 开仓策略（单通道）
         self.peak_pullback_pct = cfg.peak_pullback_pct
         self.peak_monitor_timeout_sec = cfg.peak_monitor_timeout_sec
+        self.peak_timeout_cooldown_sec = int(cfg.peak_timeout_cooldown_sec)
         self.sustain_sec = cfg.sustain_sec
         self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, trigger, signal_id}
+        self._peak_timeout_cooldown: Dict[str, datetime] = {}
         # 临时槽位：实时费率校验通过时记录的实时费率(bps)，供 _build_open_reason 取用
         self._last_realtime_rate_bps: Dict[str, float] = {}
         self._last_realtime_funding_info: Dict[str, Dict] = {}
@@ -497,6 +500,8 @@ class TradingExecutor:
 
                 # 这些冷却只拦截“新一轮信号”，不打断已经进入状态机的信号。
                 if base_asset not in self._peak_state:
+                    if not self._pass_peak_timeout_cooldown(base_asset):
+                        continue
                     if not self._pass_asset_noise_cooldown(base_asset):
                         continue
                     if not self._pass_rebound_timeout_cooldown(base_asset, open_vwap_basis):
@@ -570,6 +575,7 @@ class TradingExecutor:
                         exit_basis_bps=gate_basis,
                         trigger_type=peak_state.get('trigger')
                     )
+                    self._maybe_start_peak_timeout_cooldown(base_asset, open_vwap_basis, gate_reason)
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     logger.info(
@@ -607,6 +613,7 @@ class TradingExecutor:
                         signal_basis_bps=signal_basis,
                         pre_gate_basis_bps=open_vwap_basis,
                     )
+                    self._maybe_start_peak_timeout_cooldown(base_asset, open_vwap_basis, guard_reason)
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     logger.info(
@@ -649,6 +656,9 @@ class TradingExecutor:
                         trigger_type=trigger_type,
                         signal_basis_bps=order_group.get('signal_basis_bps'),
                         pre_gate_basis_bps=order_group.get('pre_gate_basis_bps'),
+                    )
+                    self._maybe_start_peak_timeout_cooldown(
+                        base_asset, open_vwap_basis, exec_result.get('message')
                     )
                     # 被交易所拒单后启动冷却，避免重复提交失败订单
                     self._reject_cooldown_until[base_asset] = datetime.now() + timedelta(seconds=self.reject_cooldown_sec)
@@ -973,6 +983,36 @@ class TradingExecutor:
             return True
         return False
 
+    def _pass_peak_timeout_cooldown(self, base_asset: str) -> bool:
+        cooldown_until = self._peak_timeout_cooldown.get(base_asset)
+        if cooldown_until is None:
+            return True
+        if datetime.now() >= cooldown_until:
+            self._peak_timeout_cooldown.pop(base_asset, None)
+            logger.info(f"峰值超时直开冷却解除 | {base_asset}")
+            return True
+        return False
+
+    def _maybe_start_peak_timeout_cooldown(
+        self,
+        base_asset: str,
+        basis_bps: Optional[float],
+        reason: Optional[str] = None,
+    ) -> None:
+        state = self._peak_state.get(base_asset) or {}
+        if state.get('trigger') != 'timeout':
+            return
+        if self.peak_timeout_cooldown_sec <= 0:
+            return
+        until = datetime.now() + timedelta(seconds=self.peak_timeout_cooldown_sec)
+        self._peak_timeout_cooldown[base_asset] = until
+        basis_text = 'NA' if basis_bps is None else f'{float(basis_bps):.1f}bps'
+        logger.info(
+            f"峰值超时直开冷却启动 | {base_asset} | "
+            f"cooldown={self.peak_timeout_cooldown_sec}s | basis={basis_text} | "
+            f"reason={(reason or '')[:80]}"
+        )
+
     def _start_rebound_timeout_cooldown(self, base_asset: str, basis_bps: float) -> None:
         if not self.rebound_timeout_cooldown_enabled:
             return
@@ -1236,6 +1276,9 @@ class TradingExecutor:
                 f'resiliency:{result.reason}|{metric_text}',
                 exit_basis_bps=open_vwap_basis,
                 trigger_type=trigger_type,
+            )
+            self._maybe_start_peak_timeout_cooldown(
+                base_asset, open_vwap_basis, f'resiliency:{result.reason}'
             )
             self._peak_state.pop(base_asset, None)
             self._open_resiliency.clear(base_asset)
