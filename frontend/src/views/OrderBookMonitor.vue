@@ -63,6 +63,8 @@ const {
 
 /** 列状态持久化（数据库版） */
 const PAGE_KEY = 'orderbook_monitor'
+const FUNDING_SORT_COL_ID = 'funding_rate_24h'
+let applyingFundingSort = false
 
 /** 列选择面板：当前列的可见性快照 */
 interface ColumnVisibility {
@@ -106,7 +108,7 @@ function toggleColumnVisibility(colId: string, visible: boolean) {
 /** 保存列配置到数据库 */
 async function saveColumnState() {
   if (!gridApi) return
-  const columnState = gridApi.getColumnState()
+  const columnState = normalizeFundingSortOnly(gridApi.getColumnState())
   try {
     const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
     const data = await res.json()
@@ -120,6 +122,24 @@ async function saveColumnState() {
   }
 }
 
+function normalizeFundingSortOnly(columnState: any[]) {
+  return columnState.map((state) => ({
+    ...state,
+    sort: state.colId === FUNDING_SORT_COL_ID ? 'desc' : null,
+    sortIndex: state.colId === FUNDING_SORT_COL_ID ? 0 : null,
+  }))
+}
+
+function applyFundingRateSort() {
+  if (!gridApi || applyingFundingSort) return
+  applyingFundingSort = true
+  gridApi.applyColumnState({
+    defaultState: { sort: null },
+    state: [{ colId: FUNDING_SORT_COL_ID, sort: 'desc', sortIndex: 0 }],
+  })
+  applyingFundingSort = false
+}
+
 /** 从数据库加载列配置 */
 async function loadColumnState() {
   if (!gridApi) return
@@ -127,10 +147,16 @@ async function loadColumnState() {
     const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
     const data = await res.json()
     if (data?.columnState && Array.isArray(data.columnState)) {
-      gridApi.applyColumnState({ state: data.columnState, applyOrder: true })
+      gridApi.applyColumnState({
+        state: normalizeFundingSortOnly(data.columnState),
+        applyOrder: true,
+        defaultState: { sort: null },
+      })
     }
   } catch (e) {
     console.warn('Failed to load column config from server:', e)
+  } finally {
+    applyFundingRateSort()
   }
 }
 
@@ -398,7 +424,7 @@ function fmtDepthPercent(v: number | null | undefined): string {
 /** 动态生成列定义 */
 const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
   return [
-    { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90, sort: 'asc' },
+    { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90 },
     {
       headerName: '开仓金额(USDT)',
       field: 'open_amount_usdt',
@@ -434,6 +460,8 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       field: 'funding_rate_24h',
       width: 120,
       type: 'numericColumn',
+      sort: 'desc',
+      sortIndex: 0,
       cellClass: 'ag-right-aligned-cell',
       headerClass: 'ag-right-aligned-header',
       valueFormatter: (p) => p.value != null ? (p.value * 100).toFixed(4) + '%' : '',
@@ -1336,6 +1364,7 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
         :doesExternalFilterPass="combinedFilterFunc"
         @grid-ready="onGridReady"
         @model-updated="refreshDisplayedRowCount"
+        @sort-changed="applyFundingRateSort"
       />
       </div>
     </el-card>
