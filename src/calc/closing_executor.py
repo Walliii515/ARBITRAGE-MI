@@ -149,8 +149,10 @@ class ClosingExecutor:
             'margin.topup.target_maintenance_margin_rate_pct',
             3000.0,
         )
-        self.margin_topup_max_count = config.get_int('margin.topup.max_topup_per_position', 3)
-        self.margin_topup_max_ratio = config.get_float('margin.topup.max_topup_ratio', 0.0)
+        self.margin_topup_max_notional_multiplier = config.get_float(
+            'margin.topup.max_topup_open_notional_multiplier',
+            2.0,
+        )
         self.margin_topup_min_gate_available = config.get_float('margin.topup.min_gate_available', 50.0)
         self.margin_topup_cooldown_sec = config.get_int('margin.topup.cooldown_sec', 300)
         self.margin_topup_min_amount = config.get_float('margin.topup.min_amount_usdt', 0.1)
@@ -616,10 +618,6 @@ class ClosingExecutor:
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             return None
 
-        topup_count = int(pos.get('margin_topup_count') or 0)
-        if topup_count >= self.margin_topup_max_count:
-            return None
-
         last_at = pos.get('margin_topup_last_at')
         if last_at and isinstance(last_at, str):
             try:
@@ -636,11 +634,27 @@ class ClosingExecutor:
         if topup_amount < self.margin_topup_min_amount:
             return None
 
-        initial_margin = calc['initial_margin']
-        topup_total = float(pos.get('margin_topup_total') or 0)
-        max_total = initial_margin * self.margin_topup_max_ratio
-        if max_total > 0 and topup_total + topup_amount > max_total:
-            topup_amount = max(0.0, max_total - topup_total)
+        topup_limit = self._calculate_margin_topup_limit(pos)
+        if topup_limit is not None:
+            remaining = max(0.0, topup_limit - self._contract_margin_topup_total(pos))
+            if remaining < self.margin_topup_min_amount:
+                message = (
+                    f"累计追保金额已达上限: limit={topup_limit:.4f}, "
+                    f"used={self._contract_margin_topup_total(pos):.4f}"
+                )
+                self._insert_margin_topup_log(
+                    pos, 0, calc['target_margin'], calc['margin_before'],
+                    margin_rate, calc['margin_rate_after'], None, True, False, message
+                )
+                self._set_margin_topup_cooldown(position_id)
+                self._set_margin_topup_contract_cooldown(contract)
+                logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
+                if topup_contracts_this_run is not None:
+                    topup_contracts_this_run.add(contract)
+                return None
+            if topup_amount > remaining:
+                topup_amount = remaining
+                calc = self._with_capped_topup_amount(calc, topup_amount)
             if topup_amount < self.margin_topup_min_amount:
                 return None
 
@@ -731,6 +745,39 @@ class ClosingExecutor:
         if contract:
             self._margin_topup_contract_cooldown[str(contract).upper()] = datetime.now()
 
+    def _calculate_margin_topup_limit(self, pos: Dict) -> Optional[float]:
+        multiplier = float(self.margin_topup_max_notional_multiplier or 0)
+        if multiplier <= 0:
+            return None
+        notional = _float_or_none(pos.get('gate_contract_open_notional'))
+        if notional is None or notional <= 0:
+            notional = _float_or_none(pos.get('spot_open_amount'))
+        if notional is None or notional <= 0:
+            future_qty = _float_or_none(pos.get('future_open_qty')) or 0.0
+            future_price = _float_or_none(pos.get('future_open_price')) or 0.0
+            notional = abs(future_qty) * future_price
+        if notional <= 0:
+            return None
+        return notional * multiplier
+
+    def _contract_margin_topup_total(self, pos: Dict) -> float:
+        value = _float_or_none(pos.get('gate_contract_margin_topup_total'))
+        if value is not None:
+            return value
+        return float(pos.get('margin_topup_total') or 0)
+
+    @staticmethod
+    def _with_capped_topup_amount(calc: Dict, topup_amount: float) -> Dict:
+        capped = dict(calc)
+        capped['topup_amount'] = topup_amount
+        capped['target_margin'] = capped['margin_before'] + topup_amount
+        maintenance_margin = capped.get('maintenance_margin')
+        if maintenance_margin:
+            capped['margin_rate_after'] = (
+                (capped['margin_before'] + topup_amount) / maintenance_margin * 100
+            )
+        return capped
+
     def _calculate_margin_topup_amount(self, pos: Dict) -> Optional[Dict]:
         """按 Gate 页面 MMR 口径，计算补到目标 仓位权益/维持保证金 比例所需金额。"""
         raw_margin = _float_or_none(pos.get('gate_contract_position_margin'))
@@ -759,6 +806,7 @@ class ClosingExecutor:
             'target_margin': target_margin_equity,
             'topup_amount': topup_amount,
             'margin_rate_after': margin_rate_after,
+            'maintenance_margin': maintenance_margin,
         }
 
     def _is_hedge_balanced(self, pos: Dict) -> bool:

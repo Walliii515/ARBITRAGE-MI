@@ -2170,11 +2170,15 @@ class TestGatePositionRiskEnrichment(unittest.TestCase):
                 'status': 'holding',
                 'future_contract': 'TUT_USDT',
                 'future_open_contracts': 10,
+                'spot_open_amount': 10.0,
+                'margin_topup_total': 1.5,
             },
             {
                 'status': 'holding',
                 'future_contract': 'TUT_USDT',
                 'future_open_contracts': 30,
+                'spot_open_amount': 30.0,
+                'margin_topup_total': 2.5,
             },
         ]
         gate_positions = [{
@@ -2194,6 +2198,9 @@ class TestGatePositionRiskEnrichment(unittest.TestCase):
         self.assertAlmostEqual(sum(p['gate_maintenance_margin'] for p in positions), 2.0)
         self.assertAlmostEqual(positions[0]['gate_contract_position_margin'], 14.4)
         self.assertAlmostEqual(positions[1]['gate_contract_position_margin'], 14.4)
+        self.assertEqual(positions[0]['gate_contract_local_position_count'], 2)
+        self.assertAlmostEqual(positions[0]['gate_contract_open_notional'], 40.0)
+        self.assertAlmostEqual(positions[0]['gate_contract_margin_topup_total'], 4.0)
         self.assertAlmostEqual(positions[0]['gate_maintenance_margin_rate'], 660.0)
         self.assertAlmostEqual(positions[1]['gate_maintenance_margin_rate'], 660.0)
 
@@ -2241,6 +2248,38 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertAlmostEqual(calc['target_margin'], 14.0)
         self.assertAlmostEqual(calc['topup_amount'], 2.0)
         self.assertAlmostEqual(calc['margin_rate_after'], 350.0)
+
+    def test_topup_amount_is_capped_by_contract_open_notional_multiplier(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 250.0
+        ce.margin_topup_target_rate_pct = 350.0
+        ce.margin_topup_max_notional_multiplier = 2.0
+        ce.margin_topup_min_gate_available = 0.0
+        ce.executor_client = MagicMock()
+        ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
+        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._insert_margin_topup_log = MagicMock()
+        ce._mark_margin_topup_success = MagicMock()
+
+        pos = {
+            'id': 1,
+            'base_asset': 'TUT',
+            'future_contract': 'TUT_USDT',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'gate_maintenance_margin_rate': 200.0,
+            'gate_contract_position_margin': 10.0,
+            'gate_contract_position_margin_equity': 10.0,
+            'gate_contract_maintenance_margin': 10.0,
+            'gate_contract_open_notional': 10.0,
+            'gate_contract_margin_topup_total': 18.0,
+            'margin_topup_count': 99,
+        }
+
+        result = ce._check_and_topup_margin(pos)
+
+        self.assertTrue(result['success'])
+        ce.executor_client.topup_margin.assert_called_once_with('TUT_USDT', 2.0, dual_side='short')
 
     def test_topup_amount_returns_none_without_gate_margin_fields(self):
         ce = make_closing_executor()
@@ -2338,7 +2377,6 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_close_threshold_pct = 120.0
         ce.margin_topup_target_rate_pct = 3000.0
         ce.margin_topup_min_gate_available = 50.0
-        ce.margin_topup_max_ratio = 0.0
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
         ce._get_latest_gate_available = MagicMock(return_value=100.0)
@@ -2371,7 +2409,6 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_pct = 2000.0
         ce.margin_topup_target_rate_pct = 3000.0
         ce.margin_topup_min_gate_available = 0.0
-        ce.margin_topup_max_ratio = 0.0
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
         ce._get_latest_gate_available = MagicMock(return_value=100.0)

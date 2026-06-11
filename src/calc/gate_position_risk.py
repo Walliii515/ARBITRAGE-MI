@@ -22,6 +22,14 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
         contract: sum(_position_weight(pos) for pos in rows)
         for contract, rows in holdings_by_contract.items()
     }
+    contract_open_notional = {
+        contract: sum(_position_open_notional(pos) for pos in rows)
+        for contract, rows in holdings_by_contract.items()
+    }
+    contract_topup_total = {
+        contract: sum(_float(pos.get('margin_topup_total')) for pos in rows)
+        for contract, rows in holdings_by_contract.items()
+    }
     for pos in positions:
         if pos.get('status') != 'holding':
             _clear_gate_risk_fields(pos)
@@ -46,6 +54,9 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
         pos['gate_contract_position_margin_equity'] = margin_equity
         pos['gate_contract_unrealised_pnl'] = unrealised_pnl
         pos['gate_contract_maintenance_margin'] = maintenance_margin
+        pos['gate_contract_local_position_count'] = len(holdings_by_contract.get(contract) or [])
+        pos['gate_contract_open_notional'] = contract_open_notional.get(contract, 0.0)
+        pos['gate_contract_margin_topup_total'] = contract_topup_total.get(contract, 0.0)
         pos['gate_position_margin'] = margin * share
         pos['gate_position_margin_equity'] = margin_equity * share
         pos['gate_unrealised_pnl'] = unrealised_pnl * share
@@ -102,6 +113,15 @@ def _position_weight(pos: Dict) -> float:
     return qty if qty > 0 else 1.0
 
 
+def _position_open_notional(pos: Dict) -> float:
+    spot_amount = _float(pos.get('spot_open_amount'))
+    if spot_amount > 0:
+        return spot_amount
+    future_qty = abs(_float(pos.get('future_open_qty')))
+    future_price = _float(pos.get('future_open_price'))
+    return future_qty * future_price if future_qty > 0 and future_price > 0 else 0.0
+
+
 def _clear_gate_risk_fields(pos: Dict) -> None:
     pos['gate_mark_price'] = None
     pos['gate_liq_price'] = None
@@ -109,6 +129,9 @@ def _clear_gate_risk_fields(pos: Dict) -> None:
     pos['gate_contract_position_margin_equity'] = None
     pos['gate_contract_unrealised_pnl'] = None
     pos['gate_contract_maintenance_margin'] = None
+    pos['gate_contract_local_position_count'] = None
+    pos['gate_contract_open_notional'] = None
+    pos['gate_contract_margin_topup_total'] = None
     pos['gate_position_margin'] = None
     pos['gate_position_margin_equity'] = None
     pos['gate_unrealised_pnl'] = None

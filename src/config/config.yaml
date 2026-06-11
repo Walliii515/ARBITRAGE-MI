@@ -263,10 +263,9 @@ margin:
   topup:
     enabled: true
     target_maintenance_margin_rate_pct: 350
-    max_topup_per_position: 99
-    max_topup_ratio: 0
+    max_topup_open_notional_multiplier: 2   # 累计追保金额最多为开仓名义金额的倍数；同合约多笔会按合约聚合
     min_gate_available: 50
-    cooldown_sec: 300
+    cooldown_sec: 60
     min_amount_usdt: 0.1
     snapshot_max_age_sec: 180
     hedge_balance_tolerance_pct: 5
