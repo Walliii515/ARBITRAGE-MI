@@ -42,7 +42,6 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'funding_pnl': 0.0,
             'gate_fee_cost': 0.0,
             'window': {},
-            'gate_account_book_types': {},
         }
 
         row = snapshotter._build_gate_row(datetime(2026, 6, 9, 12, 0, 0), pnl)
@@ -144,21 +143,26 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(row['fee_cost_usdt'], -2.0)
         self.assertEqual(row['total_pnl_usdt'], -18.0)
 
-    def test_exchange_pnl_summary_adds_binance_spot_realized_to_gate_pnl(self):
+    def test_exchange_pnl_summary_uses_local_strategy_pnl(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
-        snapshotter._load_gate_account_book_summary = lambda start, end: {
-            'realized_pnl': -35.0,
+        snapshotter._load_strategy_pnl_summary = lambda start, end: {
+            'realized_pnl': -20.0,
+            'gate_realized_pnl': -35.0,
             'funding_pnl': 4.0,
-            'fee_cost': -1.2,
-            'types': {'pnl': -35.0, 'fund': 4.0, 'fee': -1.2},
+            'binance_fee_cost': -0.8,
+            'gate_fee_cost': -1.2,
+            'fee_cost': -2.0,
+            'binance_spot_realized': {
+                'closed_count': 3,
+                'open_amount': 300.0,
+                'close_amount': 315.0,
+                'realized_pnl': 15.0,
+            },
+            'gate_strategy_realized': {
+                'realized_pnl': -35.0,
+                'derived_from': 'strategy_realized_pnl - binance_spot_realized_pnl',
+            },
         }
-        snapshotter._load_binance_spot_realized_summary = lambda start, end: {
-            'closed_count': 3,
-            'open_amount': 300.0,
-            'close_amount': 315.0,
-            'realized_pnl': 15.0,
-        }
-        snapshotter._load_binance_trade_fee_summary = lambda start: -0.8
 
         summary = snapshotter._load_exchange_pnl_summary(datetime(2026, 6, 9, 12, 0, 0))
 
