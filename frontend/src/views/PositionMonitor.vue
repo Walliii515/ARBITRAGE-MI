@@ -82,6 +82,10 @@ interface PositionRow {
   current_margin: number | null
   gate_mark_price: number | null
   gate_liq_price: number | null
+  gate_contract_position_margin: number | null
+  gate_contract_position_margin_equity: number | null
+  gate_contract_unrealised_pnl: number | null
+  gate_contract_maintenance_margin: number | null
   gate_position_margin: number | null
   gate_position_margin_equity: number | null
   gate_unrealised_pnl: number | null
@@ -754,11 +758,6 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     enableCellChangeFlash: true,
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
-    valueGetter: (params: ValueGetterParams<PositionRow>) => {
-      const row = params.data
-      if (!row) return null
-      return row.gate_position_margin ?? row.current_margin
-    },
     valueFormatter: pnlFormatter,
   },
   {
@@ -769,6 +768,11 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     enableCellChangeFlash: true,
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
+    valueGetter: (params: ValueGetterParams<PositionRow>) => {
+      const row = params.data
+      if (!row) return null
+      return row.gate_position_margin ?? row.current_margin
+    },
     valueFormatter: pnlFormatter,
   },
   {
@@ -800,6 +804,10 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
         row.gate_unrealised_pnl != null ? `未实现盈亏: ${formatAmount(row.gate_unrealised_pnl)}` : null,
         row.gate_position_margin_equity != null ? `仓位权益: ${formatAmount(row.gate_position_margin_equity)}` : null,
         row.gate_maintenance_margin != null ? `维持保证金: ${formatAmount(row.gate_maintenance_margin)}` : null,
+        row.gate_contract_position_margin != null ? `合约总保证金: ${formatAmount(row.gate_contract_position_margin)}` : null,
+        row.gate_contract_unrealised_pnl != null ? `合约总未实现盈亏: ${formatAmount(row.gate_contract_unrealised_pnl)}` : null,
+        row.gate_contract_position_margin_equity != null ? `合约总权益: ${formatAmount(row.gate_contract_position_margin_equity)}` : null,
+        row.gate_contract_maintenance_margin != null ? `合约总维持保证金: ${formatAmount(row.gate_contract_maintenance_margin)}` : null,
         row.gate_mark_price != null ? `标记价: ${formatDecimal(row.gate_mark_price)}` : null,
         row.gate_liq_price != null ? `强平价: ${formatDecimal(row.gate_liq_price)}` : null,
         row.gate_risk_updated_at ? `更新时间: ${row.gate_risk_updated_at}` : null,
@@ -1011,6 +1019,10 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     }, 0),
     gate_mark_price: null,
     gate_liq_price: null,
+    gate_contract_position_margin: null,
+    gate_contract_position_margin_equity: null,
+    gate_contract_unrealised_pnl: null,
+    gate_contract_maintenance_margin: null,
     gate_position_margin: sumField('gate_position_margin'),
     gate_position_margin_equity: sumField('gate_position_margin_equity'),
     gate_unrealised_pnl: sumField('gate_unrealised_pnl'),

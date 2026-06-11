@@ -2162,6 +2162,41 @@ class TestGatePositionRiskEnrichment(unittest.TestCase):
         self.assertAlmostEqual(positions[0]['gate_position_margin_equity'], 7.69702499)
         self.assertAlmostEqual(positions[0]['gate_maintenance_margin_rate'], 664.19)
 
+    def test_contract_amounts_are_allocated_across_local_positions(self):
+        from calc.gate_position_risk import attach_gate_position_risk
+
+        positions = [
+            {
+                'status': 'holding',
+                'future_contract': 'TUT_USDT',
+                'future_open_contracts': 10,
+            },
+            {
+                'status': 'holding',
+                'future_contract': 'TUT_USDT',
+                'future_open_contracts': 30,
+            },
+        ]
+        gate_positions = [{
+            'contract': 'TUT_USDT',
+            'size': '-40',
+            'margin': '14.4',
+            'unrealised_pnl': '-1.2',
+            'maintenance_margin': '2.0',
+        }]
+
+        attach_gate_position_risk(positions, gate_positions)
+
+        self.assertAlmostEqual(positions[0]['gate_position_margin'], 3.6)
+        self.assertAlmostEqual(positions[1]['gate_position_margin'], 10.8)
+        self.assertAlmostEqual(sum(p['gate_position_margin'] for p in positions), 14.4)
+        self.assertAlmostEqual(sum(p['gate_unrealised_pnl'] for p in positions), -1.2)
+        self.assertAlmostEqual(sum(p['gate_maintenance_margin'] for p in positions), 2.0)
+        self.assertAlmostEqual(positions[0]['gate_contract_position_margin'], 14.4)
+        self.assertAlmostEqual(positions[1]['gate_contract_position_margin'], 14.4)
+        self.assertAlmostEqual(positions[0]['gate_maintenance_margin_rate'], 660.0)
+        self.assertAlmostEqual(positions[1]['gate_maintenance_margin_rate'], 660.0)
+
 
 class TestMarginTopupCalculation(unittest.TestCase):
     """自动追保核心公式。"""
@@ -2184,6 +2219,28 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertAlmostEqual(calc['target_margin'], 60.0)
         self.assertAlmostEqual(calc['topup_amount'], 42.0)
         self.assertAlmostEqual(calc['margin_rate_after'], 3000.0)
+
+    def test_topup_amount_prefers_contract_totals_over_allocated_row_amounts(self):
+        ce = make_closing_executor()
+        ce.margin_topup_target_rate_pct = 350.0
+        pos = {
+            'id': 1,
+            'base_asset': 'TUT',
+            'gate_position_margin': 2.0,
+            'gate_position_margin_equity': 1.8,
+            'gate_maintenance_margin': 0.25,
+            'gate_contract_position_margin': 14.0,
+            'gate_contract_position_margin_equity': 12.0,
+            'gate_contract_maintenance_margin': 4.0,
+        }
+
+        calc = ce._calculate_margin_topup_amount(pos)
+
+        self.assertIsNotNone(calc)
+        self.assertAlmostEqual(calc['margin_before'], 12.0)
+        self.assertAlmostEqual(calc['target_margin'], 14.0)
+        self.assertAlmostEqual(calc['topup_amount'], 2.0)
+        self.assertAlmostEqual(calc['margin_rate_after'], 350.0)
 
     def test_topup_amount_returns_none_without_gate_margin_fields(self):
         ce = make_closing_executor()

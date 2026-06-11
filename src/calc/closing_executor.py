@@ -268,10 +268,12 @@ class ClosingExecutor:
                     f"保证金风控|保证金/维持保证金{margin_rate:.2f}%"
                     f"(<{self.margin_close_threshold_pct}%)"
                 )
-                if pos.get('gate_position_margin') is not None:
-                    close_reason_detail += f"|仓位保证金{float(pos.get('gate_position_margin') or 0):.4f}"
-                if pos.get('gate_maintenance_margin') is not None:
-                    close_reason_detail += f"|维持保证金{float(pos.get('gate_maintenance_margin') or 0):.4f}"
+                gate_margin = pos.get('gate_contract_position_margin', pos.get('gate_position_margin'))
+                gate_maintenance = pos.get('gate_contract_maintenance_margin', pos.get('gate_maintenance_margin'))
+                if gate_margin is not None:
+                    close_reason_detail += f"|仓位保证金{float(gate_margin or 0):.4f}"
+                if gate_maintenance is not None:
+                    close_reason_detail += f"|维持保证金{float(gate_maintenance or 0):.4f}"
                 # 紧急平仓，清除谷底状态
                 self._clear_position_close_state(ba, pos)
             elif self._check_negative_funding_exit(pos):
@@ -731,12 +733,20 @@ class ClosingExecutor:
 
     def _calculate_margin_topup_amount(self, pos: Dict) -> Optional[Dict]:
         """按 Gate 页面 MMR 口径，计算补到目标 仓位权益/维持保证金 比例所需金额。"""
-        raw_margin = _float_or_none(pos.get('gate_position_margin'))
-        margin_before = _float_or_none(pos.get('gate_position_margin_equity'))
+        raw_margin = _float_or_none(pos.get('gate_contract_position_margin'))
+        if raw_margin is None:
+            raw_margin = _float_or_none(pos.get('gate_position_margin'))
+        margin_before = _float_or_none(pos.get('gate_contract_position_margin_equity'))
         if margin_before is None:
-            unrealised_pnl = _float_or_none(pos.get('gate_unrealised_pnl')) or 0.0
+            margin_before = _float_or_none(pos.get('gate_position_margin_equity'))
+        if margin_before is None:
+            unrealised_pnl = _float_or_none(pos.get('gate_contract_unrealised_pnl'))
+            if unrealised_pnl is None:
+                unrealised_pnl = _float_or_none(pos.get('gate_unrealised_pnl')) or 0.0
             margin_before = raw_margin + unrealised_pnl if raw_margin is not None else None
-        maintenance_margin = _float_or_none(pos.get('gate_maintenance_margin'))
+        maintenance_margin = _float_or_none(pos.get('gate_contract_maintenance_margin'))
+        if maintenance_margin is None:
+            maintenance_margin = _float_or_none(pos.get('gate_maintenance_margin'))
         if margin_before is None or maintenance_margin is None or maintenance_margin <= 0:
             return None
 
