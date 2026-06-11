@@ -1236,6 +1236,9 @@ async def get_reverse_capital():
 @router.get('/reverse-reconciliation')
 async def get_reverse_reconciliation(
     days: int = Query(365, ge=1, le=365, description="最近N天持仓"),
+    mismatches_only: bool = Query(False, description="仅返回差异行"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
     """反向套利持仓对账（独立反向持仓表 + reverse 子账户）。"""
     result = list_reverse_positions(
@@ -1244,4 +1247,17 @@ async def get_reverse_reconciliation(
         page=1,
         page_size=5000,
     )
-    return build_reverse_reconciliation_rows(_serialize_rows(result.rows))
+    payload = build_reverse_reconciliation_rows(_serialize_rows(result.rows))
+    rows = payload.get('rows') or []
+    if mismatches_only:
+        rows = [row for row in rows if not row.get('is_match')]
+    total = len(rows)
+    offset = (page - 1) * page_size
+    payload['rows'] = rows[offset:offset + page_size]
+    payload['pagination'] = {
+        'page': page,
+        'page_size': page_size,
+        'total': total,
+        'total_pages': (total + page_size - 1) // page_size if total else 0,
+    }
+    return payload

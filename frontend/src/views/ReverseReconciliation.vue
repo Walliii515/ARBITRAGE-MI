@@ -45,6 +45,11 @@ const gridApi = shallowRef<GridApi<ReconciliationRow> | null>(null)
 const rowData = shallowRef<ReconciliationRow[]>([])
 const loading = ref(false)
 const days = ref(365)
+const mismatchesOnly = ref(false)
+const paginationPageSize = ref(100)
+const paginationPageSizeOptions = [100, 500, 1000, 5000]
+const paginationCurrentPage = ref(1)
+const paginationTotal = ref(0)
 const timestamp = ref<number | null>(null)
 const errors = ref<Record<string, string>>({})
 const summary = ref<ReconciliationSummary>({
@@ -62,6 +67,8 @@ const updatedAt = computed(() => {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 })
+
+const totalPages = computed(() => Math.ceil(paginationTotal.value / paginationPageSize.value) || 1)
 
 function formatDecimal(value: number | null | undefined, maxDecimals = 12): string {
   if (value == null || !Number.isFinite(Number(value))) return ''
@@ -83,7 +90,12 @@ function statusRenderer(params: { value?: boolean }) {
 async function fetchRows() {
   loading.value = true
   try {
-    const query = new URLSearchParams({ days: String(days.value) })
+    const query = new URLSearchParams({
+      days: String(days.value),
+      mismatches_only: String(mismatchesOnly.value),
+      page: String(paginationCurrentPage.value),
+      page_size: String(paginationPageSize.value),
+    })
     const res = await get(`/api/trading/reverse-reconciliation?${query.toString()}`)
     const data = await res.json()
     if (!res.ok) {
@@ -91,6 +103,7 @@ async function fetchRows() {
       return
     }
     rowData.value = Array.isArray(data.rows) ? data.rows : []
+    paginationTotal.value = Number(data.pagination?.total ?? rowData.value.length)
     summary.value = {
       local_holding: Number(data.summary?.local_holding ?? 0),
       mismatch_count: Number(data.summary?.mismatch_count ?? 0),
@@ -104,6 +117,21 @@ async function fetchRows() {
   } finally {
     loading.value = false
   }
+}
+
+function resetAndFetch() {
+  paginationCurrentPage.value = 1
+  fetchRows()
+}
+
+function onPageChange(page: number | null) {
+  paginationCurrentPage.value = Number(page || 1)
+  fetchRows()
+}
+
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1
+  fetchRows()
 }
 
 function refreshColumnVisibilities() {
@@ -195,12 +223,18 @@ onMounted(fetchRows)
     </div>
 
     <div class="page-toolbar">
-      <el-select v-model="days" size="small" style="width: 110px" @change="fetchRows">
+      <el-select v-model="days" size="small" style="width: 110px" @change="resetAndFetch">
         <el-option :value="7" label="最近7天" />
         <el-option :value="30" label="最近30天" />
         <el-option :value="90" label="最近90天" />
         <el-option :value="365" label="最近1年" />
       </el-select>
+      <el-switch
+        v-model="mismatchesOnly"
+        active-text="仅显示差异"
+        inactive-text="显示全部"
+        @change="resetAndFetch"
+      />
       <el-button size="small" :icon="Refresh" :loading="loading" @click="fetchRows">刷新</el-button>
       <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
         <template #reference>
@@ -228,6 +262,50 @@ onMounted(fetchRows)
         @grid-ready="onGridReady"
         style="width: 100%; height: 100%"
       />
+    </div>
+
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="onPageChange"
+          controls-position="right"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -315,6 +393,26 @@ onMounted(fetchRows)
   align-items: center;
   gap: 8px;
   padding: 4px 0;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 :deep(.match-ok) {

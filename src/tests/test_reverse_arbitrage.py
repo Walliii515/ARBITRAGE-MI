@@ -232,6 +232,49 @@ def test_reverse_signal_reason_contains_replay_context():
     assert 'FundingCarry(' in reason
     assert '行情滞后' in reason
 
+def test_reverse_execution_capacity_rejects_when_position_limit_reached(monkeypatch):
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            self.sql = sql
+
+        def fetchone(self):
+            return {'cnt': 10}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        'calc.reverse_signal_monitor.db_manager.get_cursor',
+        lambda: FakeCursor(),
+    )
+    monitor = ReverseSignalMonitor(
+        ReverseSignalMonitorConfig(
+            open_amount_usdt=10,
+            execution_enabled=True,
+            max_total_positions=10,
+        ),
+        ReverseArbitrageConfig(
+            open_amount_usdt=10,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            orderbook_coverage_threshold=0.6,
+        ),
+        {},
+        {},
+        {},
+    )
+
+    ok, reason = monitor._execution_capacity_ok()
+
+    assert ok is False
+    assert '反向持仓数已达上限(10/10)' in reason
+
+
 
 def test_reverse_margin_edge_must_be_non_negative():
     row = {

@@ -294,7 +294,7 @@ reconciliation:
   adl_lookback_sec: 86400                   # 回查 Gate my_trades 识别 auto_deleveraging 的窗口（24小时）
 
 # 反向资金费率套利（short spot + long future）
-# 当前只做机会扫描 + 交易信号监控，不真实下单；正向策略配置不复用这里的状态。
+# 反向策略独立于正向策略；正向策略配置不复用这里的状态。
 reverse_arbitrage:
   funding_capture_ratio: 0.5                # 边际盈亏中计入24h负费率的权重
   funding_carry:
@@ -313,8 +313,9 @@ reverse_arbitrage:
     rebound_sustain_sec: 0.4
     max_orderbook_lag_ms: 500
   execution:
-    enabled: false                          # 反向执行器接入前保持关闭
+    enabled: true                           # 反向执行器开关；下单链路仍走反向独立实现，不复用正向执行器
     dry_run: true                           # 真实执行实现前默认只做演练/记录
+    max_total_positions: 10                 # 反向最大持仓数，先限制不超过10个
     max_positions_per_asset: 1
     min_open_amount_usdt: 0                 # 0 表示第一版不做“有多少开多少”
     allow_partial_borrow_capacity: false    # 借币额度不足时不开仓

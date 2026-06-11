@@ -31,6 +31,7 @@ class ReverseSignalMonitorConfig:
     rebound_sustain_sec: float = 0.4
     max_orderbook_lag_ms: float = 500.0
     execution_enabled: bool = False
+    max_total_positions: int = 10
 
 
 class ReverseSignalMonitor:
@@ -364,10 +365,37 @@ class ReverseSignalMonitor:
             if not self.cfg.execution_enabled:
                 return True, pre_gate_basis, '反向执行器未启用，仅记录可开仓观察态'
 
+            capacity_ok, capacity_reason = self._execution_capacity_ok()
+            if not capacity_ok:
+                return False, pre_gate_basis, capacity_reason
+
             return True, pre_gate_basis, ''
         except Exception as exc:
             logger.warning(f'反向开仓旁路异常 | {base_asset}: {exc}', exc_info=True)
             return False, None, f'旁路异常({str(exc)[:120]})'
+
+    def _execution_capacity_ok(self) -> Tuple[bool, str]:
+        limit = int(self.cfg.max_total_positions or 0)
+        if limit <= 0:
+            return True, ''
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM mi_reverse_trade_position
+                    WHERE status IN ('holding', 'closing', 'risk', 'desynced')
+                    """
+                )
+                row = cursor.fetchone() or {}
+            active_positions = int(row.get('cnt') or 0)
+        except Exception as exc:
+            logger.warning(f'反向持仓上限检查失败: {exc}')
+            return False, f'反向持仓上限检查失败({str(exc)[:80]})'
+
+        if active_positions >= limit:
+            return False, f'反向持仓数已达上限({active_positions}/{limit})'
+        return True, ''
 
     def _create_signal(
         self,
@@ -485,6 +513,11 @@ class ReverseSignalMonitor:
                 reject_reason = %(reason)s
             WHERE id = %(id)s AND status = 'monitoring'
         """
+        execution_note = (
+            '反向执行器已启用，等待反向下单执行模块接入'
+            if self.cfg.execution_enabled
+            else '反向执行器未启用，仅记录可开仓观察态'
+        )
         if trigger_type == 'funding_carry':
             reason = self._build_signal_reason(
                 state.get('last_row') or {},
@@ -493,7 +526,7 @@ class ReverseSignalMonitor:
                 duration_sec,
                 trigger_type=trigger_type,
                 phase='旁路通过',
-                extra='反向执行器未启用，仅记录可开仓观察态',
+                extra=execution_note,
                 pre_gate_basis=pre_gate_basis,
             )
         else:
@@ -504,7 +537,7 @@ class ReverseSignalMonitor:
                 duration_sec,
                 trigger_type=trigger_type,
                 phase='触底反弹通过',
-                extra='反向执行器未启用，仅记录可开仓观察态',
+                extra=execution_note,
                 pre_gate_basis=pre_gate_basis,
             )
         try:

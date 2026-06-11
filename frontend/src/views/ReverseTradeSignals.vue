@@ -74,10 +74,10 @@ const loading = ref(false)
 const statusFilter = ref('')
 const assetKeyword = ref('')
 const days = ref(3)
-const page = ref(1)
-const pageSize = ref(100)
-const total = ref(0)
-const totalPages = ref(0)
+const paginationPageSize = ref(100)
+const paginationPageSizeOptions = [50, 100, 200, 500]
+const paginationCurrentPage = ref(1)
+const paginationTotal = ref(0)
 const columnVisibilities = ref<ColumnVisibility[]>([])
 const summary = ref({
   total: 0,
@@ -94,12 +94,7 @@ void gridContainerRef
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
-const pageInfo = computed(() => {
-  if (total.value <= 0) return '0 / 0'
-  const start = (page.value - 1) * pageSize.value + 1
-  const end = Math.min(page.value * pageSize.value, total.value)
-  return `${start}-${end} / ${total.value}`
-})
+const totalPages = computed(() => Math.ceil(paginationTotal.value / paginationPageSize.value) || 1)
 
 function formatBps(value: number | null | undefined): string {
   return value == null || !Number.isFinite(Number(value)) ? '' : Number(value).toFixed(2)
@@ -181,13 +176,13 @@ function triggerRenderer(params: { value?: string | null }) {
 
 async function fetchSignals(resetPage = false) {
   if (loading.value) return
-  if (resetPage) page.value = 1
+  if (resetPage) paginationCurrentPage.value = 1
   loading.value = true
   try {
     const query = new URLSearchParams({
       days: String(days.value),
-      page: String(page.value),
-      page_size: String(pageSize.value),
+      page: String(paginationCurrentPage.value),
+      page_size: String(paginationPageSize.value),
     })
     if (statusFilter.value) query.set('status', statusFilter.value)
     if (assetKeyword.value.trim()) query.set('base_asset', assetKeyword.value.trim())
@@ -199,8 +194,7 @@ async function fetchSignals(resetPage = false) {
       return
     }
     rowData.value = Array.isArray(data.signals) ? data.signals : []
-    total.value = Number(data.pagination?.total ?? rowData.value.length)
-    totalPages.value = Number(data.pagination?.total_pages ?? 1)
+    paginationTotal.value = Number(data.pagination?.total ?? rowData.value.length)
     summary.value = {
       total: Number(data.summary?.total ?? 0),
       monitoring: Number(data.summary?.monitoring ?? 0),
@@ -223,15 +217,13 @@ function setStatus(status: string) {
   fetchSignals(true)
 }
 
-function prevPage() {
-  if (page.value <= 1) return
-  page.value -= 1
+function onPageChange(page: number | null) {
+  paginationCurrentPage.value = Number(page || 1)
   fetchSignals()
 }
 
-function nextPage() {
-  if (page.value >= totalPages.value) return
-  page.value += 1
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1
   fetchSignals()
 }
 
@@ -502,18 +494,7 @@ onUnmounted(() => {
         <el-option :value="14" label="最近14天" />
         <el-option :value="30" label="最近30天" />
       </el-select>
-      <el-select v-model="pageSize" size="small" style="width: 100px" @change="fetchSignals(true)">
-        <el-option :value="50" label="50条" />
-        <el-option :value="100" label="100条" />
-        <el-option :value="200" label="200条" />
-        <el-option :value="500" label="500条" />
-      </el-select>
       <el-button size="small" :icon="Refresh" :loading="loading" @click="fetchSignals">刷新</el-button>
-      <div class="pager">
-        <el-button size="small" :disabled="page <= 1" @click="prevPage">上一页</el-button>
-        <span class="page-info">{{ pageInfo }}</span>
-        <el-button size="small" :disabled="page >= totalPages" @click="nextPage">下一页</el-button>
-      </div>
       <div class="column-actions">
         <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
           <template #reference>
@@ -547,6 +528,50 @@ onUnmounted(() => {
         style="width: 100%; height: 100%"
       />
     </div>
+
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="onPageChange"
+          controls-position="right"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -562,8 +587,7 @@ onUnmounted(() => {
 .summary-bar,
 .filter-bar,
 .column-actions,
-.summary-item,
-.pager {
+.summary-item {
   display: flex;
   align-items: center;
 }
@@ -614,18 +638,6 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
-.pager {
-  gap: 8px;
-}
-
-.page-info {
-  min-width: 92px;
-  text-align: center;
-  color: var(--app-text-muted);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
 .column-actions {
   gap: 8px;
   margin-left: auto;
@@ -650,6 +662,26 @@ onUnmounted(() => {
 
 .column-picker-label {
   font-size: 13px;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 :deep(.reverse-signal-status) {

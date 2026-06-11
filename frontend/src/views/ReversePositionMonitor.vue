@@ -61,16 +61,13 @@ const loading = ref(false)
 const baseAsset = ref('')
 const status = ref('')
 const days = ref(365)
-const page = ref(1)
-const pageSize = ref(100)
-const total = ref(0)
-const totalPages = ref(0)
+const paginationPageSize = ref(100)
+const paginationPageSizeOptions = [100, 500, 1000, 5000]
+const paginationCurrentPage = ref(1)
+const paginationTotal = ref(0)
 const columnVisibilities = ref<ColumnVisibility[]>([])
 
-const pageInfo = computed(() => {
-  if (total.value <= 0) return '0 / 0'
-  return `${(page.value - 1) * pageSize.value + 1}-${Math.min(page.value * pageSize.value, total.value)} / ${total.value}`
-})
+const totalPages = computed(() => Math.ceil(paginationTotal.value / paginationPageSize.value) || 1)
 
 function formatDecimal(value: number | null | undefined, maxDecimals = 12): string {
   if (value == null || !Number.isFinite(Number(value))) return ''
@@ -113,13 +110,13 @@ function riskLabel(row: ReversePositionRow | null | undefined): string {
 
 async function fetchRows(resetPage = false) {
   if (loading.value) return
-  if (resetPage) page.value = 1
+  if (resetPage) paginationCurrentPage.value = 1
   loading.value = true
   try {
     const query = new URLSearchParams({
       days: String(days.value),
-      page: String(page.value),
-      page_size: String(pageSize.value),
+      page: String(paginationCurrentPage.value),
+      page_size: String(paginationPageSize.value),
     })
     if (baseAsset.value.trim()) query.set('base_asset', baseAsset.value.trim())
     if (status.value) query.set('status', status.value)
@@ -130,8 +127,7 @@ async function fetchRows(resetPage = false) {
       return
     }
     rowData.value = Array.isArray(data.positions) ? data.positions : []
-    total.value = Number(data.pagination?.total ?? rowData.value.length)
-    totalPages.value = Number(data.pagination?.total_pages ?? 1)
+    paginationTotal.value = Number(data.pagination?.total ?? rowData.value.length)
   } catch {
     showError('反向持仓加载失败')
   } finally {
@@ -139,15 +135,13 @@ async function fetchRows(resetPage = false) {
   }
 }
 
-function prevPage() {
-  if (page.value <= 1) return
-  page.value -= 1
+function onPageChange(page: number | null) {
+  paginationCurrentPage.value = Number(page || 1)
   fetchRows()
 }
 
-function nextPage() {
-  if (page.value >= totalPages.value) return
-  page.value += 1
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1
   fetchRows()
 }
 
@@ -266,9 +260,6 @@ onMounted(() => {
         <el-option :value="365" label="最近1年" />
       </el-select>
       <el-button size="small" :icon="Refresh" :loading="loading" @click="fetchRows()">刷新</el-button>
-      <span class="page-count">{{ pageInfo }}</span>
-      <el-button size="small" :disabled="page <= 1" @click="prevPage">上一页</el-button>
-      <el-button size="small" :disabled="page >= totalPages" @click="nextPage">下一页</el-button>
       <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
         <template #reference>
           <el-button size="small">列选择</el-button>
@@ -297,6 +288,50 @@ onMounted(() => {
         style="width: 100%; height: 100%"
       />
     </div>
+
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          @change="onPageChange"
+          controls-position="right"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -314,12 +349,6 @@ onMounted(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-}
-
-.page-count {
-  color: var(--app-text-muted);
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
 }
 
 .grid-container {
@@ -340,5 +369,25 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   padding: 4px 0;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

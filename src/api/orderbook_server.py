@@ -1440,6 +1440,7 @@ def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
             config.get_float('trade.open.max_orderbook_lag_ms', 500.0),
         ),
         execution_enabled=config.get_bool('reverse_arbitrage.execution.enabled', False),
+        max_total_positions=config.get_int('reverse_arbitrage.execution.max_total_positions', 10),
     )
     if _reverse_signal_monitor is None:
         _reverse_signal_monitor = ReverseSignalMonitor(
