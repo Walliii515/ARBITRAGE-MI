@@ -48,6 +48,7 @@ from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
 from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
+from calc.executor_client import ExecutorClient
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
@@ -240,6 +241,7 @@ _gate_position_risk_cache_ts: float = 0.0
 _trading_executor: Optional['TradingExecutor'] = None
 _closing_executor: Optional['ClosingExecutor'] = None
 _reverse_signal_monitor: Optional['ReverseSignalMonitor'] = None
+_reverse_executor_client: Optional[ExecutorClient] = None
 _gate_risk_event_monitor = None
 _critical_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-open')
 _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-close')
@@ -1458,7 +1460,7 @@ def _run_open_position_check_once():
 
 def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
     """获取反向信号监控器；反向策略独立状态机，不复用正向 TradingExecutor。"""
-    global _reverse_signal_monitor
+    global _reverse_signal_monitor, _reverse_executor_client
     monitor_cfg = ReverseSignalMonitorConfig(
         open_amount_usdt=OPEN_AMOUNT_USDT,
         monitor_timeout_sec=config.get_float('reverse_arbitrage.signal.monitor_timeout_sec', 60.0),
@@ -1472,6 +1474,7 @@ def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
         ),
         execution_enabled=config.get_bool('reverse_arbitrage.execution.enabled', False),
         max_total_positions=config.get_int('reverse_arbitrage.execution.max_total_positions', 10),
+        max_positions_per_asset=config.get_int('reverse_arbitrage.execution.max_positions_per_asset', 2),
         monitor_timeout_cooldown_sec=config.get_int(
             'reverse_arbitrage.signal.monitor_timeout_cooldown_sec', 10
         ),
@@ -1489,6 +1492,11 @@ def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
             'reverse_arbitrage.signal.asset_noise_cooldown_min', 10
         ),
     )
+    if _reverse_executor_client is None:
+        _reverse_executor_client = ExecutorClient(
+            config.get_executor_url(),
+            timeout=config.get_int('trade.executor.timeout_sec', 5),
+        )
     if _reverse_signal_monitor is None:
         _reverse_signal_monitor = ReverseSignalMonitor(
             monitor_cfg,
@@ -1496,10 +1504,12 @@ def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
             _contract_meta,
             _spot_meta,
             _reverse_vwap_threshold_meta,
+            executor_client=_reverse_executor_client,
         )
     else:
         _reverse_signal_monitor.cfg = monitor_cfg
         _reverse_signal_monitor.update_meta(_contract_meta, _spot_meta, _reverse_vwap_threshold_meta)
+        _reverse_signal_monitor.set_executor_client(_reverse_executor_client)
 
     if svc and svc.gate_manager and svc.spot_manager:
         _reverse_signal_monitor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)

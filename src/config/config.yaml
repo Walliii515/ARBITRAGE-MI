@@ -321,9 +321,9 @@ reverse_arbitrage:
     asset_noise_cooldown_min: 10
   execution:
     enabled: true                           # 反向执行器开关；下单链路仍走反向独立实现，不复用正向执行器
-    dry_run: true                           # 真实执行实现前默认只做演练/记录
+    dry_run: false                          # 反向开仓旁路通过后真实下单
     max_total_positions: 10                 # 反向最大持仓数，先限制不超过10个
-    max_positions_per_asset: 1
+    max_positions_per_asset: 2
     min_open_amount_usdt: 0                 # 0 表示第一版不做“有多少开多少”
     allow_partial_borrow_capacity: false    # 借币额度不足时不开仓
     reject_cooldown_sec: 60

@@ -5,9 +5,10 @@
 职责边界：
 - 只处理 reverse_status == candidate 的反向机会入表与监控；
 - 不调用正向 TradingExecutor，不共享正向峰值/冷却/订单状态；
-- 当前不真实下单，只在触底反弹和旁路风控通过后标记为可开仓观察态。
+- 旁路风控通过后调用反向专用成交接口，不复用正向订单语义。
 """
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -15,9 +16,11 @@ from typing import Dict, List, Optional, Tuple
 
 from common.database import db_manager
 from common.logger import get_logger
+from calc.executor_client import ExecutorClient
 from calc.calculate_hedge_metrics import calculate_hedge_metrics
 from calc.merge_cross_exchange_orderbook import merge_orderbook_records
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
+from calc.reverse_trade_store import ensure_reverse_trade_tables, record_reverse_open_execution
 
 logger = get_logger(__name__)
 
@@ -33,6 +36,7 @@ class ReverseSignalMonitorConfig:
     max_orderbook_lag_ms: float = 500.0
     execution_enabled: bool = False
     max_total_positions: int = 10
+    max_positions_per_asset: int = 2
     monitor_timeout_cooldown_sec: int = 10
     reject_cooldown_sec: int = 60
     asset_noise_lookback_min: int = 60
@@ -54,15 +58,18 @@ class ReverseSignalMonitor:
         contract_meta: Dict[str, Dict],
         spot_meta: Dict[str, Dict],
         reverse_threshold_meta: Dict[str, Dict],
+        executor_client: Optional[ExecutorClient] = None,
     ):
         self.cfg = cfg
         self.reverse_cfg = reverse_cfg
         self.contract_meta = contract_meta
         self.spot_meta = spot_meta
         self.reverse_threshold_meta = reverse_threshold_meta
+        self.executor_client = executor_client
         self._gate_manager = None
         self._spot_manager = None
         self._states: Dict[str, Dict] = {}
+        self._pre_gate_rows: Dict[str, Dict] = {}
         self._monitor_timeout_cooldown_until: Dict[str, datetime] = {}
         self._reject_cooldown_until: Dict[str, datetime] = {}
         self._asset_noise_events: Dict[str, deque] = {}
@@ -82,6 +89,9 @@ class ReverseSignalMonitor:
     def set_orderbook_managers(self, gate_manager, spot_manager) -> None:
         self._gate_manager = gate_manager
         self._spot_manager = spot_manager
+
+    def set_executor_client(self, executor_client: Optional[ExecutorClient]) -> None:
+        self.executor_client = executor_client
 
     def process_rows(self, rows: List[Dict], borrow_meta: Optional[Dict[str, Dict]] = None) -> List[Dict]:
         """处理一轮反向信号监控，返回本轮状态变化。"""
@@ -248,14 +258,14 @@ class ReverseSignalMonitor:
             return {'base_asset': base_asset, 'status': 'gate_rejected', 'reason': reason}
 
         state['ready_notified'] = True
-        self._mark_ready_to_open(
+        exec_result = self._execute_reverse_open(
             base_asset,
             current_basis,
             pre_gate_basis,
             duration_sec,
             trigger_type='valley_rebound',
         )
-        return {'base_asset': base_asset, 'status': 'monitoring', 'trigger_type': 'valley_rebound'}
+        return exec_result or {'base_asset': base_asset, 'status': 'rejected', 'trigger_type': 'valley_rebound'}
 
     def _process_funding_carry_ready(
         self,
@@ -296,14 +306,14 @@ class ReverseSignalMonitor:
             return {'base_asset': base_asset, 'status': 'gate_rejected', 'reason': reason}
 
         state['ready_notified'] = True
-        self._mark_ready_to_open(
+        exec_result = self._execute_reverse_open(
             base_asset,
             current_basis,
             pre_gate_basis,
             duration_sec,
             trigger_type='funding_carry',
         )
-        return {'base_asset': base_asset, 'status': 'monitoring', 'trigger_type': 'funding_carry'}
+        return exec_result or {'base_asset': base_asset, 'status': 'rejected', 'trigger_type': 'funding_carry'}
 
     def _required_rebound_bps(self, state: Dict, valley_basis: float) -> float:
         signal_basis = float(state.get('signal_basis_bps', valley_basis))
@@ -454,6 +464,7 @@ class ReverseSignalMonitor:
                 reverse_threshold_meta=self.reverse_threshold_meta,
             )
             check = check_rows[0]
+            self._pre_gate_rows[base_asset] = dict(check)
             pre_gate_basis = self._as_float(check.get('reverse_basis_bps'))
             if trigger_type == 'funding_carry':
                 if check.get('reverse_funding_carry_pass') is not True:
@@ -464,7 +475,10 @@ class ReverseSignalMonitor:
             if not self.cfg.execution_enabled:
                 return True, pre_gate_basis, '反向执行器未启用，仅记录可开仓观察态'
 
-            capacity_ok, capacity_reason = self._execution_capacity_ok()
+            if self.executor_client is None:
+                return False, pre_gate_basis, '反向成交客户端未初始化'
+
+            capacity_ok, capacity_reason = self._execution_capacity_ok(base_asset)
             if not capacity_ok:
                 return False, pre_gate_basis, capacity_reason
 
@@ -473,11 +487,11 @@ class ReverseSignalMonitor:
             logger.warning(f'反向开仓旁路异常 | {base_asset}: {exc}', exc_info=True)
             return False, None, f'旁路异常({str(exc)[:120]})'
 
-    def _execution_capacity_ok(self) -> Tuple[bool, str]:
+    def _execution_capacity_ok(self, base_asset: str) -> Tuple[bool, str]:
         limit = int(self.cfg.max_total_positions or 0)
-        if limit <= 0:
-            return True, ''
+        per_asset_limit = int(self.cfg.max_positions_per_asset or 0)
         try:
+            ensure_reverse_trade_tables()
             with db_manager.get_cursor() as cursor:
                 cursor.execute(
                     """
@@ -487,13 +501,26 @@ class ReverseSignalMonitor:
                     """
                 )
                 row = cursor.fetchone() or {}
-            active_positions = int(row.get('cnt') or 0)
+                active_positions = int(row.get('cnt') or 0)
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM mi_reverse_trade_position
+                    WHERE base_asset = %s
+                      AND status IN ('holding', 'closing', 'risk', 'desynced')
+                    """,
+                    (base_asset,),
+                )
+                row = cursor.fetchone() or {}
+                active_asset_positions = int(row.get('cnt') or 0)
         except Exception as exc:
             logger.warning(f'反向持仓上限检查失败: {exc}')
             return False, f'反向持仓上限检查失败({str(exc)[:80]})'
 
-        if active_positions >= limit:
+        if limit > 0 and active_positions >= limit:
             return False, f'反向持仓数已达上限({active_positions}/{limit})'
+        if per_asset_limit > 0 and active_asset_positions >= per_asset_limit:
+            return False, f'反向同标的持仓数已达上限({active_asset_positions}/{per_asset_limit})'
         return True, ''
 
     def _create_signal(
@@ -652,6 +679,205 @@ class ReverseSignalMonitor:
         except Exception as exc:
             logger.warning(f'反向信号可开仓观察态更新失败 | {base_asset}: {exc}')
 
+    def _execute_reverse_open(
+        self,
+        base_asset: str,
+        rebound_basis: float,
+        pre_gate_basis: Optional[float],
+        duration_sec: int,
+        trigger_type: str,
+    ) -> Optional[Dict]:
+        state = self._states.get(base_asset)
+        if not state:
+            return None
+        if not self.cfg.execution_enabled:
+            self._mark_ready_to_open(base_asset, rebound_basis, pre_gate_basis, duration_sec, trigger_type)
+            return {'base_asset': base_asset, 'status': 'monitoring', 'trigger_type': trigger_type}
+        if self.executor_client is None:
+            self._resolve_signal(
+                base_asset,
+                'rejected',
+                self._build_signal_reason(
+                    state.get('last_row') or {},
+                    rebound_basis,
+                    state.get('valley_basis_bps'),
+                    duration_sec,
+                    trigger_type=trigger_type,
+                    phase='执行拒绝',
+                    extra='反向成交客户端未初始化',
+                    pre_gate_basis=pre_gate_basis,
+                ),
+                exit_basis_bps=rebound_basis,
+                trigger_type=trigger_type,
+                pre_gate_basis_bps=pre_gate_basis,
+                rebound_basis_bps=rebound_basis,
+            )
+            return {'base_asset': base_asset, 'status': 'rejected', 'trigger_type': trigger_type}
+
+        row = dict(self._pre_gate_rows.get(base_asset) or state.get('last_row') or {})
+        qty = self._as_float(row.get('spot_qty')) or self._as_float(row.get('future_qty'))
+        if qty is None or qty <= 0:
+            self._resolve_signal(
+                base_asset,
+                'rejected',
+                self._build_signal_reason(
+                    row,
+                    rebound_basis,
+                    state.get('valley_basis_bps'),
+                    duration_sec,
+                    trigger_type=trigger_type,
+                    phase='执行拒绝',
+                    extra=f'反向开仓数量无效(qty={qty})',
+                    pre_gate_basis=pre_gate_basis,
+                ),
+                exit_basis_bps=rebound_basis,
+                trigger_type=trigger_type,
+                pre_gate_basis_bps=pre_gate_basis,
+                rebound_basis_bps=rebound_basis,
+            )
+            return {'base_asset': base_asset, 'status': 'rejected', 'trigger_type': trigger_type}
+
+        order_uuid = f"rev_{uuid.uuid4().hex[:24]}"
+        contract = row.get('contract') or f'{base_asset}_USDT'
+        symbol = row.get('symbol') or f'{base_asset}USDT'
+        order_group = {
+            'order_uuid': order_uuid,
+            'signal_id': state['id'],
+            'target_amount': self.cfg.open_amount_usdt,
+            'signal_basis_bps': state.get('signal_basis_bps'),
+            'pre_gate_basis_bps': pre_gate_basis,
+            'borrow_hourly_rate': row.get('reverse_borrow_hourly_rate'),
+            'spot_order': {
+                'order_uuid': order_uuid,
+                'base_asset': base_asset,
+                'spot_symbol': symbol,
+                'market_type': 'margin_spot',
+                'order_side': 'open',
+                'trade_direction': 'sell',
+                'quantity_mode': 'base',
+                'target_qty': qty,
+                'target_amount': self.cfg.open_amount_usdt,
+            },
+            'future_order': {
+                'order_uuid': order_uuid,
+                'base_asset': base_asset,
+                'future_contract': contract,
+                'market_type': 'future',
+                'order_side': 'open',
+                'trade_direction': 'buy',
+                'quantity_mode': 'base',
+                'target_qty': qty,
+                'target_amount': self.cfg.open_amount_usdt,
+            },
+        }
+        exec_result = self.executor_client.execute_reverse_open(order_group, row)
+        persisted = record_reverse_open_execution(
+            signal_id=state['id'],
+            order_group=order_group,
+            orderbook_row=row,
+            result=exec_result,
+        )
+
+        if exec_result.get('success'):
+            reason = self._build_signal_reason(
+                row,
+                rebound_basis,
+                state.get('valley_basis_bps'),
+                duration_sec,
+                trigger_type=trigger_type,
+                phase='开仓成功',
+                extra=(
+                    f"order_uuid={order_uuid},position_id={persisted.get('position_id')},"
+                    f"actual_basis={self._fmt_optional(persisted.get('actual_basis_bps'))}bps"
+                ),
+                pre_gate_basis=pre_gate_basis,
+            )
+            self._mark_opened(
+                base_asset,
+                reason,
+                order_uuid,
+                rebound_basis,
+                pre_gate_basis,
+                persisted.get('actual_basis_bps'),
+                trigger_type,
+            )
+            return {
+                'base_asset': base_asset,
+                'status': 'opened',
+                'order_uuid': order_uuid,
+                'position_id': persisted.get('position_id'),
+                'trigger_type': trigger_type,
+            }
+
+        reason = self._build_signal_reason(
+            row,
+            rebound_basis,
+            state.get('valley_basis_bps'),
+            duration_sec,
+            trigger_type=trigger_type,
+            phase='执行拒绝',
+            extra=str(exec_result.get('message') or '反向成交失败')[:500],
+            pre_gate_basis=pre_gate_basis,
+        )
+        self._resolve_signal(
+            base_asset,
+            'rejected',
+            reason,
+            exit_basis_bps=rebound_basis,
+            trigger_type=trigger_type,
+            pre_gate_basis_bps=pre_gate_basis,
+            rebound_basis_bps=rebound_basis,
+        )
+        return {'base_asset': base_asset, 'status': 'rejected', 'reason': exec_result.get('message')}
+
+    def _mark_opened(
+        self,
+        base_asset: str,
+        reason: str,
+        order_uuid: str,
+        exit_basis_bps: Optional[float],
+        pre_gate_basis_bps: Optional[float],
+        actual_basis_bps: Optional[float],
+        trigger_type: str,
+    ) -> None:
+        state = self._states.get(base_asset)
+        if not state:
+            return
+        now = datetime.now()
+        duration_sec = int((now - state['start_time']).total_seconds())
+        sql = """
+            UPDATE mi_reverse_trade_signal
+            SET status = 'opened',
+                resolved_time = %(resolved_time)s,
+                duration_sec = %(duration_sec)s,
+                trigger_type = %(trigger_type)s,
+                reject_reason = %(reason)s,
+                order_uuid = %(order_uuid)s,
+                reverse_open_basis_bps = %(exit_basis)s,
+                rebound_basis_bps = %(exit_basis)s,
+                pre_gate_basis_bps = %(pre_gate_basis)s,
+                actual_basis_bps = %(actual_basis)s
+            WHERE id = %(id)s
+        """
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, {
+                    'resolved_time': now,
+                    'duration_sec': duration_sec,
+                    'trigger_type': trigger_type,
+                    'reason': reason,
+                    'order_uuid': order_uuid,
+                    'exit_basis': round(exit_basis_bps, 2) if exit_basis_bps is not None else None,
+                    'pre_gate_basis': round(pre_gate_basis_bps, 2) if pre_gate_basis_bps is not None else None,
+                    'actual_basis': round(actual_basis_bps, 2) if actual_basis_bps is not None else None,
+                    'id': state['id'],
+                })
+        except Exception as exc:
+            logger.error(f'反向信号开仓成功状态更新失败 | {base_asset}: {exc}', exc_info=True)
+        self._record_noise_event(base_asset, 'opened')
+        self._states.pop(base_asset, None)
+        self._pre_gate_rows.pop(base_asset, None)
+
     def _resolve_signal(
         self,
         base_asset: str,
@@ -701,6 +927,7 @@ class ReverseSignalMonitor:
             self._start_reject_cooldown(base_asset, reason)
         self._record_noise_event(base_asset, status)
         self._states.pop(base_asset, None)
+        self._pre_gate_rows.pop(base_asset, None)
 
     def _load_active_states(self) -> None:
         if self._states:
@@ -1059,6 +1286,15 @@ class ReverseSignalMonitor:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _fmt_optional(value) -> str:
+        try:
+            if value is None:
+                return '-'
+            return f'{float(value):.2f}'
+        except (TypeError, ValueError):
+            return '-'
 
     @classmethod
     def _round_or_none(cls, value) -> Optional[float]:

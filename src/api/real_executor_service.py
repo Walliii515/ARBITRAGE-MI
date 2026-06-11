@@ -44,13 +44,15 @@ logger = get_logger(__name__)
 
 # ───── 全局状态 ─────
 _executor: RealExecutor = None
+_reverse_executor: RealExecutor = None
 _contract_meta: Dict[str, Dict] = {}
 _spot_meta: Dict[str, Dict] = {}
 _meta_load_time: str = ''
 _exchange_config: ExchangeConfig = None
+_reverse_exchange_config: ExchangeConfig = None
 
 
-def _build_exchange_config() -> ExchangeConfig:
+def _build_exchange_config(strategy: str = 'forward') -> ExchangeConfig:
     """
     根据配置构建交易所配置
 
@@ -61,8 +63,8 @@ def _build_exchange_config() -> ExchangeConfig:
     env = config.get_real_executor_env()
 
     if env == 'mainnet':
-        binance_creds = get_binance_credentials('forward', mainnet=True)
-        gate_creds = get_gate_futures_credentials('forward', mainnet=True)
+        binance_creds = get_binance_credentials(strategy, mainnet=True)
+        gate_creds = get_gate_futures_credentials(strategy, mainnet=True)
         return ExchangeConfig(
             binance_base_url='https://api1.binance.com',
             binance_api_key=binance_creds.api_key,
@@ -88,22 +90,36 @@ def _build_exchange_config() -> ExchangeConfig:
 
 def _load_meta_and_init():
     """加载元数据并初始化/刷新 RealExecutor"""
-    global _executor, _contract_meta, _spot_meta, _meta_load_time, _exchange_config
+    global _executor, _reverse_executor, _contract_meta, _spot_meta, _meta_load_time
+    global _exchange_config, _reverse_exchange_config
 
     _contract_meta = fetch_contract_meta()
     _spot_meta = fetch_spot_meta()
     _meta_load_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if _executor is None:
-        _exchange_config = _build_exchange_config()
+        _exchange_config = _build_exchange_config('forward')
         leverage = config.get_int('margin.leverage', 2)
         _executor = RealExecutor(_exchange_config, _contract_meta, spot_meta=_spot_meta, leverage=leverage)
     else:
         _executor.reload_meta(_contract_meta, _spot_meta)
 
+    if _reverse_executor is None:
+        _reverse_exchange_config = _build_exchange_config('reverse')
+        leverage = config.get_int('margin.leverage', 2)
+        _reverse_executor = RealExecutor(
+            _reverse_exchange_config,
+            _contract_meta,
+            spot_meta=_spot_meta,
+            leverage=leverage,
+        )
+    else:
+        _reverse_executor.reload_meta(_contract_meta, _spot_meta)
+
     logger.info(
         f'真实成交引擎已加载: env={_exchange_config.env}, '
-        f'合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条 ({_meta_load_time})'
+        f'合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条 ({_meta_load_time}), '
+        f'reverse_env={_reverse_exchange_config.env if _reverse_exchange_config else "unknown"}'
     )
 
 
@@ -163,6 +179,25 @@ async def execute(req: ExecuteRequest):
         }
 
 
+@app.post('/api/reverse/execute-open')
+async def reverse_execute_open(req: ExecuteRequest):
+    """执行反向套利真实开仓：Binance margin short spot + Gate long future。"""
+    if _reverse_executor is None:
+        raise HTTPException(status_code=503, detail='反向成交引擎未初始化')
+
+    try:
+        return _reverse_executor.execute_reverse_open(req.order_group, req.orderbook_row)
+    except Exception as e:
+        logger.error(f'反向真实开仓异常: {e}', exc_info=True)
+        return {
+            'success': False,
+            'message': f'反向成交引擎异常: {str(e)}',
+            'spot_order': None,
+            'future_order': None,
+            'borrow_order': None,
+        }
+
+
 @app.post('/api/margin/topup')
 async def margin_topup(req: MarginTopupRequest):
     """向 Gate 逐仓仓位追加保证金。"""
@@ -204,6 +239,7 @@ async def health():
         'loaded_at': _meta_load_time,
         'binance_url': _exchange_config.binance_base_url if _exchange_config else '',
         'gate_url': _exchange_config.gate_base_url if _exchange_config else '',
+        'reverse_env': _reverse_exchange_config.env if _reverse_exchange_config else 'unknown',
     }
 
 

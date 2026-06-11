@@ -92,6 +92,37 @@ class ExecutorClient:
             logger.error(error_msg, exc_info=True)
             return self._error_result(error_msg)
 
+    def execute_reverse_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:
+        """调用真实成交服务执行反向开仓。
+
+        反向策略使用独立接口，避免复用正向 `/api/execute` 的账户和订单语义。
+        """
+        url = f'{self.base_url}/api/reverse/execute-open'
+        payload = {
+            'order_group': self._sanitize_order_group(order_group),
+            'orderbook_row': self._sanitize_dict(orderbook_row)
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f'反向成交引擎服务连接失败({self.base_url}): {e}'
+            logger.error(error_msg)
+            return self._error_result(error_msg)
+        except requests.exceptions.Timeout as e:
+            error_msg = f'反向成交引擎请求超时({self.timeout}s): {e}'
+            logger.error(error_msg)
+            return self._error_result(error_msg)
+        except requests.exceptions.HTTPError:
+            error_msg = f'反向成交引擎返回错误: {resp.status_code} {resp.text[:300]}'
+            logger.error(error_msg)
+            return self._error_result(error_msg)
+        except Exception as e:
+            error_msg = f'反向成交引擎调用异常: {e}'
+            logger.error(error_msg, exc_info=True)
+            return self._error_result(error_msg)
+
     def check_connectivity(self) -> Dict:
         """
         检查成交引擎交易所连通性

@@ -164,6 +164,99 @@ class RealExecutor:
 
         return result
 
+    def execute_reverse_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:
+        """
+        执行反向套利真实开仓。
+
+        方向：
+        - Binance Cross Margin 借入 base asset 后卖出
+        - Gate USDT 永续买入开多
+
+        本方法只服务反向策略，避免复用正向 spot buy + future sell 的语义。
+        """
+        result = {
+            'success': False,
+            'borrow_order': None,
+            'spot_order': None,
+            'future_order': None,
+            'repay_order': None,
+            'unwind_order': None,
+            'message': '',
+        }
+        spot_order = dict(order_group.get('spot_order') or {})
+        future_order = dict(order_group.get('future_order') or {})
+        base_asset = str(spot_order.get('base_asset') or future_order.get('base_asset') or '').upper()
+        target_qty = float(spot_order.get('target_qty') or future_order.get('target_qty') or 0)
+        if not base_asset or target_qty <= 0:
+            result['message'] = f'反向开仓参数无效(base={base_asset}, qty={target_qty})'
+            return result
+
+        borrow_result = self._place_binance_margin_borrow(base_asset, target_qty)
+        result['borrow_order'] = borrow_result
+        if not borrow_result.get('success'):
+            result['message'] = f"借币失败: {borrow_result.get('reason')}"
+            return result
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                spot_future = pool.submit(self._place_binance_margin_order, spot_order)
+                gate_future = pool.submit(self._place_gate_futures_order, future_order)
+                spot_result = spot_future.result()
+                future_result = gate_future.result()
+
+            result['spot_order'] = spot_result
+            result['future_order'] = future_result
+
+            if spot_result.get('success') and future_result.get('success'):
+                result['success'] = True
+                result['message'] = '反向开仓成交成功'
+                logger.info(
+                    f"反向真实开仓成功 | {base_asset} | "
+                    f"margin_sell: price={spot_result.get('exec_price')}, qty={spot_result.get('exec_qty')} | "
+                    f"future_long: price={future_result.get('exec_price')}, qty={future_result.get('exec_qty')}"
+                )
+                return result
+
+            if spot_result.get('success') and not future_result.get('success'):
+                buyback = self._unwind_margin_spot_leg(spot_order, spot_result)
+                result['unwind_order'] = buyback
+                if buyback.get('success'):
+                    repay = self._place_binance_margin_repay(base_asset, min(
+                        float(borrow_result.get('amount') or 0),
+                        float(buyback.get('exec_qty') or 0),
+                    ))
+                    result['repay_order'] = repay
+                result['message'] = (
+                    f"期货拒单，margin现货已成交并尝试买回: {future_result.get('reason')} | "
+                    f"buyback={buyback.get('success')}"
+                )
+                logger.critical(f"⚠️ 反向单边风险 | {base_asset} | {result['message']}")
+                return result
+
+            if future_result.get('success') and not spot_result.get('success'):
+                unwind = self._unwind_filled_future_leg(future_order, future_result)
+                repay = self._place_binance_margin_repay(base_asset, float(borrow_result.get('amount') or 0))
+                result['unwind_order'] = unwind
+                result['repay_order'] = repay
+                result['message'] = (
+                    f"margin现货拒单，future已成交并尝试撤腿: {spot_result.get('reason')} | "
+                    f"future_unwind={unwind.get('success')}"
+                )
+                logger.critical(f"⚠️ 反向单边风险 | {base_asset} | {result['message']}")
+                return result
+
+            repay = self._place_binance_margin_repay(base_asset, float(borrow_result.get('amount') or 0))
+            result['repay_order'] = repay
+            result['message'] = (
+                f"双边拒单: margin现货({spot_result.get('reason')}), "
+                f"期货({future_result.get('reason')}); repay={repay.get('success')}"
+            )
+            return result
+        except Exception as e:
+            result['message'] = f"反向开仓系统异常: {str(e)}"
+            logger.error(f"反向 RealExecutor 异常: {e}", exc_info=True)
+            return result
+
     @staticmethod
     def _is_future_maker_order(future_order: Dict) -> bool:
         return (
@@ -678,6 +771,122 @@ class RealExecutor:
         """公开的 Binance 现货单腿执行入口，用于交易所断腿自动处置。"""
         return self._place_binance_spot_order(order)
 
+    def _binance_signed_post(self, path: str, params: Dict) -> Dict:
+        payload = dict(params)
+        payload.setdefault('recvWindow', 5000)
+        payload['timestamp'] = int(time.time() * 1000)
+        query_string = urlencode(payload)
+        payload['signature'] = self._binance_sign(query_string)
+        headers = {'X-MBX-APIKEY': self.config.binance_api_key}
+        resp = self._session.post(
+            f"{self.config.binance_base_url}{path}",
+            params=payload,
+            headers=headers,
+            timeout=self.config.timeout_sec,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Binance {path} HTTP {resp.status_code}: {resp.text[:200]}")
+        return resp.json()
+
+    def _place_binance_margin_borrow(self, asset: str, amount: float) -> Dict:
+        """Binance Cross Margin 借币。"""
+        asset = str(asset or '').upper()
+        qty = self._format_decimal(amount, 12)
+        try:
+            data = self._binance_signed_post('/sapi/v1/margin/borrow-repay', {
+                'asset': asset,
+                'amount': qty,
+                'type': 'BORROW',
+            })
+            return {
+                'success': True,
+                'asset': asset,
+                'amount': float(qty),
+                'exchange_order_id': str(data.get('tranId') or ''),
+                'raw': data,
+            }
+        except Exception as e:
+            logger.warning(f"Binance margin 借币失败 | {asset} | amount={qty} | {e}")
+            return {'success': False, 'asset': asset, 'amount': float(amount or 0), 'reason': str(e)[:200]}
+
+    def _place_binance_margin_repay(self, asset: str, amount: float) -> Dict:
+        """Binance Cross Margin 还币。失败不抛出，交由上层记录风险。"""
+        asset = str(asset or '').upper()
+        if float(amount or 0) <= 0:
+            return {'success': True, 'asset': asset, 'amount': 0.0, 'reason': '无需还币'}
+        qty = self._format_decimal(amount, 12)
+        try:
+            data = self._binance_signed_post('/sapi/v1/margin/borrow-repay', {
+                'asset': asset,
+                'amount': qty,
+                'type': 'REPAY',
+            })
+            return {
+                'success': True,
+                'asset': asset,
+                'amount': float(qty),
+                'exchange_order_id': str(data.get('tranId') or ''),
+                'raw': data,
+            }
+        except Exception as e:
+            logger.warning(f"Binance margin 还币失败 | {asset} | amount={qty} | {e}")
+            return {'success': False, 'asset': asset, 'amount': float(amount or 0), 'reason': str(e)[:200]}
+
+    def _place_binance_margin_order(self, order: Dict) -> Dict:
+        """Binance Cross Margin 市价/IOC 下单，用于反向现货腿。"""
+        base_asset = order.get('base_asset', '')
+        symbol = f"{base_asset}USDT"
+        side = 'BUY' if order.get('trade_direction') == 'buy' else 'SELL'
+        order_type = 'LIMIT' if order.get('protective_price') is not None else 'MARKET'
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': order_type,
+            'newClientOrderId': f"arb_{order.get('order_uuid', '')[:8]}_mspot",
+            'newOrderRespType': 'FULL',
+        }
+
+        if order_type == 'LIMIT':
+            protective_price = float(order.get('protective_price') or 0)
+            if protective_price <= 0:
+                return {'success': False, 'reason': 'margin spot保护IOC缺少有效保护价'}
+            price_precision = self._get_spot_price_precision(base_asset)
+            price = truncate_to_precision(protective_price, price_precision)
+            if price is None or price <= 0:
+                return {'success': False, 'reason': f'margin spot保护价无效({protective_price})'}
+            params['price'] = f"{price:.{price_precision}f}"
+            params['timeInForce'] = 'IOC'
+
+        quantity = float(order.get('target_qty', 0))
+        qty_precision = self._get_spot_qty_precision(base_asset)
+        quantity = truncate_to_precision(quantity, qty_precision)
+        if quantity is None or quantity <= 0:
+            return {'success': False, 'reason': f'margin spot数量无效({order.get("target_qty")})'}
+        params['quantity'] = str(quantity)
+
+        try:
+            data = self._binance_signed_post('/sapi/v1/margin/order', params)
+            return self._parse_binance_response(data)
+        except requests.exceptions.Timeout:
+            return {'success': False, 'reason': f'Binance margin 请求超时({self.config.timeout_sec}s)'}
+        except requests.exceptions.ConnectionError as e:
+            return {'success': False, 'reason': f'Binance margin 连接失败: {str(e)[:100]}'}
+        except Exception as e:
+            return {'success': False, 'reason': f'Binance margin 异常: {str(e)[:200]}'}
+
+    def _unwind_margin_spot_leg(self, spot_order: Dict, spot_result: Dict) -> Dict:
+        exec_qty = float(spot_result.get('exec_qty') or 0)
+        if exec_qty <= 0:
+            return {'success': True, 'reason': 'margin spot无成交无需撤腿'}
+        reverse_order = dict(spot_order)
+        reverse_order.pop('protective_price', None)
+        reverse_order.pop('order_type', None)
+        reverse_order['trade_direction'] = 'buy' if spot_order.get('trade_direction') == 'sell' else 'sell'
+        reverse_order['quantity_mode'] = 'base'
+        reverse_order['target_qty'] = exec_qty
+        reverse_order['target_amount'] = spot_result.get('exec_amount')
+        return self._place_binance_margin_order(reverse_order)
+
     def _parse_binance_response(self, data: Dict) -> Dict:
         """
         解析 Binance 订单响应
@@ -759,6 +968,11 @@ class RealExecutor:
             'fee_amount_usdt': round(fee_amount_usdt, 8) if fee_amount_usdt_complete else None,
             'fee_asset': fee_asset,
         }
+
+    @staticmethod
+    def _format_decimal(value: float, precision: int = 12) -> str:
+        text = f"{float(value):.{precision}f}".rstrip('0').rstrip('.')
+        return text if text else '0'
 
     def _convert_fee_to_usdt(
         self,

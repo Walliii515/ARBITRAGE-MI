@@ -6,9 +6,11 @@ mi_trade_order，避免两套策略的持仓语义互相污染。
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from calc.orderbook_enricher import calc_vwap_basis_bps
 from common.database import db_manager
 from common.logger import get_logger
 
@@ -264,3 +266,181 @@ def list_reverse_orders(
         )
         rows = cursor.fetchall()
     return PageResult(rows=list(rows or []), total=total, page=page, page_size=page_size)
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value or {}, ensure_ascii=False, default=str)
+
+
+def record_reverse_open_execution(
+    *,
+    signal_id: Optional[int],
+    order_group: Dict[str, Any],
+    orderbook_row: Dict[str, Any],
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist reverse open execution result into reverse-owned tables."""
+    ensure_reverse_trade_tables()
+    spot_order = dict(order_group.get('spot_order') or {})
+    future_order = dict(order_group.get('future_order') or {})
+    base_asset = str(spot_order.get('base_asset') or future_order.get('base_asset') or '').upper()
+    order_uuid = str(order_group.get('order_uuid') or '')
+    spot_result = dict(result.get('spot_order') or {})
+    future_result = dict(result.get('future_order') or {})
+    borrow_result = dict(result.get('borrow_order') or {})
+    repay_result = dict(result.get('repay_order') or {})
+    unwind_result = dict(result.get('unwind_order') or {})
+
+    spot_success = bool(spot_result.get('success'))
+    future_success = bool(future_result.get('success'))
+    success = bool(result.get('success')) and spot_success and future_success
+    borrow_left_open = bool(borrow_result.get('success')) and not bool(repay_result.get('success'))
+    has_real_leg = spot_success or future_success or borrow_left_open
+    position_id = None
+
+    actual_basis = calc_vwap_basis_bps(
+        spot_result.get('exec_price'),
+        future_result.get('exec_price'),
+    )
+    pre_gate_basis = order_group.get('pre_gate_basis_bps')
+    execution_drift = (
+        actual_basis - _as_float(pre_gate_basis)
+        if actual_basis is not None and pre_gate_basis is not None
+        else None
+    )
+    fee_total_usdt = sum(
+        _as_float(x.get('fee_amount_usdt'))
+        for x in (spot_result, future_result)
+        if x.get('fee_amount_usdt') is not None
+    )
+    open_amount = spot_result.get('exec_amount') or future_result.get('exec_amount') or order_group.get('target_amount')
+
+    with db_manager.get_cursor() as cursor:
+        if has_real_leg:
+            position_status = 'holding' if success else 'desynced'
+            cursor.execute(
+                """
+                INSERT INTO mi_reverse_trade_position (
+                    order_uuid, signal_id, base_asset, spot_symbol, future_contract, status,
+                    open_amount_usdt, borrow_asset, borrow_qty, borrow_hourly_rate,
+                    spot_open_qty, spot_open_price, spot_open_amount,
+                    future_open_qty, future_open_price, future_open_amount,
+                    reverse_open_basis_bps, signal_basis_bps, pre_gate_basis_bps,
+                    actual_basis_bps, execution_drift_bps, fee_total_usdt,
+                    exchange_risk_status, exchange_risk_type, exchange_risk_detail
+                ) VALUES (
+                    %(order_uuid)s, %(signal_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s, %(status)s,
+                    %(open_amount)s, %(borrow_asset)s, %(borrow_qty)s, %(borrow_hourly_rate)s,
+                    %(spot_qty)s, %(spot_price)s, %(spot_amount)s,
+                    %(future_qty)s, %(future_price)s, %(future_amount)s,
+                    %(reverse_open_basis)s, %(signal_basis)s, %(pre_gate_basis)s,
+                    %(actual_basis)s, %(execution_drift)s, %(fee_total_usdt)s,
+                    %(risk_status)s, %(risk_type)s, %(risk_detail)s
+                )
+                """,
+                {
+                    'order_uuid': order_uuid,
+                    'signal_id': signal_id,
+                    'base_asset': base_asset,
+                    'spot_symbol': spot_order.get('spot_symbol') or f'{base_asset}USDT',
+                    'future_contract': future_order.get('future_contract') or f'{base_asset}_USDT',
+                    'status': position_status,
+                    'open_amount': open_amount,
+                    'borrow_asset': base_asset,
+                    'borrow_qty': borrow_result.get('amount'),
+                    'borrow_hourly_rate': order_group.get('borrow_hourly_rate'),
+                    'spot_qty': spot_result.get('exec_qty'),
+                    'spot_price': spot_result.get('exec_price'),
+                    'spot_amount': spot_result.get('exec_amount'),
+                    'future_qty': future_result.get('exec_qty'),
+                    'future_price': future_result.get('exec_price'),
+                    'future_amount': future_result.get('exec_amount'),
+                    'reverse_open_basis': orderbook_row.get('reverse_basis_bps'),
+                    'signal_basis': order_group.get('signal_basis_bps'),
+                    'pre_gate_basis': pre_gate_basis,
+                    'actual_basis': actual_basis,
+                    'execution_drift': execution_drift,
+                    'fee_total_usdt': fee_total_usdt,
+                    'risk_status': 'normal' if success else 'desynced',
+                    'risk_type': None if success else 'reverse_open_partial_or_failed',
+                    'risk_detail': None if success else str(result.get('message') or '')[:1000],
+                },
+            )
+            position_id = cursor.lastrowid
+
+        order_rows = [
+            ('open', 'margin_spot', 'borrow', borrow_result, {'target_qty': borrow_result.get('amount')}),
+            ('open', 'margin_spot', 'sell', spot_result, spot_order),
+            ('open', 'future', 'buy', future_result, future_order),
+        ]
+        if repay_result:
+            order_rows.append(('repay', 'margin_repay', 'repay', repay_result, {'target_qty': repay_result.get('amount')}))
+        if unwind_result:
+            market = 'future' if future_success and not spot_success else 'margin_spot'
+            direction = 'sell' if market == 'future' else 'buy'
+            order_rows.append(('unwind', market, direction, unwind_result, {}))
+
+        for order_side, market_type, trade_direction, exec_row, request_order in order_rows:
+            if not exec_row:
+                continue
+            status = 'filled' if exec_row.get('success') else 'failed'
+            cursor.execute(
+                """
+                INSERT INTO mi_reverse_trade_order (
+                    order_uuid, position_id, signal_id, base_asset, spot_symbol, future_contract,
+                    order_side, market_type, trade_direction, status,
+                    target_qty, target_amount, exec_price, exec_qty, exec_amount,
+                    exchange_order_id, client_order_id, fee_amount, fee_asset, fee_amount_usdt,
+                    reduce_only, protective_price, execution_style, reject_reason, raw_response
+                ) VALUES (
+                    %(order_uuid)s, %(position_id)s, %(signal_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
+                    %(order_side)s, %(market_type)s, %(trade_direction)s, %(status)s,
+                    %(target_qty)s, %(target_amount)s, %(exec_price)s, %(exec_qty)s, %(exec_amount)s,
+                    %(exchange_order_id)s, %(client_order_id)s, %(fee_amount)s, %(fee_asset)s, %(fee_amount_usdt)s,
+                    %(reduce_only)s, %(protective_price)s, %(execution_style)s, %(reject_reason)s, %(raw_response)s
+                )
+                """,
+                {
+                    'order_uuid': order_uuid,
+                    'position_id': position_id,
+                    'signal_id': signal_id,
+                    'base_asset': base_asset,
+                    'spot_symbol': spot_order.get('spot_symbol') or f'{base_asset}USDT',
+                    'future_contract': future_order.get('future_contract') or f'{base_asset}_USDT',
+                    'order_side': order_side,
+                    'market_type': market_type,
+                    'trade_direction': trade_direction,
+                    'status': status,
+                    'target_qty': request_order.get('target_qty'),
+                    'target_amount': request_order.get('target_amount'),
+                    'exec_price': exec_row.get('exec_price'),
+                    'exec_qty': exec_row.get('exec_qty') or exec_row.get('amount'),
+                    'exec_amount': exec_row.get('exec_amount'),
+                    'exchange_order_id': exec_row.get('exchange_order_id'),
+                    'client_order_id': request_order.get('client_order_id'),
+                    'fee_amount': exec_row.get('fee_amount'),
+                    'fee_asset': exec_row.get('fee_asset'),
+                    'fee_amount_usdt': exec_row.get('fee_amount_usdt'),
+                    'reduce_only': 1 if request_order.get('reduce_only') else 0,
+                    'protective_price': request_order.get('protective_price'),
+                    'execution_style': request_order.get('execution_style'),
+                    'reject_reason': exec_row.get('reason') or (None if exec_row.get('success') else result.get('message')),
+                    'raw_response': _json_dumps(exec_row.get('raw') or exec_row),
+                },
+            )
+
+    return {
+        'position_id': position_id,
+        'actual_basis_bps': actual_basis,
+        'execution_drift_bps': execution_drift,
+        'fee_total_usdt': fee_total_usdt,
+    }

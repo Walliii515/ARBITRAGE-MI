@@ -278,6 +278,10 @@ def test_reverse_execution_capacity_rejects_when_position_limit_reached(monkeypa
         'calc.reverse_signal_monitor.db_manager.get_cursor',
         lambda: FakeCursor(),
     )
+    monkeypatch.setattr(
+        'calc.reverse_signal_monitor.ensure_reverse_trade_tables',
+        lambda: None,
+    )
     monitor = ReverseSignalMonitor(
         ReverseSignalMonitorConfig(
             open_amount_usdt=10,
@@ -297,10 +301,112 @@ def test_reverse_execution_capacity_rejects_when_position_limit_reached(monkeypa
         {},
     )
 
-    ok, reason = monitor._execution_capacity_ok()
+    ok, reason = monitor._execution_capacity_ok('AI')
 
     assert ok is False
     assert '反向持仓数已达上限(10/10)' in reason
+
+
+def test_reverse_execute_open_calls_executor_and_marks_opened(monkeypatch):
+    executed = {}
+    updates = []
+
+    class FakeExecutorClient:
+        def execute_reverse_open(self, order_group, orderbook_row):
+            executed['order_group'] = order_group
+            executed['orderbook_row'] = orderbook_row
+            return {
+                'success': True,
+                'message': 'reverse open filled',
+                'borrow_order': {'success': True, 'amount': 10},
+                'spot_order': {
+                    'success': True,
+                    'exec_price': 1.0,
+                    'exec_qty': 10,
+                    'exec_amount': 10,
+                },
+                'future_order': {
+                    'success': True,
+                    'exec_price': 0.99,
+                    'exec_qty': 10,
+                    'exec_amount': 9.9,
+                },
+            }
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            updates.append((sql, params))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        'calc.reverse_signal_monitor.db_manager.get_cursor',
+        lambda: FakeCursor(),
+    )
+    monkeypatch.setattr(
+        'calc.reverse_signal_monitor.record_reverse_open_execution',
+        lambda **kwargs: {'position_id': 123, 'actual_basis_bps': -100.0},
+    )
+
+    monitor = ReverseSignalMonitor(
+        ReverseSignalMonitorConfig(
+            open_amount_usdt=10,
+            execution_enabled=True,
+            max_total_positions=10,
+            max_positions_per_asset=2,
+        ),
+        ReverseArbitrageConfig(
+            open_amount_usdt=10,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            orderbook_coverage_threshold=0.6,
+        ),
+        {},
+        {},
+        {},
+        executor_client=FakeExecutorClient(),
+    )
+    monitor._states['AI'] = {
+        'id': 77,
+        'base_asset': 'AI',
+        'start_time': datetime.now() - timedelta(seconds=5),
+        'signal_basis_bps': -50.0,
+        'valley_basis_bps': -70.0,
+        'last_row': {'base_asset': 'AI'},
+    }
+    monitor._pre_gate_rows['AI'] = {
+        'base_asset': 'AI',
+        'contract': 'AI_USDT',
+        'symbol': 'AIUSDT',
+        'spot_qty': 10,
+        'future_qty': 10,
+        'reverse_basis_bps': -55.0,
+        'reverse_borrow_hourly_rate': 0.00001,
+    }
+
+    result = monitor._execute_reverse_open(
+        'AI',
+        rebound_basis=-60.0,
+        pre_gate_basis=-55.0,
+        duration_sec=5,
+        trigger_type='valley_rebound',
+    )
+
+    assert result['status'] == 'opened'
+    assert result['position_id'] == 123
+    assert executed['order_group']['spot_order']['market_type'] == 'margin_spot'
+    assert executed['order_group']['spot_order']['trade_direction'] == 'sell'
+    assert executed['order_group']['future_order']['market_type'] == 'future'
+    assert executed['order_group']['future_order']['trade_direction'] == 'buy'
+    assert 'AI' not in monitor._states
+    assert 'AI' not in monitor._pre_gate_rows
+    assert any(params and params.get('order_uuid') == result['order_uuid'] for _, params in updates)
 
 
 def test_reverse_margin_edge_must_be_non_negative():
