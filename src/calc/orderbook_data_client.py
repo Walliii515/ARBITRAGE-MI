@@ -254,8 +254,11 @@ class OrderBookDataClient:
         self.get_status(force=True)
         return bool(res.get('ok')), res.get('message', '')
 
-    def retry_contract(self, base_asset: str) -> Tuple[bool, str]:
-        res = self._request('POST', '/api/service/retry-snapshot', {'base_asset': base_asset})
+    def retry_contract(self, base_asset: str, force: bool = False) -> Tuple[bool, str]:
+        res = self._request('POST', '/api/service/retry-snapshot', {
+            'base_asset': base_asset,
+            'force': force,
+        })
         return bool(res.get('ok')), res.get('message', '')
 
     def shutdown(self) -> None:

@@ -113,9 +113,10 @@ async def service_stop():
 @app.post('/api/service/retry-snapshot')
 async def retry_snapshot(body: dict):
     base_asset = (body.get('base_asset') or '').strip()
+    force = bool(body.get('force'))
     if not base_asset:
         raise HTTPException(status_code=400, detail='base_asset 不能为空')
-    ok, message = svc.retry_contract(base_asset)
+    ok, message = svc.retry_contract(base_asset, force=force)
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {'ok': True, 'message': message}
