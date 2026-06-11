@@ -4,7 +4,7 @@ import type { ITooltipParams } from 'ag-grid-community'
 
 /**
  * AG Grid 自定义 Tooltip 组件 —— 资金费结算明细
- * 展示每次资金费结算的序号、费率、金额
+ * 展示每次资金费结算的序号、本次结算费率、金额
  *
  * 使用方式（列定义中配置）：
  *   tooltipComponent: FundingHistoryTooltip,
@@ -26,7 +26,7 @@ const totalPnl = computed(() => {
       <thead>
         <tr>
           <th>次</th>
-          <th>8h费率</th>
+          <th>本次费率</th>
           <th>金额(USDT)</th>
           <th>时间</th>
         </tr>
