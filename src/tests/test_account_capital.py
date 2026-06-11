@@ -173,6 +173,20 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(summary['fee_cost'], -2.0)
         self.assertEqual(summary['total_pnl'], -18.0)
 
+    def test_position_strategy_realized_pnl_uses_basis_and_actual_open_amount(self):
+        snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
+        pnl = snapshotter._position_strategy_realized_pnl({
+            'open_spread_bps': 30.0,
+            'close_spread_bps': 45.0,
+            'spot_open_amount': 10.0,
+            'spot_close_amount': 12.0,
+            'future_open_qty': 100.0,
+            'future_open_price': 0.1,
+            'future_close_amount': 12.2,
+        })
+
+        self.assertAlmostEqual(pnl, -0.015)
+
 
 if __name__ == '__main__':
     unittest.main()

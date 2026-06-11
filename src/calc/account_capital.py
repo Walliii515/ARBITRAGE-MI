@@ -388,6 +388,15 @@ def _float(value) -> float:
         return 0.0
 
 
+def _float_or_none(value) -> Optional[float]:
+    if value is None or value == '':
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _has_value(value) -> bool:
     return value is not None and str(value).strip() != ''
 
