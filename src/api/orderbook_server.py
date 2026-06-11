@@ -246,7 +246,7 @@ _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=
 
 # ───── 开仓暂停开关 ─────
 _open_paused: bool = True                    # 正向开仓启动默认暂停，需人工恢复；平仓不受影响
-_reverse_open_paused: bool = False           # 反向开仓独立控制，默认保持运行
+_reverse_open_paused: bool = True            # 反向开仓启动默认暂停，需人工恢复；正向不受影响
 
 # ───── 交易链路连通性熔断 ─────
 # 仅实盘模式下启用：Binance + Gate 任一不通即禁止交易

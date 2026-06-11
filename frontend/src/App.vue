@@ -38,11 +38,15 @@ const tradingModeColor = computed(() => {
 })
 
 // ───── 开仓暂停开关 ─────
-const openPaused = ref(false)
-const openPauseLoading = ref(false)
+const forwardOpenPaused = ref(true)
+const reverseOpenPaused = ref(true)
+const forwardOpenPauseLoading = ref(false)
+const reverseOpenPauseLoading = ref(false)
 
-const openPauseTitle = computed(() => (openPaused.value ? '恢复开仓' : '暂停开仓'))
-const openPauseIcon = computed(() => (openPaused.value ? VideoPlay : VideoPause))
+const forwardOpenPauseTitle = computed(() => (forwardOpenPaused.value ? '恢复正向开仓' : '暂停正向开仓'))
+const reverseOpenPauseTitle = computed(() => (reverseOpenPaused.value ? '恢复反向开仓' : '暂停反向开仓'))
+const forwardOpenPauseIcon = computed(() => (forwardOpenPaused.value ? VideoPlay : VideoPause))
+const reverseOpenPauseIcon = computed(() => (reverseOpenPaused.value ? VideoPlay : VideoPause))
 
 async function fetchTradingMode() {
   try {
@@ -64,26 +68,44 @@ async function fetchOpenPausedStatus() {
   try {
     const res = await get('/api/trading/open/status')
     const data = await res.json()
-    openPaused.value = !!data.open_paused
+    forwardOpenPaused.value = !!data.open_paused
+    reverseOpenPaused.value = !!data.reverse_open_paused
   } catch {
     // 服务未启动时静默失败
   }
 }
 
-async function toggleOpenPause() {
-  openPauseLoading.value = true
+async function toggleForwardOpenPause() {
+  forwardOpenPauseLoading.value = true
   try {
-    const url = openPaused.value ? '/api/trading/open/resume' : '/api/trading/open/pause'
+    const url = forwardOpenPaused.value ? '/api/trading/open/resume' : '/api/trading/open/pause'
     const res = await post(url)
     const data = await res.json()
     if (data.ok) {
-      openPaused.value = data.open_paused
-      ElMessage.success(data.open_paused ? '开仓已暂停，平仓不受影响' : '开仓已恢复')
+      forwardOpenPaused.value = data.open_paused
+      ElMessage.success(data.open_paused ? '正向开仓已暂停，平仓不受影响' : '正向开仓已恢复')
     }
   } catch (e: any) {
     ElMessage.error(`操作失败: ${e.message || '未知错误'}`)
   } finally {
-    openPauseLoading.value = false
+    forwardOpenPauseLoading.value = false
+  }
+}
+
+async function toggleReverseOpenPause() {
+  reverseOpenPauseLoading.value = true
+  try {
+    const url = reverseOpenPaused.value ? '/api/trading/reverse-open/resume' : '/api/trading/reverse-open/pause'
+    const res = await post(url)
+    const data = await res.json()
+    if (data.ok) {
+      reverseOpenPaused.value = data.reverse_open_paused
+      ElMessage.success(data.reverse_open_paused ? '反向开仓已暂停，正向不受影响' : '反向开仓已恢复')
+    }
+  } catch (e: any) {
+    ElMessage.error(`操作失败: ${e.message || '未知错误'}`)
+  } finally {
+    reverseOpenPauseLoading.value = false
   }
 }
 
@@ -243,20 +265,37 @@ function toggleMenu() {
         </el-sub-menu>
       </el-menu>
 
-      <el-tooltip
-        :content="openPauseTitle"
-        placement="right"
-        :disabled="!isCollapsed"
-      >
-        <div
-          class="open-pause-control"
-          :class="{ 'is-paused': openPaused, 'is-loading': openPauseLoading }"
-          @click="toggleOpenPause"
+      <div class="open-pause-controls">
+        <el-tooltip
+          :content="forwardOpenPauseTitle"
+          placement="right"
+          :disabled="!isCollapsed"
         >
-          <el-icon><component :is="openPauseIcon" /></el-icon>
-          <span v-if="!isCollapsed" class="open-pause-text">{{ openPauseTitle }}</span>
-        </div>
-      </el-tooltip>
+          <div
+            class="open-pause-control"
+            :class="{ 'is-paused': forwardOpenPaused, 'is-loading': forwardOpenPauseLoading }"
+            @click="toggleForwardOpenPause"
+          >
+            <el-icon><component :is="forwardOpenPauseIcon" /></el-icon>
+            <span v-if="!isCollapsed" class="open-pause-text">{{ forwardOpenPauseTitle }}</span>
+          </div>
+        </el-tooltip>
+
+        <el-tooltip
+          :content="reverseOpenPauseTitle"
+          placement="right"
+          :disabled="!isCollapsed"
+        >
+          <div
+            class="open-pause-control"
+            :class="{ 'is-paused': reverseOpenPaused, 'is-loading': reverseOpenPauseLoading }"
+            @click="toggleReverseOpenPause"
+          >
+            <el-icon><component :is="reverseOpenPauseIcon" /></el-icon>
+            <span v-if="!isCollapsed" class="open-pause-text">{{ reverseOpenPauseTitle }}</span>
+          </div>
+        </el-tooltip>
+      </div>
       
       <!-- 折叠/展开按钮 -->
       <div class="collapse-btn" @click="toggleMenu">
@@ -383,14 +422,23 @@ function toggleMenu() {
   background-color: rgba(255, 255, 255, 0.04) !important;
 }
 
+.open-pause-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--app-border);
+}
+
 .open-pause-control {
-  height: 48px;
+  min-height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   color: #e6a23c;
-  border-top: 1px solid var(--app-border);
+  border: 1px solid rgba(230, 162, 60, 0.35);
+  border-radius: 4px;
   cursor: pointer;
   user-select: none;
   transition: all 0.3s ease;
@@ -403,6 +451,7 @@ function toggleMenu() {
 
 .open-pause-control.is-paused {
   color: #67c23a;
+  border-color: rgba(103, 194, 58, 0.35);
 }
 
 .open-pause-control.is-paused:hover {
@@ -420,7 +469,7 @@ function toggleMenu() {
 }
 
 .open-pause-text {
-  font-size: 13px;
+  font-size: 12px;
   white-space: nowrap;
 }
 
