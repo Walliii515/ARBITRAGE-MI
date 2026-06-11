@@ -1301,7 +1301,6 @@ def _run_open_position_check_once():
                 min_future_volume_24h_usdt=config.get_float('trade.filter.min_future_volume_24h_usdt', 0),
                 peak_pullback_pct=config.get_float('trade.peak_pullback.pullback_pct', 0.10),
                 peak_monitor_timeout_sec=config.get_int('trade.peak_pullback.monitor_timeout_sec', 60),
-                peak_timeout_cooldown_sec=config.get_int('trade.peak_pullback.timeout_cooldown_sec', 300),
                 sustain_sec=config.get_float('trade.peak_pullback.sustain_sec', 5.0),
                 margin_warning_pct=config.get_float('margin.warning_pct', 8.0),
                 risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),

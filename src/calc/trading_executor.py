@@ -67,7 +67,6 @@ class TradingExecutorConfig:
     # ─── 峰值回落 + sustain 确认（开仓回落通道） ───
     peak_pullback_pct: float = 0.10
     peak_monitor_timeout_sec: int = 60
-    peak_timeout_cooldown_sec: int = 300
     sustain_sec: float = 5.0                # 峰值监控最低持续秒数（过滤脉冲信号）
 
     # ─── 保证金风控 ───
@@ -219,10 +218,8 @@ class TradingExecutor:
         # 峰值回落 + sustain 开仓策略（单通道）
         self.peak_pullback_pct = cfg.peak_pullback_pct
         self.peak_monitor_timeout_sec = cfg.peak_monitor_timeout_sec
-        self.peak_timeout_cooldown_sec = cfg.peak_timeout_cooldown_sec
         self.sustain_sec = cfg.sustain_sec
         self._peak_state: Dict[str, Dict] = {}  # base_asset -> {peak_bps, start_time, trigger, signal_id}
-        self._timeout_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 超时冷却截止时间
         # 临时槽位：实时费率校验通过时记录的实时费率(bps)，供 _build_open_reason 取用
         self._last_realtime_rate_bps: Dict[str, float] = {}
         self._last_realtime_funding_info: Dict[str, Dict] = {}
@@ -524,11 +521,7 @@ class TradingExecutor:
                 if not self._pass_cooldown_check(base_asset):
                     continue
                                 
-                # 2.5 超时开仓冷却检查（防止连续超时重复开仓）
-                if not self._pass_timeout_cooldown(base_asset):
-                    continue
-                                
-                # 2.6 拒单冷却检查（被交易所拒单后暂停该标开仓）
+                # 2.5 拒单冷却检查（被交易所拒单后暂停该标开仓）
                 if not self._pass_reject_cooldown(base_asset):
                     continue
                                 
@@ -664,7 +657,7 @@ class TradingExecutor:
                         f"冷却{self.reject_cooldown_sec}s | 原因: {exec_result.get('message', '')[:80]}"
                     )
                 
-                # 开仓后清除峰值状态（trigger 仅可能为 'pullback'，超时分支已在 _pass_peak_check 内放弃）
+                # 开仓后清除峰值状态（pullback / timeout 等通道共用）
                 self._peak_state.pop(base_asset, None)
                 self._open_resiliency.clear(base_asset)
                 
@@ -1846,8 +1839,8 @@ class TradingExecutor:
         峰值回落 + sustain 开仓确认（单通道）:
         - 首次超阈值: 实时校验资金费率 + 记录峰值、开始时间, 返回 False(等待)
         - 后续更高: 更新峰值, 返回 False(继续等待)
-        - 监控超时(elapsed ≥ monitor_timeout_sec): 基差长期不回落，放弃本轮 + resolve 信号为
-          'monitor_timeout' + 进入 timeout_cooldown_sec 冷却, 返回 False（不开劣质单）
+        - 监控超时(elapsed ≥ monitor_timeout_sec): 基差长期不回落，设置 trigger='timeout'，
+          进入盘口恢复与最终旁路风控，避免错过持续高基差机会。
         - 从峰值回落 ≥ pullback_pct，且 elapsed ≥ sustain_sec:
           设置 trigger='pullback' + resiliency_active=True，进入盘口恢复等待。
         - resiliency_active 后续轮次：直接返回 True，让恢复检查持续采样；
@@ -1891,26 +1884,20 @@ class TradingExecutor:
         if current_basis_bps > state['peak_bps']:
             state['peak_bps'] = current_basis_bps
 
-        # 监控超时：基差长期不回落，放弃本轮 + 进入冷却（不开劣质单）
+        # 监控超时：基差长期不回落，直接进入盘口恢复与最终旁路风控。
         elapsed_sec = (now - state['start_time']).total_seconds()
         if elapsed_sec >= self.peak_monitor_timeout_sec:
             peak_bps = state['peak_bps']
-            # resolve 必须在 pop 之前，_resolve_signal 内部依赖 _peak_state 取 signal_id
-            self._resolve_signal(
-                base_asset, 'monitor_timeout',
-                f'监控{elapsed_sec:.0f}s未回落(峰{peak_bps:.1f}bps)',
-                exit_basis_bps=current_basis_bps,
-                trigger_type='monitor_timeout',
-            )
-            self._peak_state.pop(base_asset, None)
-            self._open_resiliency.clear(base_asset)
-            self._timeout_cooldown_until[base_asset] = now + timedelta(seconds=self.peak_timeout_cooldown_sec)
+            state['trigger'] = 'timeout'
+            state['resiliency_active'] = True
+            state['resiliency_start_time'] = now
+            state['timeout_elapsed_sec'] = elapsed_sec
             logger.info(
-                f"峰值监控超时放弃 | {base_asset} | "
+                f"峰值监控超时直开候选 | {base_asset} | "
                 f"peak={peak_bps:.2f} | current={current_basis_bps:.2f} | "
-                f"elapsed={elapsed_sec:.0f}s | 冷却{self.peak_timeout_cooldown_sec}s 后重新监控"
+                f"elapsed={elapsed_sec:.0f}s | 进入盘口恢复与最终旁路风控"
             )
-            return False
+            return True
 
         # 检查回落阈值：当前基差 ≤ 峰值 × (1 - pullback_pct)
         pullback_threshold = state['peak_bps'] * (1 - self.peak_pullback_pct)
@@ -2227,6 +2214,12 @@ class TradingExecutor:
                     f"距结算{float(entry_snapshot.get('funding_carry_next_min', 0)):.1f}min,"
                     f"金额{float(entry_snapshot.get('funding_carry_amount_usdt', self.open_amount_usdt)):.1f}U)"
                 )
+            elif trigger == 'timeout':
+                timeout_elapsed = float(peak_state.get('timeout_elapsed_sec', elapsed) or 0)
+                parts.append(
+                    f"峰值超时直开(峰{peak_bps:.1f},持续{timeout_elapsed:.1f}s≥"
+                    f"{self.peak_monitor_timeout_sec}s)"
+                )
             else:
                 parts.append(f"峰值{peak_bps:.1f}")
 
@@ -2289,17 +2282,6 @@ class TradingExecutor:
             parts.append(f"量({'|'.join(vol_parts)})")
 
         return '|'.join(parts)
-
-    def _pass_timeout_cooldown(self, base_asset: str) -> bool:
-        """检查超时开仓冷却期（防止连续超时重复开仓）"""
-        cooldown_until = self._timeout_cooldown_until.get(base_asset)
-        if cooldown_until is None:
-            return True  # 无超时冷却
-        if datetime.now() >= cooldown_until:
-            # 冷却已过期，清除
-            self._timeout_cooldown_until.pop(base_asset, None)
-            return True
-        return False
 
     def _pass_reject_cooldown(self, base_asset: str) -> bool:
         """检查开仓拒单冷却期（被交易所拒单后暂停该标的开仓）"""

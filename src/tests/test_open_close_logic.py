@@ -4,7 +4,7 @@
 
 覆盖目标：
   TradingExecutor:
-    - _pass_peak_check（首次/更新峰值/超时/未回落/sustain不足/通过）
+    - _pass_peak_check（首次/更新峰值/超时直开候选/未回落/sustain不足/通过）
     - _pass_open_resiliency_check（盘口恢复等待/通过/超时拒绝）
     - _pre_execution_gate（manager未注入/lag拦截/基差衰减/盈利性守卫/覆盖超限/通过）
   ClosingExecutor:
@@ -894,20 +894,18 @@ class TestTradingExecutorPeakCheck(unittest.TestCase):
         self.assertTrue(ret)
         self.assertTrue(self.te._peak_state['BTC']['resiliency_active'])
 
-    def test_monitor_timeout_resolves_and_cools(self):
-        """监控超时（elapsed ≥ 60s）→ 不开单 + 进入 timeout_cooldown，状态清除"""
+    def test_monitor_timeout_passes_with_timeout_trigger(self):
+        """监控超时（elapsed ≥ 60s）→ 进入盘口恢复/旁路风控，trigger=timeout"""
         self.te._pass_peak_check('BTC', 100.0, self.row)
         # 推早 65s 模拟超时
         self.te._peak_state['BTC']['start_time'] = datetime.now() - timedelta(seconds=65)
 
         ret = self.te._pass_peak_check('BTC', 95.0, self.row)
-        self.assertFalse(ret)
-        self.assertNotIn('BTC', self.te._peak_state)
-        self.assertIn('BTC', self.te._timeout_cooldown_until)
-        self.te._resolve_signal.assert_called_once()
-        # resolve 调用参数中 status='monitor_timeout'
-        args, kwargs = self.te._resolve_signal.call_args
-        self.assertEqual(args[1], 'monitor_timeout')
+        self.assertTrue(ret)
+        self.assertIn('BTC', self.te._peak_state)
+        self.assertEqual(self.te._peak_state['BTC']['trigger'], 'timeout')
+        self.assertTrue(self.te._peak_state['BTC']['resiliency_active'])
+        self.te._resolve_signal.assert_not_called()
 
 
 class TestTradingExecutorPreExecutionGate(unittest.TestCase):
