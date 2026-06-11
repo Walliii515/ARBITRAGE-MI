@@ -24,6 +24,7 @@ from calc.account_capital import build_default_capital_snapshotter
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
 from calc.reverse_trade_store import list_reverse_orders, list_reverse_positions
 
 logger = get_logger(__name__)
@@ -1224,3 +1225,23 @@ async def get_reverse_orders(
             'total_pages': result.total_pages,
         },
     }
+
+
+@router.get('/reverse-capital')
+async def get_reverse_capital():
+    """读取反向套利资金快照（reverse 子账户，只读）。"""
+    return get_reverse_capital_snapshot()
+
+
+@router.get('/reverse-reconciliation')
+async def get_reverse_reconciliation(
+    days: int = Query(365, ge=1, le=365, description="最近N天持仓"),
+):
+    """反向套利持仓对账（独立反向持仓表 + reverse 子账户）。"""
+    result = list_reverse_positions(
+        status='holding',
+        days=days,
+        page=1,
+        page_size=5000,
+    )
+    return build_reverse_reconciliation_rows(_serialize_rows(result.rows))

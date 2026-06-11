@@ -41,6 +41,26 @@ const router = createRouter({
       component: () => import('../views/ReverseTradeSignals.vue'),
     },
     {
+      path: '/reverse-arbitrage/orders',
+      name: 'reverse-arbitrage-orders',
+      component: () => import('../views/ReverseOrderManagement.vue'),
+    },
+    {
+      path: '/reverse-arbitrage/positions',
+      name: 'reverse-arbitrage-positions',
+      component: () => import('../views/ReversePositionMonitor.vue'),
+    },
+    {
+      path: '/reverse-arbitrage/capital',
+      name: 'reverse-arbitrage-capital',
+      component: () => import('../views/ReverseCapitalMonitor.vue'),
+    },
+    {
+      path: '/reverse-arbitrage/reconciliation',
+      name: 'reverse-arbitrage-reconciliation',
+      component: () => import('../views/ReverseReconciliation.vue'),
+    },
+    {
       path: '/positions',
       name: 'positions',
       component: () => import('../views/PositionMonitor.vue'),

@@ -209,6 +209,22 @@ function toggleMenu() {
             <el-icon><Stopwatch /></el-icon>
             <template #title>交易信号</template>
           </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/orders">
+            <el-icon><List /></el-icon>
+            <template #title>订单管理</template>
+          </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/positions">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title>持仓监控</template>
+          </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/capital">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title>资金监控</template>
+          </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/reconciliation">
+            <el-icon><DataAnalysis /></el-icon>
+            <template #title>持仓对账</template>
+          </el-menu-item>
         </el-sub-menu>
 
         <el-sub-menu index="settings">
