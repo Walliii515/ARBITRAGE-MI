@@ -145,16 +145,20 @@ class AccountCapitalSnapshotter:
             'position_value_usdt': spot_value,
             'margin_used_usdt': 0.0,
             'unrealized_pnl_usdt': 0.0,
-            'realized_pnl_usdt': 0.0,
+            'realized_pnl_usdt': pnl['binance_realized_pnl'],
             'funding_pnl_usdt': 0.0,
             'fee_cost_usdt': pnl['binance_fee_cost'],
-            'total_pnl_usdt': pnl['binance_fee_cost'],
+            'total_pnl_usdt': pnl['binance_realized_pnl'] + pnl['binance_fee_cost'],
             'detail': {
                 'source': 'exchange_api',
                 'balances': balances,
                 'prices': prices,
                 'pnl_window': pnl.get('window'),
-                'note': 'Binance spot does not expose a single realized PnL field; fees are aggregated from myTrades.',
+                'binance_spot_realized': pnl.get('binance_spot_realized'),
+                'note': (
+                    'Binance spot realized PnL is calculated from local closed positions '
+                    '(spot_close_amount - spot_open_amount); fees are aggregated from myTrades.'
+                ),
             },
         }
 
@@ -226,19 +230,21 @@ class AccountCapitalSnapshotter:
         start_sec = int(start_at.timestamp())
         end_sec = int(snapshot_at.timestamp())
         gate_summary = self._load_gate_account_book_summary(start_sec, end_sec)
+        binance_spot = self._load_binance_spot_realized_summary(start_at, snapshot_at)
         binance_fee = self._load_binance_trade_fee_summary(start_at)
         fee_cost = gate_summary['fee_cost'] + binance_fee
-        realized_pnl = gate_summary['realized_pnl']
+        realized_pnl = gate_summary['realized_pnl'] + binance_spot['realized_pnl']
         funding_pnl = gate_summary['funding_pnl']
         return {
-            'binance_realized_pnl': 0.0,
-            'gate_realized_pnl': realized_pnl,
+            'binance_realized_pnl': binance_spot['realized_pnl'],
+            'gate_realized_pnl': gate_summary['realized_pnl'],
             'realized_pnl': realized_pnl,
             'funding_pnl': funding_pnl,
             'binance_fee_cost': binance_fee,
             'gate_fee_cost': gate_summary['fee_cost'],
             'fee_cost': fee_cost,
             'total_pnl': realized_pnl + funding_pnl + fee_cost,
+            'binance_spot_realized': binance_spot,
             'gate_account_book_types': gate_summary['types'],
             'window': {
                 'from': start_at.strftime('%Y-%m-%d %H:%M:%S'),
@@ -266,6 +272,35 @@ class AccountCapitalSnapshotter:
             'funding_pnl': funding,
             'fee_cost': fee,
             'types': type_totals,
+        }
+
+    def _load_binance_spot_realized_summary(self, start_at: datetime, end_at: datetime) -> Dict:
+        """
+        Binance 现货没有 futures 那种 realized PnL 流水，按系统已平仓持仓计算：
+        现货已实现盈亏 = 平仓卖出现货成交金额 - 开仓买入现货成交金额。
+        手续费仍由 myTrades 单独统计到 fee_cost，避免重复扣费。
+        """
+        sql = """
+            SELECT
+                COUNT(*) AS closed_count,
+                COALESCE(SUM(spot_open_amount), 0) AS open_amount,
+                COALESCE(SUM(spot_close_amount), 0) AS close_amount,
+                COALESCE(SUM(spot_close_amount - spot_open_amount), 0) AS realized_pnl
+            FROM mi_trade_position
+            WHERE status = 'closed'
+              AND closed_at >= %s
+              AND closed_at <= %s
+              AND spot_open_amount IS NOT NULL
+              AND spot_close_amount IS NOT NULL
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (start_at, end_at))
+            row = cursor.fetchone() or {}
+        return {
+            'closed_count': int(row.get('closed_count') or 0),
+            'open_amount': _float(row.get('open_amount')),
+            'close_amount': _float(row.get('close_amount')),
+            'realized_pnl': _float(row.get('realized_pnl')),
         }
 
     def _load_binance_trade_fee_summary(self, start_at: datetime) -> float:
