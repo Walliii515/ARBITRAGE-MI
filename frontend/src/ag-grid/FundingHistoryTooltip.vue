@@ -17,6 +17,12 @@ const totalPnl = computed(() => {
   if (!Array.isArray(history)) return 0
   return history.reduce((sum: number, item: any) => sum + (item.pnl || 0), 0)
 })
+
+const totalRate = computed(() => {
+  const history = props.params?.value
+  if (!Array.isArray(history)) return 0
+  return history.reduce((sum: number, item: any) => sum + (item.rate || 0), 0)
+})
 </script>
 
 <template>
@@ -45,7 +51,10 @@ const totalPnl = computed(() => {
       </tbody>
       <tfoot>
         <tr class="fh-summary">
-          <td colspan="2">合计 ({{ params.value.length }}次)</td>
+          <td>合计 ({{ params.value.length }}次)</td>
+          <td class="fh-rate" :class="{ positive: totalRate > 0, negative: totalRate < 0 }">
+            {{ (totalRate * 100).toFixed(4) }}%
+          </td>
           <td class="fh-pnl" :class="{ positive: totalPnl > 0, negative: totalPnl < 0 }">
             {{ totalPnl.toFixed(4) }}
           </td>
