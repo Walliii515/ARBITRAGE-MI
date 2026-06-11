@@ -10,18 +10,20 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from common.tools import generate_signature, timestamp_to_datetime, calculate_24h_funding_rate
 from common.logger import get_logger, log_print
+from common.strategy_accounts import get_gate_futures_credentials
 
 logger = get_logger(__name__)
 
 # 自动加载 .env 文件（从当前目录向上查找）
 load_dotenv()
 
-# 获取 API 密钥
-API_KEY = os.getenv('GATE_FUTURES_API_KEY')
-API_SECRET = os.getenv('GATE_FUTURES_API_SECRET')
+# 获取 API 密钥（公共数据脚本默认使用正向 Gate 子账户）
+_CREDS = get_gate_futures_credentials(os.getenv('STRATEGY_ACCOUNT', 'forward'), mainnet=True)
+API_KEY = _CREDS.api_key
+API_SECRET = _CREDS.api_secret
 
 if not API_KEY or not API_SECRET:
-    raise ValueError("请确保 .envs 文件中配置了 GATE_FUTURES_API_KEY 和 GATE_FUTURES_API_SECRET")
+    raise ValueError("请确保 .env 文件中配置了 FORWARD_GATE_FUTURES_API_KEY/FORWARD_GATE_FUTURES_API_SECRET")
 
 host = "https://api.gateio.ws"
 prefix = "/api/v4"
@@ -135,4 +137,3 @@ if __name__ == '__main__':
                     log_print(f"     {j}. 资金费率: {rate} | 24h费率: {rate_24h} | 时间: {dt}")
             
             log_print("-" * 100)
-

@@ -33,6 +33,7 @@ from common.config import config
 from common.database import db_manager
 from common.logger import get_logger, log_print, setup_logging
 from common.meta_loader import fetch_asset_tier_meta, fetch_contract_meta, fetch_spot_meta
+from common.strategy_accounts import get_binance_credentials
 
 from api.trading_api import router as trading_router
 from api.auth import router as auth_router, verify_token_dependency, verify_ws_token
@@ -272,8 +273,9 @@ def _build_binance_margin_borrow_client() -> Optional[BinanceMarginBorrowClient]
         return None
 
     trade_mode = config.get_trade_mode()
-    api_key = os.getenv('BINANCE_API_KEY', '') if trade_mode == 'live' else os.getenv('BINANCE_TESTNET_API_KEY', '')
-    api_secret = os.getenv('BINANCE_API_SECRET', '') if trade_mode == 'live' else os.getenv('BINANCE_TESTNET_API_SECRET', '')
+    creds = get_binance_credentials('reverse', mainnet=trade_mode == 'live')
+    api_key = creds.api_key
+    api_secret = creds.api_secret
     if not api_key or not api_secret:
         return None
 

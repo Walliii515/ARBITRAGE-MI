@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from calc.real_executor import RealExecutor, ExchangeConfig
+from common.strategy_accounts import get_binance_credentials, get_gate_futures_credentials
 
 
 def main():
@@ -35,13 +36,16 @@ def main():
 
     # 构建配置
     if env == 'mainnet':
+        strategy = os.getenv('STRATEGY_ACCOUNT', 'forward').lower()
+        binance_creds = get_binance_credentials(strategy, mainnet=True)
+        gate_creds = get_gate_futures_credentials(strategy, mainnet=True)
         config = ExchangeConfig(
             binance_base_url='https://api.binance.com',
-            binance_api_key=os.getenv('BINANCE_API_KEY', ''),
-            binance_api_secret=os.getenv('BINANCE_API_SECRET', ''),
+            binance_api_key=binance_creds.api_key,
+            binance_api_secret=binance_creds.api_secret,
             gate_base_url='https://api.gateio.ws',
-            gate_api_key=os.getenv('GATE_FUTURES_API_KEY', ''),
-            gate_api_secret=os.getenv('GATE_FUTURES_API_SECRET', ''),
+            gate_api_key=gate_creds.api_key,
+            gate_api_secret=gate_creds.api_secret,
             env='mainnet',
         )
     else:

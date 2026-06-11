@@ -16,6 +16,7 @@ from common.config import config
 from common.database import db_manager
 from common.logger import get_logger
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+from common.strategy_accounts import get_binance_credentials, get_gate_futures_credentials
 
 logger = get_logger(__name__)
 
@@ -61,13 +62,15 @@ def build_exchange_config() -> ExchangeConfig:
     env = config.get_real_executor_env()
     timeout_sec = config.get_int('real_executor.timeout_sec', 10)
     if env == 'mainnet':
+        binance_creds = get_binance_credentials('forward', mainnet=True)
+        gate_creds = get_gate_futures_credentials('forward', mainnet=True)
         return ExchangeConfig(
             binance_base_url='https://api1.binance.com',
-            binance_api_key=os.getenv('BINANCE_API_KEY', ''),
-            binance_api_secret=os.getenv('BINANCE_API_SECRET', ''),
+            binance_api_key=binance_creds.api_key,
+            binance_api_secret=binance_creds.api_secret,
             gate_base_url='https://api.gateio.ws',
-            gate_api_key=os.getenv('GATE_FUTURES_API_KEY', ''),
-            gate_api_secret=os.getenv('GATE_FUTURES_API_SECRET', ''),
+            gate_api_key=gate_creds.api_key,
+            gate_api_secret=gate_creds.api_secret,
             timeout_sec=timeout_sec,
             env='mainnet',
         )
