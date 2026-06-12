@@ -41,6 +41,7 @@ interface PositionRow {
   opened_at: string | null
   closed_at: string | null
   base_asset: string | null
+  market_profile: string | null
   spot_symbol: string | null
   future_contract: string | null
   status: string | null
@@ -454,6 +455,12 @@ const pnlCellStyle = (params: ValueFormatterParams) => {
 
 const feeBpsCellStyle = () => ({ color: '#67c23a' })
 
+const profileColorMap: Record<string, string> = {
+  normal: '#67c23a',
+  thin_bursty: '#e6a23c',
+  illiquid_blocked: '#f56c6c',
+}
+
 /* ───── 列定义 ───── */
 const columnDefs = computed<ColDef<PositionRow>[]>(() => [
   {
@@ -467,6 +474,17 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     field: 'base_asset',
     width: 100,
     pinned: 'left',
+  },
+  {
+    headerName: '画像',
+    field: 'market_profile',
+    width: 115,
+    pinned: 'left',
+    cellRenderer: (params: any) => {
+      const profile = params.value || 'normal'
+      const color = profileColorMap[profile] || '#909399'
+      return `<span style="color:${color};font-weight:700">${profile}</span>`
+    },
   },
   {
     headerName: '现货',
@@ -980,6 +998,7 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
   return [{
     id: -1,
     base_asset: '汇总',
+    market_profile: null,
     opened_at: null,
     closed_at: null,
     spot_symbol: null,

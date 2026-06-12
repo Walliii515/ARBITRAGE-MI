@@ -48,7 +48,7 @@ const loading = ref(false)
 // 筛选条件
 const filterStatus = ref<string>('')
 const filterExitReason = ref<string>('')
-const filterDays = ref<number>(1) // 默认今日
+const filterDays = ref<number>(90) // 默认90天，与持仓监控一致
 const filterAsset = ref<string>('')
 
 // 分页配置
@@ -435,6 +435,7 @@ onUnmounted(() => {
           <el-button :type="filterDays === 3 ? 'primary' : 'default'" @click="setDaysFilter(3)">3天</el-button>
           <el-button :type="filterDays === 7 ? 'primary' : 'default'" @click="setDaysFilter(7)">7天</el-button>
           <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDaysFilter(30)">30天</el-button>
+          <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDaysFilter(90)">90天</el-button>
         </el-button-group>
       </div>
 

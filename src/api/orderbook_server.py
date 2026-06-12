@@ -1495,7 +1495,7 @@ def _run_open_position_check_once():
                 funding_carry_amount_usdt=config.get_float('trade.funding_carry_open.amount_usdt', 0.0),
                 thin_bursty_enabled=config.get_bool('trade.market_profile.thin_bursty.enabled', True),
                 thin_bursty_open_amount_multiplier=config.get_float(
-                    'trade.market_profile.thin_bursty.open_amount_multiplier', 0.5
+                    'trade.market_profile.thin_bursty.open_amount_multiplier', 0.8
                 ),
                 thin_bursty_max_orderbook_lag_ms=config.get_float(
                     'trade.market_profile.thin_bursty.max_orderbook_lag_ms', 1500.0

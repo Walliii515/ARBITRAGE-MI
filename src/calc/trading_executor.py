@@ -132,7 +132,7 @@ class TradingExecutorConfig:
 
     # ─── 行情画像参数覆盖 ───
     thin_bursty_enabled: bool = True
-    thin_bursty_open_amount_multiplier: float = 0.5
+    thin_bursty_open_amount_multiplier: float = 0.8
     thin_bursty_max_orderbook_lag_ms: float = 1500.0
     thin_bursty_max_book_skew_ms: float = 1500.0
 

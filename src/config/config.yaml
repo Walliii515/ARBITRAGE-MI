@@ -155,7 +155,7 @@ trade:
   market_profile:
     thin_bursty:
       enabled: true                         # 薄盘/跳动式更新标的启用专用参数
-      open_amount_multiplier: 0.5           # 单笔金额缩小，降低旧盘口/薄盘口成交漂移
+      open_amount_multiplier: 0.8           # 单笔金额为普通开仓的80%，避免触碰最低开仓金额
       max_orderbook_lag_ms: 1500            # 最终旁路仍检查新鲜度，但允许比 normal 更宽
       max_book_skew_ms: 1500                # Gate/Binance 两边最近更新相差过大仍拒单
 

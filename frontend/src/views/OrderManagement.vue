@@ -61,6 +61,7 @@ interface PositionRow {
   id: number
   order_uuid: string | null
   base_asset: string
+  market_profile: string | null
   status: string  // holding / closed
   opened_at: string | null
   closed_at: string | null
@@ -105,7 +106,7 @@ const loading = ref(false)
 const orderSideFilter = ref<string>('')
 const exchangeRiskOnly = ref<boolean>(false)
 const baseAssetFilter = ref<string>('')
-const filterDays = ref<number>(1) // 默认今日
+const filterDays = ref<number>(90) // 默认90天，与持仓监控一致
 const orderSummary = ref<OrderSummary>({ total: 0, open: 0, close: 0, exchange_risk: 0 })
 
 // 一键全部平仓
@@ -221,6 +222,12 @@ function formatExchangeRisk(row: PositionRow | null | undefined): string {
   return typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status
 }
 
+const profileColorMap: Record<string, string> = {
+  normal: '#67c23a',
+  thin_bursty: '#e6a23c',
+  illiquid_blocked: '#f56c6c',
+}
+
 /* ───── 列定义 ───── */
 const columnDefs = computed((): ColDef[] => [
   {
@@ -244,6 +251,17 @@ const columnDefs = computed((): ColDef[] => [
       const row = params.data as PositionRow
       const count = row?.order_count ?? 0
       return `<strong class="group-asset">${row?.base_asset ?? ''} (${count})</strong>`
+    },
+  },
+  {
+    headerName: '画像',
+    field: 'market_profile',
+    width: 115,
+    pinned: 'left',
+    cellRenderer: (params: any) => {
+      const profile = params.value || 'normal'
+      const color = profileColorMap[profile] || '#909399'
+      return `<span style="color:${color};font-weight:700">${profile}</span>`
     },
   },
   {
@@ -672,6 +690,7 @@ onUnmounted(() => {
           <el-button :type="filterDays === 3 ? 'primary' : 'default'" @click="setDaysFilter(3)">3天</el-button>
           <el-button :type="filterDays === 7 ? 'primary' : 'default'" @click="setDaysFilter(7)">7天</el-button>
           <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDaysFilter(30)">30天</el-button>
+          <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDaysFilter(90)">90天</el-button>
         </el-button-group>
 
         <span class="filter-label" style="margin-left: 24px;">标的：</span>

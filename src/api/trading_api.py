@@ -120,7 +120,7 @@ async def get_orders(
     exchange_risk: bool = Query(False, description="仅展示交易所风险持仓"),
     position_id: Optional[int] = Query(None, description="持仓ID过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
-    days: int = Query(1, ge=1, le=90, description="最近N天"),
+    days: int = Query(90, ge=1, le=90, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页持仓数"),
 ):
@@ -209,11 +209,14 @@ async def get_orders(
     query_params = list(params) + [page_size, offset]
     sql = f"""
         SELECT p.*,
+               COALESCE(b.market_profile, 'normal') AS market_profile,
                t.open_basis_p20 AS open_vwap_threshold_bps,
                t.{close_threshold_col} AS close_vwap_threshold_bps,
                (SELECT o.channel FROM mi_trade_order o WHERE o.position_id = p.id LIMIT 1) AS channel,
                (SELECT COUNT(*) FROM mi_trade_order o WHERE o.position_id = p.id) AS order_count
         FROM mi_trade_position p
+        LEFT JOIN mi_base_asset b
+          ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
         LEFT JOIN (
             SELECT v.*
             FROM mi_vwap_basis_threshold v
@@ -369,17 +372,23 @@ async def get_positions(
         
         # 查询分页数据
         offset = (page - 1) * page_size
-        sql = "SELECT * FROM mi_trade_position WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+        sql = """
+            SELECT p.*, COALESCE(b.market_profile, 'normal') AS market_profile
+            FROM mi_trade_position p
+            LEFT JOIN mi_base_asset b
+              ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
+            WHERE p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
+        """
         params = [days]
         
         if status:
-            sql += " AND status = %s"
+            sql += " AND p.status = %s"
             params.append(status)
         if base_asset:
-            sql += " AND base_asset = %s"
+            sql += " AND p.base_asset = %s"
             params.append(base_asset)
         
-        sql += " ORDER BY opened_at DESC LIMIT %s OFFSET %s"
+        sql += " ORDER BY p.opened_at DESC LIMIT %s OFFSET %s"
         params.extend([page_size, offset])
         
         with db_manager.get_cursor() as cursor:
@@ -605,7 +614,8 @@ async def get_capital_latest():
             realized_pnl_usdt,
             funding_pnl_usdt,
             fee_cost_usdt,
-            total_pnl_usdt
+            total_pnl_usdt,
+            COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
@@ -653,7 +663,8 @@ async def get_capital_history(
             s.realized_pnl_usdt,
             s.funding_pnl_usdt,
             s.fee_cost_usdt,
-            s.total_pnl_usdt
+            s.total_pnl_usdt,
+            COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt
         FROM mi_capital_snapshot s
         INNER JOIN (
             SELECT
@@ -1018,7 +1029,7 @@ async def get_signals(
     status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected/gate_rejected"),
     exit_reason: Optional[str] = Query(None, description="结束原因模糊过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
-    days: int = Query(3, ge=1, le=30, description="最近N天"),
+    days: int = Query(90, ge=1, le=90, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):

@@ -110,7 +110,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_carry_basis_relax_bps=15.0,
         funding_carry_max_next_funding_min=30.0,
         funding_carry_amount_usdt=10.0,
-        thin_bursty_open_amount_multiplier=0.5,
+        thin_bursty_open_amount_multiplier=0.8,
         thin_bursty_max_orderbook_lag_ms=1500.0,
         thin_bursty_max_book_skew_ms=1500.0,
     )
@@ -1055,7 +1055,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         """thin_bursty 单笔金额按配置缩小。"""
         self.te.asset_profile_meta = {'BTC': {'market_profile': 'thin_bursty'}}
         self.te.open_amount_usdt = 10.0
-        self.assertEqual(self.te._active_open_amount_usdt({'base_asset': 'BTC'}), 5.0)
+        self.assertEqual(self.te._active_open_amount_usdt({'base_asset': 'BTC'}), 8.0)
 
     def test_live_pre_gate_uses_realtime_funding_snapshot(self):
         """实盘旁路用下单前实时 funding 覆盖缓存 funding，并重算 entry snapshot。"""

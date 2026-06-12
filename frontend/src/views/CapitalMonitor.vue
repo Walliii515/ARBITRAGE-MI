@@ -19,6 +19,7 @@ interface CapitalRow {
   funding_pnl_usdt: number | null
   fee_cost_usdt: number | null
   total_pnl_usdt: number | null
+  gross_total_pnl_usdt: number | null
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -30,6 +31,7 @@ type ChartMetric =
   | 'realized_pnl_usdt'
   | 'funding_pnl_usdt'
   | 'total_pnl_usdt'
+  | 'gross_total_pnl_usdt'
 
 const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
@@ -50,6 +52,7 @@ const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | '
   { key: 'realized_pnl_usdt', label: '平仓盈亏', group: 'pnl', color: '#9b59b6' },
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
   { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#303133' },
+  { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
 ]
 
 const latestByExchange = computed(() => {
@@ -334,6 +337,12 @@ onBeforeUnmount(() => {
           <span>净已实现收益</span>
           <strong :class="Number(latestByExchange[exchange]?.total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.total_pnl_usdt) }}
+          </strong>
+        </div>
+        <div class="metric-row">
+          <span>总盈亏</span>
+          <strong :class="Number(latestByExchange[exchange]?.gross_total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+            {{ formatAmount(latestByExchange[exchange]?.gross_total_pnl_usdt) }}
           </strong>
         </div>
       </div>

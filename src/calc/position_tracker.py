@@ -488,9 +488,12 @@ class PositionTracker:
     def get_holding_positions(self) -> List[Dict]:
         """获取所有持仓中记录"""
         sql = """
-            SELECT * FROM mi_trade_position 
-            WHERE status = 'holding' 
-            ORDER BY opened_at DESC
+            SELECT p.*, COALESCE(b.market_profile, 'normal') AS market_profile
+            FROM mi_trade_position p
+            LEFT JOIN mi_base_asset b
+              ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
+            WHERE p.status = 'holding'
+            ORDER BY p.opened_at DESC
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
@@ -499,8 +502,11 @@ class PositionTracker:
     def get_all_positions(self) -> List[Dict]:
         """获取全部持仓记录（含已平仓），用于实时推送"""
         sql = """
-            SELECT * FROM mi_trade_position
-            ORDER BY opened_at DESC
+            SELECT p.*, COALESCE(b.market_profile, 'normal') AS market_profile
+            FROM mi_trade_position p
+            LEFT JOIN mi_base_asset b
+              ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
+            ORDER BY p.opened_at DESC
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
