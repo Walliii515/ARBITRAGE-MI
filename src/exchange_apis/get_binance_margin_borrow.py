@@ -206,9 +206,22 @@ class BinanceMarginBorrowClient:
             result.setdefault(asset, {})
             result[asset]['max_borrowable_amount'] = amount
             result[asset]['account_borrow_limit'] = limit
-            if result[asset].get('borrow_limit') is None:
-                result[asset]['borrow_limit'] = limit
+            if amount is not None:
+                result[asset]['borrow_limit'] = amount
             if result[asset].get('borrowable') is None:
                 result[asset]['borrowable'] = (amount or 0) > 0
+            elif amount is not None and amount <= 0:
+                result[asset]['borrowable'] = False
+        for asset in clean_assets[:max(0, max_borrowable_assets)]:
+            if 'max_borrowable_amount' in result.get(asset, {}):
+                continue
+            # maxBorrowable 返回 -3045 时，crossMarginData 仍可能给出理论 borrowLimit。
+            # 真实开仓必须以实时可借库存为准，不能用理论额度兜底。
+            result.setdefault(asset, {})
+            result[asset]['max_borrowable_amount'] = 0.0
+            result[asset]['account_borrow_limit'] = result[asset].get('borrow_limit')
+            result[asset]['borrow_limit'] = 0.0
+            result[asset]['borrowable'] = False
+            result[asset]['borrow_unavailable_reason'] = 'max_borrowable_unavailable'
 
         return result

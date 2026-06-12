@@ -492,7 +492,7 @@ def test_binance_margin_borrow_client_maps_interest_and_borrow_limit(monkeypatch
     assert meta['HOME']['account_borrow_limit'] == 200000
 
 
-def test_binance_margin_borrow_client_uses_fee_data_borrow_limit_when_amount_is_zero(monkeypatch):
+def test_binance_margin_borrow_client_uses_realtime_amount_when_amount_is_zero(monkeypatch):
     client = BinanceMarginBorrowClient(BinanceMarginBorrowConfig(
         base_url='https://example.test',
         api_key='key',
@@ -518,8 +518,95 @@ def test_binance_margin_borrow_client_uses_fee_data_borrow_limit_when_amount_is_
 
     meta = client.get_cross_margin_borrow_meta(['HOME'])
 
-    assert meta['HOME']['borrowable'] is True
+    assert meta['HOME']['borrowable'] is False
     assert meta['HOME']['hourly_interest_rate'] == 0.0000994603
-    assert meta['HOME']['borrow_limit'] == 170000
+    assert meta['HOME']['borrow_limit'] == 0
     assert meta['HOME']['max_borrowable_amount'] == 0
     assert meta['HOME']['account_borrow_limit'] == 200000
+
+
+def test_binance_margin_borrow_client_marks_asset_unavailable_when_max_borrowable_fails(monkeypatch):
+    client = BinanceMarginBorrowClient(BinanceMarginBorrowConfig(
+        base_url='https://example.test',
+        api_key='key',
+        api_secret='secret',
+    ))
+
+    def fake_signed_get(path, params):
+        if path.endswith('next-hourly-interest-rate'):
+            return [{'asset': 'ID', 'nextHourlyInterestRate': '0.00014107'}]
+        if path.endswith('crossMarginData'):
+            return [{
+                'coin': 'ID',
+                'borrowable': True,
+                'dailyInterest': '0.00338568',
+                'yearlyInterest': '1.2357732',
+                'borrowLimit': '76000',
+            }]
+        if path.endswith('maxBorrowable'):
+            raise RuntimeError(
+                'Binance margin /sapi/v1/margin/maxBorrowable HTTP 400: '
+                '{"code":-3045,"msg":"The system does not have enough asset now."}'
+            )
+        raise AssertionError(path)
+
+    monkeypatch.setattr(client, '_signed_get', fake_signed_get)
+
+    meta = client.get_cross_margin_borrow_meta(['ID'])
+
+    assert meta['ID']['borrowable'] is False
+    assert meta['ID']['borrow_limit'] == 0
+    assert meta['ID']['max_borrowable_amount'] == 0
+    assert meta['ID']['account_borrow_limit'] == 76000
+    assert meta['ID']['borrow_unavailable_reason'] == 'max_borrowable_unavailable'
+
+
+def test_reverse_opportunity_uses_realtime_max_borrowable_amount_for_capacity():
+    row = {
+        'base_asset': 'ID',
+        'contract': 'ID_USDT',
+        'spot_qty': 301,
+        'future_qty': 301,
+        'spot_price_bid_1': 0.0331,
+        'spot_volume_bid_1': 100000,
+        'future_price_ask_1': 0.0331,
+        'future_volume_ask_1': 100000,
+    }
+    for i in range(2, 21):
+        row[f'spot_price_bid_{i}'] = 0.0331
+        row[f'spot_volume_bid_{i}'] = 0
+        row[f'future_price_ask_{i}'] = 0.0331
+        row[f'future_volume_ask_{i}'] = 0
+
+    cfg = ReverseArbitrageConfig(
+        open_amount_usdt=10,
+        spot_open_fee=0.00075,
+        spot_close_fee=0.00075,
+        future_open_fee=0.0002,
+        future_close_fee=0.0002,
+        orderbook_coverage_threshold=0.6,
+    )
+    contract_meta = {'ID': {'funding_rate_24h': -0.031866, 'quanto_multiplier': 1}}
+    borrow_meta = {
+        'ID': {
+            'borrowable': False,
+            'hourly_interest_rate': 0.00014107,
+            'borrow_limit': 76000,
+            'max_borrowable_amount': 0,
+            'account_borrow_limit': 76000,
+        }
+    }
+    reverse_threshold_meta = {
+        'ID': {
+            'reverse_open_basis_p20': -4.03,
+            'reverse_close_basis_p20': -22.76,
+        }
+    }
+
+    enrich_reverse_opportunities([row], contract_meta, cfg, borrow_meta, reverse_threshold_meta)
+
+    assert row['reverse_borrow_limit'] == 0
+    assert row['reverse_theoretical_borrow_limit'] == 76000
+    assert row['reverse_borrow_capacity_usdt'] == 0
+    assert row['reverse_borrow_pass'] is False
+    assert row['reverse_status'] == 'borrow_unavailable'
