@@ -426,6 +426,20 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
   return [
     { headerName: '标的资产', field: 'base_asset', pinned: 'left', width: 90 },
     {
+      headerName: '行情画像',
+      field: 'market_profile',
+      pinned: 'left',
+      width: 120,
+      tooltipField: 'market_profile_reason',
+      valueFormatter: (p) => p.value == null ? 'normal' : String(p.value),
+      cellStyle: (params) => {
+        const profile = String(params.value || 'normal')
+        if (profile === 'thin_bursty') return { color: '#e6a23c', fontWeight: '700' }
+        if (profile === 'illiquid_blocked') return { color: '#f56c6c', fontWeight: '700' }
+        return { color: '#67c23a', fontWeight: '400' }
+      },
+    },
+    {
       headerName: '开仓金额(USDT)',
       field: 'open_amount_usdt',
       width: 120,
@@ -536,6 +550,46 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       if (p.value == null) return '—'
       return Number(p.value).toLocaleString('en-US', { maximumFractionDigits: 0 })
     },
+  },
+  {
+    headerName: '现货Spread(bps)',
+    field: 'spot_spread_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toFixed(1),
+    cellStyle: (params) => Number(params.value ?? 0) >= 30 ? { color: '#e6a23c' } : null,
+  },
+  {
+    headerName: '合约Spread(bps)',
+    field: 'future_spread_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toFixed(1),
+    cellStyle: (params) => Number(params.value ?? 0) >= 30 ? { color: '#e6a23c' } : null,
+  },
+  {
+    headerName: '现货顶层深度',
+    field: 'spot_top_ask_usdt',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toLocaleString('en-US', { maximumFractionDigits: 0 }),
+    cellStyle: (params) => Number(params.value ?? 0) < 100 ? { color: '#e6a23c' } : null,
+  },
+  {
+    headerName: '合约顶层深度',
+    field: 'future_top_bid_usdt',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toLocaleString('en-US', { maximumFractionDigits: 0 }),
+    cellStyle: (params) => Number(params.value ?? 0) < 100 ? { color: '#e6a23c' } : null,
   },
   {
     headerName: '开仓盘口覆盖',

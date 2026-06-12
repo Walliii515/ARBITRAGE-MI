@@ -150,6 +150,19 @@ def _run_calculate_funding_rate_threshold():
     count_positive_funding_rates(max_days=30)
 
 
+def _run_update_asset_market_profiles():
+    """
+    标的行情画像刷新
+
+    数据源：mi_base_asset + mi_binance_spot_info + mi_gate_future_contracts
+    目标表：mi_base_asset.market_profile*
+    更新策略：按 24h 双边流动性将标的标记为 normal / thin_bursty / illiquid_blocked
+    用途：开仓状态机对薄盘跳动式标的使用更宽监控、更严执行的小仓位逻辑。
+    """
+    from calc.update_asset_market_profiles import update_asset_market_profiles
+    update_asset_market_profiles()
+
+
 def _run_cleanup_vwap_snapshots():
     """
     VWAP 基差快照数据清理
@@ -245,6 +258,15 @@ ETL_TASKS: List[ETLTask] = [
         interval_minutes=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
         run_on_startup=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('run_on_startup', True),
         enabled=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('enabled', True),
+    ),
+    ETLTask(
+        name='update_asset_market_profiles',
+        description='标的行情画像 → mi_base_asset.market_profile（normal/thin_bursty/illiquid_blocked）',
+        runner=_run_update_asset_market_profiles,
+        schedule='interval',
+        interval_minutes=_etl_config.get('tasks', {}).get('update_asset_market_profiles', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
+        run_on_startup=_etl_config.get('tasks', {}).get('update_asset_market_profiles', {}).get('run_on_startup', True),
+        enabled=_etl_config.get('tasks', {}).get('update_asset_market_profiles', {}).get('enabled', True),
     ),
     ETLTask(
         name='cleanup_vwap_snapshots',

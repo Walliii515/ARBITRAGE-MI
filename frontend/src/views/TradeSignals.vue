@@ -13,6 +13,7 @@ interface SignalRow {
   id: number
   base_asset: string
   strategy_tier: 'A' | 'B' | 'C' | string | null
+  market_profile: string | null
   signal_time: string
   resolved_time: string | null
   status: 'monitoring' | 'opened' | 'conditions_lost' | 'rejected' | 'gate_rejected'
@@ -139,6 +140,12 @@ const tierColorMap: Record<string, string> = {
   C: '#909399',
 }
 
+const profileColorMap: Record<string, string> = {
+  normal: '#67c23a',
+  thin_bursty: '#e6a23c',
+  illiquid_blocked: '#f56c6c',
+}
+
 function formatBps(value: unknown): string {
   if (value == null || value === '') return ''
   const n = Number(value)
@@ -170,6 +177,17 @@ const columnDefs = ref<ColDef[]>([
       const tier = params.value || 'C'
       const color = tierColorMap[tier] || '#909399'
       return `<span style="color:${color};font-weight:700">${tier}</span>`
+    },
+  },
+  {
+    headerName: '画像',
+    field: 'market_profile',
+    width: 115,
+    pinned: 'left',
+    cellRenderer: (params: any) => {
+      const profile = params.value || 'normal'
+      const color = profileColorMap[profile] || '#909399'
+      return `<span style="color:${color};font-weight:700">${profile}</span>`
     },
   },
   { headerName: '信号时间', field: 'signal_time', width: 165 },

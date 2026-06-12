@@ -56,9 +56,8 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
-    max_total_positions: 45                 # 全局最大持仓数，保留资金buffer给future追保
-    max_positions_per_asset: 7              # 同标的最大持仓数
-    # max_positions_per_asset: 1              # 同标的最大持仓数
+    min_available_ratio: 0.10               # Binance/Gate 下单后可用资金不得低于各自总资金的比例
+    max_asset_exposure_ratio: 0.10          # 单标的 spot开仓额 / future当前保证金 均不得超过各自总资金比例
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
@@ -147,8 +146,18 @@ trade:
     allowed_tiers: [A, B]
     min_24h_bps: 30                         # 当前实时24h资金费率 >= 30bps
     basis_relax_bps: 15                     # current_basis >= max(开仓p20, 平仓p20) - 15bps
-    max_next_funding_min: 60                # 距离下次资金费结算 <= 60分钟
+    max_next_funding_min: 30                # 距离下次资金费结算 <= 30分钟
     amount_usdt: 10                         # 单笔小仓位金额；设0则跟随 trade.open.amount_usdt
+
+  # ─── 行情画像参数覆盖 ───
+  # market_profile 不替代 A/B/C 分层：A/B/C 决定是否进交易池，
+  # market_profile 决定行情稀疏/薄盘标的使用哪组监控和执行参数。
+  market_profile:
+    thin_bursty:
+      enabled: true                         # 薄盘/跳动式更新标的启用专用参数
+      open_amount_multiplier: 0.5           # 单笔金额缩小，降低旧盘口/薄盘口成交漂移
+      max_orderbook_lag_ms: 1500            # 最终旁路仍检查新鲜度，但允许比 normal 更宽
+      max_book_skew_ms: 1500                # Gate/Binance 两边最近更新相差过大仍拒单
 
   # ─── 信号降噪 / 执行质量冷却 ───
   rebound_timeout_cooldown:
@@ -407,3 +416,7 @@ orderbook:
 
   # WebSocket 向前端广播订单簿快照的最小间隔（秒），用于节流
   broadcast_throttle_sec: 2.0
+
+asset_market_profile:
+  thin_spot_volume_24h_usdt: 1000000       # 低于该现货成交额的 A/B 标的标为 thin_bursty
+  thin_future_volume_24h_usdt: 500000      # 低于该合约成交额的 A/B 标的标为 thin_bursty

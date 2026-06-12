@@ -107,3 +107,43 @@ def fetch_asset_tier_meta() -> Dict[str, str]:
     except Exception as e:
         logger.error(f'加载标的策略分层失败: {e}', exc_info=True)
     return result
+
+
+def fetch_asset_market_profile_meta() -> Dict[str, Dict]:
+    """
+    从 mi_base_asset 加载行情画像，按 base_asset 索引。
+
+    Returns:
+        base_asset -> {
+            market_profile: 'normal'/'thin_bursty'/'illiquid_blocked',
+            market_profile_reason,
+            market_profile_updated_at,
+        }
+    """
+    sql = """
+        SELECT
+            base_asset,
+            COALESCE(market_profile, 'normal') AS market_profile,
+            market_profile_reason,
+            market_profile_updated_at
+        FROM mi_base_asset
+    """
+    result = {}
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            for row in rows:
+                base_asset = row.get('base_asset')
+                if not base_asset:
+                    continue
+                profile = (row.get('market_profile') or 'normal').strip()
+                result[base_asset.strip().upper()] = {
+                    'market_profile': profile,
+                    'market_profile_reason': row.get('market_profile_reason'),
+                    'market_profile_updated_at': row.get('market_profile_updated_at'),
+                }
+    except Exception as e:
+        # 兼容尚未执行 migration 024 的环境。
+        logger.warning(f'加载标的行情画像失败，按 normal 退化: {e}')
+    return result

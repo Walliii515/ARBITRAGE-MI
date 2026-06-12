@@ -81,10 +81,11 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           rebound_allowed_tiers=None,
                           funding_entry_enabled=True,
                           funding_carry_enabled=False,
-                          max_total_positions=45,
-                          max_positions_per_asset=1,
+                          min_available_ratio=0.10,
+                          max_asset_exposure_ratio=0.10,
                           contract_meta=None,
-                          spot_meta=None):
+                          spot_meta=None,
+                          asset_profile_meta=None):
     """构造独立的 TradingExecutor 实例（不依赖 DB / API）"""
     from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 
@@ -102,19 +103,23 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         rebound_allowed_tiers=rebound_allowed_tiers or ['A', 'B'],
         funding_entry_enabled=funding_entry_enabled,
         funding_carry_enabled=funding_carry_enabled,
-        max_total_positions=max_total_positions,
-        max_positions_per_asset=max_positions_per_asset,
+        min_available_ratio=min_available_ratio,
+        max_asset_exposure_ratio=max_asset_exposure_ratio,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
-        funding_carry_max_next_funding_min=60.0,
+        funding_carry_max_next_funding_min=30.0,
         funding_carry_amount_usdt=10.0,
+        thin_bursty_open_amount_multiplier=0.5,
+        thin_bursty_max_orderbook_lag_ms=1500.0,
+        thin_bursty_max_book_skew_ms=1500.0,
     )
     te = TradingExecutor(
         cfg, contract_meta=contract_meta or {}, spot_meta=spot_meta or {},
         vwap_threshold_meta=vwap_threshold_meta,
         close_vwap_threshold_meta=close_vwap_threshold_meta,
         asset_tier_meta=asset_tier_meta,
+        asset_profile_meta=asset_profile_meta,
     )
     return te
 
@@ -1033,6 +1038,25 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         self.assertAlmostEqual(gate_lag, 50, delta=30)
         self.assertAlmostEqual(spot_lag, 60, delta=30)
 
+    def test_thin_bursty_profile_uses_wider_pre_gate_lag(self):
+        """thin_bursty 可放宽最终旁路 lag，但仍走其它旁路风控。"""
+        self.te.asset_profile_meta = {'BTC': {'market_profile': 'thin_bursty'}}
+        self._setup_books(gate_lag_sec=1.0, spot_lag_sec=1.0)
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(
+            vwap_basis_bps=0, open_coverage=0.5,
+        )
+        with m_merge, m_hedge, m_vwap:
+            passed, _, basis, reason = self.te._pre_execution_gate('BTC', 'BTC_USDT', 'BTCUSDT')
+        self.assertTrue(passed)
+        self.assertEqual(reason, '')
+        self.assertEqual(basis, 0)
+
+    def test_thin_bursty_profile_scales_open_amount(self):
+        """thin_bursty 单笔金额按配置缩小。"""
+        self.te.asset_profile_meta = {'BTC': {'market_profile': 'thin_bursty'}}
+        self.te.open_amount_usdt = 10.0
+        self.assertEqual(self.te._active_open_amount_usdt({'base_asset': 'BTC'}), 5.0)
+
     def test_live_pre_gate_uses_realtime_funding_snapshot(self):
         """实盘旁路用下单前实时 funding 覆盖缓存 funding，并重算 entry snapshot。"""
         self.te.funding_entry_enabled = True
@@ -1112,19 +1136,67 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_risk_check(self._row('ALLO', 10.0, 0.008646)))
         self.assertTrue(te._pass_risk_check(self._row('ALLO', 20.0, 0.008646)))
 
-    def test_global_position_limit_blocks_new_open(self):
+    def test_total_available_ratio_blocks_new_open(self):
         te = make_trading_executor(
-            max_total_positions=2,
-            max_positions_per_asset=99,
+            min_available_ratio=0.10,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
-        te._holding_total_count = 2
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 25.0, 'net_value': 100.0},
+            'gate': {'available': 14.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
 
         row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 10.0
 
         self.assertFalse(te._pass_risk_check(row))
-        self.assertEqual(te._get_risk_fail_reason(row), '总持仓数上限(2/2)')
+        self.assertIn('Gate下单后可用', te._get_risk_fail_reason(row))
+
+    def test_asset_exposure_ratio_blocks_new_open(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 5.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 10.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('Binance spot', te._get_risk_fail_reason(row))
+
+    def test_asset_future_margin_exposure_ratio_blocks_new_open(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_future_margin_by_asset['ALLO'] = 8.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 10.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('Gate保证金', te._get_risk_fail_reason(row))
 
     def test_low_funding_negative_p20_requires_positive_carry_floor(self):
         te = make_trading_executor(
@@ -1180,7 +1252,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertAlmostEqual(snapshot['entry_floor_bps'], -25.0)
         self.assertTrue(te._pass_risk_check(row))
 
-    def test_funding_carry_uses_60_min_next_funding_window(self):
+    def test_funding_carry_uses_30_min_next_funding_window(self):
         te = make_trading_executor(
             funding_carry_enabled=True,
             vwap_threshold_meta={'BANANA': {'p20': -18.0}},
@@ -1188,12 +1260,12 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             asset_tier_meta={'BANANA': 'B'},
         )
         row = self._row('BANANA', -20.0, 0.0030)
-        row['funding_next_apply'] = (datetime.now() + timedelta(minutes=59)).strftime('%Y-%m-%d %H:%M:%S')
+        row['funding_next_apply'] = (datetime.now() + timedelta(minutes=29)).strftime('%Y-%m-%d %H:%M:%S')
 
         self.assertIsNotNone(te._annotate_funding_carry_candidate(row, -20.0))
 
         late_row = self._row('BANANA', -20.0, 0.0030)
-        late_row['funding_next_apply'] = (datetime.now() + timedelta(minutes=61)).strftime('%Y-%m-%d %H:%M:%S')
+        late_row['funding_next_apply'] = (datetime.now() + timedelta(minutes=31)).strftime('%Y-%m-%d %H:%M:%S')
 
         self.assertIsNone(te._annotate_funding_carry_candidate(late_row, -20.0))
 
@@ -1259,8 +1331,8 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te.capital_required = True
         te.open_amount_usdt = 100.0
         te._account_summary = {
-            'binance': {'available': 11.0},
-            'gate': {'available': 6.0},
+            'binance': {'available': 25.0, 'net_value': 100.0},
+            'gate': {'available': 16.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
 
@@ -1500,7 +1572,7 @@ class TestTradingExecutorOpenFlowResiliency(unittest.TestCase):
             vwap_threshold_meta={'BTC': {'p20': 20}},
             close_vwap_threshold_meta={'BTC': {'close_basis_p20': -100}},
         )
-        te._refresh_holding_count_from_db = MagicMock()
+        te._refresh_holding_exposure_from_db = MagicMock()
         te._load_open_cooldown_from_db = MagicMock()
         te._verify_realtime_funding_rate = MagicMock(return_value=True)
         te._create_signal = MagicMock(return_value=1001)

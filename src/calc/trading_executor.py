@@ -42,8 +42,8 @@ class TradingExecutorConfig:
     cooldown_sec: int = 3600
     min_funding_rate_bps: float = -6.0
     open_amount_usdt: float = 5.0
-    max_total_positions: int = 45
-    max_positions_per_asset: int = 1
+    min_available_ratio: float = 0.10
+    max_asset_exposure_ratio: float = 0.10
     reject_cooldown_sec: int = 60
     # 旁路风控新鲜度硬约束：本地接收最近一次 WS 盘口与当前下单时刻的允许最大延迟（毫秒）
     # 阐释：update_time(交易所时间戳) 不可靠，只以本地 last_update_time 判定“现在距上次收到行情多久”
@@ -127,8 +127,14 @@ class TradingExecutorConfig:
     funding_carry_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
     funding_carry_min_24h_bps: float = 30.0
     funding_carry_basis_relax_bps: float = 15.0
-    funding_carry_max_next_funding_min: float = 60.0
+    funding_carry_max_next_funding_min: float = 30.0
     funding_carry_amount_usdt: float = 0.0
+
+    # ─── 行情画像参数覆盖 ───
+    thin_bursty_enabled: bool = True
+    thin_bursty_open_amount_multiplier: float = 0.5
+    thin_bursty_max_orderbook_lag_ms: float = 1500.0
+    thin_bursty_max_book_skew_ms: float = 1500.0
 
     # ─── 信号降噪 / 执行质量冷却 ───
     rebound_timeout_cooldown_enabled: bool = True
@@ -166,7 +172,8 @@ class TradingExecutor:
     def __init__(self, cfg: TradingExecutorConfig, contract_meta: Dict, spot_meta: Dict,
                  vwap_threshold_meta: Optional[Dict[str, float]] = None,
                  close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None,
-                 asset_tier_meta: Optional[Dict[str, str]] = None):
+                 asset_tier_meta: Optional[Dict[str, str]] = None,
+                 asset_profile_meta: Optional[Dict[str, Dict]] = None):
         """
         Args:
             cfg: 配置 dataclass（由 api/ 层构造后注入）
@@ -175,6 +182,7 @@ class TradingExecutor:
             vwap_threshold_meta: base_asset -> threshold_bps (按标的VWAP基差阈值)
             close_vwap_threshold_meta: base_asset -> {close_basis_p10..p40} (平仓基差阈值；旧模式用于盈利性守卫)
             asset_tier_meta: base_asset -> strategy_tier ('A'/'B'/'C')
+            asset_profile_meta: base_asset -> market_profile metadata
         """
         self.contract_meta = contract_meta
         self.spot_meta = spot_meta
@@ -184,6 +192,11 @@ class TradingExecutor:
             str(k).strip().upper(): str(v).strip().upper()
             for k, v in (asset_tier_meta or {}).items()
             if k
+        }
+        self.asset_profile_meta = {
+            str(k).strip().upper(): dict(v)
+            for k, v in (asset_profile_meta or {}).items()
+            if k and isinstance(v, dict)
         }
         
         # 通过 HTTP 客户端调用独立的成交引擎服务（虚拟/实盘），实现虚实分离
@@ -231,10 +244,11 @@ class TradingExecutor:
         self.margin_warning_pct = cfg.margin_warning_pct
         # 持仓 Gate 保证金/维持保证金缓存: base_asset -> min(gate_maintenance_margin_rate)
         self._holding_margin_rate: Dict[str, float] = {}
-        self._holding_count: Dict[str, int] = {}  # base_asset -> 持仓中仓位数量
-        self._holding_total_count: int = 0
-        self.max_total_positions = max(int(cfg.max_total_positions or 0), 0)
-        self.max_positions_per_asset = cfg.max_positions_per_asset
+        self._holding_spot_amount_by_asset: Dict[str, float] = {}
+        self._holding_future_margin_by_asset: Dict[str, float] = {}
+        self._holding_future_margin_cache_by_asset: Dict[str, float] = {}
+        self.min_available_ratio = max(float(cfg.min_available_ratio or 0), 0.0)
+        self.max_asset_exposure_ratio = max(float(cfg.max_asset_exposure_ratio or 0), 0.0)
 
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
         self.reject_cooldown_sec = cfg.reject_cooldown_sec
@@ -335,6 +349,14 @@ class TradingExecutor:
         self.funding_carry_max_next_funding_min = float(cfg.funding_carry_max_next_funding_min)
         self.funding_carry_amount_usdt = float(cfg.funding_carry_amount_usdt or 0.0)
 
+        self.thin_bursty_enabled = bool(cfg.thin_bursty_enabled)
+        self.thin_bursty_open_amount_multiplier = max(
+            min(float(cfg.thin_bursty_open_amount_multiplier or 1.0), 1.0),
+            0.05,
+        )
+        self.thin_bursty_max_orderbook_lag_ms = float(cfg.thin_bursty_max_orderbook_lag_ms)
+        self.thin_bursty_max_book_skew_ms = float(cfg.thin_bursty_max_book_skew_ms)
+
         self.rebound_timeout_cooldown_enabled = bool(cfg.rebound_timeout_cooldown_enabled)
         self.rebound_timeout_cooldown_sec = int(cfg.rebound_timeout_cooldown_sec)
         self.rebound_timeout_basis_change_reset_bps = float(cfg.rebound_timeout_basis_change_reset_bps)
@@ -406,14 +428,13 @@ class TradingExecutor:
         """
         更新持仓的 Gate 保证金/维持保证金缓存（由 _margin_status_loop 每 5s 调用一次）
 
-        注意：本方法不再维护 self._holding_count。
-        持仓数量计数由 _refresh_holding_count_from_db() 在每轮 check_and_open 开始时
-        从 DB 实时刷新，避免 5s 刷新窗口被高频开仓循环（0.5s）穿透。
+        同时维护每个标的的 Gate 当前保证金缓存，用于单标的资金占用上限。
 
         Args:
             positions: 已由 calculate_realtime_pnl 和 attach_gate_position_risk 富化的持仓列表
         """
         self._holding_margin_rate.clear()
+        future_margin_by_asset: Dict[str, float] = {}
         for pos in positions:
             if pos.get('status') != 'holding':
                 continue
@@ -426,33 +447,60 @@ class TradingExecutor:
                 # 同一标的多个仓位时，取最小保证金/维持保证金比例（最危险的）
                 if ba not in self._holding_margin_rate or margin_rate < self._holding_margin_rate[ba]:
                     self._holding_margin_rate[ba] = margin_rate
+            margin = self._float_or_none(pos.get('gate_position_margin'))
+            if margin is None:
+                margin = self._float_or_none(pos.get('current_margin'))
+            if margin is not None:
+                future_margin_by_asset[ba] = future_margin_by_asset.get(ba, 0.0) + max(float(margin), 0.0)
+        self._holding_future_margin_cache_by_asset = future_margin_by_asset
+        for ba, margin in future_margin_by_asset.items():
+            self._holding_future_margin_by_asset[ba] = max(
+                self._holding_future_margin_by_asset.get(ba, 0.0),
+                margin,
+            )
 
-    def _refresh_holding_count_from_db(self):
+    def _refresh_holding_exposure_from_db(self):
         """
-        从 DB 实时刷新各标的持仓中仓位数量（每轮 check_and_open 开始时调用）。
+        从 DB 实时刷新各标的资金占用（每轮 check_and_open 开始时调用）。
 
         设计目的：
-        - 消除 _margin_status_loop 5s 刷新与 _open_position_loop 0.5s 检查之间的时间窗口；
-        - 消除服务启动后首个 5s 内 _holding_count 为空的窗口（仅靠 cooldown_sec 兜底易失效）；
-        - 与 DB 单一真理源一致，避免内存计数与 DB 偏离（如 margin_loop 异常时 _holding_count 残留）。
+        - 现货按开仓金额汇总；
+        - 期货按当前保证金汇总，优先使用 margin_loop 的交易所实时缓存，DB 估算兜底；
+        - 与 DB 单一真理源一致，避免内存资金占用与 DB 偏离。
 
         热路径开销：单次 SELECT + GROUP BY，在 holding 仓位有限（<<100）时延迟 < 5ms，可接受。
         """
         try:
             sql = """
-                SELECT base_asset, COUNT(*) AS cnt
+                SELECT
+                    base_asset,
+                    COALESCE(SUM(spot_open_amount), 0) AS spot_amount,
+                    COALESCE(SUM(
+                        COALESCE(ABS(future_open_price * future_open_qty), spot_open_amount, 0) / %s
+                        + COALESCE(margin_topup_total, 0)
+                    ), 0) AS future_margin
                 FROM mi_trade_position
                 WHERE status = 'holding'
                 GROUP BY base_asset
             """
             with db_manager.get_cursor() as cursor:
-                cursor.execute(sql)
+                cursor.execute(sql, (self.capital_gate_leverage,))
                 rows = cursor.fetchall()
-            self._holding_count = {r['base_asset']: int(r['cnt']) for r in rows if r.get('base_asset')}
-            self._holding_total_count = sum(self._holding_count.values())
+            spot_amounts: Dict[str, float] = {}
+            future_margins: Dict[str, float] = {}
+            for r in rows:
+                ba = str(r.get('base_asset') or '').upper()
+                if not ba:
+                    continue
+                spot_amounts[ba] = float(r.get('spot_amount') or 0.0)
+                future_margins[ba] = float(r.get('future_margin') or 0.0)
+            for ba, margin in self._holding_future_margin_cache_by_asset.items():
+                future_margins[ba] = max(future_margins.get(ba, 0.0), float(margin or 0.0))
+            self._holding_spot_amount_by_asset = spot_amounts
+            self._holding_future_margin_by_asset = future_margins
         except Exception as e:
-            # 查询失败时保留旧计数（保守策略：宁可拦截过多也不绕过上限）
-            logger.error(f"刷新 _holding_count 失败，沿用旧计数: {e}")
+            # 查询失败时保留旧资金占用（保守策略：宁可拦截过多也不绕过上限）
+            logger.error(f"刷新持仓资金占用失败，沿用旧缓存: {e}")
 
     def check_and_open(self, orderbook_rows: List[Dict]) -> List[Dict]:
         """
@@ -466,9 +514,8 @@ class TradingExecutor:
         """
         results = []
 
-        # 每轮开始时从 DB 实时刷新持仓数量计数（DB 作为单一真理源），
-        # 避免依赖 5s 间隔的 margin_loop 导致计数滞后被高频检查穿透。
-        self._refresh_holding_count_from_db()
+        # 每轮开始时从 DB 实时刷新持仓资金占用（DB 作为单一真理源）。
+        self._refresh_holding_exposure_from_db()
         exchange_risk_blocked_assets = self._load_exchange_risk_blocked_assets()
 
         # 启动后首次进入：一次性从 DB 加载所有标的的最近一次成功开仓时间，
@@ -679,16 +726,33 @@ class TradingExecutor:
                 })
                 
                 if exec_result['success']:
-                    # 立即递增持仓计数 + 写入冷却时间，避免下一轮（0.5s后）穿透上限/冷却检查
-                    self._holding_count[base_asset] = self._holding_count.get(base_asset, 0) + 1
-                    self._holding_total_count += 1
+                    # 立即递增资金占用 + 写入冷却时间，避免下一轮（0.5s后）穿透资金上限/冷却检查。
+                    spot_amount = self._float_or_none(
+                        (exec_result.get('spot_order') or {}).get('exec_amount')
+                    )
+                    future_amount = self._float_or_none(
+                        (exec_result.get('future_order') or {}).get('exec_amount')
+                    )
+                    fallback_amount = self._active_open_amount_usdt(row)
+                    spot_amount = spot_amount if spot_amount is not None else fallback_amount
+                    future_margin = (
+                        (future_amount if future_amount is not None else fallback_amount)
+                        / self.capital_gate_leverage
+                    )
+                    ba = str(base_asset or '').upper()
+                    self._holding_spot_amount_by_asset[ba] = (
+                        self._holding_spot_amount_by_asset.get(ba, 0.0) + max(spot_amount, 0.0)
+                    )
+                    self._holding_future_margin_by_asset[ba] = (
+                        self._holding_future_margin_by_asset.get(ba, 0.0) + max(future_margin, 0.0)
+                    )
                     self._last_open_time[base_asset] = datetime.now()
                     logger.info(
                         f"开仓成功 | {base_asset} | "
                         f"spot_vwap={exec_result['spot_order']['exec_price']} | "
                         f"future_vwap={exec_result['future_order']['exec_price']} | "
-                        f"holding_count={self._holding_count[base_asset]}/{self.max_positions_per_asset} | "
-                        f"total_holding={self._holding_total_count}/{self.max_total_positions or '∞'}"
+                        f"spot_exposure={self._holding_spot_amount_by_asset[ba]:.2f}USDT | "
+                        f"future_margin={self._holding_future_margin_by_asset[ba]:.2f}USDT"
                     )
                 else:
                     logger.warning(f"开仓拒单 | {base_asset} | reason={exec_result['message']}")
@@ -740,6 +804,24 @@ class TradingExecutor:
     def _asset_tier(self, base_asset: str) -> str:
         return self.asset_tier_meta.get((base_asset or '').strip().upper(), 'C')
 
+    def _asset_profile(self, base_asset: str) -> str:
+        profile = self.asset_profile_meta.get((base_asset or '').strip().upper(), {})
+        return str(profile.get('market_profile') or 'normal').strip()
+
+    def _profile_params(self, base_asset: str) -> Dict[str, float]:
+        profile = self._asset_profile(base_asset)
+        if self.thin_bursty_enabled and profile == 'thin_bursty':
+            return {
+                'max_orderbook_lag_ms': self.thin_bursty_max_orderbook_lag_ms,
+                'max_book_skew_ms': self.thin_bursty_max_book_skew_ms,
+                'open_amount_multiplier': self.thin_bursty_open_amount_multiplier,
+            }
+        return {
+            'max_orderbook_lag_ms': self._max_orderbook_lag_ms,
+            'max_book_skew_ms': self._max_orderbook_lag_ms,
+            'open_amount_multiplier': 1.0,
+        }
+
     def _funding_24h_bps(self, base_asset: str, row: Optional[Dict] = None) -> float:
         row = row or {}
         funding_rate = row.get('funding_rate_24h')
@@ -748,6 +830,15 @@ class TradingExecutor:
         if funding_rate is None:
             return 0.0
         return float(funding_rate) * 10000.0
+
+    @staticmethod
+    def _float_or_none(value) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _parse_datetime(self, value) -> Optional[datetime]:
         if value is None:
@@ -787,13 +878,19 @@ class TradingExecutor:
             values.append(float(close_p20))
         return max(values) if values else None
 
-    def _funding_carry_amount(self) -> float:
-        return self.funding_carry_amount_usdt if self.funding_carry_amount_usdt > 0 else self.open_amount_usdt
+    def _profile_open_amount(self, base_asset: str, amount_usdt: float) -> float:
+        params = self._profile_params(base_asset)
+        return max(float(amount_usdt) * float(params.get('open_amount_multiplier', 1.0)), 0.0)
+
+    def _funding_carry_amount(self, base_asset: Optional[str] = None) -> float:
+        amount = self.funding_carry_amount_usdt if self.funding_carry_amount_usdt > 0 else self.open_amount_usdt
+        return self._profile_open_amount(base_asset or '', amount)
 
     def _active_open_amount_usdt(self, row: Optional[Dict] = None) -> float:
         if row and row.get('open_amount_usdt') is not None:
             return float(row.get('open_amount_usdt'))
-        return self.open_amount_usdt
+        base_asset = (row or {}).get('base_asset', '')
+        return self._profile_open_amount(base_asset, self.open_amount_usdt)
 
     def _funding_carry_snapshot(
         self, base_asset: str, basis_bps: float, row: Optional[Dict] = None
@@ -841,7 +938,7 @@ class TradingExecutor:
             'funding_carry_p20_floor_bps': round(p20_floor, 4),
             'funding_carry_next_min': round(next_min, 4),
             'funding_carry_tier': tier,
-            'funding_carry_amount_usdt': round(self._funding_carry_amount(), 4),
+            'funding_carry_amount_usdt': round(self._funding_carry_amount(base_asset), 4),
         }
 
     def _apply_entry_snapshot_to_row(self, row: Dict, snapshot: Dict) -> None:
@@ -855,7 +952,7 @@ class TradingExecutor:
             row.pop('_funding_carry_candidate', None)
             return None
         row['_funding_carry_candidate'] = True
-        row['open_amount_usdt'] = self._funding_carry_amount()
+        row['open_amount_usdt'] = self._funding_carry_amount(base_asset)
         self._apply_entry_snapshot_to_row(row, snapshot)
         return snapshot
 
@@ -1137,7 +1234,7 @@ class TradingExecutor:
                 row['_funding_carry_realtime_rejected'] = True
             return False
         row['_funding_carry_candidate'] = True
-        row['open_amount_usdt'] = self._funding_carry_amount()
+        row['open_amount_usdt'] = self._funding_carry_amount(base_asset)
         self._apply_entry_snapshot_to_row(row, snapshot)
 
         signal_id = self._create_signal(base_asset, current_basis_bps)
@@ -1524,14 +1621,6 @@ class TradingExecutor:
         """
         base_asset = row.get('base_asset', '')
 
-        # 全局持仓数上限检查：保留可用资金 buffer 给 future 追保/极端行情。
-        if self.max_total_positions > 0 and self._holding_total_count >= self.max_total_positions:
-            return False
-
-        # 同标的持仓数上限检查：防止同一波收敛行情中连续开仓
-        if self._holding_count.get(base_asset, 0) >= self.max_positions_per_asset:
-            return False
-
         # 保证金风控检查：该标的现有持仓保证金/维持保证金比例过低时禁止加仓
         if base_asset in self._holding_margin_rate:
             if self._holding_margin_rate[base_asset] < self.margin_warning_pct:
@@ -1539,6 +1628,8 @@ class TradingExecutor:
 
         active_amount = self._active_open_amount_usdt(row)
         if not self._pass_account_capital_check(active_amount):
+            return False
+        if not self._pass_asset_exposure_check(base_asset, active_amount):
             return False
 
         # 最小名义价值检查：开仓金额低于交易所最低要求时直接过滤
@@ -1596,23 +1687,101 @@ class TradingExecutor:
         return True
 
     def _pass_account_capital_check(self, amount_usdt: Optional[float] = None) -> bool:
-        """真实资金检查：开仓前确认 Binance/Gate 可用资金足够且快照新鲜。"""
-        if not self.capital_required:
-            return True
-        if not self._account_summary or not self._account_summary_ts:
-            return False
-        if time.time() - self._account_summary_ts > self.capital_max_age_sec:
-            return False
+        """真实资金检查：下单后 Binance/Gate 可用资金不能低于各自总资金阈值。"""
+        return self._check_account_capital(amount_usdt)[0]
 
-        binance_available = float((self._account_summary.get('binance') or {}).get('available') or 0)
-        gate_available = float((self._account_summary.get('gate') or {}).get('available') or 0)
+    def _pass_asset_exposure_check(self, base_asset: str, amount_usdt: Optional[float] = None) -> bool:
+        """单标的资金占用检查：spot 开仓额、future 当前保证金分别不超过各自账户阈值。"""
+        return self._check_asset_exposure(base_asset, amount_usdt)[0]
+
+    def _check_account_capital(self, amount_usdt: Optional[float] = None) -> tuple:
+        if not self.capital_required:
+            return True, ''
+        if not self._account_summary or not self._account_summary_ts:
+            return False, '资金风控(无交易所资金快照)'
+        if time.time() - self._account_summary_ts > self.capital_max_age_sec:
+            age = time.time() - self._account_summary_ts
+            return False, f"资金风控(资金快照过期{age:.0f}s>{self.capital_max_age_sec}s)"
+
+        binance = self._account_summary.get('binance') or {}
+        gate = self._account_summary.get('gate') or {}
+        binance_available = float(binance.get('available') or 0)
+        gate_available = float(gate.get('available') or 0)
+        binance_total = float(binance.get('net_value') or binance.get('equity') or 0)
+        gate_total = float(gate.get('net_value') or gate.get('equity') or 0)
         amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
         spot_required = amount * (1 + self._fee_spot_open)
         gate_required = (
             amount / self.capital_gate_leverage
             + amount * self._fee_future_open
         )
-        return binance_available >= spot_required and gate_available >= gate_required
+        if binance_available < spot_required:
+            return False, f"资金风控(Binance可用{binance_available:.2f}<需{spot_required:.2f}USDT)"
+        if gate_available < gate_required:
+            return False, f"资金风控(Gate可用{gate_available:.2f}<需{gate_required:.2f}USDT)"
+        if self.min_available_ratio > 0:
+            if binance_total <= 0:
+                return False, '资金风控(Binance总资金无效)'
+            if gate_total <= 0:
+                return False, '资金风控(Gate总资金无效)'
+            binance_after = binance_available - spot_required
+            gate_after = gate_available - gate_required
+            min_binance_available = binance_total * self.min_available_ratio
+            min_gate_available = gate_total * self.min_available_ratio
+            if binance_after < min_binance_available:
+                return (
+                    False,
+                    f"资金风控(Binance下单后可用{binance_after:.2f}<"
+                    f"总资金{self.min_available_ratio:.0%}={min_binance_available:.2f}USDT)"
+                )
+            if gate_after < min_gate_available:
+                return (
+                    False,
+                    f"资金风控(Gate下单后可用{gate_after:.2f}<"
+                    f"总资金{self.min_available_ratio:.0%}={min_gate_available:.2f}USDT)"
+                )
+        return True, ''
+
+    def _check_asset_exposure(self, base_asset: str, amount_usdt: Optional[float] = None) -> tuple:
+        if not self.capital_required or self.max_asset_exposure_ratio <= 0:
+            return True, ''
+        if not self._account_summary or not self._account_summary_ts:
+            return False, '单标的资金风控(无交易所资金快照)'
+        if time.time() - self._account_summary_ts > self.capital_max_age_sec:
+            age = time.time() - self._account_summary_ts
+            return False, f"单标的资金风控(资金快照过期{age:.0f}s>{self.capital_max_age_sec}s)"
+
+        binance = self._account_summary.get('binance') or {}
+        gate = self._account_summary.get('gate') or {}
+        binance_total = float(binance.get('net_value') or binance.get('equity') or 0)
+        gate_total = float(gate.get('net_value') or gate.get('equity') or 0)
+        if binance_total <= 0:
+            return False, '单标的资金风控(Binance总资金无效)'
+        if gate_total <= 0:
+            return False, '单标的资金风控(Gate总资金无效)'
+
+        ba = str(base_asset or '').upper()
+        amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
+        spot_after = self._holding_spot_amount_by_asset.get(ba, 0.0) + amount
+        future_margin_after = (
+            self._holding_future_margin_by_asset.get(ba, 0.0)
+            + amount / self.capital_gate_leverage
+        )
+        spot_limit = binance_total * self.max_asset_exposure_ratio
+        future_limit = gate_total * self.max_asset_exposure_ratio
+        if spot_after > spot_limit:
+            return (
+                False,
+                f"单标的资金占用(Binance spot {spot_after:.2f}>"
+                f"总资金{self.max_asset_exposure_ratio:.0%}={spot_limit:.2f}USDT)"
+            )
+        if future_margin_after > future_limit:
+            return (
+                False,
+                f"单标的资金占用(Gate保证金 {future_margin_after:.2f}>"
+                f"总资金{self.max_asset_exposure_ratio:.0%}={future_limit:.2f}USDT)"
+            )
+        return True, ''
 
     def _apply_realtime_funding_info(self, base_asset: str, row: Optional[Dict]) -> None:
         """
@@ -1717,17 +1886,22 @@ class TradingExecutor:
             spot_local_ts = float(getattr(spot_ob, 'last_update_time', 0) or 0)
             gate_lag_ms = (now_ts - gate_local_ts) * 1000.0 if gate_local_ts > 0 else float('inf')
             spot_lag_ms = (now_ts - spot_local_ts) * 1000.0 if spot_local_ts > 0 else float('inf')
+            profile = self._asset_profile(base_asset)
+            profile_params = self._profile_params(base_asset)
+            max_lag_ms = float(profile_params.get('max_orderbook_lag_ms', self._max_orderbook_lag_ms))
+            max_skew_ms = float(profile_params.get('max_book_skew_ms', max_lag_ms))
 
-            if gate_lag_ms > self._max_orderbook_lag_ms or spot_lag_ms > self._max_orderbook_lag_ms:
+            if gate_lag_ms > max_lag_ms or spot_lag_ms > max_lag_ms:
                 logger.info(
                     f"开仓旁路-行情滞后拦截 | {base_asset} | "
+                    f"profile={profile} | "
                     f"now={now_ts:.3f} | gate_local={gate_local_ts:.3f}(lag={gate_lag_ms:.0f}ms) | "
                     f"spot_local={spot_local_ts:.3f}(lag={spot_lag_ms:.0f}ms) | "
-                    f"max={self._max_orderbook_lag_ms:.0f}ms"
+                    f"max={max_lag_ms:.0f}ms"
                 )
                 return False, None, None, (
                     f'行情滞后(gate_lag={gate_lag_ms:.0f}ms, spot_lag={spot_lag_ms:.0f}ms, '
-                    f'max={self._max_orderbook_lag_ms:.0f}ms)'
+                    f'max={max_lag_ms:.0f}ms,profile={profile})'
                 )
 
             gate_ready = getattr(gate_ob, 'is_ready', lambda: True)()
@@ -1740,14 +1914,14 @@ class TradingExecutor:
                 return False, None, None, 'Gate本地簿未接上连续WS增量'
 
             book_skew_ms = abs(gate_local_ts - spot_local_ts) * 1000.0
-            if book_skew_ms > self._max_orderbook_lag_ms:
+            if book_skew_ms > max_skew_ms:
                 logger.info(
                     f"开仓旁路-跨所盘口不同步拦截 | {base_asset} | "
-                    f"skew={book_skew_ms:.0f}ms > max={self._max_orderbook_lag_ms:.0f}ms | "
+                    f"profile={profile} | skew={book_skew_ms:.0f}ms > max={max_skew_ms:.0f}ms | "
                     f"gate_local={gate_local_ts:.3f} | spot_local={spot_local_ts:.3f}"
                 )
                 return False, None, None, (
-                    f'跨所盘口不同步(skew={book_skew_ms:.0f}ms, max={self._max_orderbook_lag_ms:.0f}ms)'
+                    f'跨所盘口不同步(skew={book_skew_ms:.0f}ms, max={max_skew_ms:.0f}ms,profile={profile})'
                 )
 
             # ── 3. 合并 + 计算对冲指标（单元素列表，开销极小）──
@@ -1760,9 +1934,9 @@ class TradingExecutor:
 
             state = self._peak_state.get(base_asset)
             target_amount_usdt = (
-                self._funding_carry_amount()
+                self._funding_carry_amount(base_asset)
                 if state and state.get('trigger') == 'funding_carry'
-                else self.open_amount_usdt
+                else self._profile_open_amount(base_asset, self.open_amount_usdt)
             )
             merged = calculate_hedge_metrics(
                 merged, self.contract_meta, self.spot_meta, target_amount_usdt
@@ -1868,7 +2042,7 @@ class TradingExecutor:
                 f"开仓旁路通过 | {base_asset} | "
                 f"gate_basis={gate_basis_bps:.2f}bps | coverage={open_coverage} | "
                 f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms,"
-                f"skew={book_skew_ms:.0f}ms,max={self._max_orderbook_lag_ms:.0f}ms)"
+                f"skew={book_skew_ms:.0f}ms,max={max_lag_ms:.0f}ms,profile={profile})"
             )
             return True, row, gate_basis_bps, ''
 
@@ -2070,15 +2244,6 @@ class TradingExecutor:
         """识别风控失败的具体原因（用于信号日志）"""
         base_asset = row.get('base_asset', '')
 
-        if self.max_total_positions > 0 and self._holding_total_count >= self.max_total_positions:
-            return f"总持仓数上限({self._holding_total_count}/{self.max_total_positions})"
-
-        if self._holding_count.get(base_asset, 0) >= self.max_positions_per_asset:
-            return (
-                f"同标的持仓数上限"
-                f"({self._holding_count.get(base_asset, 0)}/{self.max_positions_per_asset})"
-            )
-
         # 保证金风控检查
         if base_asset in self._holding_margin_rate:
             margin_rate = self._holding_margin_rate[base_asset]
@@ -2088,27 +2253,15 @@ class TradingExecutor:
                     f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
                 )
 
-        if self.capital_required:
-            if not self._account_summary or not self._account_summary_ts:
-                return '资金风控(无交易所资金快照)'
-            age = time.time() - self._account_summary_ts
-            if age > self.capital_max_age_sec:
-                return f"资金风控(资金快照过期{age:.0f}s>{self.capital_max_age_sec}s)"
-            active_amount = self._active_open_amount_usdt(row)
-            binance_available = float((self._account_summary.get('binance') or {}).get('available') or 0)
-            gate_available = float((self._account_summary.get('gate') or {}).get('available') or 0)
-            spot_required = active_amount * (1 + self._fee_spot_open)
-            gate_required = (
-                active_amount / self.capital_gate_leverage
-                + active_amount * self._fee_future_open
-            )
-            if binance_available < spot_required:
-                return f"资金风控(Binance可用{binance_available:.2f}<需{spot_required:.2f}USDT)"
-            if gate_available < gate_required:
-                return f"资金风控(Gate可用{gate_available:.2f}<需{gate_required:.2f}USDT)"
+        active_amount = self._active_open_amount_usdt(row)
+        capital_ok, capital_reason = self._check_account_capital(active_amount)
+        if not capital_ok:
+            return capital_reason
+        exposure_ok, exposure_reason = self._check_asset_exposure(base_asset, active_amount)
+        if not exposure_ok:
+            return exposure_reason
 
         # 最小名义价值检查
-        active_amount = self._active_open_amount_usdt(row)
         if base_asset in self.spot_meta:
             min_notional = self.spot_meta[base_asset].get('min_notional')
             if min_notional is not None and active_amount < min_notional:
@@ -2182,6 +2335,13 @@ class TradingExecutor:
         p20 = float(entry_snapshot.get('p20_bps', self.basis_threshold_bps))
         entry_floor = float(entry_snapshot.get('entry_floor_bps', p20))
         parts.append(f"基差{open_vwap_basis:.1f}bps(entry_floor={entry_floor:.1f},p20={p20:.1f})")
+        profile = self._asset_profile(base_asset)
+        if profile != 'normal':
+            profile_params = self._profile_params(base_asset)
+            parts.append(
+                f"画像({profile},amount={self._active_open_amount_usdt(row):.1f}U,"
+                f"lag_max={float(profile_params.get('max_orderbook_lag_ms', self._max_orderbook_lag_ms)):.0f}ms)"
+            )
         parts.append(
             f"carry(funding24h={float(entry_snapshot.get('funding_24h_bps', 0)):.1f}bps,"
             f"预期={float(entry_snapshot.get('expected_funding_bps', 0)):.1f}bps,"

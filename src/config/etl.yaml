@@ -63,6 +63,15 @@ tasks:
     interval_minutes: 15  # 每 15 分钟执行一次
     run_on_startup: true  # 服务启动时立即执行一次
 
+  # 标的行情画像刷新
+  # 用途：把低于普通 B 流动性标准、但仍进入订阅池的标的标为 thin_bursty，
+  #      供开仓状态机使用“宽监控 + 严执行 + 小仓位”参数。
+  update_asset_market_profiles:
+    enabled: true
+    schedule: interval
+    interval_minutes: 15
+    run_on_startup: true
+
   # Gate.io 历史资金费率更新
   # 数据源：Gate.io Futures Funding Rate History API（每批最多 10 个合约）
   # 目标表：mi_gate_future_his_funding_rates

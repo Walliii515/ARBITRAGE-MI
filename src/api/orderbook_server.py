@@ -32,7 +32,12 @@ from calc.etl_pipeline import start_daily_schedulers, stop_daily_schedulers, ETL
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger, log_print, setup_logging
-from common.meta_loader import fetch_asset_tier_meta, fetch_contract_meta, fetch_spot_meta
+from common.meta_loader import (
+    fetch_asset_market_profile_meta,
+    fetch_asset_tier_meta,
+    fetch_contract_meta,
+    fetch_spot_meta,
+)
 from common.strategy_accounts import get_binance_credentials
 
 from api.trading_api import router as trading_router
@@ -240,6 +245,7 @@ _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p
 _reverse_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {reverse_open_basis_p20, reverse_close_basis_p20}
 _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费率(止盈用)
 _asset_tier_meta: Dict[str, str] = {}  # base_asset -> strategy_tier
+_asset_profile_meta: Dict[str, Dict] = {}  # base_asset -> market_profile metadata
 _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇总
 _latest_account_summary_ts: float = 0.0
 _gate_position_risk_cache: List[Dict] = []
@@ -581,7 +587,8 @@ def build_payload() -> dict:
     enrich_snapshot_fields(
         rows, _contract_meta, _spot_meta, _threshold_meta,
         _vwap_threshold_meta, _enrich_cfg, _meta_update_time,
-        _close_vwap_threshold_meta
+        _close_vwap_threshold_meta,
+        _asset_profile_meta,
     )
 
     return {
@@ -607,7 +614,8 @@ def _build_reverse_enriched_rows() -> tuple[List[Dict], Dict[str, Dict], str]:
     enrich_snapshot_fields(
         rows, _contract_meta, _spot_meta, _threshold_meta,
         _vwap_threshold_meta, _enrich_cfg, _meta_update_time,
-        _close_vwap_threshold_meta
+        _close_vwap_threshold_meta,
+        _asset_profile_meta,
     )
     negative_assets = [
         row.get('base_asset')
@@ -775,10 +783,12 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(broadcast_worker())
 
     global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
-    global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
+    global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
+    global _asset_tier_meta, _asset_profile_meta, _meta_update_time
     _contract_meta = fetch_contract_meta()
     _spot_meta = fetch_spot_meta()
     _asset_tier_meta = fetch_asset_tier_meta()
+    _asset_profile_meta = fetch_asset_market_profile_meta()
     _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
@@ -786,7 +796,8 @@ async def lifespan(app: FastAPI):
     _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_print(
         f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，'
-        f'标的分层 {len(_asset_tier_meta)} 条，阈値元数据 {len(_threshold_meta)} 条，'
+        f'标的分层 {len(_asset_tier_meta)} 条，行情画像 {len(_asset_profile_meta)} 条，'
+        f'阈値元数据 {len(_threshold_meta)} 条，'
         f'VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条，'
         f'反向阈値 {len(_reverse_vwap_threshold_meta)} 条，'
         f'费率p40 {len(_funding_rate_p40_meta)} 条'
@@ -809,10 +820,12 @@ async def lifespan(app: FastAPI):
                 logger.info(f'开始定时刷新内存缓存 (间隔: {min_interval} 分钟)...')
                 # 刷新内存缓存
                 global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
-                global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta, _asset_tier_meta, _meta_update_time
+                global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
+                global _asset_tier_meta, _asset_profile_meta, _meta_update_time
                 _contract_meta = fetch_contract_meta()
                 _spot_meta = fetch_spot_meta()
                 _asset_tier_meta = fetch_asset_tier_meta()
+                _asset_profile_meta = fetch_asset_market_profile_meta()
                 _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
                 new_close_meta = fetch_close_vwap_threshold_meta()
@@ -828,7 +841,8 @@ async def lifespan(app: FastAPI):
                 _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 logger.info(
                     f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, '
-                    f'标的分层 {len(_asset_tier_meta)} 条, 阈値 {len(_threshold_meta)} 条, '
+                    f'标的分层 {len(_asset_tier_meta)} 条, 行情画像 {len(_asset_profile_meta)} 条, '
+                    f'阈値 {len(_threshold_meta)} 条, '
                     f'VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, '
                     f'反向阈値 {len(_reverse_vwap_threshold_meta)} 条, '
                     f'费率p40 {len(_funding_rate_p40_meta)} 条'
@@ -1100,8 +1114,8 @@ async def open_status():
     return {
         'open_paused': _open_paused,
         'reverse_open_paused': _reverse_open_paused,
-        'max_total_positions': config.get_int('trade.open.max_total_positions', 45),
-        'max_positions_per_asset': config.get_int('trade.open.max_positions_per_asset', 1),
+        'min_available_ratio': config.get_float('trade.open.min_available_ratio', 0.10),
+        'max_asset_exposure_ratio': config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
     }
 
 
@@ -1367,7 +1381,7 @@ def _get_fresh_trading_rows() -> List[Dict]:
 
     rows = _get_merged_rows()
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
-    enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg)
+    enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg, _asset_profile_meta)
     _cached_trading_rows = [dict(row) for row in rows]
     _cached_trading_ts = now
     return [dict(row) for row in _cached_trading_rows]
@@ -1406,8 +1420,8 @@ def _run_open_position_check_once():
                 cooldown_sec=config.get_int('trade.open.cooldown_sec', 3600),
                 min_funding_rate_bps=config.get_float('trade.open.min_funding_rate_bps', -6.0),
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
-                max_total_positions=config.get_int('trade.open.max_total_positions', 45),
-                max_positions_per_asset=config.get_int('trade.open.max_positions_per_asset', 1),
+                min_available_ratio=config.get_float('trade.open.min_available_ratio', 0.10),
+                max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
                 reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 60),
                 max_orderbook_lag_ms=config.get_float('trade.open.max_orderbook_lag_ms', 1000.0),
                 fee_spot_open=config.get_float('trade.fee.spot_open', 0.00075),
@@ -1476,9 +1490,19 @@ def _run_open_position_check_once():
                 funding_carry_min_24h_bps=config.get_float('trade.funding_carry_open.min_24h_bps', 30.0),
                 funding_carry_basis_relax_bps=config.get_float('trade.funding_carry_open.basis_relax_bps', 15.0),
                 funding_carry_max_next_funding_min=config.get_float(
-                    'trade.funding_carry_open.max_next_funding_min', 60.0
+                    'trade.funding_carry_open.max_next_funding_min', 30.0
                 ),
                 funding_carry_amount_usdt=config.get_float('trade.funding_carry_open.amount_usdt', 0.0),
+                thin_bursty_enabled=config.get_bool('trade.market_profile.thin_bursty.enabled', True),
+                thin_bursty_open_amount_multiplier=config.get_float(
+                    'trade.market_profile.thin_bursty.open_amount_multiplier', 0.5
+                ),
+                thin_bursty_max_orderbook_lag_ms=config.get_float(
+                    'trade.market_profile.thin_bursty.max_orderbook_lag_ms', 1500.0
+                ),
+                thin_bursty_max_book_skew_ms=config.get_float(
+                    'trade.market_profile.thin_bursty.max_book_skew_ms', 1500.0
+                ),
                 rebound_timeout_cooldown_enabled=config.get_bool('trade.rebound_timeout_cooldown.enabled', True),
                 rebound_timeout_cooldown_sec=config.get_int('trade.rebound_timeout_cooldown.cooldown_sec', 60),
                 rebound_timeout_basis_change_reset_bps=config.get_float('trade.rebound_timeout_cooldown.basis_change_reset_bps', 5.0),
@@ -1517,7 +1541,8 @@ def _run_open_position_check_once():
             )
             _trading_executor = TradingExecutor(
                 _trading_cfg, _contract_meta, _spot_meta,
-                _vwap_threshold_meta, _close_vwap_threshold_meta, _asset_tier_meta
+                _vwap_threshold_meta, _close_vwap_threshold_meta, _asset_tier_meta,
+                _asset_profile_meta
             )
             _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
 

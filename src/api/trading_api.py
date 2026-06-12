@@ -1045,7 +1045,10 @@ async def get_signals(
     # 查询分页数据
     offset = (page - 1) * page_size
     sql = """
-        SELECT s.*, COALESCE(b.strategy_tier, 'C') AS strategy_tier
+        SELECT
+            s.*,
+            COALESCE(b.strategy_tier, 'C') AS strategy_tier,
+            COALESCE(b.market_profile, 'normal') AS market_profile
         FROM mi_trade_signal s
         LEFT JOIN mi_base_asset b
           ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))
@@ -1165,7 +1168,10 @@ async def get_reverse_signals(
 
     offset = (page - 1) * page_size
     sql = f"""
-        SELECT s.*, COALESCE(b.strategy_tier, 'C') AS strategy_tier
+        SELECT
+            s.*,
+            COALESCE(b.strategy_tier, 'C') AS strategy_tier,
+            COALESCE(b.market_profile, 'normal') AS market_profile
         FROM mi_reverse_trade_signal s
         LEFT JOIN mi_base_asset b
           ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))

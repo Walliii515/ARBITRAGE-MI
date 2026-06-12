@@ -107,6 +107,17 @@ def calc_full_fee_bps(spot_open_fee: float, spot_close_fee: float,
                    future_open_fee + future_close_fee) * 10000, 2)
 
 
+def _spread_bps(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None:
+        return None
+    bid = float(bid)
+    ask = float(ask)
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid * 10000.0
+
+
 def calc_entry_snapshot_bps(base_asset: str, basis_bps: Optional[float],
                             funding_rate_24h: Optional[float],
                             vwap_threshold_meta: Dict[str, Dict],
@@ -165,7 +176,8 @@ def calc_entry_snapshot_bps(base_asset: str, basis_bps: Optional[float],
 
 
 def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
-                          threshold_meta: Dict[str, float], cfg: EnrichConfig) -> None:
+                          threshold_meta: Dict[str, float], cfg: EnrichConfig,
+                          asset_profile_meta: Optional[Dict[str, Dict]] = None) -> None:
     """
     为开仓检查富化行数据（就地修改 rows）
 
@@ -178,10 +190,14 @@ def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
     - funding_threshold: 资金费率阈值
     """
     open_fee_bps = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
+    asset_profile_meta = asset_profile_meta or {}
 
     for row in rows:
         base_asset = row.get('base_asset', '')
         contract = row.get('contract', '')
+        profile = asset_profile_meta.get(base_asset, {})
+        row['market_profile'] = profile.get('market_profile', 'normal')
+        row['market_profile_reason'] = profile.get('market_profile_reason')
 
         # 1. 开仓 VWAP 基差 (bps)
         open_basis = calc_vwap_basis_bps(row.get('spot_open_vwap'), row.get('future_open_vwap'))
@@ -216,7 +232,8 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                            spot_meta: Dict[str, Dict], threshold_meta: Dict[str, float],
                            vwap_threshold_meta: Dict[str, Dict],
                            cfg: EnrichConfig, meta_update_time: str,
-                           close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None) -> None:
+                           close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None,
+                           asset_profile_meta: Optional[Dict[str, Dict]] = None) -> None:
     """
     为 WS 快照推送富化完整字段（就地修改 rows）
 
@@ -229,10 +246,15 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
     """
     open_fee_bps = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
     close_fee_bps = round(-(cfg.spot_close_fee + cfg.future_close_fee) * 10000, 2)
+    asset_profile_meta = asset_profile_meta or {}
 
     for row in rows:
         base_asset = row.get('base_asset', '')
         row['open_amount_usdt'] = cfg.open_amount_usdt
+        profile = asset_profile_meta.get(base_asset, {})
+        row['market_profile'] = profile.get('market_profile', 'normal')
+        row['market_profile_reason'] = profile.get('market_profile_reason')
+        row['market_profile_updated_at'] = profile.get('market_profile_updated_at')
 
         # --- 从 contract_meta 注入 ---
         quanto_multiplier = 1.0
@@ -325,6 +347,18 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
 
         row['spot_usdt_bid_total'] = round(spot_bid_total, 2)
         row['spot_usdt_ask_total'] = round(spot_ask_total, 2)
+        row['future_spread_bps'] = _spread_bps(
+            row.get('future_price_bid_1'),
+            row.get('future_price_ask_1'),
+        )
+        row['spot_spread_bps'] = _spread_bps(
+            row.get('spot_price_bid_1'),
+            row.get('spot_price_ask_1'),
+        )
+        row['future_top_bid_usdt'] = row.get('future_usdt_bid_1')
+        row['future_top_ask_usdt'] = row.get('future_usdt_ask_1')
+        row['spot_top_bid_usdt'] = row.get('spot_usdt_bid_1')
+        row['spot_top_ask_usdt'] = row.get('spot_usdt_ask_1')
 
         # --- 按标的 VWAP 基差阈值（前端展示用 p20） ---
         threshold_entry = vwap_threshold_meta.get(base_asset)

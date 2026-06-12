@@ -7,6 +7,9 @@ export interface OrderBookRow {
   spot_update_id: number | null
   spot_update_time: number | null
   spot_ready?: boolean
+  market_profile?: string | null
+  market_profile_reason?: string | null
+  market_profile_updated_at?: string | null
   /** 每次开仓金额（USDT），后端从配置文件推送 */
   open_amount_usdt?: number
   spot_qty?: number | null
@@ -55,6 +58,12 @@ export interface OrderBookRow {
   future_usdt_ask_total?: number | null
   spot_usdt_bid_total?: number | null
   spot_usdt_ask_total?: number | null
+  future_spread_bps?: number | null
+  spot_spread_bps?: number | null
+  future_top_bid_usdt?: number | null
+  future_top_ask_usdt?: number | null
+  spot_top_bid_usdt?: number | null
+  spot_top_ask_usdt?: number | null
   // VWAP基差相关
   open_vwap_basis_bps?: number | null
   close_vwap_basis_bps?: number | null
