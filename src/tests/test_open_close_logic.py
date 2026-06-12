@@ -2219,6 +2219,32 @@ class TestGatePositionRiskEnrichment(unittest.TestCase):
 class TestMarginTopupCalculation(unittest.TestCase):
     """自动追保核心公式。"""
 
+    def test_topup_success_amount_allocates_across_contract_rows(self):
+        ce = make_closing_executor()
+        rows = [
+            {'id': 11, 'future_open_contracts': 2},
+            {'id': 12, 'future_open_contracts': 3},
+            {'id': 13, 'future_open_contracts': 5},
+        ]
+
+        allocations = ce._allocate_margin_topup_amount(rows, 10.0)
+
+        self.assertEqual(allocations, [(11, 2.0), (12, 3.0), (13, 5.0)])
+        self.assertAlmostEqual(sum(amount for _, amount in allocations), 10.0)
+
+    def test_topup_success_allocation_keeps_rounding_remainder(self):
+        ce = make_closing_executor()
+        rows = [
+            {'id': 1, 'future_open_contracts': 1},
+            {'id': 2, 'future_open_contracts': 1},
+            {'id': 3, 'future_open_contracts': 1},
+        ]
+
+        allocations = ce._allocate_margin_topup_amount(rows, 1.0)
+
+        self.assertEqual(allocations, [(1, 0.333333), (2, 0.333333), (3, 0.333334)])
+        self.assertAlmostEqual(sum(amount for _, amount in allocations), 1.0)
+
     def test_topup_amount_targets_gate_margin_maintenance_rate(self):
         ce = make_closing_executor()
         ce.margin_topup_target_rate_pct = 3000.0

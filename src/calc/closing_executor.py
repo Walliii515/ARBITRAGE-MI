@@ -846,15 +846,84 @@ class ClosingExecutor:
         return float(row.get('available_usdt') or 0)
 
     def _mark_margin_topup_success(self, position_id: int, amount: float):
-        sql = """
-            UPDATE mi_trade_position SET
-                margin_topup_count = margin_topup_count + 1,
-                margin_topup_total = margin_topup_total + %s,
-                margin_topup_last_at = NOW()
-            WHERE id = %s AND status = 'holding'
-        """
+        if not position_id or amount <= 0:
+            return
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, (amount, position_id))
+            cursor.execute(
+                """
+                SELECT id, future_contract, future_open_contracts, future_open_qty
+                FROM mi_trade_position
+                WHERE id = %s AND status = 'holding'
+                """,
+                (position_id,),
+            )
+            trigger_row = cursor.fetchone()
+            if not trigger_row:
+                return
+
+            contract = str(trigger_row.get('future_contract') or '').upper()
+            rows = []
+            if contract:
+                cursor.execute(
+                    """
+                    SELECT id, future_open_contracts, future_open_qty
+                    FROM mi_trade_position
+                    WHERE status = 'holding' AND future_contract = %s
+                    ORDER BY id
+                    """,
+                    (contract,),
+                )
+                rows = cursor.fetchall() or []
+            if not rows:
+                rows = [trigger_row]
+
+            allocations = self._allocate_margin_topup_amount(rows, amount)
+            cursor.executemany(
+                """
+                UPDATE mi_trade_position SET
+                    margin_topup_count = margin_topup_count + 1,
+                    margin_topup_total = margin_topup_total + %s,
+                    margin_topup_last_at = NOW()
+                WHERE id = %s AND status = 'holding'
+                """,
+                [(part, row_id) for row_id, part in allocations],
+            )
+
+    @staticmethod
+    def _allocate_margin_topup_amount(rows: List[Dict], amount: float) -> List[tuple]:
+        """Gate 追保是合约级动作，本地多行持仓按张数权重分摊金额。"""
+        valid_rows = [row for row in rows if row.get('id')]
+        if not valid_rows:
+            return []
+        total_amount = round(float(amount or 0), 6)
+        if total_amount <= 0:
+            return [(int(row['id']), 0.0) for row in valid_rows]
+
+        weights = [ClosingExecutor._margin_topup_row_weight(row) for row in valid_rows]
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            weights = [1.0 for _ in valid_rows]
+            total_weight = float(len(valid_rows))
+
+        allocations = []
+        remaining = total_amount
+        for idx, row in enumerate(valid_rows):
+            row_id = int(row['id'])
+            if idx == len(valid_rows) - 1:
+                part = round(remaining, 6)
+            else:
+                part = round(total_amount * weights[idx] / total_weight, 6)
+                remaining = round(remaining - part, 6)
+            allocations.append((row_id, part))
+        return allocations
+
+    @staticmethod
+    def _margin_topup_row_weight(row: Dict) -> float:
+        contracts = abs(_float_or_none(row.get('future_open_contracts')) or 0.0)
+        if contracts > 0:
+            return contracts
+        qty = abs(_float_or_none(row.get('future_open_qty')) or 0.0)
+        return qty if qty > 0 else 1.0
 
     def _insert_margin_topup_log(
         self, pos: Dict, amount: float, target_margin: float, margin_before: float,
