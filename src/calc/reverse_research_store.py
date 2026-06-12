@@ -366,3 +366,93 @@ def get_reverse_research_analysis(
         'top_borrow_drain': [_serialize_row(r) for r in top_drain],
         'top_candidates': [_serialize_row(r) for r in top_candidates],
     }
+
+
+def _latest_with_metrics(
+    *,
+    hours: int,
+    open_amount_usdt: float,
+    funding_capture_ratio: float,
+    fee_cost_bps: float,
+) -> List[Dict[str, Any]]:
+    latest = _latest_rows(hours)
+    history = _history_rows(max(1, min(hours, 2)))
+    _attach_drain(latest, history)
+    _attach_market_metrics(latest, funding_capture_ratio, fee_cost_bps)
+    return latest
+
+
+def _rows_for_view(rows: List[Dict[str, Any]], view: str) -> List[Dict[str, Any]]:
+    if view == 'drain':
+        return sorted(
+            [r for r in rows if _as_float(r.get('borrow_change_15m_pct')) is not None],
+            key=lambda r: _as_float(r.get('borrow_change_15m_pct'), 999.0) or 999.0,
+        )
+    if view == 'candidate':
+        return [
+            r for r in sorted(
+                rows,
+                key=lambda r: _as_float(r.get('reverse_margin_edge_bps'), -999999.0) or -999999.0,
+                reverse=True,
+            )
+            if r.get('reverse_status') in {'candidate', 'borrow_unavailable', 'borrow_capacity_low'}
+        ]
+    return sorted(
+        rows,
+        key=lambda r: _as_float(r.get('funding_rate_24h'), 999.0) or 999.0,
+    )
+
+
+def _filter_keyword(rows: List[Dict[str, Any]], keyword: str) -> List[Dict[str, Any]]:
+    text = str(keyword or '').strip().upper()
+    if not text:
+        return rows
+    return [
+        row for row in rows
+        if text in str(row.get('base_asset') or '').upper()
+        or text in str(row.get('contract') or '').upper()
+        or text in str(row.get('symbol') or '').upper()
+    ]
+
+
+def get_reverse_research_page(
+    *,
+    hours: int = 24,
+    view: str = 'negative',
+    keyword: str = '',
+    page: int = 1,
+    page_size: int = 100,
+    open_amount_usdt: float = 10.0,
+    funding_capture_ratio: float = 0.5,
+    fee_cost_bps: float = 0.0,
+) -> Dict[str, Any]:
+    hours = min(max(int(hours or 24), 1), 168)
+    page = max(int(page or 1), 1)
+    page_size = min(max(int(page_size or 100), 10), 5000)
+    view = view if view in {'negative', 'drain', 'candidate'} else 'negative'
+
+    latest = _latest_with_metrics(
+        hours=hours,
+        open_amount_usdt=open_amount_usdt,
+        funding_capture_ratio=funding_capture_ratio,
+        fee_cost_bps=fee_cost_bps,
+    )
+    rows = _filter_keyword(_rows_for_view(latest, view), keyword)
+    total = len(rows)
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    page_rows = rows[start:start + page_size]
+
+    return {
+        'hours': hours,
+        'view': view,
+        'summary': _summary(latest, open_amount_usdt),
+        'rows': [_serialize_row(r) for r in page_rows],
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total': total,
+            'total_pages': total_pages,
+        },
+    }

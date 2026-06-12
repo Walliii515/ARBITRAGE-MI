@@ -49,7 +49,7 @@ from calc.account_capital import build_default_capital_snapshotter
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
 from calc.reverse_research_store import (
     ReverseResearchConfig,
-    get_reverse_research_analysis,
+    get_reverse_research_page,
     record_reverse_research_snapshot,
 )
 from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
@@ -1034,11 +1034,17 @@ async def reverse_arbitrage_opportunities():
 @app.get('/api/reverse-research/analysis', dependencies=[Depends(verify_token_dependency)])
 async def reverse_research_analysis(
     hours: int = Query(24, ge=1, le=168),
-    limit: int = Query(100, ge=1, le=500),
+    view: str = Query('negative'),
+    keyword: str = Query('', max_length=64),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=10, le=5000),
 ):
-    return get_reverse_research_analysis(
+    return get_reverse_research_page(
         hours=hours,
-        limit=limit,
+        view=view,
+        keyword=keyword,
+        page=page,
+        page_size=page_size,
         open_amount_usdt=OPEN_AMOUNT_USDT,
         funding_capture_ratio=_reverse_cfg.funding_capture_ratio,
         fee_cost_bps=(SPOT_OPEN_FEE + SPOT_CLOSE_FEE + FUTURE_OPEN_FEE + FUTURE_CLOSE_FEE) * 10000.0,

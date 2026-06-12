@@ -69,9 +69,13 @@ interface ReverseResearchSummary {
 interface ReverseResearchPayload {
   hours?: number
   summary?: ReverseResearchSummary
-  top_negative_funding?: ReverseResearchRow[]
-  top_borrow_drain?: ReverseResearchRow[]
-  top_candidates?: ReverseResearchRow[]
+  rows?: ReverseResearchRow[]
+  pagination?: {
+    page: number
+    page_size: number
+    total: number
+    total_pages: number
+  }
 }
 
 const PAGE_KEY = 'reverse_research_analysis'
@@ -82,9 +86,11 @@ const loading = ref(false)
 const collectLoading = ref(false)
 const keyword = ref('')
 const summary = ref<ReverseResearchSummary>({})
-const negativeRows = shallowRef<ReverseResearchRow[]>([])
-const drainRows = shallowRef<ReverseResearchRow[]>([])
-const candidateRows = shallowRef<ReverseResearchRow[]>([])
+const rowData = shallowRef<ReverseResearchRow[]>([])
+const paginationPageSize = ref(100)
+const paginationPageSizeOptions = [50, 100, 500, 1000, 5000]
+const paginationCurrentPage = ref(1)
+const paginationTotal = ref(0)
 const columnVisibilities = ref<ColumnVisibility[]>([])
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
@@ -92,21 +98,7 @@ void gridContainerRef
 let gridApi: GridApi<ReverseResearchRow> | null = null
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
-const sourceRows = computed(() => {
-  if (activeView.value === 'drain') return drainRows.value
-  if (activeView.value === 'candidate') return candidateRows.value
-  return negativeRows.value
-})
-
-const rowData = computed(() => {
-  const term = keyword.value.trim().toLowerCase()
-  if (!term) return sourceRows.value
-  return sourceRows.value.filter((row) => {
-    const asset = String(row.base_asset || '').toLowerCase()
-    const contract = String(row.contract || '').toLowerCase()
-    return asset.includes(term) || contract.includes(term)
-  })
-})
+const totalPages = computed(() => Math.ceil(paginationTotal.value / paginationPageSize.value) || 1)
 
 const summaryItems = computed(() => [
   { label: '观察标的', value: summary.value.asset_count ?? 0, tone: '' },
@@ -363,15 +355,25 @@ async function loadColumnState() {
   }
 }
 
-async function fetchAnalysis() {
+async function fetchAnalysis(resetPage = false) {
+  if (loading.value) return
+  if (resetPage) paginationCurrentPage.value = 1
   loading.value = true
   try {
-    const res = await get(`/api/reverse-research/analysis?hours=${hours.value}&limit=150`)
+    const params = new URLSearchParams({
+      hours: String(hours.value),
+      view: activeView.value,
+      keyword: keyword.value.trim(),
+      page: String(paginationCurrentPage.value),
+      page_size: String(paginationPageSize.value),
+    })
+    const res = await get(`/api/reverse-research/analysis?${params.toString()}`)
     const data = (await res.json()) as ReverseResearchPayload
     summary.value = data.summary || {}
-    negativeRows.value = data.top_negative_funding || []
-    drainRows.value = data.top_borrow_drain || []
-    candidateRows.value = data.top_candidates || []
+    rowData.value = data.rows || []
+    paginationTotal.value = Number(data.pagination?.total || 0)
+    paginationCurrentPage.value = Number(data.pagination?.page || paginationCurrentPage.value)
+    paginationPageSize.value = Number(data.pagination?.page_size || paginationPageSize.value)
   } catch {
     showError('加载反向研究分析失败')
   } finally {
@@ -391,6 +393,23 @@ async function collectSnapshot() {
   } finally {
     collectLoading.value = false
   }
+}
+
+function setView(view: ResearchView) {
+  activeView.value = view
+  fetchAnalysis(true)
+}
+
+function onPageChange(page: number | undefined) {
+  const nextPage = Number(page || 1)
+  if (!Number.isFinite(nextPage)) return
+  paginationCurrentPage.value = Math.min(Math.max(nextPage, 1), totalPages.value)
+  fetchAnalysis()
+}
+
+function onPaginationSizeChange() {
+  paginationCurrentPage.value = 1
+  fetchAnalysis()
 }
 
 function onGridReady(params: GridReadyEvent<ReverseResearchRow>) {
@@ -426,9 +445,9 @@ onUnmounted(() => {
 
     <div class="filter-bar">
       <el-button-group size="small">
-        <el-button :type="activeView === 'negative' ? 'primary' : 'default'" @click="activeView = 'negative'">负费率</el-button>
-        <el-button :type="activeView === 'drain' ? 'primary' : 'default'" @click="activeView = 'drain'">借币流失</el-button>
-        <el-button :type="activeView === 'candidate' ? 'primary' : 'default'" @click="activeView = 'candidate'">候选观察</el-button>
+        <el-button :type="activeView === 'negative' ? 'primary' : 'default'" @click="setView('negative')">负费率</el-button>
+        <el-button :type="activeView === 'drain' ? 'primary' : 'default'" @click="setView('drain')">借币流失</el-button>
+        <el-button :type="activeView === 'candidate' ? 'primary' : 'default'" @click="setView('candidate')">候选观察</el-button>
       </el-button-group>
       <el-input
         v-model="keyword"
@@ -437,8 +456,10 @@ onUnmounted(() => {
         size="small"
         clearable
         style="width: 150px"
+        @change="fetchAnalysis(true)"
+        @clear="fetchAnalysis(true)"
       />
-      <el-select v-model="hours" size="small" style="width: 110px" @change="fetchAnalysis">
+      <el-select v-model="hours" size="small" style="width: 110px" @change="fetchAnalysis(true)">
         <el-option :value="6" label="最近6小时" />
         <el-option :value="24" label="最近24小时" />
         <el-option :value="72" label="最近3天" />
@@ -477,6 +498,50 @@ onUnmounted(() => {
         style="width: 100%; height: 100%"
         @grid-ready="onGridReady"
       />
+    </div>
+
+    <div class="pagination-bar">
+      <div class="pagination-info">
+        共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
+      </div>
+      <div class="pagination-controls">
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === 1"
+          @click="onPageChange(paginationCurrentPage - 1)"
+        >
+          上一页
+        </el-button>
+        <el-select
+          v-model="paginationPageSize"
+          size="small"
+          style="width: 100px; margin: 0 8px"
+          @change="onPaginationSizeChange"
+        >
+          <el-option
+            v-for="size in paginationPageSizeOptions"
+            :key="size"
+            :label="`${size}条/页`"
+            :value="size"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          :disabled="paginationCurrentPage === totalPages"
+          @click="onPageChange(paginationCurrentPage + 1)"
+        >
+          下一页
+        </el-button>
+        <el-input-number
+          v-model="paginationCurrentPage"
+          :min="1"
+          :max="totalPages"
+          size="small"
+          style="width: 100px; margin-left: 8px"
+          controls-position="right"
+          @change="onPageChange"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -570,5 +635,25 @@ onUnmounted(() => {
 
 .column-picker-label {
   font-size: 13px;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  gap: 16px;
+}
+
+.pagination-info {
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+  white-space: nowrap;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>
