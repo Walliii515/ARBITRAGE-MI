@@ -12,7 +12,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from common.database import db_manager
 from common.logger import get_logger
@@ -59,6 +59,7 @@ class ReverseSignalMonitor:
         spot_meta: Dict[str, Dict],
         reverse_threshold_meta: Dict[str, Dict],
         executor_client: Optional[ExecutorClient] = None,
+        borrow_meta_refresher: Optional[Callable[[str], Dict[str, Dict]]] = None,
     ):
         self.cfg = cfg
         self.reverse_cfg = reverse_cfg
@@ -66,6 +67,7 @@ class ReverseSignalMonitor:
         self.spot_meta = spot_meta
         self.reverse_threshold_meta = reverse_threshold_meta
         self.executor_client = executor_client
+        self.borrow_meta_refresher = borrow_meta_refresher
         self._gate_manager = None
         self._spot_manager = None
         self._states: Dict[str, Dict] = {}
@@ -92,6 +94,12 @@ class ReverseSignalMonitor:
 
     def set_executor_client(self, executor_client: Optional[ExecutorClient]) -> None:
         self.executor_client = executor_client
+
+    def set_borrow_meta_refresher(
+        self,
+        borrow_meta_refresher: Optional[Callable[[str], Dict[str, Dict]]],
+    ) -> None:
+        self.borrow_meta_refresher = borrow_meta_refresher
 
     def process_rows(self, rows: List[Dict], borrow_meta: Optional[Dict[str, Dict]] = None) -> List[Dict]:
         """处理一轮反向信号监控，返回本轮状态变化。"""
@@ -456,21 +464,40 @@ class ReverseSignalMonitor:
             check_rows[0]['symbol'] = symbol
             c_meta = self.contract_meta.get(base_asset, {})
             check_rows[0]['funding_rate_24h'] = c_meta.get('funding_rate_24h')
+            effective_borrow_meta, borrow_refresh_reason = self._pre_gate_borrow_meta(
+                base_asset,
+                borrow_meta,
+            )
+            if borrow_refresh_reason:
+                return False, None, borrow_refresh_reason
+
             enrich_reverse_opportunities(
                 check_rows,
                 self.contract_meta,
                 self.reverse_cfg,
-                borrow_meta=borrow_meta,
+                borrow_meta=effective_borrow_meta,
                 reverse_threshold_meta=self.reverse_threshold_meta,
             )
             check = check_rows[0]
             self._pre_gate_rows[base_asset] = dict(check)
             pre_gate_basis = self._as_float(check.get('reverse_basis_bps'))
+            reverse_status = check.get('reverse_status')
+            if reverse_status != 'candidate':
+                reason = f"旁路复核失败({reverse_status or 'unknown'})"
+                if self.cfg.execution_enabled and self.borrow_meta_refresher and reverse_status in {
+                    'missing_borrow_data',
+                    'borrow_unavailable',
+                    'borrow_capacity_low',
+                }:
+                    reason = (
+                        f"实时借币复核失败({reverse_status},"
+                        f"额度={self._fmt_optional(check.get('reverse_borrow_limit'))},"
+                        f"额度USDT={self._fmt_optional(check.get('reverse_borrow_capacity_usdt'))})"
+                    )
+                return False, pre_gate_basis, reason
             if trigger_type == 'funding_carry':
                 if check.get('reverse_funding_carry_pass') is not True:
                     return False, pre_gate_basis, 'FundingCarry旁路复核失败(实时条件不满足)'
-            elif check.get('reverse_status') != 'candidate':
-                return False, pre_gate_basis, f"旁路复核失败({check.get('reverse_status') or 'unknown'})"
 
             if not self.cfg.execution_enabled:
                 return True, pre_gate_basis, '反向执行器未启用，仅记录可开仓观察态'
@@ -486,6 +513,23 @@ class ReverseSignalMonitor:
         except Exception as exc:
             logger.warning(f'反向开仓旁路异常 | {base_asset}: {exc}', exc_info=True)
             return False, None, f'旁路异常({str(exc)[:120]})'
+
+    def _pre_gate_borrow_meta(
+        self,
+        base_asset: str,
+        borrow_meta: Optional[Dict[str, Dict]],
+    ) -> Tuple[Dict[str, Dict], str]:
+        effective_borrow_meta = dict(borrow_meta or {})
+        if not self.cfg.execution_enabled or self.borrow_meta_refresher is None:
+            return effective_borrow_meta, ''
+
+        live_meta = self.borrow_meta_refresher(base_asset) or {}
+        live_item = live_meta.get(base_asset)
+        if not live_item:
+            return effective_borrow_meta, '实时借币复核失败(无数据)'
+
+        effective_borrow_meta[base_asset] = dict(live_item)
+        return effective_borrow_meta, ''
 
     def _execution_capacity_ok(self, base_asset: str) -> Tuple[bool, str]:
         limit = int(self.cfg.max_total_positions or 0)

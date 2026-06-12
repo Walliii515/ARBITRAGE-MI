@@ -352,6 +352,43 @@ def _get_reverse_borrow_meta(assets: List[str]) -> tuple[Dict[str, Dict], str]:
     return {}, 'none'
 
 
+def _get_reverse_realtime_borrow_meta(asset: str) -> Dict[str, Dict]:
+    """旁路风控专用：只复核单个标的当前真实可借额度。"""
+    global _reverse_borrow_cache, _reverse_borrow_cache_ts
+
+    base_asset = _normalize_base_asset(asset)
+    if not base_asset:
+        return {}
+
+    client = _build_binance_margin_borrow_client()
+    cached = dict(_reverse_borrow_cache.get(base_asset) or {})
+    if not client:
+        return {base_asset: cached} if cached else {}
+
+    try:
+        borrowable = client.get_max_borrowable(base_asset)
+        amount = borrowable.get('amount')
+        limit = borrowable.get('borrowLimit')
+        cached['max_borrowable_amount'] = amount
+        cached['account_borrow_limit'] = limit
+        cached['borrow_limit'] = amount
+        if amount is not None:
+            cached['borrowable'] = amount > 0
+    except Exception as exc:
+        logger.warning(f'反向旁路实时借币额度复核失败 | {base_asset} | {exc}')
+        cached['max_borrowable_amount'] = 0.0
+        cached['account_borrow_limit'] = cached.get('account_borrow_limit') or cached.get('borrow_limit')
+        cached['borrow_limit'] = 0.0
+        cached['borrowable'] = False
+        cached['borrow_unavailable_reason'] = 'pre_gate_max_borrowable_unavailable'
+
+    if cached:
+        _reverse_borrow_cache[base_asset] = cached
+        _reverse_borrow_cache_ts = time.time()
+        return {base_asset: cached}
+    return {}
+
+
 def _normalize_base_asset(value) -> str:
     """统一元数据索引键，避免 DB 小写/混合大小写导致前端阈值匹配失败。"""
     return str(value or '').strip().upper()
@@ -1505,11 +1542,13 @@ def _get_reverse_signal_monitor() -> ReverseSignalMonitor:
             _spot_meta,
             _reverse_vwap_threshold_meta,
             executor_client=_reverse_executor_client,
+            borrow_meta_refresher=_get_reverse_realtime_borrow_meta,
         )
     else:
         _reverse_signal_monitor.cfg = monitor_cfg
         _reverse_signal_monitor.update_meta(_contract_meta, _spot_meta, _reverse_vwap_threshold_meta)
         _reverse_signal_monitor.set_executor_client(_reverse_executor_client)
+        _reverse_signal_monitor.set_borrow_meta_refresher(_get_reverse_realtime_borrow_meta)
 
     if svc and svc.gate_manager and svc.spot_manager:
         _reverse_signal_monitor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)

@@ -409,6 +409,81 @@ def test_reverse_execute_open_calls_executor_and_marks_opened(monkeypatch):
     assert any(params and params.get('order_uuid') == result['order_uuid'] for _, params in updates)
 
 
+def test_reverse_pre_gate_uses_realtime_borrow_meta_over_cached_meta():
+    monitor = ReverseSignalMonitor(
+        ReverseSignalMonitorConfig(
+            open_amount_usdt=10,
+            execution_enabled=True,
+        ),
+        ReverseArbitrageConfig(
+            open_amount_usdt=10,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            orderbook_coverage_threshold=0.6,
+        ),
+        {},
+        {},
+        {},
+        borrow_meta_refresher=lambda asset: {
+            asset: {
+                'borrowable': False,
+                'hourly_interest_rate': 0.00014107,
+                'borrow_limit': 0,
+                'max_borrowable_amount': 0,
+                'account_borrow_limit': 76000,
+            }
+        },
+    )
+
+    effective, reason = monitor._pre_gate_borrow_meta('ID', {
+        'ID': {
+            'borrowable': True,
+            'hourly_interest_rate': 0.00014107,
+            'borrow_limit': 76000,
+            'max_borrowable_amount': 76000,
+        }
+    })
+
+    assert reason == ''
+    assert effective['ID']['borrowable'] is False
+    assert effective['ID']['borrow_limit'] == 0
+    assert effective['ID']['account_borrow_limit'] == 76000
+
+
+def test_reverse_pre_gate_rejects_when_realtime_borrow_meta_missing():
+    monitor = ReverseSignalMonitor(
+        ReverseSignalMonitorConfig(
+            open_amount_usdt=10,
+            execution_enabled=True,
+        ),
+        ReverseArbitrageConfig(
+            open_amount_usdt=10,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            orderbook_coverage_threshold=0.6,
+        ),
+        {},
+        {},
+        {},
+        borrow_meta_refresher=lambda asset: {},
+    )
+
+    effective, reason = monitor._pre_gate_borrow_meta('ID', {
+        'ID': {
+            'borrowable': True,
+            'hourly_interest_rate': 0.00014107,
+            'borrow_limit': 76000,
+        }
+    })
+
+    assert effective['ID']['borrow_limit'] == 76000
+    assert reason == '实时借币复核失败(无数据)'
+
+
 def test_reverse_margin_edge_must_be_non_negative():
     row = {
         'base_asset': 'ABC',
