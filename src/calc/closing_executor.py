@@ -885,7 +885,7 @@ class ClosingExecutor:
                 'gate_available': gate_available,
                 'hedge_balanced': 1 if hedge_balanced else 0,
                 'success': 1 if success else 0,
-                'error_msg': (message or '')[:200],
+                'error_msg': message or '',
             })
 
     def _check_funding_count(self, pos: Dict) -> bool:
@@ -1694,7 +1694,7 @@ class ClosingExecutor:
     @staticmethod
     def _position_close_reason(close_reason_detail: str) -> str:
         """Position 表只保存可展示摘要；完整执行审计仍保留在 mi_trade_order.reject_reason。"""
-        max_len = 4000
+        max_len = 60000
         text = str(close_reason_detail or '')
         if len(text) <= max_len:
             return text

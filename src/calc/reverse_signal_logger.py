@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS mi_reverse_trade_signal (
     last_seen_time DATETIME DEFAULT NULL,
     status ENUM('candidate', 'rejected', 'conditions_lost') NOT NULL,
     reverse_status VARCHAR(64) NOT NULL,
-    trigger_reason VARCHAR(500) DEFAULT NULL,
+    trigger_reason TEXT DEFAULT NULL,
     reject_reason TEXT DEFAULT NULL,
     funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
     reverse_gross_funding_bps DECIMAL(12,4) DEFAULT NULL,
@@ -77,6 +77,7 @@ def ensure_reverse_signal_table() -> None:
         for column, alter_sql in REVERSE_SIGNAL_EXTRA_COLUMNS.items():
             if column not in existing:
                 cursor.execute(f"ALTER TABLE mi_reverse_trade_signal {alter_sql}")
+        cursor.execute("ALTER TABLE mi_reverse_trade_signal MODIFY COLUMN trigger_reason TEXT DEFAULT NULL")
 
 
 def reverse_signal_status(reverse_status: Optional[str]) -> str:

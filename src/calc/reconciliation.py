@@ -370,8 +370,8 @@ class Reconciler:
                 'status': risk.get('status') or 'desynced',
                 'type': risk.get('type') or 'unknown',
                 'event_at': risk.get('event_at') or datetime.now(),
-                'detail': str(risk.get('detail') or '')[:1000],
-                'reason': reason[:500],
+                'detail': str(risk.get('detail') or ''),
+                'reason': reason,
                 'reason_like': f"%交易所仓位风险:{risk.get('type')}%",
                 'base_asset': base_asset,
             })

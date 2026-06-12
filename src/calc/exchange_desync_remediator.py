@@ -209,7 +209,7 @@ class ExchangeDesyncRemediator:
         return (
             f"交易所断腿自动处置|{risk.get('type', 'unknown')}|"
             f"{risk.get('detail', '')}|动作=Binance现货市价卖出"
-        )[:1000]
+        )
 
     def _insert_spot_order(self, order: Dict, exec_data: Dict, reason: str, success: bool, now: datetime):
         fields = self._execution_fields('spot_order', order, exec_data, success)
@@ -374,7 +374,7 @@ class ExchangeDesyncRemediator:
             WHERE id = %(position_id)s
         """
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, {'message': message[:300], 'position_id': position_id})
+            cursor.execute(sql, {'message': message, 'position_id': position_id})
 
     def _mark_positions_exchange_risk(self, positions: List[Dict], risk: Dict):
         ids = [int(row['id']) for row in positions if row.get('id') is not None]
@@ -399,10 +399,10 @@ class ExchangeDesyncRemediator:
         params = [
             risk.get('type') or 'unknown',
             risk.get('event_at') or datetime.now(),
-            str(risk.get('detail') or '')[:1000],
-            reason[:500],
+            str(risk.get('detail') or ''),
+            reason,
             f"%交易所仓位风险:{risk.get('type')}%",
-            reason[:500],
+            reason,
             *ids,
         ]
         with db_manager.get_cursor() as cursor:
