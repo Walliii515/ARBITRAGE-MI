@@ -89,17 +89,24 @@ interface PositionRow {
   order_count: number | null
 }
 
+interface OrderSummary {
+  total: number
+  open: number
+  close: number
+  exchange_risk: number
+}
+
 /* ───── 状态 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
 const rowData = shallowRef<PositionRow[]>([])
 let gridApi: GridApi<PositionRow> | null = null
 const loading = ref(false)
-const statusFilter = ref<string>('')
-const channelFilter = ref<string>('')
 const orderSideFilter = ref<string>('')
+const exchangeRiskOnly = ref<boolean>(false)
 const baseAssetFilter = ref<string>('')
 const filterDays = ref<number>(1) // 默认今日
+const orderSummary = ref<OrderSummary>({ total: 0, open: 0, close: 0, exchange_risk: 0 })
 
 // 一键全部平仓
 const closeAllLoading = ref(false)
@@ -408,16 +415,9 @@ function setDaysFilter(days: number) {
   fetchOrders()
 }
 
-/** 快捷状态过滤 */
-function setStatusFilter(status: string) {
-  statusFilter.value = status
-  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
-  fetchOrders()
-}
-
-/** 快捷渠道过滤 */
-function setChannelFilter(channel: string) {
-  channelFilter.value = channel
+/** 交易所风险过滤 */
+function setExchangeRiskOnly(enabled: boolean) {
+  exchangeRiskOnly.value = enabled
   paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
   fetchOrders()
 }
@@ -435,14 +435,11 @@ async function fetchOrders() {
     params.set('days', String(filterDays.value))
     params.set('page', String(paginationCurrentPage.value))
     params.set('page_size', String(paginationPageSize.value))
-    if (statusFilter.value) {
-      params.set('status', statusFilter.value)
-    }
-    if (channelFilter.value) {
-      params.set('channel', channelFilter.value)
-    }
     if (orderSideFilter.value) {
       params.set('order_side', orderSideFilter.value)
+    }
+    if (exchangeRiskOnly.value) {
+      params.set('exchange_risk', 'true')
     }
     if (baseAssetFilter.value) {
       params.set('base_asset', baseAssetFilter.value.trim())
@@ -456,6 +453,12 @@ async function fetchOrders() {
     }
     const data = await res.json()
     rowData.value = data.orders || []
+    orderSummary.value = {
+      total: Number(data.summary?.total || 0),
+      open: Number(data.summary?.open || 0),
+      close: Number(data.summary?.close || 0),
+      exchange_risk: Number(data.summary?.exchange_risk || 0),
+    }
     
     // 更新分页信息
     if (data.pagination) {
@@ -648,28 +651,17 @@ onUnmounted(() => {
   <div class="monitor-page">
     <el-card shadow="never" class="status-card">
       <div class="filter-row">
-        <span class="filter-label">状态：</span>
+        <span class="filter-label">方向：</span>
         <el-button-group size="small">
-          <el-button :type="statusFilter === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部</el-button>
-          <el-button :type="statusFilter === 'executed' ? 'primary' : 'default'" @click="setStatusFilter('executed')">已成交</el-button>
-          <el-button :type="statusFilter === 'pending' ? 'primary' : 'default'" @click="setStatusFilter('pending')">待执行</el-button>
-          <el-button :type="statusFilter === 'rejected' ? 'primary' : 'default'" @click="setStatusFilter('rejected')">被拒</el-button>
-          <el-button :type="statusFilter === 'failed' ? 'primary' : 'default'" @click="setStatusFilter('failed')">失败</el-button>
+          <el-button :type="orderSideFilter === '' ? 'primary' : 'default'" @click="setOrderSideFilter('')">全部({{ orderSummary.total }})</el-button>
+          <el-button :type="orderSideFilter === 'open' ? 'primary' : 'default'" @click="setOrderSideFilter('open')">开仓({{ orderSummary.open }})</el-button>
+          <el-button :type="orderSideFilter === 'close' ? 'primary' : 'default'" @click="setOrderSideFilter('close')">平仓({{ orderSummary.close }})</el-button>
         </el-button-group>
 
-        <span class="filter-label" style="margin-left: 24px;">渠道：</span>
+        <span class="filter-label" style="margin-left: 24px;">交易所风险：</span>
         <el-button-group size="small">
-          <el-button :type="channelFilter === '' ? 'primary' : 'default'" @click="setChannelFilter('')">全部</el-button>
-          <el-button :type="channelFilter === 'Mock' ? 'primary' : 'default'" @click="setChannelFilter('Mock')">Mock</el-button>
-          <el-button :type="channelFilter === 'SimTrade' ? 'primary' : 'default'" @click="setChannelFilter('SimTrade')">SimTrade</el-button>
-          <el-button :type="channelFilter === 'Live' ? 'primary' : 'default'" @click="setChannelFilter('Live')">Live</el-button>
-        </el-button-group>
-
-        <span class="filter-label" style="margin-left: 24px;">方向：</span>
-        <el-button-group size="small">
-          <el-button :type="orderSideFilter === '' ? 'primary' : 'default'" @click="setOrderSideFilter('')">全部</el-button>
-          <el-button :type="orderSideFilter === 'open' ? 'primary' : 'default'" @click="setOrderSideFilter('open')">开仓</el-button>
-          <el-button :type="orderSideFilter === 'close' ? 'primary' : 'default'" @click="setOrderSideFilter('close')">平仓</el-button>
+          <el-button :type="!exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(false)">全部</el-button>
+          <el-button :type="exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(true)">有风险({{ orderSummary.exchange_risk }})</el-button>
         </el-button-group>
       </div>
 

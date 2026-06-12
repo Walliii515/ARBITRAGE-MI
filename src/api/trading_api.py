@@ -117,6 +117,7 @@ async def get_orders(
     status: Optional[str] = Query(None, description="持仓状态(holding/closed)"),
     channel: Optional[str] = Query(None, description="渠道过滤"),
     order_side: Optional[str] = Query(None, description="方向过滤(open=持仓中/close=已平仓)"),
+    exchange_risk: bool = Query(False, description="仅展示交易所风险持仓"),
     position_id: Optional[int] = Query(None, description="持仓ID过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
     days: int = Query(1, ge=1, le=90, description="最近N天"),
@@ -133,36 +134,68 @@ async def get_orders(
         close_threshold_col = 'close_basis_p20'
 
     # ─── 构建 WHERE 条件 ───
-    where_clauses = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
-    params: list = [days]
+    base_where_clauses = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    base_params: list = [days]
+
+    legacy_status_clause = None
+    if status in ('holding', 'closed'):
+        legacy_status_clause = status
+    elif status in ('pending', 'rejected', 'failed'):
+        # 这些状态不适用于持仓级别，返回空。保留兼容旧前端/旧书签。
+        return {
+            'orders': [],
+            'pagination': {'page': page, 'page_size': page_size, 'total': 0, 'total_pages': 0},
+            'summary': {'total': 0, 'open': 0, 'close': 0, 'exchange_risk': 0},
+        }
+
+    if base_asset:
+        base_where_clauses.append("p.base_asset = %s")
+        base_params.append(base_asset)
+
+    if position_id is not None:
+        base_where_clauses.append("p.id = %s")
+        base_params.append(position_id)
+
+    if channel:
+        base_where_clauses.append("EXISTS (SELECT 1 FROM mi_trade_order o WHERE o.position_id = p.id AND o.channel = %s)")
+        base_params.append(channel)
+
+    if exchange_risk:
+        base_where_clauses.append("p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal'")
+
+    where_clauses = list(base_where_clauses)
+    params = list(base_params)
 
     # 方向过滤 → 映射为持仓状态
     if order_side == 'open':
         where_clauses.append("p.status = 'holding'")
     elif order_side == 'close':
         where_clauses.append("p.status = 'closed'")
-    elif status in ('holding', 'closed'):
+    elif legacy_status_clause:
         where_clauses.append("p.status = %s")
-        params.append(status)
-    elif status == 'executed':
-        pass  # 所有持仓都是成功开仓的，不需额外过滤
-    elif status in ('pending', 'rejected', 'failed'):
-        # 这些状态不适用于持仓级别，返回空
-        return {'orders': [], 'pagination': {'page': page, 'page_size': page_size, 'total': 0, 'total_pages': 0}}
-
-    if base_asset:
-        where_clauses.append("p.base_asset = %s")
-        params.append(base_asset)
-
-    if position_id is not None:
-        where_clauses.append("p.id = %s")
-        params.append(position_id)
-
-    if channel:
-        where_clauses.append("EXISTS (SELECT 1 FROM mi_trade_order o WHERE o.position_id = p.id AND o.channel = %s)")
-        params.append(channel)
+        params.append(legacy_status_clause)
 
     where_sql = " AND ".join(where_clauses)
+    summary_where_sql = " AND ".join(base_where_clauses)
+
+    summary_sql = f"""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN p.status = 'holding' THEN 1 ELSE 0 END) AS open_count,
+            SUM(CASE WHEN p.status = 'closed' THEN 1 ELSE 0 END) AS close_count,
+            SUM(CASE WHEN p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal' THEN 1 ELSE 0 END) AS exchange_risk_count
+        FROM mi_trade_position p
+        WHERE {summary_where_sql}
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(summary_sql, base_params)
+        summary_row = cursor.fetchone() or {}
+        summary = {
+            'total': int(summary_row.get('total') or 0),
+            'open': int(summary_row.get('open_count') or 0),
+            'close': int(summary_row.get('close_count') or 0),
+            'exchange_risk': int(summary_row.get('exchange_risk_count') or 0),
+        }
 
     # ─── 统计持仓总数 ───
     count_sql = f"SELECT COUNT(*) AS total FROM mi_trade_position p WHERE {where_sql}"
@@ -207,7 +240,8 @@ async def get_orders(
             'page_size': page_size,
             'total': total,
             'total_pages': (total + page_size - 1) // page_size if total else 0,
-        }
+        },
+        'summary': summary,
     }
 
 
@@ -295,6 +329,28 @@ async def get_positions(
 ):
     """查询持仓列表（含资金费结算历史，支持分页）"""
     try:
+        summary_sql = """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'holding' THEN 1 ELSE 0 END) as holding_count,
+                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed_count
+            FROM mi_trade_position
+            WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
+        """
+        summary_params = [days]
+        if base_asset:
+            summary_sql += " AND base_asset = %s"
+            summary_params.append(base_asset)
+
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(summary_sql, summary_params)
+            summary_row = cursor.fetchone() or {}
+            summary = {
+                'total': int(summary_row.get('total') or 0),
+                'holding': int(summary_row.get('holding_count') or 0),
+                'closed': int(summary_row.get('closed_count') or 0),
+            }
+
         # 查询总数
         count_sql = "SELECT COUNT(*) as total FROM mi_trade_position WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
         count_params = [days]
@@ -338,7 +394,8 @@ async def get_positions(
                     'page_size': page_size,
                     'total': 0,
                     'total_pages': 0,
-                }
+                },
+                'summary': summary,
             }
         
         # 获取资金费结算历史（仅查询当前返回的持仓 ID）
@@ -393,6 +450,7 @@ async def get_positions(
                 'total': total,
                 'total_pages': (total + page_size - 1) // page_size,
             },
+            'summary': summary,
             # 标准开仓金额，前端用于兑底计算 funding_pnl_bps、避免硬编码与后端配置漂移
             'open_amount_usdt': config.get_float('trade.open.amount_usdt', 10.0),
         }

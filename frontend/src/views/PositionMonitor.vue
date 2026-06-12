@@ -136,6 +136,12 @@ interface AccountSummary {
   total: AccountTotal
 }
 
+interface PositionSummary {
+  total: number
+  holding: number
+  closed: number
+}
+
 /* ───── 状态 ───── */
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
@@ -150,6 +156,7 @@ const filterDays = ref<number>(90) // 默认90天
 const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
 const wsLatencyMs = ref<number | null>(null)
 const accountSummary = ref<AccountSummary | null>(null)
+const positionSummary = ref<PositionSummary>({ total: 0, holding: 0, closed: 0 })
 
 // 分页配置
 const paginationPageSize = ref<number>(100)
@@ -1074,6 +1081,11 @@ async function fetchPositions() {
     if (data.pagination) {
       paginationTotal.value = data.pagination.total || 0
     }
+    positionSummary.value = {
+      total: Number(data.summary?.total || 0),
+      holding: Number(data.summary?.holding || 0),
+      closed: Number(data.summary?.closed || 0),
+    }
   } catch {
     showError('请求持仓数据失败')
   } finally {
@@ -1326,9 +1338,9 @@ onUnmounted(() => {
       <div class="filter-row">
         <span class="filter-label">状态：</span>
         <el-button-group size="small">
-          <el-button :type="statusFilter === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部</el-button>
-          <el-button :type="statusFilter === 'holding' ? 'primary' : 'default'" @click="setStatusFilter('holding')">持仓中</el-button>
-          <el-button :type="statusFilter === 'closed' ? 'primary' : 'default'" @click="setStatusFilter('closed')">已平仓</el-button>
+          <el-button :type="statusFilter === '' ? 'primary' : 'default'" @click="setStatusFilter('')">全部({{ positionSummary.total }})</el-button>
+          <el-button :type="statusFilter === 'holding' ? 'primary' : 'default'" @click="setStatusFilter('holding')">开仓({{ positionSummary.holding }})</el-button>
+          <el-button :type="statusFilter === 'closed' ? 'primary' : 'default'" @click="setStatusFilter('closed')">平仓({{ positionSummary.closed }})</el-button>
         </el-button-group>
 
         <span class="filter-label" style="margin-left: 24px;">时间：</span>
