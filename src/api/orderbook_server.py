@@ -47,6 +47,11 @@ from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
+from calc.reverse_research_store import (
+    ReverseResearchConfig,
+    get_reverse_research_analysis,
+    record_reverse_research_snapshot,
+)
 from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
 from calc.executor_client import ExecutorClient
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
@@ -156,6 +161,9 @@ REVERSE_BORROW_CACHE_TTL_SEC = config.get_float('reverse_arbitrage.binance_margi
 REVERSE_BORROW_MAX_ASSETS = config.get_int('reverse_arbitrage.binance_margin.max_borrowable_assets_per_refresh', 250)
 REVERSE_SIGNAL_ENABLED = config.get_bool('reverse_arbitrage.signal.enabled', True)
 REVERSE_SIGNAL_INTERVAL_SEC = config.get_float('reverse_arbitrage.signal.check_interval_sec', 1.0)
+REVERSE_RESEARCH_ENABLED = config.get_bool('reverse_arbitrage.research.enabled', True)
+REVERSE_RESEARCH_INTERVAL_SEC = config.get_float('reverse_arbitrage.research.snapshot_interval_sec', 60.0)
+REVERSE_RESEARCH_MAX_ROWS = config.get_int('reverse_arbitrage.research.max_rows_per_snapshot', 400)
 
 # 富化配置实例（快照推送、开仓检查共用）
 _enrich_cfg = EnrichConfig(
@@ -646,6 +654,25 @@ def build_reverse_opportunities_payload() -> dict:
     }
 
 
+def record_reverse_research_snapshot_once(sample_source: str = 'manual') -> dict:
+    """记录一批反向研究快照；仅用于观察分析，不参与开仓判断。"""
+    rows, _borrow_meta, borrow_source = _build_reverse_enriched_rows()
+    inserted = record_reverse_research_snapshot(
+        rows,
+        ReverseResearchConfig(
+            open_amount_usdt=OPEN_AMOUNT_USDT,
+            max_rows_per_snapshot=REVERSE_RESEARCH_MAX_ROWS,
+        ),
+        sample_source=sample_source,
+    )
+    return {
+        'ok': True,
+        'inserted': inserted,
+        'borrow_data_source': borrow_source,
+        'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
 def build_payload_json() -> str:
     """构建并预序列化广播载荷 JSON 字符串（缓存复用，避免重复序列化）"""
     global _cached_payload_json, _cached_payload_ts
@@ -824,6 +851,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_position_realtime_push())
     asyncio.create_task(_reconciliation_loop())
     asyncio.create_task(_vwap_snapshot_loop())
+    asyncio.create_task(_reverse_research_snapshot_loop())
     asyncio.create_task(_stale_signal_cleanup_loop())
     _start_gate_risk_event_monitor()
 
@@ -1001,6 +1029,27 @@ async def orderbook_snapshot():
 @app.get('/api/reverse-arbitrage/opportunities', dependencies=[Depends(verify_token_dependency)])
 async def reverse_arbitrage_opportunities():
     return build_reverse_opportunities_payload()
+
+
+@app.get('/api/reverse-research/analysis', dependencies=[Depends(verify_token_dependency)])
+async def reverse_research_analysis(
+    hours: int = Query(24, ge=1, le=168),
+    limit: int = Query(100, ge=1, le=500),
+):
+    return get_reverse_research_analysis(
+        hours=hours,
+        limit=limit,
+        open_amount_usdt=OPEN_AMOUNT_USDT,
+    )
+
+
+@app.post('/api/reverse-research/collect', dependencies=[Depends(verify_token_dependency)])
+async def reverse_research_collect():
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: record_reverse_research_snapshot_once('manual'),
+    )
 
 
 @app.post('/api/service/start', dependencies=[Depends(verify_token_dependency)])
@@ -1580,6 +1629,31 @@ def _run_reverse_signal_check_once():
         elapsed_ms = (time.monotonic() - start) * 1000.0
         if elapsed_ms > 1000:
             logger.warning(f"反向信号监控耗时偏高: {elapsed_ms:.0f}ms")
+
+
+async def _reverse_research_snapshot_loop():
+    """定时记录反向研究快照；观察任务和交易关键路径隔离。"""
+    if not REVERSE_RESEARCH_ENABLED:
+        logger.info('反向研究快照采集已关闭')
+        return
+
+    interval = max(30.0, float(REVERSE_RESEARCH_INTERVAL_SEC or 60.0))
+    loop = asyncio.get_running_loop()
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            if svc and svc.state == SERVICE_RUNNING:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: record_reverse_research_snapshot_once('loop'),
+                )
+                inserted = int(result.get('inserted') or 0)
+                if inserted > 0:
+                    logger.info(f'反向研究快照已记录 {inserted} 条')
+        except Exception as e:
+            logger.error(f'反向研究快照采集失败: {e}', exc_info=True)
+        await asyncio.sleep(interval)
 
 
 async def _open_position_loop():

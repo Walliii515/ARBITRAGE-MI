@@ -231,6 +231,10 @@ function toggleMenu() {
             <el-icon><Stopwatch /></el-icon>
             <template #title>交易信号</template>
           </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/research">
+            <el-icon><DataAnalysis /></el-icon>
+            <template #title>研究分析</template>
+          </el-menu-item>
           <el-menu-item index="/reverse-arbitrage/orders">
             <el-icon><List /></el-icon>
             <template #title>订单管理</template>

@@ -304,6 +304,10 @@ reverse_arbitrage:
     max_next_funding_min: 60                # 距离下次资金费结算 <= 60分钟
     min_margin_edge_bps: 50                 # 边际盈亏至少 50bps
     basis_relax_bps: 30                     # reverse_basis <= min(开仓P20, 平仓P20) + 30bps
+  research:
+    enabled: true
+    snapshot_interval_sec: 60               # 反向研究快照采集间隔；仅观测落库，不参与开仓
+    max_rows_per_snapshot: 400
   signal:
     enabled: true
     check_interval_sec: 1.0
