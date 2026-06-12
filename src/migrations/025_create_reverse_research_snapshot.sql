@@ -1,4 +1,5 @@
--- 反向套利研究快照：记录负费率、真实借币额度、基差和盘口覆盖的观察数据。
+-- 反向套利研究快照：只记录借币侧观察数据。
+-- Funding 和 VWAP/基差使用既有历史表，查询时关联，不在这里重复采样。
 -- 只用于分析和复盘，不参与正向或反向交易执行判断。
 
 CREATE TABLE IF NOT EXISTS mi_reverse_research_snapshot (
@@ -8,27 +9,13 @@ CREATE TABLE IF NOT EXISTS mi_reverse_research_snapshot (
     contract VARCHAR(64) DEFAULT NULL,
     symbol VARCHAR(64) DEFAULT NULL,
     sample_source VARCHAR(32) NOT NULL DEFAULT 'loop',
-    funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
-    gross_funding_bps DECIMAL(12,4) DEFAULT NULL,
-    expected_funding_bps DECIMAL(12,4) DEFAULT NULL,
-    next_funding_time DATETIME DEFAULT NULL,
-    next_funding_min DECIMAL(12,4) DEFAULT NULL,
     borrowable TINYINT DEFAULT NULL,
     max_borrowable_amount DECIMAL(28,12) DEFAULT NULL,
+    account_borrow_limit DECIMAL(28,12) DEFAULT NULL,
     borrow_capacity_usdt DECIMAL(20,4) DEFAULT NULL,
     borrow_hourly_rate DECIMAL(18,10) DEFAULT NULL,
     borrow_24h_bps DECIMAL(12,4) DEFAULT NULL,
     borrow_unavailable_reason VARCHAR(128) DEFAULT NULL,
-    reverse_open_basis_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_close_basis_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_margin_edge_bps DECIMAL(12,4) DEFAULT NULL,
-    reverse_open_coverage DECIMAL(10,6) DEFAULT NULL,
-    spot_spread_bps DECIMAL(12,4) DEFAULT NULL,
-    future_spread_bps DECIMAL(12,4) DEFAULT NULL,
-    spot_top_bid_usdt DECIMAL(20,4) DEFAULT NULL,
-    future_top_ask_usdt DECIMAL(20,4) DEFAULT NULL,
-    spot_quote_volume_24h DECIMAL(24,4) DEFAULT NULL,
-    future_volume_24h_settle DECIMAL(24,4) DEFAULT NULL,
     reverse_status VARCHAR(64) DEFAULT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_snapshot_time (snapshot_time),

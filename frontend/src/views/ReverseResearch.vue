@@ -36,6 +36,7 @@ interface ReverseResearchRow {
   next_funding_min?: number | null
   borrowable?: number | boolean | null
   max_borrowable_amount?: number | null
+  account_borrow_limit?: number | null
   borrow_capacity_usdt?: number | null
   borrow_hourly_rate?: number | null
   borrow_24h_bps?: number | null
@@ -86,6 +87,7 @@ const drainRows = shallowRef<ReverseResearchRow[]>([])
 const candidateRows = shallowRef<ReverseResearchRow[]>([])
 const columnVisibilities = ref<ColumnVisibility[]>([])
 const { gridContainerRef, setupGridCopy } = useGridCopy()
+void gridContainerRef
 
 let gridApi: GridApi<ReverseResearchRow> | null = null
 let refreshTimer: ReturnType<typeof setInterval> | null = null
@@ -210,6 +212,13 @@ const columnDefs = ref<ColDef<ReverseResearchRow>[]>([
   {
     field: 'max_borrowable_amount',
     headerName: '真实可借数量',
+    minWidth: 130,
+    type: 'numericColumn',
+    valueFormatter: (p) => formatDecimal(p.value, 6),
+  },
+  {
+    field: 'account_borrow_limit',
+    headerName: '账户借币上限',
     minWidth: 130,
     type: 'numericColumn',
     valueFormatter: (p) => formatDecimal(p.value, 6),
@@ -375,7 +384,7 @@ async function collectSnapshot() {
   try {
     const res = await post('/api/reverse-research/collect')
     const data = await res.json()
-    if (data?.ok) showSuccess(`已采集 ${data.inserted || 0} 条快照`)
+    if (data?.ok) showSuccess(`已采集 ${data.inserted || 0} 条借币快照`)
     await fetchAnalysis()
   } catch {
     showError('手动采集失败')

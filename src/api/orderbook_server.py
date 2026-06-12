@@ -1040,6 +1040,8 @@ async def reverse_research_analysis(
         hours=hours,
         limit=limit,
         open_amount_usdt=OPEN_AMOUNT_USDT,
+        funding_capture_ratio=_reverse_cfg.funding_capture_ratio,
+        fee_cost_bps=(SPOT_OPEN_FEE + SPOT_CLOSE_FEE + FUTURE_OPEN_FEE + FUTURE_CLOSE_FEE) * 10000.0,
     )
 
 
