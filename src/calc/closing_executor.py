@@ -1583,6 +1583,7 @@ class ClosingExecutor:
         execution_audit = format_execution_audit(exec_result)
         if execution_audit:
             close_reason_detail = f"{close_reason_detail}|{execution_audit}"
+        position_close_reason = self._position_close_reason(close_reason_detail)
 
         # ── 插入平仓订单 ──
         insert_sql = """
@@ -1677,7 +1678,7 @@ class ClosingExecutor:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(update_sql, {
                     'closed_at':            datetime.now(),
-                    'close_reason':         close_reason_detail,
+                    'close_reason':         position_close_reason,
                     'spot_close_price':     spot_close_price,
                     'future_close_price':   future_close_price,
                     'spot_close_amount':    spot_close_amount,
@@ -1689,6 +1690,16 @@ class ClosingExecutor:
                 f"持仓状态更新为 closed | position_id={position_id} | "
                 f"close_spread_bps={close_spread_bps}"
             )
+
+    @staticmethod
+    def _position_close_reason(close_reason_detail: str) -> str:
+        """Position 表只保存可展示摘要；完整执行审计仍保留在 mi_trade_order.reject_reason。"""
+        max_len = 4000
+        text = str(close_reason_detail or '')
+        if len(text) <= max_len:
+            return text
+        suffix = '|...(完整执行审计见mi_trade_order.reject_reason)'
+        return text[: max_len - len(suffix)] + suffix
 
     def _position_future_leverage(self, pos: Dict) -> float:
         leverage = _float_or_none(pos.get('future_open_leverage'))
