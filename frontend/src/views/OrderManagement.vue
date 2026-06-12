@@ -112,8 +112,8 @@ const orderSummary = ref<OrderSummary>({ total: 0, open: 0, close: 0, exchange_r
 const closeAllLoading = ref(false)
 
 // 分页配置
-const paginationPageSize = ref<number>(500)
-const paginationPageSizeOptions = [500, 1000, 2000, 5000]
+const paginationPageSize = ref<number>(50)
+const paginationPageSizeOptions = [50, 100, 500, 1000, 5000]
 const paginationCurrentPage = ref<number>(1)
 const paginationTotal = ref<number>(0)
 

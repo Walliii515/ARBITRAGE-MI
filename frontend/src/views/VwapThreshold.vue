@@ -48,7 +48,7 @@ const calcProgress = ref({ processed: 0, total: 0, message: '', running: false }
 let calcProgressTimer: ReturnType<typeof window.setInterval> | null = null
 
 const paginationPageSize = ref<number>(100)
-const paginationPageSizeOptions = [100, 500, 1000, 5000]
+const paginationPageSizeOptions = [50, 100, 500, 1000, 5000]
 const paginationCurrentPage = ref<number>(1)
 const paginationTotal = ref<number>(0)
 
