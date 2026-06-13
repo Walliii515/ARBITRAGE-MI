@@ -179,21 +179,6 @@ function rowNotional(row: ReversePositionRow): number {
   return numericValue(row.open_amount_usdt) ?? numericValue(row.spot_open_amount) ?? numericValue(row.future_open_amount) ?? 0
 }
 
-function bpsFromTotalAmount(rows: ReversePositionRow[], field: keyof ReversePositionRow): number {
-  let amount = 0
-  let notional = 0
-  for (const row of rows) {
-    const rowAmount = numericValue(row[field])
-    if (rowAmount == null) continue
-    const rowNotionalValue = rowNotional(row)
-    if (!Number.isFinite(rowNotionalValue) || rowNotionalValue <= 0) continue
-    amount += rowAmount
-    notional += rowNotionalValue
-  }
-  if (!Number.isFinite(notional) || notional <= 0) return 0
-  return amount / notional * 10000
-}
-
 function weightedAverage(rows: ReversePositionRow[], getter: (row: ReversePositionRow) => unknown): number | null {
   let weighted = 0
   let notional = 0
@@ -482,9 +467,9 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     borrow_hourly_rate: null,
     open_borrow_24h_bps: weightedAverage(rows, (row) => row.open_borrow_24h_bps),
     borrow_interest_usdt: borrowInterest,
-    borrow_interest_bps: bpsFromTotalAmount(rows, 'borrow_interest_usdt'),
+    borrow_interest_bps: sumRows(rows, 'borrow_interest_bps'),
     borrow_interest_realtime_usdt: rows.reduce((sum, row) => sum + Number(row.borrow_interest_realtime_usdt ?? row.borrow_interest_usdt ?? 0), 0),
-    borrow_interest_realtime_bps: bpsFromTotalAmount(rows, 'borrow_interest_realtime_usdt'),
+    borrow_interest_realtime_bps: sumRows(rows, 'borrow_interest_realtime_bps'),
     spot_open_qty: sumRows(rows, 'spot_open_qty'),
     spot_open_price: null,
     spot_open_amount: sumRows(rows, 'spot_open_amount'),
@@ -507,22 +492,22 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     execution_drift_bps: weightedAverage(rows, (row) => row.execution_drift_bps),
     open_funding_rate_24h: weightedAverage(rows, (row) => row.open_funding_rate_24h),
     funding_pnl_usdt: fundingPnl,
-    funding_pnl_bps: bpsFromTotalAmount(rows, 'funding_pnl_usdt'),
+    funding_pnl_bps: sumRows(rows, 'funding_pnl_bps'),
     fee_total_usdt: feeAmount,
-    fee_total_bps: bpsFromTotalAmount(rows, 'fee_cost'),
+    fee_total_bps: sumRows(rows, 'fee_total_bps'),
     realized_pnl_usdt: realizedPnl,
-    realized_pnl_bps: bpsFromTotalAmount(rows, 'realized_pnl_usdt'),
+    realized_pnl_bps: sumRows(rows, 'realized_pnl_bps'),
     current_spot_price: null,
     current_future_price: null,
     current_spread_bps: weightedAverage(rows, (row) => row.current_spread_bps),
     floating_spot_pnl: sumRows(rows, 'floating_spot_pnl'),
     floating_future_pnl: sumRows(rows, 'floating_future_pnl'),
     floating_pnl_total: floatingPnl,
-    floating_pnl_bps: bpsFromTotalAmount(rows, 'floating_pnl_total'),
+    floating_pnl_bps: sumRows(rows, 'floating_pnl_bps'),
     funding_total_pnl: sumRows(rows, 'funding_total_pnl'),
     fee_cost: feeCost,
     total_pnl: totalPnl,
-    total_pnl_bps: bpsFromTotalAmount(rows, 'total_pnl'),
+    total_pnl_bps: sumRows(rows, 'total_pnl_bps'),
     exchange_risk_status: null,
     exchange_risk_type: null,
     exchange_risk_at: null,
