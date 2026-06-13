@@ -426,6 +426,13 @@ onBeforeUnmount(() => {
             <span v-if="hasAmount(latestByExchange[exchange]?.available_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
+        <div class="metric-row">
+          <span>占用</span>
+          <strong>
+            <span>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</span>
+            <span v-if="hasAmount(occupiedAmount(latestByExchange[exchange], exchange))" class="metric-unit">USDT</span>
+          </strong>
+        </div>
         <div v-if="exchange === 'binance'" class="metric-row bnb-metric-row">
           <span>BNB可用</span>
           <strong class="bnb-value">
@@ -434,13 +441,6 @@ onBeforeUnmount(() => {
             <span class="metric-separator">/ ≈</span>
             <span>{{ formatAmount(latestByExchange.binance?.bnb_available_usdt) }}</span>
             <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
-          </strong>
-        </div>
-        <div class="metric-row">
-          <span>占用</span>
-          <strong>
-            <span>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</span>
-            <span v-if="hasAmount(occupiedAmount(latestByExchange[exchange], exchange))" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
