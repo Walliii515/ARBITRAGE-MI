@@ -94,8 +94,9 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
                 binance_balances=[
                     {'asset': 'USDT', 'free': '100', 'locked': '2', 'total': '102'},
                     {'asset': 'BTC', 'free': '0.1', 'locked': '0', 'total': '0.1'},
+                    {'asset': 'BNB', 'free': '0.25', 'locked': '0.01', 'total': '0.26'},
                 ],
-                binance_prices={'BTC': 50000},
+                binance_prices={'BTC': 50000, 'BNB': 600},
             ),
             AccountCapitalConfig(),
         )
@@ -113,11 +114,13 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
 
         row = snapshotter._build_binance_row(datetime(2026, 6, 9, 12, 0, 0), pnl)
 
-        self.assertEqual(row['equity_usdt'], 5102.0)
+        self.assertEqual(row['equity_usdt'], 5258.0)
         self.assertEqual(row['realized_pnl_usdt'], 12.5)
         self.assertEqual(row['fee_cost_usdt'], -0.8)
         self.assertEqual(row['total_pnl_usdt'], 11.7)
         self.assertEqual(row['detail']['binance_spot_realized']['closed_count'], 2)
+        self.assertEqual(row['detail']['bnb_fee_asset']['free'], 0.25)
+        self.assertEqual(row['detail']['bnb_fee_asset']['free_value_usdt'], 150.0)
 
     def test_binance_row_includes_cross_margin_risk_detail(self):
         snapshotter = AccountCapitalSnapshotter(

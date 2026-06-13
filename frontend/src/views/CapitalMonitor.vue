@@ -20,6 +20,8 @@ interface CapitalRow {
   fee_cost_usdt: number | null
   total_pnl_usdt: number | null
   gross_total_pnl_usdt: number | null
+  bnb_available?: number | null
+  bnb_available_usdt?: number | null
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -83,6 +85,19 @@ const chartSeries = computed(() => {
 function formatAmount(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+function formatToken(value: number | null | undefined, digits = 6): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return Number(value).toLocaleString('en-US', { maximumFractionDigits: digits })
+}
+
+function formatBnbFeeAsset(row: CapitalRow | undefined): string {
+  if (!row) return '-'
+  const amount = formatToken(row.bnb_available, 6)
+  const value = formatAmount(row.bnb_available_usdt)
+  if (amount === '-' && value === '-') return '-'
+  return `${amount} BNB / ≈ ${value} USDT`
 }
 
 function exchangeLabel(exchange: string): string {
@@ -313,6 +328,10 @@ onBeforeUnmount(() => {
         <div class="metric-row">
           <span>可用资金</span>
           <strong>{{ formatAmount(latestByExchange[exchange]?.available_usdt) }}</strong>
+        </div>
+        <div v-if="exchange === 'binance'" class="metric-row">
+          <span>BNB可用</span>
+          <strong>{{ formatBnbFeeAsset(latestByExchange.binance) }}</strong>
         </div>
         <div class="metric-row">
           <span>占用</span>

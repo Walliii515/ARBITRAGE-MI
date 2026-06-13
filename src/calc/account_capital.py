@@ -141,6 +141,7 @@ class AccountCapitalSnapshotter:
         non_usdt = [b for b in balances if b.get('asset') != 'USDT']
         prices = self.executor.fetch_binance_ticker_prices([b.get('asset') for b in non_usdt])
         spot_value = sum(float(b.get('total') or 0) * float(prices.get(b.get('asset'), 0)) for b in non_usdt)
+        bnb_fee_asset = _build_bnb_fee_asset_detail(balances, prices)
         available = float(usdt.get('free') or 0)
         locked = float(usdt.get('locked') or 0)
         equity = available + locked + spot_value
@@ -166,6 +167,7 @@ class AccountCapitalSnapshotter:
                 'binance_spot_realized': pnl.get('binance_spot_realized'),
                 'pnl_source': pnl.get('source'),
                 'spot_floating_pnl': pnl.get('binance_spot_floating_pnl', 0.0),
+                'bnb_fee_asset': bnb_fee_asset,
                 'binance_cross_margin': margin_detail,
             },
         }
@@ -539,6 +541,23 @@ def _capital_detail(row: Dict) -> Dict:
         except Exception:
             return {}
     return {}
+
+
+def _build_bnb_fee_asset_detail(balances: List[Dict], prices: Dict) -> Dict:
+    bnb = next((item for item in balances if str(item.get('asset') or '').upper() == 'BNB'), None) or {}
+    free = _float(bnb.get('free'))
+    locked = _float(bnb.get('locked'))
+    total = _float(bnb.get('total'))
+    price = _float(prices.get('BNB'))
+    return {
+        'asset': 'BNB',
+        'free': free,
+        'locked': locked,
+        'total': total,
+        'price_usdt': price,
+        'free_value_usdt': free * price,
+        'total_value_usdt': total * price,
+    }
 
 
 def _serialize_capital_row(row: Dict) -> Dict:
