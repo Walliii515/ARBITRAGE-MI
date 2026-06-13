@@ -89,6 +89,25 @@ function formatAmount(value: number | null | undefined): string {
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
+function formatUsdt(value: number | null | undefined): string {
+  const amount = formatAmount(value)
+  return amount === '-' ? '-' : `${amount} USDT`
+}
+
+function formatShare(value: number | null | undefined, row: CapitalRow | undefined): string {
+  const amount = Number(value)
+  const equity = Number(row?.equity_usdt)
+  if (!Number.isFinite(amount) || !Number.isFinite(equity) || equity === 0) return '-'
+  return `${(amount / equity * 100).toFixed(1)}%`
+}
+
+function formatUsdtShare(value: number | null | undefined, row: CapitalRow | undefined): string {
+  const amount = formatUsdt(value)
+  if (amount === '-') return '-'
+  const share = formatShare(value, row)
+  return share === '-' ? amount : `${amount} · ${share}`
+}
+
 function formatToken(value: number | null | undefined, digits = 6): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return Number(value).toLocaleString('en-US', { maximumFractionDigits: digits })
@@ -97,9 +116,11 @@ function formatToken(value: number | null | undefined, digits = 6): string {
 function formatBnbFeeAsset(row: CapitalRow | undefined): string {
   if (!row) return '-'
   const amount = formatToken(row.bnb_available, 6)
-  const value = formatAmount(row.bnb_available_usdt)
+  const value = formatUsdt(row.bnb_available_usdt)
+  const share = formatShare(row.bnb_available_usdt, row)
   if (amount === '-' && value === '-') return '-'
-  return `${amount} BNB / ≈ ${value} USDT`
+  const text = `${amount} BNB / ≈ ${value}`
+  return share === '-' ? text : `${text} · ${share}`
 }
 
 function exchangeLabel(exchange: string): string {
@@ -377,67 +398,70 @@ onBeforeUnmount(() => {
         :key="exchange"
         class="summary-card"
       >
-        <div class="card-title">{{ exchange === 'total' ? '合计' : exchange }}</div>
-        <div class="metric-row">
-          <span>总资产</span>
-          <strong>{{ formatAmount(latestByExchange[exchange]?.equity_usdt) }}</strong>
+        <div class="card-header">
+          <div class="card-title">{{ exchange === 'total' ? '合计' : exchange }}</div>
+          <el-button
+            v-if="exchange === 'binance'"
+            size="small"
+            type="primary"
+            :loading="bnbBuying"
+            @click="buyBnbFeeAsset"
+          >
+            买BNB
+          </el-button>
         </div>
         <div class="metric-row">
+          <span>总资产</span>
+          <strong>{{ formatUsdtShare(latestByExchange[exchange]?.equity_usdt, latestByExchange[exchange]) }}</strong>
+        </div>
+        <div class="metric-row available-row">
           <span>可用资金</span>
-          <strong>{{ formatAmount(latestByExchange[exchange]?.available_usdt) }}</strong>
+          <strong class="available-value">
+            {{ formatUsdtShare(latestByExchange[exchange]?.available_usdt, latestByExchange[exchange]) }}
+          </strong>
         </div>
         <div v-if="exchange === 'binance'" class="metric-row bnb-metric-row">
           <span>BNB可用</span>
-          <div class="bnb-metric-value">
-            <strong>{{ formatBnbFeeAsset(latestByExchange.binance) }}</strong>
-            <el-button
-              size="small"
-              type="primary"
-              :loading="bnbBuying"
-              @click="buyBnbFeeAsset"
-            >
-              买BNB
-            </el-button>
-          </div>
+          <strong>{{ formatBnbFeeAsset(latestByExchange.binance) }}</strong>
         </div>
         <div class="metric-row">
           <span>占用</span>
-          <strong>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</strong>
+          <strong>{{ formatUsdtShare(occupiedAmount(latestByExchange[exchange], exchange), latestByExchange[exchange]) }}</strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>未实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatAmount(latestByExchange[exchange]?.unrealized_pnl_usdt) }}
+            {{ formatUsdtShare(latestByExchange[exchange]?.unrealized_pnl_usdt, latestByExchange[exchange]) }}
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>已实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.realized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatAmount(latestByExchange[exchange]?.realized_pnl_usdt) }}
+            {{ formatUsdtShare(latestByExchange[exchange]?.realized_pnl_usdt, latestByExchange[exchange]) }}
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>资金费收益</span>
           <strong :class="Number(latestByExchange[exchange]?.funding_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatAmount(latestByExchange[exchange]?.funding_pnl_usdt) }}
+            {{ formatUsdtShare(latestByExchange[exchange]?.funding_pnl_usdt, latestByExchange[exchange]) }}
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>手续费成本</span>
           <strong :class="Number(latestByExchange[exchange]?.fee_cost_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatAmount(latestByExchange[exchange]?.fee_cost_usdt) }}
+            {{ formatUsdtShare(latestByExchange[exchange]?.fee_cost_usdt, latestByExchange[exchange]) }}
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>净已实现收益</span>
           <strong :class="Number(latestByExchange[exchange]?.total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatAmount(latestByExchange[exchange]?.total_pnl_usdt) }}
+            {{ formatUsdtShare(latestByExchange[exchange]?.total_pnl_usdt, latestByExchange[exchange]) }}
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>总盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.gross_total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatAmount(latestByExchange[exchange]?.gross_total_pnl_usdt) }}
+            {{ formatUsdtShare(latestByExchange[exchange]?.gross_total_pnl_usdt, latestByExchange[exchange]) }}
           </strong>
         </div>
       </div>
@@ -516,12 +540,20 @@ onBeforeUnmount(() => {
   padding: 12px 14px;
 }
 
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  min-height: 28px;
+}
+
 .card-title {
   color: var(--app-text);
   font-size: 15px;
   font-weight: 600;
   text-transform: uppercase;
-  margin-bottom: 8px;
 }
 
 .metric-row {
@@ -536,20 +568,25 @@ onBeforeUnmount(() => {
 .metric-row strong {
   color: var(--app-text);
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .bnb-metric-row {
   align-items: center;
 }
 
-.bnb-metric-value {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  text-align: right;
-  min-width: 0;
-  flex-wrap: wrap;
+.available-row {
+  background: color-mix(in srgb, var(--app-primary, #409eff) 8%, transparent);
+  border-radius: 4px;
+  margin: 2px -6px;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+
+.available-value {
+  color: #1677ff !important;
+  font-size: 14px;
+  font-weight: 700;
 }
 
 .pnl-positive {
