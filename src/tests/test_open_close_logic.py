@@ -1237,6 +1237,40 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertEqual(te._peak_state['ALLO']['trigger'], 'rebound')
         te._resolve_signal.assert_not_called()
 
+    def test_high_funding_extends_rebound_wait_window(self):
+        te = make_trading_executor(
+            vwap_threshold_meta={'CGPT': {'p20': 20.0}},
+            close_vwap_threshold_meta={'CGPT': {'close_basis_p20': -100}},
+            asset_tier_meta={'CGPT': 'B'},
+        )
+        te.rebound_min_rise_bps = 4.0
+        te.rebound_min_slope_bps = 0.5
+        te.rebound_min_basis_buffer_bps = 2.0
+        te.rebound_max_wait_sec = 5.0
+        te.rebound_high_funding_24h_bps = 50.0
+        te.rebound_high_funding_max_wait_sec = 10.0
+        te._resolve_signal = MagicMock()
+        row = self._row('CGPT', 20.0, 0.006)
+        te._peak_state['CGPT'] = {
+            'peak_bps': 40.0,
+            'start_time': datetime.now(),
+            'trigger': 'pullback',
+            'signal_id': 1001,
+            'signal_basis_bps': 40.0,
+            'resiliency_active': True,
+            'entry_snapshot': te._entry_snapshot('CGPT', 20.0, row),
+        }
+
+        self.assertFalse(te._pass_rebound_check('CGPT', 20.0, row))
+        te._peak_state['CGPT']['rebound_start_time'] = datetime.now() - timedelta(seconds=6)
+        self.assertFalse(te._pass_rebound_check('CGPT', 21.0, row))
+        te._resolve_signal.assert_not_called()
+
+        te._peak_state['CGPT']['rebound_start_time'] = datetime.now() - timedelta(seconds=11)
+        self.assertFalse(te._pass_rebound_check('CGPT', 21.0, row))
+        reason = te._resolve_signal.call_args.args[2]
+        self.assertIn('timeout=11.0/10.0s', reason)
+
     def test_funding_carry_allows_near_p20_before_standard_entry_floor(self):
         te = make_trading_executor(
             funding_carry_enabled=True,

@@ -1467,6 +1467,12 @@ def _run_open_position_check_once():
                 rebound_min_slope_bps=config.get_float('trade.rebound_open.min_slope_bps', 0.5),
                 rebound_min_basis_buffer_bps=config.get_float('trade.rebound_open.min_basis_buffer_bps', 4.0),
                 rebound_max_wait_sec=config.get_float('trade.rebound_open.max_wait_sec', 4.0),
+                rebound_high_funding_24h_bps=config.get_float(
+                    'trade.rebound_open.high_funding_24h_bps', 50.0
+                ),
+                rebound_high_funding_max_wait_sec=config.get_float(
+                    'trade.rebound_open.high_funding_max_wait_sec', 10.0
+                ),
                 rebound_strong_cushion_bps=config.get_float('trade.rebound_open.strong_cushion_bps', 20.0),
                 rebound_strong_cushion_min_hold_sec=config.get_float(
                     'trade.rebound_open.strong_cushion_min_hold_sec', 1.0

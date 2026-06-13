@@ -103,6 +103,8 @@ class TradingExecutorConfig:
     rebound_min_slope_bps: float = 0.5
     rebound_min_basis_buffer_bps: float = 4.0
     rebound_max_wait_sec: float = 4.0
+    rebound_high_funding_24h_bps: float = 50.0
+    rebound_high_funding_max_wait_sec: float = 10.0
     rebound_strong_cushion_bps: float = 20.0
     rebound_strong_cushion_min_hold_sec: float = 1.0
     rebound_strong_cushion_max_wait_sec: float = 8.0
@@ -321,6 +323,8 @@ class TradingExecutor:
         self.rebound_min_slope_bps = float(cfg.rebound_min_slope_bps)
         self.rebound_min_basis_buffer_bps = float(cfg.rebound_min_basis_buffer_bps)
         self.rebound_max_wait_sec = float(cfg.rebound_max_wait_sec)
+        self.rebound_high_funding_24h_bps = float(cfg.rebound_high_funding_24h_bps)
+        self.rebound_high_funding_max_wait_sec = float(cfg.rebound_high_funding_max_wait_sec)
         self.rebound_strong_cushion_bps = float(cfg.rebound_strong_cushion_bps)
         self.rebound_strong_cushion_min_hold_sec = float(cfg.rebound_strong_cushion_min_hold_sec)
         self.rebound_strong_cushion_max_wait_sec = float(cfg.rebound_strong_cushion_max_wait_sec)
@@ -1417,6 +1421,7 @@ class TradingExecutor:
         now = datetime.now()
         entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
         entry_floor = float(entry_snapshot.get('entry_floor_bps'))
+        funding_24h_bps = float(entry_snapshot.get('funding_24h_bps') or 0.0)
         min_basis = entry_floor + self.rebound_min_basis_buffer_bps
         strong_basis = entry_floor + self.rebound_strong_cushion_bps
 
@@ -1491,7 +1496,11 @@ class TradingExecutor:
         timeout_sec = (
             self.rebound_strong_cushion_max_wait_sec
             if strong_active
-            else self.rebound_max_wait_sec
+            else (
+                self.rebound_high_funding_max_wait_sec
+                if funding_24h_bps >= self.rebound_high_funding_24h_bps
+                else self.rebound_max_wait_sec
+            )
         )
         if waited_sec > timeout_sec:
             self._resolve_signal(

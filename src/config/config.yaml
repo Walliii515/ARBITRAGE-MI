@@ -111,6 +111,8 @@ trade:
     min_slope_bps: 0.5                      # 当前样本相对上一样本仍需向上
     min_basis_buffer_bps: 4                 # 当前基差需至少高于 entry_floor 的额外安全垫
     max_wait_sec: 5.0                       # 回调恢复后最多等待普通二次突破多久
+    high_funding_24h_bps: 50                # 24h资金费足够厚时，可给普通二次突破更长等待窗口
+    high_funding_max_wait_sec: 10.0         # funding≥high_funding_24h_bps 时的普通二次突破最长等待
     strong_cushion_bps: 20                  # 若当前基差已高于 entry_floor 这么多，可走强安全垫确认
     strong_cushion_min_hold_sec: 1.0        # 强安全垫需连续保持多久，避免单跳误触发
     strong_cushion_max_wait_sec: 8.0        # 强安全垫活跃时最多等待确认多久
