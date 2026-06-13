@@ -206,8 +206,31 @@ trade:
     cooldown_sec: 60                        # 平仓失败冷却（秒）
     take_profit_mode: fixed_net_bps         # 止盈模式：fixed_net_bps=固定净收益；legacy_p40=历史p40资金费倍数
     fixed_take_profit_bps: 200              # 固定净止盈阈值：收敛收益 + 已收资金费 - 全部手续费
+    dynamic_take_profit:
+      enabled: true                         # funding/basis 潜力弱时，允许把固定净止盈阈值动态降低
+      recent_settlements: 3                 # 最近N次结算用于判断短期 funding 支撑
+      high_confidence_min_samples: 6        # 去重后历史结算样本数>=该值，使用高置信公式
+      medium_confidence_min_samples: 3      # 样本数>=该值，使用中置信公式；否则低置信不激进提前止盈
+      high_recent_weight: 0.6               # 高置信: 最近结算均值权重
+      high_p50_weight: 0.4                  # 高置信: 历史p50权重
+      medium_current_weight: 0.5            # 中置信: 当前实时24h funding权重
+      medium_recent_weight: 0.3             # 中置信: 最近结算均值权重
+      medium_p50_weight: 0.2                # 中置信: 历史p50权重
+      basis_discount_tier_a: 0.45           # A类标的剩余基差潜力折扣
+      basis_discount_normal: 0.35           # 普通画像剩余基差潜力折扣
+      basis_discount_thin_bursty: 0.25      # thin_bursty 剩余基差潜力折扣
+      basis_score_cap_bps: 30               # 基差潜力最多给止盈阈值贡献30bps，防止极端p20抬得过高
+      low_confidence_min_take_profit_bps: 110 # 低置信不把止盈阈值降得过低
+      medium_confidence_min_take_profit_bps: 60
+      tiers:
+        - { hold_value_min_bps: 60, take_profit_bps: 200 }
+        - { hold_value_min_bps: 40, take_profit_bps: 150 }
+        - { hold_value_min_bps: 25, take_profit_bps: 110 }
+        - { hold_value_min_bps: 15, take_profit_bps: 80 }
+        - { hold_value_min_bps: 5, take_profit_bps: 60 }
+        - { hold_value_min_bps: 0, take_profit_bps: 45 }
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
-    positive_funding_hold_window_min: 60    # 距下一次资金费结算多少分钟内启用暂缓
+    positive_funding_hold_window_min: 30    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
     negative_funding_exit_enabled: true     # 当前负24h费率临近结算/极端恶化，或历史实际负资金费成本过高时风险平仓
     negative_funding_exit_current_24h_bps: 21 # 当前24h负资金费率达到该阈值且临近结算才进入平仓

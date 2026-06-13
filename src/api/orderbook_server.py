@@ -1870,6 +1870,7 @@ def _run_close_position_check_once():
         positions = tracker.get_holding_positions()
         if not positions:
             return
+        tracker.attach_funding_histories(positions)
 
         calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
         attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())

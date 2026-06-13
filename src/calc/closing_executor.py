@@ -27,6 +27,11 @@ from calc.orderbook_resiliency import (
 )
 from calc.execution_audit import format_execution_audit
 from calc.order_fee_resolver import build_order_execution_fields
+from calc.dynamic_take_profit import (
+    DynamicTakeProfitConfig,
+    evaluate_dynamic_take_profit,
+    format_dynamic_take_profit,
+)
 
 logger = get_logger(__name__)
 
@@ -61,6 +66,10 @@ class ClosingExecutor:
         self.take_profit_mode = config.get_str('trade.close.take_profit_mode', 'fixed_net_bps')
         self.fixed_take_profit_bps = config.get_float('trade.close.fixed_take_profit_bps', 50.0)
         self.take_profit_multiplier = config.get_float('trade.close.take_profit_days_multiplier', 6.0)
+        self.close_threshold_col = config.get_str(
+            'trade.vwap.close_threshold_percentile', 'close_basis_p20'
+        ).strip()
+        self.dynamic_take_profit_cfg = self._load_dynamic_take_profit_config()
         self.max_funding_payments = config.get_int('trade.close.max_funding_payments', 30)
         self.positive_funding_hold_enabled = config.get_bool(
             'trade.close.positive_funding_hold_enabled', True
@@ -165,6 +174,8 @@ class ClosingExecutor:
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
         # 临时槽位：旁路风控读取到的 (gate_lag_ms, spot_lag_ms)，供平仓原因拼接
         self._last_orderbook_lag_ms: Dict[str, tuple] = {}
+        self._last_take_profit_eval: Dict[object, object] = {}
+        self._active_close_vwap_threshold_meta: Dict[str, Dict] = {}
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -194,6 +205,39 @@ class ClosingExecutor:
             ],
             ['spot_close_coverage', 'future_close_coverage'],
             'close',
+        )
+
+    def _load_dynamic_take_profit_config(self) -> DynamicTakeProfitConfig:
+        cfg = config.get('trade.close.dynamic_take_profit', {}) or {}
+        raw_tiers = cfg.get('tiers') or DynamicTakeProfitConfig().tiers
+        return DynamicTakeProfitConfig(
+            enabled=bool(cfg.get('enabled', True)),
+            recent_settlements=int(cfg.get('recent_settlements', 3)),
+            high_confidence_min_samples=int(cfg.get('high_confidence_min_samples', 6)),
+            medium_confidence_min_samples=int(cfg.get('medium_confidence_min_samples', 3)),
+            high_recent_weight=float(cfg.get('high_recent_weight', 0.6)),
+            high_p50_weight=float(cfg.get('high_p50_weight', 0.4)),
+            medium_current_weight=float(cfg.get('medium_current_weight', 0.5)),
+            medium_recent_weight=float(cfg.get('medium_recent_weight', 0.3)),
+            medium_p50_weight=float(cfg.get('medium_p50_weight', 0.2)),
+            basis_discount_tier_a=float(cfg.get('basis_discount_tier_a', 0.45)),
+            basis_discount_normal=float(cfg.get('basis_discount_normal', 0.35)),
+            basis_discount_thin_bursty=float(cfg.get('basis_discount_thin_bursty', 0.25)),
+            basis_score_cap_bps=float(cfg.get('basis_score_cap_bps', 30.0)),
+            low_confidence_min_take_profit_bps=float(
+                cfg.get('low_confidence_min_take_profit_bps', 110.0)
+            ),
+            medium_confidence_min_take_profit_bps=float(
+                cfg.get('medium_confidence_min_take_profit_bps', 60.0)
+            ),
+            tiers=[
+                {
+                    'hold_value_min_bps': float(row.get('hold_value_min_bps', 0.0)),
+                    'take_profit_bps': float(row.get('take_profit_bps', 45.0)),
+                }
+                for row in raw_tiers
+                if isinstance(row, dict)
+            ],
         )
 
     def set_orderbook_managers(self, gate_manager, spot_manager):
@@ -233,6 +277,7 @@ class ClosingExecutor:
         """
         results = []
         topup_contracts_this_run: Set[str] = set()
+        self._active_close_vwap_threshold_meta = close_vwap_threshold_meta or {}
 
         for pos in positions:
             if pos.get('status') != 'holding':
@@ -291,7 +336,11 @@ class ClosingExecutor:
                 )
                 # 强制平仓，清除谷底状态
                 self._clear_position_close_state(ba, pos)
-            elif self._check_take_profit(pos, current_spread_bps):
+            elif self._check_take_profit(
+                pos,
+                current_spread_bps,
+                close_vwap_threshold_meta.get(ba, {}),
+            ):
                 # 止盈条件满足，进入谷底反弹确认
                 orderbook_row = orderbook_rows_by_asset.get(ba)
                 if orderbook_row is not None:
@@ -409,7 +458,9 @@ class ClosingExecutor:
         return base_asset
 
     def _clear_position_close_state(self, base_asset: str, pos: Optional[Dict] = None) -> None:
-        self._valley_state.pop(self._valley_key(base_asset, pos), None)
+        key = self._valley_key(base_asset, pos)
+        self._valley_state.pop(key, None)
+        self._last_take_profit_eval.pop(key, None)
         self._close_resiliency.clear(base_asset)
 
     def _annotate_resiliency_row(self, row: Dict, base_asset: str) -> None:
@@ -962,18 +1013,24 @@ class ClosingExecutor:
         count = int(pos.get('funding_payments_count') or 0)
         return count >= self.max_funding_payments
 
-    def _check_take_profit(self, pos: Dict, current_spread_bps: float) -> bool:
+    def _check_take_profit(
+        self,
+        pos: Dict,
+        current_spread_bps: float,
+        close_threshold_meta: Optional[Dict] = None,
+    ) -> bool:
         """
         止盈条件：
             fixed_net_bps:
-                基差收敛 + 已收资金费 - 全部手续费 >= fixed_take_profit_bps
+                基差收敛 + 已收资金费 - 全部手续费 >= 动态净止盈阈值
             legacy_p40:
                 总盈亏bps(基差收敛 + 已收资金费) >= percentile_40费率(bps) * multiplier + 手续费(bps)
         """
         ba = pos.get('base_asset', '')
         if self.take_profit_mode == 'fixed_net_bps':
-            comps = self._profit_components(pos, current_spread_bps)
-            if comps['net_profit_bps'] < self.fixed_take_profit_bps:
+            eval_ = self._take_profit_eval(pos, current_spread_bps, close_threshold_meta)
+            self._last_take_profit_eval[self._valley_key(ba, pos)] = eval_
+            if eval_.net_profit_bps < eval_.threshold_bps:
                 return False
             if self._should_hold_for_positive_funding(pos, current_spread_bps):
                 return False
@@ -998,6 +1055,26 @@ class ClosingExecutor:
         fee_cost_bps = self.fee_full_bps
         threshold = funding_rate_bps * self.take_profit_multiplier + fee_cost_bps
         return total_pnl_bps >= threshold
+
+    def _take_profit_eval(
+        self,
+        pos: Dict,
+        current_spread_bps: float,
+        close_threshold_meta: Optional[Dict] = None,
+    ):
+        ba = pos.get('base_asset', '')
+        threshold_meta = close_threshold_meta
+        if threshold_meta is None:
+            threshold_meta = self._active_close_vwap_threshold_meta.get(ba, {})
+        return evaluate_dynamic_take_profit(
+            position=pos,
+            close_basis_bps=float(current_spread_bps),
+            close_threshold_meta=threshold_meta,
+            close_threshold_col=self.close_threshold_col,
+            fixed_take_profit_bps=self.fixed_take_profit_bps,
+            fee_full_bps=self.fee_full_bps,
+            cfg=self.dynamic_take_profit_cfg,
+        )
 
     def _pre_execution_gate(
         self,
@@ -1170,16 +1247,18 @@ class ClosingExecutor:
                     )
 
             if self.take_profit_mode == 'fixed_net_bps':
-                comps = self._profit_components(pos, gate_basis_bps)
-                if comps['net_profit_bps'] < self.fixed_take_profit_bps:
+                eval_ = self._take_profit_eval(pos, gate_basis_bps)
+                self._last_take_profit_eval[self._valley_key(base_asset, pos)] = eval_
+                if eval_.net_profit_bps < eval_.threshold_bps:
                     logger.info(
-                        f"平仓旁路-固定净止盈不足拦截 | {base_asset} | "
-                        f"net={comps['net_profit_bps']:.2f}bps < {self.fixed_take_profit_bps:.2f}bps | "
+                        f"平仓旁路-动态净止盈不足拦截 | {base_asset} | "
+                        f"net={eval_.net_profit_bps:.2f}bps < {eval_.threshold_bps:.2f}bps | "
+                        f"hold={eval_.hold_value_bps:.2f}bps | "
                         f"gate_basis={gate_basis_bps:.2f}bps"
                     )
                     return False, row, gate_basis_bps, (
-                        f'固定净止盈不足(净{comps["net_profit_bps"]:.1f}bps < '
-                        f'{self.fixed_take_profit_bps:.1f}bps)'
+                        f'动态净止盈不足(净{eval_.net_profit_bps:.1f}bps < '
+                        f'{eval_.threshold_bps:.1f}bps, hold={eval_.hold_value_bps:.1f})'
                     )
                 if self._should_hold_for_positive_funding(pos, gate_basis_bps):
                     return False, row, gate_basis_bps, (
@@ -1288,14 +1367,21 @@ class ClosingExecutor:
         """构建止盈平仓的详细原因字符串（含谷底确认信息 + 行情新鲜度）"""
         ba = pos.get('base_asset', '')
         if self.take_profit_mode == 'fixed_net_bps':
-            comps = self._profit_components(pos, current_spread_bps)
-            detail = (
-                f"固定净止盈|净{comps['net_profit_bps']:.1f}bps"
-                f"(收敛{comps['spread_profit_bps']:.1f}+资金费{comps['funding_earned_bps']:.1f}"
-                f"-{comps['fee_full_bps']:.0f}费)"
-                f">={self.fixed_take_profit_bps:.1f}bps"
-                f"|{self._funding_context_text(pos)}"
-            )
+            eval_key = self._valley_key(ba, pos)
+            eval_ = self._last_take_profit_eval.get(eval_key)
+            if eval_ is None:
+                eval_ = self._take_profit_eval(pos, current_spread_bps)
+            if self.dynamic_take_profit_cfg.enabled:
+                detail = f"{format_dynamic_take_profit(eval_)}|{self._funding_context_text(pos)}"
+            else:
+                comps = self._profit_components(pos, current_spread_bps)
+                detail = (
+                    f"固定净止盈|净{comps['net_profit_bps']:.1f}bps"
+                    f"(收敛{comps['spread_profit_bps']:.1f}+资金费{comps['funding_earned_bps']:.1f}"
+                    f"-{comps['fee_full_bps']:.0f}费)"
+                    f">={self.fixed_take_profit_bps:.1f}bps"
+                    f"|{self._funding_context_text(pos)}"
+                )
         else:
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
             spread_profit_bps = open_spread_bps - current_spread_bps

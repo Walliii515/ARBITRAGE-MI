@@ -488,7 +488,9 @@ class PositionTracker:
     def get_holding_positions(self) -> List[Dict]:
         """获取所有持仓中记录"""
         sql = """
-            SELECT p.*, COALESCE(b.market_profile, 'normal') AS market_profile
+            SELECT p.*,
+                   COALESCE(b.strategy_tier, 'C') AS strategy_tier,
+                   COALESCE(b.market_profile, 'normal') AS market_profile
             FROM mi_trade_position p
             LEFT JOIN mi_base_asset b
               ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
@@ -502,7 +504,9 @@ class PositionTracker:
     def get_all_positions(self) -> List[Dict]:
         """获取全部持仓记录（含已平仓），用于实时推送"""
         sql = """
-            SELECT p.*, COALESCE(b.market_profile, 'normal') AS market_profile
+            SELECT p.*,
+                   COALESCE(b.strategy_tier, 'C') AS strategy_tier,
+                   COALESCE(b.market_profile, 'normal') AS market_profile
             FROM mi_trade_position p
             LEFT JOIN mi_base_asset b
               ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
@@ -542,6 +546,78 @@ class PositionTracker:
                 'time': row['settled_at'].strftime('%m-%d %H:%M') if row['settled_at'] else None,
             })
         return result
+
+    def attach_funding_histories(self, positions: List[Dict]) -> None:
+        """
+        批量注入资金费历史：
+        - funding_history: 当前 position_id 的结算明细
+        - asset_funding_history: 同标的去重后的结算费率序列，用于新开仓位判断后续 funding 潜力
+        """
+        position_ids = [int(p.get('id') or 0) for p in positions if p.get('id')]
+        assets = sorted({
+            str(p.get('base_asset') or '').strip().upper()
+            for p in positions
+            if p.get('base_asset')
+        })
+        if not position_ids and not assets:
+            return
+
+        where_parts = []
+        params = []
+        if position_ids:
+            where_parts.append('position_id IN (' + ','.join(['%s'] * len(position_ids)) + ')')
+            params.extend(position_ids)
+        if assets:
+            where_parts.append('base_asset IN (' + ','.join(['%s'] * len(assets)) + ')')
+            params.extend(assets)
+
+        sql = f"""
+            SELECT position_id, base_asset, payment_seq, funding_rate, funding_rate_24h,
+                   funding_pnl, future_notional, settled_at
+            FROM mi_trade_funding_fee_history
+            WHERE {' OR '.join(where_parts)}
+            ORDER BY base_asset, settled_at, payment_seq
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+        by_position: Dict[int, List[Dict]] = {}
+        by_asset_seen: Dict[str, set] = {}
+        by_asset: Dict[str, List[Dict]] = {}
+        for row in rows:
+            item = self._serialize_funding_history_row(row)
+            pid = int(row.get('position_id') or 0)
+            ba = str(row.get('base_asset') or '').strip().upper()
+            if pid:
+                by_position.setdefault(pid, []).append(item)
+            if ba:
+                key = (
+                    item.get('settled_at') or item.get('time') or item.get('seq'),
+                    round(float(item.get('rate_24h') or 0.0), 10),
+                )
+                seen = by_asset_seen.setdefault(ba, set())
+                if key not in seen:
+                    seen.add(key)
+                    by_asset.setdefault(ba, []).append(item)
+
+        for pos in positions:
+            pid = int(pos.get('id') or 0)
+            ba = str(pos.get('base_asset') or '').strip().upper()
+            pos['funding_history'] = by_position.get(pid, [])
+            pos['asset_funding_history'] = by_asset.get(ba, [])
+
+    def _serialize_funding_history_row(self, row: Dict) -> Dict:
+        settled_at = row.get('settled_at')
+        return {
+            'seq': row['payment_seq'],
+            'rate': float(row['funding_rate']),
+            'rate_24h': float(row['funding_rate_24h']) if row.get('funding_rate_24h') else None,
+            'pnl': float(row['funding_pnl']),
+            'notional': float(row['future_notional']) if row.get('future_notional') else None,
+            'time': settled_at.strftime('%m-%d %H:%M') if settled_at else None,
+            'settled_at': settled_at.strftime('%Y-%m-%d %H:%M:%S') if settled_at else None,
+        }
     
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         """获取合约面值"""

@@ -2007,7 +2007,7 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
             )
         self.assertFalse(passed)
         self.assertEqual(basis, 35)
-        self.assertIn('固定净止盈不足', reason)
+        self.assertIn('动态净止盈不足', reason)
 
     def test_risk_gate_does_not_require_profit(self):
         """风险平仓旁路只查执行质量，不用收敛盈利性挡住退出。"""
@@ -2184,6 +2184,58 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 
         self.assertNotIn('protective_price', group['spot_order'])
         self.assertEqual(group['future_order']['protective_price'], 101.23)
+
+    def test_dynamic_take_profit_uses_asset_funding_history_when_current_drops(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'BANK',
+            'open_spread_bps': 180.0,
+            'funding_rate_24h': 0.0003,  # current 3bps
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([10, 28, 29, 30, 31, 38, 47])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            70.0,
+            {'close_basis_p20': 42.0},
+        )
+        self.assertEqual(eval_.confidence, 'high')
+        self.assertGreater(eval_.funding_potential_bps, 25.0)
+        self.assertEqual(eval_.threshold_bps, 150.0)
+        self.assertFalse(self.ce._check_take_profit(
+            self.pos,
+            70.0,
+            {'close_basis_p20': 42.0},
+        ))
+
+    def test_dynamic_take_profit_lowers_threshold_when_history_is_weak(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'EPIC',
+            'open_spread_bps': 150.0,
+            'funding_rate_24h': 0.0016,  # current 16bps, but history weak
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([3, 3, 3, 4, 6, 6, 31])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            70.0,
+            {'close_basis_p20': 45.0},
+        )
+        self.assertEqual(eval_.confidence, 'high')
+        self.assertLessEqual(eval_.funding_potential_bps, 6.0)
+        self.assertEqual(eval_.threshold_bps, 60.0)
+        self.assertTrue(self.ce._check_take_profit(
+            self.pos,
+            70.0,
+            {'close_basis_p20': 45.0},
+        ))
 
     def test_live_close_order_group_adds_future_maker_params(self):
         self.ce.executor_client.channel = 'Live'
