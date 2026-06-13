@@ -790,7 +790,11 @@ class ReverseSignalMonitor:
             'target_amount': self.cfg.open_amount_usdt,
             'signal_basis_bps': state.get('signal_basis_bps'),
             'pre_gate_basis_bps': pre_gate_basis,
+            'funding_rate_24h': row.get('funding_rate_24h'),
             'borrow_hourly_rate': row.get('reverse_borrow_hourly_rate'),
+            'borrow_24h_bps': row.get('reverse_borrow_24h_bps'),
+            'reverse_open_basis_p20': row.get('reverse_open_basis_p20'),
+            'reverse_close_basis_p20': row.get('reverse_close_basis_p20'),
             'spot_order': {
                 'order_uuid': order_uuid,
                 'base_asset': base_asset,

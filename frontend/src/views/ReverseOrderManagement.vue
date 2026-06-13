@@ -55,6 +55,7 @@ interface ReversePositionRow {
   borrow_qty: number | null
   borrow_repaid_qty: number | null
   borrow_hourly_rate: number | null
+  open_borrow_24h_bps: number | null
   borrow_interest_usdt: number | null
   borrow_interest_bps: number | null
   spot_open_qty: number | null
@@ -71,10 +72,13 @@ interface ReversePositionRow {
   future_close_amount: number | null
   reverse_open_basis_bps: number | null
   reverse_close_basis_bps: number | null
+  reverse_open_basis_p20: number | null
+  reverse_close_basis_p20: number | null
   signal_basis_bps: number | null
   pre_gate_basis_bps: number | null
   actual_basis_bps: number | null
   execution_drift_bps: number | null
+  open_funding_rate_24h: number | null
   funding_pnl_usdt: number | null
   funding_pnl_bps: number | null
   fee_total_usdt: number | null
@@ -312,6 +316,24 @@ const columnDefs = computed((): ColDef<ReversePositionRow>[] => [
     valueFormatter: rateFormatter,
   },
   {
+    headerName: '借币24h成本',
+    field: 'open_borrow_24h_bps',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '开仓24h Funding',
+    field: 'open_funding_rate_24h',
+    width: 145,
+    type: 'numericColumn',
+    cellClass: signedCellClass,
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: rateFormatter,
+  },
+  {
     headerName: '借币利息',
     field: 'borrow_interest_usdt',
     width: 115,
@@ -356,9 +378,27 @@ const columnDefs = computed((): ColDef<ReversePositionRow>[] => [
     valueFormatter: bpsFormatter,
   },
   {
+    headerName: '开仓VWAP阈值',
+    field: 'reverse_open_basis_p20',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
     headerName: '平仓基差',
     field: 'reverse_close_basis_bps',
     width: 115,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '平仓VWAP阈值',
+    field: 'reverse_close_basis_p20',
+    width: 135,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',

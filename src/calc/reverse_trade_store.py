@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS mi_reverse_trade_position (
     borrow_qty DECIMAL(30,12) DEFAULT NULL,
     borrow_repaid_qty DECIMAL(30,12) DEFAULT NULL,
     borrow_hourly_rate DECIMAL(18,10) DEFAULT NULL,
+    open_borrow_24h_bps DECIMAL(12,4) DEFAULT NULL,
     borrow_interest_usdt DECIMAL(24,8) NOT NULL DEFAULT 0,
     borrow_interest_bps DECIMAL(12,4) NOT NULL DEFAULT 0,
     spot_open_qty DECIMAL(30,12) DEFAULT NULL,
@@ -51,10 +52,13 @@ CREATE TABLE IF NOT EXISTS mi_reverse_trade_position (
     future_close_amount DECIMAL(24,8) DEFAULT NULL,
     reverse_open_basis_bps DECIMAL(12,4) DEFAULT NULL,
     reverse_close_basis_bps DECIMAL(12,4) DEFAULT NULL,
+    reverse_open_basis_p20 DECIMAL(12,4) DEFAULT NULL,
+    reverse_close_basis_p20 DECIMAL(12,4) DEFAULT NULL,
     signal_basis_bps DECIMAL(12,4) DEFAULT NULL,
     pre_gate_basis_bps DECIMAL(12,4) DEFAULT NULL,
     actual_basis_bps DECIMAL(12,4) DEFAULT NULL,
     execution_drift_bps DECIMAL(12,4) DEFAULT NULL,
+    open_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
     funding_pnl_usdt DECIMAL(24,8) NOT NULL DEFAULT 0,
     funding_pnl_bps DECIMAL(12,4) NOT NULL DEFAULT 0,
     fee_total_usdt DECIMAL(24,8) NOT NULL DEFAULT 0,
@@ -149,7 +153,34 @@ def ensure_reverse_trade_tables() -> None:
     with db_manager.get_cursor() as cursor:
         cursor.execute(REVERSE_POSITION_TABLE_SQL)
         cursor.execute(REVERSE_ORDER_TABLE_SQL)
+        _upgrade_reverse_trade_tables(cursor)
     _tables_ready = True
+
+
+def _upgrade_reverse_trade_tables(cursor) -> None:
+    cursor.execute("SHOW COLUMNS FROM mi_reverse_trade_position")
+    columns = {row['Field'] for row in cursor.fetchall()}
+    add_columns = {
+        'open_borrow_24h_bps': (
+            "ALTER TABLE mi_reverse_trade_position "
+            "ADD COLUMN open_borrow_24h_bps DECIMAL(12,4) DEFAULT NULL AFTER borrow_hourly_rate"
+        ),
+        'reverse_open_basis_p20': (
+            "ALTER TABLE mi_reverse_trade_position "
+            "ADD COLUMN reverse_open_basis_p20 DECIMAL(12,4) DEFAULT NULL AFTER reverse_close_basis_bps"
+        ),
+        'reverse_close_basis_p20': (
+            "ALTER TABLE mi_reverse_trade_position "
+            "ADD COLUMN reverse_close_basis_p20 DECIMAL(12,4) DEFAULT NULL AFTER reverse_open_basis_p20"
+        ),
+        'open_funding_rate_24h': (
+            "ALTER TABLE mi_reverse_trade_position "
+            "ADD COLUMN open_funding_rate_24h DECIMAL(18,10) DEFAULT NULL AFTER execution_drift_bps"
+        ),
+    }
+    for column, ddl in add_columns.items():
+        if column not in columns:
+            cursor.execute(ddl)
 
 
 def _page_bounds(page: int, page_size: int) -> Tuple[int, int]:
@@ -192,20 +223,20 @@ def list_reverse_positions(
     ensure_reverse_trade_tables()
     page, page_size = _page_bounds(page, page_size)
     days = max(min(int(days or 30), 365), 1)
-    where = ["opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    where = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
     params: List[Any] = [days]
-    _append_exact_filter(where, params, 'status', status, ALLOWED_POSITION_STATUSES)
+    _append_exact_filter(where, params, 'p.status', status, ALLOWED_POSITION_STATUSES)
     if order_side == 'open':
-        where.append("status IN ('holding','closing','risk','desynced')")
+        where.append("p.status IN ('holding','closing','risk','desynced')")
     elif order_side == 'close':
-        where.append("status = 'closed'")
+        where.append("p.status = 'closed'")
     if exchange_risk:
-        where.append("exchange_risk_status IS NOT NULL AND exchange_risk_status <> 'normal'")
-    _append_like_filter(where, params, 'UPPER(base_asset)', base_asset)
+        where.append("p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal'")
+    _append_like_filter(where, params, 'UPPER(p.base_asset)', base_asset)
     where_sql = " AND ".join(where)
 
     with db_manager.get_cursor() as cursor:
-        cursor.execute(f"SELECT COUNT(*) AS total FROM mi_reverse_trade_position WHERE {where_sql}", params)
+        cursor.execute(f"SELECT COUNT(*) AS total FROM mi_reverse_trade_position p WHERE {where_sql}", params)
         total_row = cursor.fetchone() or {}
         total = int(total_row.get('total') or 0)
 
@@ -214,15 +245,37 @@ def list_reverse_positions(
         cursor.execute(
             f"""
             SELECT p.*,
+                   s.funding_rate_24h AS signal_open_funding_rate_24h,
+                   s.borrow_24h_bps AS signal_open_borrow_24h_bps,
+                   s.reverse_open_basis_p20 AS signal_reverse_open_basis_p20,
+                   s.reverse_close_basis_p20 AS signal_reverse_close_basis_p20,
                    (SELECT COUNT(*) FROM mi_reverse_trade_order o WHERE o.position_id = p.id) AS order_count
             FROM mi_reverse_trade_position p
+            LEFT JOIN mi_reverse_trade_signal s ON s.id = p.signal_id
             WHERE {where_sql}
             ORDER BY p.opened_at DESC, p.id DESC
             LIMIT %s OFFSET %s
             """,
             query_params,
         )
-        rows = cursor.fetchall()
+        rows = list(cursor.fetchall() or [])
+    for row in rows:
+        if row.get('open_funding_rate_24h') is None:
+            row['open_funding_rate_24h'] = row.pop('signal_open_funding_rate_24h', None)
+        else:
+            row.pop('signal_open_funding_rate_24h', None)
+        if row.get('open_borrow_24h_bps') is None:
+            row['open_borrow_24h_bps'] = row.pop('signal_open_borrow_24h_bps', None)
+        else:
+            row.pop('signal_open_borrow_24h_bps', None)
+        if row.get('reverse_open_basis_p20') is None:
+            row['reverse_open_basis_p20'] = row.pop('signal_reverse_open_basis_p20', None)
+        else:
+            row.pop('signal_reverse_open_basis_p20', None)
+        if row.get('reverse_close_basis_p20') is None:
+            row['reverse_close_basis_p20'] = row.pop('signal_reverse_close_basis_p20', None)
+        else:
+            row.pop('signal_reverse_close_basis_p20', None)
     return PageResult(rows=list(rows or []), total=total, page=page, page_size=page_size)
 
 
@@ -238,11 +291,11 @@ def summarize_reverse_positions(
     """
     ensure_reverse_trade_tables()
     days = max(min(int(days or 30), 365), 1)
-    where = ["opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    where = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
     params: List[Any] = [days]
     if exchange_risk:
-        where.append("exchange_risk_status IS NOT NULL AND exchange_risk_status <> 'normal'")
-    _append_like_filter(where, params, 'UPPER(base_asset)', base_asset)
+        where.append("p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal'")
+    _append_like_filter(where, params, 'UPPER(p.base_asset)', base_asset)
     where_sql = " AND ".join(where)
 
     with db_manager.get_cursor() as cursor:
@@ -250,10 +303,10 @@ def summarize_reverse_positions(
             f"""
             SELECT
                 COUNT(*) AS total,
-                SUM(CASE WHEN status IN ('holding','closing','risk','desynced') THEN 1 ELSE 0 END) AS open_count,
-                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS close_count,
-                SUM(CASE WHEN exchange_risk_status IS NOT NULL AND exchange_risk_status <> 'normal' THEN 1 ELSE 0 END) AS exchange_risk_count
-            FROM mi_reverse_trade_position
+                SUM(CASE WHEN p.status IN ('holding','closing','risk','desynced') THEN 1 ELSE 0 END) AS open_count,
+                SUM(CASE WHEN p.status = 'closed' THEN 1 ELSE 0 END) AS close_count,
+                SUM(CASE WHEN p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal' THEN 1 ELSE 0 END) AS exchange_risk_count
+            FROM mi_reverse_trade_position p
             WHERE {where_sql}
             """,
             params,
@@ -398,19 +451,21 @@ def record_reverse_open_execution(
                 """
                 INSERT INTO mi_reverse_trade_position (
                     order_uuid, signal_id, base_asset, spot_symbol, future_contract, status,
-                    open_amount_usdt, borrow_asset, borrow_qty, borrow_hourly_rate,
+                    open_amount_usdt, borrow_asset, borrow_qty, borrow_hourly_rate, open_borrow_24h_bps,
                     spot_open_qty, spot_open_price, spot_open_amount,
                     future_open_qty, future_open_price, future_open_amount,
-                    reverse_open_basis_bps, signal_basis_bps, pre_gate_basis_bps,
-                    actual_basis_bps, execution_drift_bps, fee_total_usdt,
+                    reverse_open_basis_bps, reverse_open_basis_p20, reverse_close_basis_p20,
+                    signal_basis_bps, pre_gate_basis_bps,
+                    actual_basis_bps, execution_drift_bps, open_funding_rate_24h, fee_total_usdt,
                     exchange_risk_status, exchange_risk_type, exchange_risk_detail
                 ) VALUES (
                     %(order_uuid)s, %(signal_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s, %(status)s,
-                    %(open_amount)s, %(borrow_asset)s, %(borrow_qty)s, %(borrow_hourly_rate)s,
+                    %(open_amount)s, %(borrow_asset)s, %(borrow_qty)s, %(borrow_hourly_rate)s, %(borrow_24h_bps)s,
                     %(spot_qty)s, %(spot_price)s, %(spot_amount)s,
                     %(future_qty)s, %(future_price)s, %(future_amount)s,
-                    %(reverse_open_basis)s, %(signal_basis)s, %(pre_gate_basis)s,
-                    %(actual_basis)s, %(execution_drift)s, %(fee_total_usdt)s,
+                    %(reverse_open_basis)s, %(reverse_open_basis_p20)s, %(reverse_close_basis_p20)s,
+                    %(signal_basis)s, %(pre_gate_basis)s,
+                    %(actual_basis)s, %(execution_drift)s, %(funding_rate_24h)s, %(fee_total_usdt)s,
                     %(risk_status)s, %(risk_type)s, %(risk_detail)s
                 )
                 """,
@@ -425,6 +480,7 @@ def record_reverse_open_execution(
                     'borrow_asset': base_asset,
                     'borrow_qty': borrow_result.get('amount'),
                     'borrow_hourly_rate': order_group.get('borrow_hourly_rate'),
+                    'borrow_24h_bps': order_group.get('borrow_24h_bps'),
                     'spot_qty': spot_result.get('exec_qty'),
                     'spot_price': spot_result.get('exec_price'),
                     'spot_amount': spot_result.get('exec_amount'),
@@ -432,10 +488,13 @@ def record_reverse_open_execution(
                     'future_price': future_result.get('exec_price'),
                     'future_amount': future_result.get('exec_amount'),
                     'reverse_open_basis': orderbook_row.get('reverse_basis_bps'),
+                    'reverse_open_basis_p20': order_group.get('reverse_open_basis_p20'),
+                    'reverse_close_basis_p20': order_group.get('reverse_close_basis_p20'),
                     'signal_basis': order_group.get('signal_basis_bps'),
                     'pre_gate_basis': pre_gate_basis,
                     'actual_basis': actual_basis,
                     'execution_drift': execution_drift,
+                    'funding_rate_24h': order_group.get('funding_rate_24h'),
                     'fee_total_usdt': fee_total_usdt,
                     'risk_status': 'normal' if success else 'desynced',
                     'risk_type': None if success else 'reverse_open_partial_or_failed',

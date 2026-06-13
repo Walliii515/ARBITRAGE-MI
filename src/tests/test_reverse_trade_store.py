@@ -27,6 +27,8 @@ class FakeCursor:
         return value
 
     def fetchall(self):
+        if self.calls and self.calls[-1][0].startswith("SHOW COLUMNS"):
+            return []
         value = self._fetch_queue.pop(0)
         assert isinstance(value, list)
         return value
@@ -118,7 +120,7 @@ def test_ensure_reverse_trade_tables_executes_only_reverse_ddl(monkeypatch):
     store.ensure_reverse_trade_tables()
 
     ddl_sql = '\n'.join(sql for sql, _params in cursor.calls)
-    assert cursor.calls and len(cursor.calls) == 2
+    assert len(cursor.calls) >= 2
     assert 'mi_reverse_trade_position' in ddl_sql
     assert 'mi_reverse_trade_order' in ddl_sql
     assert 'mi_trade_position' not in ddl_sql

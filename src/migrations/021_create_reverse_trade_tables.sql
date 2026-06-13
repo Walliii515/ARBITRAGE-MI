@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS mi_reverse_trade_position (
     borrow_qty DECIMAL(30,12) DEFAULT NULL,
     borrow_repaid_qty DECIMAL(30,12) DEFAULT NULL,
     borrow_hourly_rate DECIMAL(18,10) DEFAULT NULL,
+    open_borrow_24h_bps DECIMAL(12,4) DEFAULT NULL COMMENT '开仓时刻24h借币成本bps',
     borrow_interest_usdt DECIMAL(24,8) NOT NULL DEFAULT 0,
     borrow_interest_bps DECIMAL(12,4) NOT NULL DEFAULT 0,
 
@@ -41,10 +42,13 @@ CREATE TABLE IF NOT EXISTS mi_reverse_trade_position (
 
     reverse_open_basis_bps DECIMAL(12,4) DEFAULT NULL,
     reverse_close_basis_bps DECIMAL(12,4) DEFAULT NULL,
+    reverse_open_basis_p20 DECIMAL(12,4) DEFAULT NULL COMMENT '开仓时刻反向开仓VWAP阈值',
+    reverse_close_basis_p20 DECIMAL(12,4) DEFAULT NULL COMMENT '开仓时刻反向平仓VWAP阈值',
     signal_basis_bps DECIMAL(12,4) DEFAULT NULL,
     pre_gate_basis_bps DECIMAL(12,4) DEFAULT NULL,
     actual_basis_bps DECIMAL(12,4) DEFAULT NULL,
     execution_drift_bps DECIMAL(12,4) DEFAULT NULL,
+    open_funding_rate_24h DECIMAL(18,10) DEFAULT NULL COMMENT '开仓时刻24h资金费率',
 
     funding_pnl_usdt DECIMAL(24,8) NOT NULL DEFAULT 0,
     funding_pnl_bps DECIMAL(12,4) NOT NULL DEFAULT 0,
