@@ -89,23 +89,8 @@ function formatAmount(value: number | null | undefined): string {
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
-function formatUsdt(value: number | null | undefined): string {
-  const amount = formatAmount(value)
-  return amount === '-' ? '-' : `${amount} USDT`
-}
-
-function formatShare(value: number | null | undefined, row: CapitalRow | undefined): string {
-  const amount = Number(value)
-  const equity = Number(row?.equity_usdt)
-  if (!Number.isFinite(amount) || !Number.isFinite(equity) || equity === 0) return '-'
-  return `${(amount / equity * 100).toFixed(1)}%`
-}
-
-function formatUsdtShare(value: number | null | undefined, row: CapitalRow | undefined): string {
-  const amount = formatUsdt(value)
-  if (amount === '-') return '-'
-  const share = formatShare(value, row)
-  return share === '-' ? amount : `${amount} · ${share}`
+function hasAmount(value: number | null | undefined): boolean {
+  return value != null && Number.isFinite(Number(value))
 }
 
 function formatToken(value: number | null | undefined, digits = 6): string {
@@ -116,11 +101,9 @@ function formatToken(value: number | null | undefined, digits = 6): string {
 function formatBnbFeeAsset(row: CapitalRow | undefined): string {
   if (!row) return '-'
   const amount = formatToken(row.bnb_available, 6)
-  const value = formatUsdt(row.bnb_available_usdt)
-  const share = formatShare(row.bnb_available_usdt, row)
+  const value = formatAmount(row.bnb_available_usdt)
   if (amount === '-' && value === '-') return '-'
-  const text = `${amount} BNB / ≈ ${value}`
-  return share === '-' ? text : `${text} · ${share}`
+  return `${amount} BNB / ≈ ${value} USDT`
 }
 
 function exchangeLabel(exchange: string): string {
@@ -412,56 +395,75 @@ onBeforeUnmount(() => {
         </div>
         <div class="metric-row">
           <span>总资产</span>
-          <strong>{{ formatUsdtShare(latestByExchange[exchange]?.equity_usdt, latestByExchange[exchange]) }}</strong>
+          <strong>
+            <span>{{ formatAmount(latestByExchange[exchange]?.equity_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.equity_usdt)" class="metric-unit">USDT</span>
+          </strong>
         </div>
         <div class="metric-row available-row">
           <span>可用资金</span>
           <strong class="available-value">
-            {{ formatUsdtShare(latestByExchange[exchange]?.available_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.available_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.available_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="exchange === 'binance'" class="metric-row bnb-metric-row">
           <span>BNB可用</span>
-          <strong>{{ formatBnbFeeAsset(latestByExchange.binance) }}</strong>
+          <strong class="bnb-value">
+            <span>{{ formatToken(latestByExchange.binance?.bnb_available, 6) }}</span>
+            <span v-if="hasAmount(latestByExchange.binance?.bnb_available)" class="metric-unit">BNB</span>
+            <span class="metric-separator">/ ≈</span>
+            <span>{{ formatAmount(latestByExchange.binance?.bnb_available_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
+          </strong>
         </div>
         <div class="metric-row">
           <span>占用</span>
-          <strong>{{ formatUsdtShare(occupiedAmount(latestByExchange[exchange], exchange), latestByExchange[exchange]) }}</strong>
+          <strong>
+            <span>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</span>
+            <span v-if="hasAmount(occupiedAmount(latestByExchange[exchange], exchange))" class="metric-unit">USDT</span>
+          </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>未实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatUsdtShare(latestByExchange[exchange]?.unrealized_pnl_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.unrealized_pnl_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.unrealized_pnl_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>已实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.realized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatUsdtShare(latestByExchange[exchange]?.realized_pnl_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.realized_pnl_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.realized_pnl_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>资金费收益</span>
           <strong :class="Number(latestByExchange[exchange]?.funding_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatUsdtShare(latestByExchange[exchange]?.funding_pnl_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.funding_pnl_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.funding_pnl_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>手续费成本</span>
           <strong :class="Number(latestByExchange[exchange]?.fee_cost_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatUsdtShare(latestByExchange[exchange]?.fee_cost_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.fee_cost_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.fee_cost_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>净已实现收益</span>
           <strong :class="Number(latestByExchange[exchange]?.total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatUsdtShare(latestByExchange[exchange]?.total_pnl_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.total_pnl_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.total_pnl_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>总盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.gross_total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            {{ formatUsdtShare(latestByExchange[exchange]?.gross_total_pnl_usdt, latestByExchange[exchange]) }}
+            <span>{{ formatAmount(latestByExchange[exchange]?.gross_total_pnl_usdt) }}</span>
+            <span v-if="hasAmount(latestByExchange[exchange]?.gross_total_pnl_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
       </div>
@@ -566,13 +568,29 @@ onBeforeUnmount(() => {
 }
 
 .metric-row strong {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-wrap: wrap;
   color: var(--app-text);
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
 
+.metric-unit,
+.metric-separator {
+  color: var(--app-text-muted) !important;
+  font-size: 11px;
+  font-weight: 500;
+}
+
 .bnb-metric-row {
   align-items: center;
+}
+
+.bnb-value {
+  max-width: 72%;
 }
 
 .available-row {
