@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
+import { ElMessageBox } from 'element-plus'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
 
@@ -44,6 +45,8 @@ const selectedMetric = ref<ChartMetric>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
 const showSummaryDetails = ref(false)
+const bnbBuyAmount = ref<number | undefined>(20)
+const bnbBuying = ref(false)
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -270,6 +273,56 @@ async function runSnapshot() {
   }
 }
 
+async function buyBnbFeeAsset() {
+  const amount = Number(bnbBuyAmount.value)
+  if (!Number.isFinite(amount) || amount < 5) {
+    showError('买入金额至少 5 USDT')
+    return
+  }
+  if (amount > 200) {
+    showError('单次买入金额不能超过 200 USDT')
+    return
+  }
+  const binance = latestByExchange.value.binance
+  const available = Number(binance?.available_usdt ?? 0)
+  if (amount > available) {
+    showError(`Binance USDT 可用余额不足: ${formatAmount(available)}`)
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `确认使用 ${formatAmount(amount)} USDT 市价买入 BNB？\n当前 BNB 可用: ${formatBnbFeeAsset(binance)}`,
+      '买入 BNB 确认',
+      {
+        confirmButtonText: '确认买入',
+        cancelButtonText: '取消',
+        type: 'warning',
+      }
+    )
+  } catch {
+    return
+  }
+
+  bnbBuying.value = true
+  try {
+    const res = await post('/api/trading/capital/binance-bnb/buy', { amount_usdt: amount })
+    const data = await res.json()
+    if (data.success) {
+      showSuccess(data.message || 'BNB 买入成功')
+      await fetchCapital()
+    } else {
+      showError(data.message || 'BNB 买入失败')
+    }
+  } catch (e: any) {
+    if (e?.message && !e.message.includes('未授权') && !e.message.includes('权限不足')) {
+      showError(`BNB 买入请求失败: ${e.message}`)
+    }
+  } finally {
+    bnbBuying.value = false
+  }
+}
+
 function setDays(days: number) {
   filterDays.value = days
   fetchCapital()
@@ -332,6 +385,26 @@ onBeforeUnmount(() => {
         <div v-if="exchange === 'binance'" class="metric-row">
           <span>BNB可用</span>
           <strong>{{ formatBnbFeeAsset(latestByExchange.binance) }}</strong>
+        </div>
+        <div v-if="exchange === 'binance'" class="bnb-buy-row">
+          <el-input-number
+            v-model="bnbBuyAmount"
+            :min="5"
+            :max="200"
+            :precision="2"
+            :step="5"
+            size="small"
+            controls-position="right"
+            class="bnb-buy-input"
+          />
+          <el-button
+            size="small"
+            type="primary"
+            :loading="bnbBuying"
+            @click="buyBnbFeeAsset"
+          >
+            买BNB
+          </el-button>
         </div>
         <div class="metric-row">
           <span>占用</span>
@@ -469,6 +542,17 @@ onBeforeUnmount(() => {
 .metric-row strong {
   color: var(--app-text);
   font-variant-numeric: tabular-nums;
+}
+
+.bnb-buy-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 5px 0 6px;
+}
+
+.bnb-buy-input {
+  width: 132px;
 }
 
 .pnl-positive {

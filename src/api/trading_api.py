@@ -13,14 +13,17 @@ import threading
 from decimal import Decimal
 from datetime import datetime, date
 from typing import Optional, Any, List, Dict
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends
+from pydantic import BaseModel
 
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
+from api.auth import verify_token_dependency
 from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
+from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -500,6 +503,10 @@ _capital_running = False
 _capital_lock = threading.Lock()
 
 
+class BinanceBnbBuyRequest(BaseModel):
+    amount_usdt: float
+
+
 _CAPITAL_HISTORY_INTERVALS = {
     '1m': 60,
     '10m': 600,
@@ -721,6 +728,35 @@ async def run_capital_snapshot_now():
     finally:
         with _capital_lock:
             _capital_running = False
+
+
+@router.post('/capital/binance-bnb/buy', dependencies=[Depends(verify_token_dependency)])
+async def buy_forward_binance_bnb(req: BinanceBnbBuyRequest):
+    """FORWARD Binance Spot 使用 USDT 市价买入 BNB 手续费余额。"""
+    if config.get_trade_mode() == 'virtual':
+        return {'success': False, 'message': 'virtual 模式不执行 Binance 真实买入'}
+    try:
+        result = await asyncio.to_thread(lambda: build_default_forward_bnb_fee_buyer().buy_with_usdt(req.amount_usdt))
+    except ValueError as exc:
+        return {'success': False, 'message': str(exc)}
+    except Exception as exc:
+        logger.error('FORWARD Binance BNB 手续费余额买入失败: %s', exc, exc_info=True)
+        return {'success': False, 'message': f'买入失败: {exc}'}
+
+    payload = {
+        'success': result.success,
+        'message': result.message,
+        'amount_usdt': result.amount_usdt,
+        'result': result.result,
+    }
+    if result.success:
+        try:
+            snapshot = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
+            payload['capital_snapshot'] = snapshot
+        except Exception as exc:
+            logger.warning('FORWARD Binance BNB 买入后资金快照刷新失败: %s', exc, exc_info=True)
+            payload['snapshot_error'] = str(exc)
+    return payload
 
 
 # ─── VWAP 基差阈值 ────────────────────────────────────────────────────────────
