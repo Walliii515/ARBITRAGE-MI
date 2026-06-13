@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
+import { ElMessageBox } from 'element-plus'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
 
@@ -50,6 +51,7 @@ interface BinanceCrossMargin {
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
 type HistoryInterval = '1m' | '10m' | '1h'
+type MarginAction = 'borrow' | 'repay' | 'margin_to_spot' | 'spot_to_margin'
 type ChartMetric =
   | 'equity_usdt'
   | 'available_usdt'
@@ -67,6 +69,9 @@ const filterDays = ref(7)
 const selectedMetric = ref<ChartMetric>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
+const marginAction = ref<MarginAction>('borrow')
+const marginAmount = ref<number | undefined>(50)
+const marginOperating = ref(false)
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -79,6 +84,23 @@ const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | '
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
   { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#303133' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
+]
+
+const marginActionOptions: Array<{ key: MarginAction; label: string; endpoint: string; direction?: string }> = [
+  { key: 'borrow', label: '借入 USDT', endpoint: '/api/trading/capital/binance-margin/borrow' },
+  { key: 'repay', label: '还款 USDT', endpoint: '/api/trading/capital/binance-margin/repay' },
+  {
+    key: 'margin_to_spot',
+    label: '杠杆转现货',
+    endpoint: '/api/trading/capital/binance-margin/transfer',
+    direction: 'margin_to_spot',
+  },
+  {
+    key: 'spot_to_margin',
+    label: '现货转杠杆',
+    endpoint: '/api/trading/capital/binance-margin/transfer',
+    direction: 'spot_to_margin',
+  },
 ]
 
 const latestByExchange = computed(() => {
@@ -144,6 +166,10 @@ function marginStatusClass(info: BinanceCrossMargin | null): string {
   if (info.error || info.status === 'blocked') return 'risk-danger'
   if (info.status === 'warning' || info.status === 'unknown') return 'risk-warning'
   return 'risk-ok'
+}
+
+function selectedMarginAction() {
+  return marginActionOptions.find((item) => item.key === marginAction.value) || marginActionOptions[0]
 }
 
 function exchangeLabel(exchange: string): string {
@@ -311,6 +337,50 @@ async function runSnapshot() {
   }
 }
 
+async function runMarginAction() {
+  const amount = Number(marginAmount.value)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    showError('请输入有效金额')
+    return
+  }
+  const action = selectedMarginAction()
+  const margin = marginInfo('binance')
+  const marginLevelText = formatRatio(margin?.marginLevel)
+  const borrowedText = formatAmount(margin?.USDT?.borrowed)
+  try {
+    await ElMessageBox.confirm(
+      `确认执行 ${action.label} ${amount} USDT？\n当前 Margin Level: ${marginLevelText}\n当前 USDT 借款: ${borrowedText}`,
+      'Binance Margin 操作确认',
+      {
+        confirmButtonText: '确认执行',
+        cancelButtonText: '取消',
+        type: action.key === 'borrow' ? 'warning' : 'info',
+      }
+    )
+  } catch {
+    return
+  }
+
+  marginOperating.value = true
+  try {
+    const payload = action.direction ? { amount, direction: action.direction } : { amount }
+    const res = await post(action.endpoint, payload)
+    const data = await res.json()
+    if (data.success) {
+      showSuccess(data.message || `${action.label}成功`)
+      await fetchCapital()
+    } else {
+      showError(data.message || `${action.label}失败`)
+    }
+  } catch (e: any) {
+    if (e?.message && !e.message.includes('未授权') && !e.message.includes('权限不足')) {
+      showError(`${action.label}请求失败: ${e.message}`)
+    }
+  } finally {
+    marginOperating.value = false
+  }
+}
+
 function setDays(days: number) {
   filterDays.value = days
   fetchCapital()
@@ -437,6 +507,43 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <div class="margin-action-panel">
+      <div class="chart-header">
+        <span>Binance Margin 操作</span>
+        <span class="margin-state" :class="marginStatusClass(marginInfo('binance'))">
+          {{ marginStatusText(marginInfo('binance')) }} / {{ formatRatio(marginInfo('binance')?.marginLevel) }}
+        </span>
+      </div>
+      <div class="margin-action-row">
+        <el-radio-group v-model="marginAction" size="small" class="margin-action-selector">
+          <el-radio-button
+            v-for="action in marginActionOptions"
+            :key="action.key"
+            :label="action.key"
+          >
+            {{ action.label }}
+          </el-radio-button>
+        </el-radio-group>
+        <el-input-number
+          v-model="marginAmount"
+          :min="0"
+          :precision="2"
+          :step="10"
+          size="small"
+          controls-position="right"
+          class="margin-amount-input"
+        />
+        <el-button
+          size="small"
+          type="primary"
+          :loading="marginOperating"
+          @click="runMarginAction"
+        >
+          执行
+        </el-button>
+      </div>
+    </div>
+
     <div class="chart-panel">
       <div class="chart-header">
         <span>资金趋势</span>
@@ -557,6 +664,34 @@ onBeforeUnmount(() => {
   color: #f56c6c !important;
 }
 
+.margin-action-panel {
+  border: 1px solid var(--app-border);
+  background: var(--app-surface);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.margin-state {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.margin-action-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.margin-action-selector {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.margin-amount-input {
+  width: 160px;
+}
+
 .chart-panel {
   border: 1px solid var(--app-border);
   background: var(--app-surface);
@@ -625,8 +760,14 @@ onBeforeUnmount(() => {
 
   .exchange-selector,
   .interval-selector,
-  .metric-selector {
+  .metric-selector,
+  .margin-action-selector {
     justify-content: flex-start;
+  }
+
+  .margin-action-row {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 </style>
