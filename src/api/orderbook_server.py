@@ -60,6 +60,7 @@ from calc.reverse_research_store import (
 )
 from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
 from calc.reverse_trade_store import list_reverse_positions, summarize_reverse_positions
+from calc.reverse_position_cost_sync import refresh_reverse_position_costs
 from calc.executor_client import ExecutorClient
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
@@ -1797,25 +1798,33 @@ async def _position_funding_loop():
     结算完成后通过 WS 推送 funding_history_update 事件，前端按需更新。
     """
     interval = max(config.get_int('trade.position.funding_update_sec', 600), 60)
+    loop = asyncio.get_running_loop()
 
     # 启动后等待服务就绪再执行第一次
     await asyncio.sleep(10)
 
     while True:
+        histories = []
         try:
             tracker = PositionTracker(_contract_meta)
             tracker.update_funding_pnl()
-            # 结算后推送一次性的资金费历史更新事件
             histories = tracker.get_all_funding_histories()
-            if histories and broadcast_queue:
-                payload = {
-                    'type': 'funding_history_update',
-                    'funding_histories': histories,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                await broadcast_queue.put(payload)
         except Exception as e:
-            logger.error(f"资金费更新失败: {e}")
+            logger.error(f"正向资金费更新失败: {e}")
+
+        try:
+            await loop.run_in_executor(_critical_open_executor, refresh_reverse_position_costs)
+        except Exception as e:
+            logger.error(f"反向持仓成本同步失败: {e}")
+
+        # 结算后推送一次性的正向资金费历史更新事件
+        if histories and broadcast_queue:
+            payload = {
+                'type': 'funding_history_update',
+                'funding_histories': histories,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            await broadcast_queue.put(payload)
 
         next_run = datetime.now() + timedelta(seconds=interval)
         logger.info(f"资金费下次检查时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")

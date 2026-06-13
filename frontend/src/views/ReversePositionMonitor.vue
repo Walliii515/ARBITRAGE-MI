@@ -143,8 +143,8 @@ const summaryStats = computed(() => {
   const closedCount = rows.filter((row) => row.status === 'closed').length
   const riskCount = rows.filter((row) => row.exchange_risk_status && row.exchange_risk_status !== 'normal').length
   const totalFundingPnl = sumRows(rows, 'funding_pnl_usdt')
-  const totalBorrowInterest = rows.reduce((sum, row) => sum + Number(row.borrow_interest_realtime_usdt ?? row.borrow_interest_usdt ?? 0), 0)
-  const totalFees = sumRows(rows, 'fee_total_usdt')
+  const totalBorrowInterest = sumRows(rows, 'borrow_interest_usdt')
+  const totalFees = sumRows(rows, 'fee_cost')
   const totalRealizedPnl = sumRows(rows, 'realized_pnl_usdt')
   const totalFloatingPnl = sumRows(rows, 'floating_pnl_total')
   const totalPnl = rows.reduce((sum, row) => sum + Number(row.total_pnl ?? 0), 0)
@@ -299,12 +299,34 @@ const columnDefs = computed<ColDef<ReversePositionRow>[]>(() => [
   { headerName: '已还数量', field: 'borrow_repaid_qty', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
   { headerName: '借币小时利率', field: 'borrow_hourly_rate', width: 130, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: rateFormatter },
   { headerName: '借币24h成本(bps)', field: 'open_borrow_24h_bps', width: 140, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
-  { headerName: '实时借币利息', field: 'borrow_interest_realtime_usdt', width: 125, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
+  {
+    headerName: '实际借币费(bps)',
+    colId: 'borrow_interest_cost_bps',
+    valueGetter: (params: ValueGetterParams<ReversePositionRow>) => -Number(params.data?.borrow_interest_bps ?? 0),
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: bpsFormatter,
+    cellStyle: pnlCellStyle,
+  },
+  {
+    headerName: '实际借币费',
+    colId: 'borrow_interest_cost',
+    valueGetter: (params: ValueGetterParams<ReversePositionRow>) => -Number(params.data?.borrow_interest_usdt ?? 0),
+    width: 115,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: pnlFormatter,
+    cellStyle: pnlCellStyle,
+  },
   { headerName: '开仓24h资金费', field: 'open_funding_rate_24h', width: 135, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: rateFormatter, cellStyle: fundingCellStyle },
-  { headerName: '资金费收益(bps)', field: 'funding_pnl_bps', width: 130, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
-  { headerName: '资金费收益', field: 'funding_pnl_usdt', width: 120, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
-  { headerName: '手续费(bps)', field: 'fee_total_bps', width: 110, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
-  { headerName: '手续费', field: 'fee_total_usdt', width: 100, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
+  { headerName: '实际资金费(bps)', field: 'funding_pnl_bps', width: 135, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
+  { headerName: '实际资金费', field: 'funding_pnl_usdt', width: 120, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
+  { headerName: '手续费(bps)', field: 'fee_total_bps', width: 110, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
+  { headerName: '手续费', field: 'fee_cost', width: 100, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
   { headerName: '实现盈亏(bps)', field: 'realized_pnl_bps', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
   { headerName: '实现盈亏', field: 'realized_pnl_usdt', width: 115, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
   { headerName: '现货开仓VWAP', field: 'spot_open_price', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },

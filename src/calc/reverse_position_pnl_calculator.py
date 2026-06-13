@@ -70,7 +70,9 @@ def _fee_cost(pos: Dict) -> float:
 
 
 def _fee_bps(pos: Dict) -> float:
-    return _as_float(pos.get('fee_total_bps'), 0.0) or 0.0
+    value = _as_float(pos.get('fee_total_bps'), 0.0) or 0.0
+    # 反向持仓统一口径：手续费是成本，bps 进入总盈亏时应为负值。
+    return -abs(value) if value else 0.0
 
 
 def _funding_pnl(pos: Dict) -> float:
@@ -117,7 +119,9 @@ def _inject_totals(pos: Dict, floating_bps: Optional[float], floating_usdt: Opti
     borrow_interest, borrow_bps = _estimate_borrow_interest(pos, pos.get('current_spot_price'))
     pos['borrow_interest_realtime_usdt'] = borrow_interest
     pos['borrow_interest_realtime_bps'] = borrow_bps
-    pos['fee_cost'] = -round(_fee_cost(pos), 8)
+    fee_cost = -round(_fee_cost(pos), 8)
+    pos['fee_cost'] = fee_cost
+    pos['fee_total_bps'] = round(_fee_bps(pos), 4)
     pos['funding_total_pnl'] = round(_funding_pnl(pos), 8)
 
     if pos.get('status') == 'closed':
@@ -134,8 +138,8 @@ def _inject_totals(pos: Dict, floating_bps: Optional[float], floating_usdt: Opti
         pos['total_pnl'] = None
         return
 
-    total_bps = floating_bps + realized_bps + _funding_bps(pos) - borrow_bps - _fee_bps(pos)
-    total_usdt = floating_usdt + realized_usdt + _funding_pnl(pos) - borrow_interest - _fee_cost(pos)
+    total_bps = floating_bps + realized_bps + _funding_bps(pos) - borrow_bps + _fee_bps(pos)
+    total_usdt = floating_usdt + realized_usdt + _funding_pnl(pos) - borrow_interest + fee_cost
     pos['total_pnl_bps'] = round(total_bps, 4)
     pos['total_pnl'] = round(total_usdt, 8)
 

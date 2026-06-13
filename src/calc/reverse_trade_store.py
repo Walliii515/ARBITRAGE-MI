@@ -443,6 +443,8 @@ def record_reverse_open_execution(
         if x.get('fee_amount_usdt') is not None
     )
     open_amount = spot_result.get('exec_amount') or future_result.get('exec_amount') or order_group.get('target_amount')
+    open_notional = _as_float(open_amount)
+    fee_total_bps = -fee_total_usdt / open_notional * 10000 if open_notional > 0 else 0.0
 
     with db_manager.get_cursor() as cursor:
         if has_real_leg:
@@ -456,7 +458,7 @@ def record_reverse_open_execution(
                     future_open_qty, future_open_price, future_open_amount,
                     reverse_open_basis_bps, reverse_open_basis_p20, reverse_close_basis_p20,
                     signal_basis_bps, pre_gate_basis_bps,
-                    actual_basis_bps, execution_drift_bps, open_funding_rate_24h, fee_total_usdt,
+                    actual_basis_bps, execution_drift_bps, open_funding_rate_24h, fee_total_usdt, fee_total_bps,
                     exchange_risk_status, exchange_risk_type, exchange_risk_detail
                 ) VALUES (
                     %(order_uuid)s, %(signal_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s, %(status)s,
@@ -465,7 +467,7 @@ def record_reverse_open_execution(
                     %(future_qty)s, %(future_price)s, %(future_amount)s,
                     %(reverse_open_basis)s, %(reverse_open_basis_p20)s, %(reverse_close_basis_p20)s,
                     %(signal_basis)s, %(pre_gate_basis)s,
-                    %(actual_basis)s, %(execution_drift)s, %(funding_rate_24h)s, %(fee_total_usdt)s,
+                    %(actual_basis)s, %(execution_drift)s, %(funding_rate_24h)s, %(fee_total_usdt)s, %(fee_total_bps)s,
                     %(risk_status)s, %(risk_type)s, %(risk_detail)s
                 )
                 """,
@@ -496,6 +498,7 @@ def record_reverse_open_execution(
                     'execution_drift': execution_drift,
                     'funding_rate_24h': order_group.get('funding_rate_24h'),
                     'fee_total_usdt': fee_total_usdt,
+                    'fee_total_bps': fee_total_bps,
                     'risk_status': 'normal' if success else 'desynced',
                     'risk_type': None if success else 'reverse_open_partial_or_failed',
                     'risk_detail': None if success else str(result.get('message') or '')[:1000],
