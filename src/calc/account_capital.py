@@ -47,9 +47,9 @@ class AccountCapitalSnapshotter:
         self.executor = executor
         self.cfg = cfg or AccountCapitalConfig()
 
-    def run_once(self) -> Dict:
+    def run_once(self, strategy_pnl_summary: Optional[Dict] = None) -> Dict:
         snapshot_at = datetime.now()
-        pnl = self._load_exchange_pnl_summary(snapshot_at)
+        pnl = self._load_exchange_pnl_summary(snapshot_at, strategy_pnl_summary)
         binance = self._build_binance_row(snapshot_at, pnl)
         gate = self._build_gate_row(snapshot_at, pnl)
         total = self._build_total_row(snapshot_at, binance, gate, pnl)
@@ -139,7 +139,7 @@ class AccountCapitalSnapshotter:
             'locked_usdt': locked,
             'position_value_usdt': spot_value,
             'margin_used_usdt': 0.0,
-            'unrealized_pnl_usdt': 0.0,
+            'unrealized_pnl_usdt': pnl.get('binance_spot_floating_pnl', 0.0),
             'realized_pnl_usdt': pnl['binance_realized_pnl'],
             'funding_pnl_usdt': 0.0,
             'fee_cost_usdt': pnl['binance_fee_cost'],
@@ -151,10 +151,7 @@ class AccountCapitalSnapshotter:
                 'pnl_window': pnl.get('window'),
                 'binance_spot_realized': pnl.get('binance_spot_realized'),
                 'pnl_source': pnl.get('source'),
-                'note': (
-                    'Binance spot realized PnL is calculated from local closed positions '
-                    '(spot_close_amount - spot_open_amount); fees are aggregated from local orders.'
-                ),
+                'spot_floating_pnl': pnl.get('binance_spot_floating_pnl', 0.0),
             },
         }
 
@@ -162,7 +159,7 @@ class AccountCapitalSnapshotter:
         account = self.executor.fetch_gate_futures_account()
         available = _float(account.get('available'))
         total = _float(account.get('total'))
-        unrealized = _float(account.get('unrealised_pnl') or account.get('unrealized_pnl'))
+        account_unrealized = _float(account.get('unrealised_pnl') or account.get('unrealized_pnl'))
         position_margin = _float(account.get('position_margin'))
         isolated_position_margin = _float(account.get('isolated_position_margin'))
         position_initial_margin = _float(account.get('position_initial_margin'))
@@ -171,11 +168,12 @@ class AccountCapitalSnapshotter:
         if _has_value(account.get('total')):
             # Gate futures `total` is wallet balance including isolated margin, but it does
             # not include unrealized PnL. Add it here so equity matches net account value.
-            equity = total + unrealized
+            equity = total + account_unrealized
             equity_formula = 'gate_total_plus_unrealized_pnl'
         else:
-            equity = available + margin_used + unrealized
+            equity = available + margin_used + account_unrealized
             equity_formula = 'available_plus_margin_plus_unrealized_pnl'
+        strategy_future_floating = pnl.get('gate_future_floating_pnl', account_unrealized)
         return {
             'snapshot_at': snapshot_at,
             'exchange': 'gate',
@@ -184,7 +182,7 @@ class AccountCapitalSnapshotter:
             'locked_usdt': order_margin,
             'position_value_usdt': margin_used,
             'margin_used_usdt': margin_used,
-            'unrealized_pnl_usdt': unrealized,
+            'unrealized_pnl_usdt': strategy_future_floating,
             'realized_pnl_usdt': pnl['gate_realized_pnl'],
             'funding_pnl_usdt': pnl['funding_pnl'],
             'fee_cost_usdt': pnl['gate_fee_cost'],
@@ -193,6 +191,8 @@ class AccountCapitalSnapshotter:
                 'source': 'exchange_api',
                 'account': account,
                 'raw_total_usdt': total,
+                'account_unrealized_pnl': account_unrealized,
+                'strategy_future_floating_pnl': strategy_future_floating,
                 'equity_formula': equity_formula,
                 'pnl_window': pnl.get('window'),
                 'pnl_source': pnl.get('source'),
@@ -209,7 +209,10 @@ class AccountCapitalSnapshotter:
             'locked_usdt': binance['locked_usdt'] + gate['locked_usdt'],
             'position_value_usdt': binance['position_value_usdt'] + gate['position_value_usdt'],
             'margin_used_usdt': gate['margin_used_usdt'],
-            'unrealized_pnl_usdt': gate['unrealized_pnl_usdt'],
+            'unrealized_pnl_usdt': pnl.get(
+                'floating_pnl',
+                gate['unrealized_pnl_usdt'] + binance['unrealized_pnl_usdt'],
+            ),
             'realized_pnl_usdt': pnl['realized_pnl'],
             'funding_pnl_usdt': pnl['funding_pnl'],
             'fee_cost_usdt': pnl['fee_cost'],
@@ -223,9 +226,31 @@ class AccountCapitalSnapshotter:
             },
         }
 
-    def _load_exchange_pnl_summary(self, snapshot_at: datetime) -> Dict:
+    def _load_exchange_pnl_summary(
+        self,
+        snapshot_at: datetime,
+        strategy_pnl_summary: Optional[Dict] = None,
+    ) -> Dict:
         start_at = snapshot_at - timedelta(days=max(int(self.cfg.pnl_lookback_days or 1), 1))
         strategy_summary = self._load_strategy_pnl_summary(start_at, snapshot_at)
+        if strategy_pnl_summary:
+            strategy_summary.update({
+                key: strategy_pnl_summary[key]
+                for key in (
+                    'realized_pnl',
+                    'gate_realized_pnl',
+                    'funding_pnl',
+                    'fee_cost',
+                    'binance_spot_floating_pnl',
+                    'gate_future_floating_pnl',
+                    'floating_pnl',
+                    'position_count',
+                    'closed_count',
+                    'pnl_rows',
+                    'missing_realtime_rows',
+                )
+                if key in strategy_pnl_summary
+            })
         binance_spot = strategy_summary['binance_spot_realized']
         binance_fee = strategy_summary['binance_fee_cost']
         fee_cost = strategy_summary['fee_cost']
@@ -236,6 +261,9 @@ class AccountCapitalSnapshotter:
             'gate_realized_pnl': strategy_summary['gate_realized_pnl'],
             'realized_pnl': realized_pnl,
             'funding_pnl': funding_pnl,
+            'binance_spot_floating_pnl': strategy_summary.get('binance_spot_floating_pnl', 0.0),
+            'gate_future_floating_pnl': strategy_summary.get('gate_future_floating_pnl', 0.0),
+            'floating_pnl': strategy_summary.get('floating_pnl', 0.0),
             'binance_fee_cost': binance_fee,
             'gate_fee_cost': strategy_summary['gate_fee_cost'],
             'fee_cost': fee_cost,
@@ -248,6 +276,7 @@ class AccountCapitalSnapshotter:
                 'to': snapshot_at.strftime('%Y-%m-%d %H:%M:%S'),
                 'lookback_days': self.cfg.pnl_lookback_days,
             },
+            'realtime_strategy_summary': strategy_pnl_summary,
         }
 
     def _load_strategy_pnl_summary(self, start_at: datetime, end_at: datetime) -> Dict:

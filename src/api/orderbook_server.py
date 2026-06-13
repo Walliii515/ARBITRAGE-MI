@@ -1889,6 +1889,64 @@ def _get_gate_position_risk_snapshot() -> List[Dict]:
         return _gate_position_risk_cache
 
 
+def _build_position_close_vwaps() -> Dict[str, Dict]:
+    close_vwaps: Dict[str, Dict] = {}
+    if not svc or not svc.gate_manager or not svc.spot_manager:
+        return close_vwaps
+    for row in _get_merged_rows():
+        ba = row.get('base_asset', '')
+        spot_cv = row.get('spot_close_vwap')
+        future_cv = row.get('future_close_vwap')
+        if ba and spot_cv is not None and future_cv is not None:
+            close_vwaps[ba] = {
+                'spot_close_vwap': float(spot_cv),
+                'future_close_vwap': float(future_cv),
+            }
+    return close_vwaps
+
+
+def _build_strategy_position_pnl_summary() -> Dict:
+    positions = PositionTracker(_contract_meta).get_all_positions()
+    if not positions:
+        return {
+            'position_count': 0,
+            'closed_count': 0,
+            'realized_pnl': 0.0,
+            'funding_pnl': 0.0,
+            'fee_cost': 0.0,
+            'binance_spot_floating_pnl': 0.0,
+            'gate_future_floating_pnl': 0.0,
+            'floating_pnl': 0.0,
+            'total_pnl': 0.0,
+            'pnl_rows': 0,
+            'missing_realtime_rows': 0,
+        }
+
+    calculate_realtime_pnl(positions, _build_position_close_vwaps(), _contract_meta, _pnl_cfg)
+    realized_pnl = sum(float(pos.get('realized_pnl') or 0) for pos in positions)
+    funding_pnl = sum(float(pos.get('funding_total_pnl') or 0) for pos in positions)
+    fee_cost = sum(float(pos.get('fee_cost') or 0) for pos in positions)
+    spot_floating = sum(float(pos.get('floating_spot_pnl') or 0) for pos in positions)
+    future_floating = sum(float(pos.get('floating_future_pnl') or 0) for pos in positions)
+    floating_pnl = sum(float(pos.get('floating_pnl_total') or 0) for pos in positions)
+    total_pnl = sum(float(pos.get('total_pnl') or 0) for pos in positions)
+    pnl_rows = sum(1 for pos in positions if pos.get('total_pnl') is not None)
+    missing_rows = len(positions) - pnl_rows
+    return {
+        'position_count': len(positions),
+        'closed_count': sum(1 for pos in positions if pos.get('status') == 'closed'),
+        'realized_pnl': round(realized_pnl, 8),
+        'funding_pnl': round(funding_pnl, 8),
+        'fee_cost': round(fee_cost, 8),
+        'binance_spot_floating_pnl': round(spot_floating, 8),
+        'gate_future_floating_pnl': round(future_floating, 8),
+        'floating_pnl': round(floating_pnl, 8),
+        'strategy_total_pnl': round(total_pnl, 8),
+        'pnl_rows': pnl_rows,
+        'missing_realtime_rows': missing_rows,
+    }
+
+
 async def _position_realtime_push():
     """定时推送持仓实时数据（含已平仓，使用平仓 VWAP 作为实时价格）
     注意：funding_history 不在此推送（低频数据），仅通过 REST 初始加载 + 结算后事件推送。
@@ -1908,23 +1966,8 @@ async def _position_realtime_push():
             if not positions:
                 continue
 
-            # 从缓存获取平仓 VWAP
-            close_vwaps: Dict[str, Dict] = {}
-            if svc.gate_manager and svc.spot_manager:
-                merged_rows = _get_merged_rows()
-
-                for row in merged_rows:
-                    ba = row.get('base_asset', '')
-                    spot_cv = row.get('spot_close_vwap')
-                    future_cv = row.get('future_close_vwap')
-                    if ba and spot_cv is not None and future_cv is not None:
-                        close_vwaps[ba] = {
-                            'spot_close_vwap': float(spot_cv),
-                            'future_close_vwap': float(future_cv),
-                        }
-
             # 计算实时盈亏（已平仓持仓用DB存储的价格，不依赖 close_vwaps）
-            calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
+            calculate_realtime_pnl(positions, _build_position_close_vwaps(), _contract_meta, _pnl_cfg)
             attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())
             
             # 资金汇总来自交易所真实资金快照（分钟级刷新）
@@ -1958,7 +2001,10 @@ async def _account_capital_snapshot_loop():
     interval = max(30, config.get_int('account_capital.snapshot_interval_sec', 60))
     while True:
         try:
-            result = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
+            strategy_pnl = _build_strategy_position_pnl_summary()
+            result = await asyncio.to_thread(
+                lambda: build_default_capital_snapshotter().run_once(strategy_pnl)
+            )
             _latest_account_summary = result.get('summary')
             _latest_account_summary_ts = time.time()
             logger.info(f"交易所资金快照完成: snapshot_at={result.get('snapshot_at')}")

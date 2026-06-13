@@ -297,6 +297,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
 
             floating_spot = (current_spot - spot_open_price) * spot_qty
             floating_future = (future_open_price - current_future) * future_qty
+            pos['floating_spot_pnl'] = round(floating_spot, 4)
+            pos['floating_future_pnl'] = round(floating_future, 4)
             pos['floating_pnl_total'] = round(floating_spot + floating_future, 4)
 
             # 手续费金额 - 持仓中只计开仓手续费
@@ -333,6 +335,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['current_spot_price'] = None
             pos['current_future_price'] = None
             pos['current_spread_bps'] = None
+            pos['floating_spot_pnl'] = None
+            pos['floating_future_pnl'] = None
             pos['floating_pnl_total'] = None
             pos['floating_pnl_bps'] = None
             pos['realized_pnl_bps'] = None
