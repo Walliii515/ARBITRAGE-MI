@@ -27,7 +27,7 @@ interface CapitalRow {
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
 type HistoryInterval = '1m' | '10m' | '1h'
-type TimeWindowKey = '1h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
+type TimeWindowKey = '1h' | '3h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
 type ChartMetric =
   | 'equity_usdt'
   | 'available_usdt'
@@ -63,6 +63,7 @@ const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | '
 
 const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
   { key: '1h', label: '1小时', hours: 1 },
+  { key: '3h', label: '3小时', hours: 3 },
   { key: '6h', label: '6小时', hours: 6 },
   { key: '12h', label: '12小时', hours: 12 },
   { key: '1d', label: '24小时', days: 1 },
@@ -256,7 +257,8 @@ async function fetchHistory() {
   loading.value = true
   try {
     const params = new URLSearchParams()
-    const window = timeWindowOptions.find((item) => item.key === selectedWindow.value) || timeWindowOptions[4]
+    const window = timeWindowOptions.find((item) => item.key === selectedWindow.value)
+      || timeWindowOptions.find((item) => item.key === '7d')!
     if (window.hours != null) params.set('hours', String(window.hours))
     else params.set('days', String(window.days || 7))
     params.set('exchange', selectedExchange.value)
