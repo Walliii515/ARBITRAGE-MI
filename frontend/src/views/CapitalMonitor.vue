@@ -27,6 +27,7 @@ interface CapitalRow {
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
 type HistoryInterval = '1m' | '10m' | '1h'
+type TimeWindowKey = '1h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
 type ChartMetric =
   | 'equity_usdt'
   | 'available_usdt'
@@ -40,7 +41,7 @@ const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
 const loading = ref(false)
 const running = ref(false)
-const filterDays = ref(7)
+const selectedWindow = ref<TimeWindowKey>('7d')
 const selectedMetric = ref<ChartMetric>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
@@ -58,6 +59,16 @@ const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | '
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
   { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#303133' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
+]
+
+const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
+  { key: '1h', label: '1小时', hours: 1 },
+  { key: '6h', label: '6小时', hours: 6 },
+  { key: '12h', label: '12小时', hours: 12 },
+  { key: '1d', label: '24小时', days: 1 },
+  { key: '7d', label: '7天', days: 7 },
+  { key: '30d', label: '30天', days: 30 },
+  { key: '90d', label: '90天', days: 90 },
 ]
 
 const latestByExchange = computed(() => {
@@ -245,7 +256,9 @@ async function fetchHistory() {
   loading.value = true
   try {
     const params = new URLSearchParams()
-    params.set('days', String(filterDays.value))
+    const window = timeWindowOptions.find((item) => item.key === selectedWindow.value) || timeWindowOptions[4]
+    if (window.hours != null) params.set('hours', String(window.hours))
+    else params.set('days', String(window.days || 7))
     params.set('exchange', selectedExchange.value)
     params.set('interval', selectedInterval.value)
     const historyRes = await get(`/api/trading/capital/history?${params.toString()}`)
@@ -331,8 +344,8 @@ async function buyBnbFeeAsset() {
   }
 }
 
-function setDays(days: number) {
-  filterDays.value = days
+function setWindow(window: TimeWindowKey) {
+  selectedWindow.value = window
   fetchCapital()
 }
 
@@ -364,10 +377,14 @@ onBeforeUnmount(() => {
         立即采集
       </el-button>
       <el-button-group size="small">
-        <el-button :type="filterDays === 1 ? 'primary' : 'default'" @click="setDays(1)">24小时</el-button>
-        <el-button :type="filterDays === 7 ? 'primary' : 'default'" @click="setDays(7)">7天</el-button>
-        <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDays(30)">30天</el-button>
-        <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDays(90)">90天</el-button>
+        <el-button
+          v-for="window in timeWindowOptions"
+          :key="window.key"
+          :type="selectedWindow === window.key ? 'primary' : 'default'"
+          @click="setWindow(window.key)"
+        >
+          {{ window.label }}
+        </el-button>
       </el-button-group>
       <el-button size="small" :loading="loading" @click="fetchCapital">刷新</el-button>
       <el-button size="small" @click="showSummaryDetails = !showSummaryDetails">

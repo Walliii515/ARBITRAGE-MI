@@ -650,16 +650,23 @@ async def get_capital_latest():
 @router.get('/capital/history')
 async def get_capital_history(
     days: int = Query(7, ge=1, le=90, description="最近N天"),
+    hours: Optional[int] = Query(None, ge=1, le=24, description="最近N小时，优先于days"),
     exchange: Optional[str] = Query(None, description="交易所过滤(binance/gate/total)"),
     interval: str = Query('10m', description="采样间隔(1m/10m/1h)"),
 ):
     """返回资金历史曲线数据。"""
     bucket_sec = _CAPITAL_HISTORY_INTERVALS.get(interval, _CAPITAL_HISTORY_INTERVALS['10m'])
+    if hours is not None:
+        window_clause = "snapshot_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)"
+        window_value = hours
+    else:
+        window_clause = "snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+        window_value = days
     where = [
-        "snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+        window_clause,
         "JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'",
     ]
-    params: List[Any] = [days]
+    params: List[Any] = [window_value]
     if exchange in ('binance', 'gate', 'total'):
         where.append("exchange = %s")
         params.append(exchange)
@@ -702,7 +709,11 @@ async def get_capital_history(
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, [bucket_sec, bucket_sec, *params])
         rows = cursor.fetchall()
-    return {'rows': _serialize_rows(rows), 'interval': interval if interval in _CAPITAL_HISTORY_INTERVALS else '10m'}
+    return {
+        'rows': _serialize_rows(rows),
+        'interval': interval if interval in _CAPITAL_HISTORY_INTERVALS else '10m',
+        'window': {'hours': hours} if hours is not None else {'days': days},
+    }
 
 
 @router.post('/capital/run')
