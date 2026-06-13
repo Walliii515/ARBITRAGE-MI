@@ -222,6 +222,13 @@ trade:
       basis_score_cap_bps: 30               # 基差潜力最多给止盈阈值贡献30bps，防止极端p20抬得过高
       low_confidence_min_take_profit_bps: 110 # 低置信不把止盈阈值降得过低
       medium_confidence_min_take_profit_bps: 60
+      aging_enabled: true                   # 持仓老化后降低止盈阈值上限，但仍要求净收益为正
+      aging_start_days: 5                   # 持仓>=5天进入老化止盈
+      aging_max_threshold_bps: 100          # 老化后动态止盈阈值最高100bps
+      aging_min_net_profit_bps: 30          # 老化后至少净赚30bps才允许退出
+      aging_hard_days: 8                    # 持仓>=8天进入更积极释放仓位
+      aging_hard_max_threshold_bps: 60      # 深度老化后动态止盈阈值最高60bps
+      aging_hard_min_net_profit_bps: 20     # 深度老化后至少净赚20bps才允许退出
       tiers:
         - { hold_value_min_bps: 60, take_profit_bps: 200 }
         - { hold_value_min_bps: 40, take_profit_bps: 150 }

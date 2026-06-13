@@ -230,6 +230,17 @@ class ClosingExecutor:
             medium_confidence_min_take_profit_bps=float(
                 cfg.get('medium_confidence_min_take_profit_bps', 60.0)
             ),
+            aging_enabled=bool(cfg.get('aging_enabled', True)),
+            aging_start_days=float(cfg.get('aging_start_days', 5.0)),
+            aging_max_threshold_bps=float(cfg.get('aging_max_threshold_bps', 100.0)),
+            aging_min_net_profit_bps=float(cfg.get('aging_min_net_profit_bps', 30.0)),
+            aging_hard_days=float(cfg.get('aging_hard_days', 8.0)),
+            aging_hard_max_threshold_bps=float(
+                cfg.get('aging_hard_max_threshold_bps', 60.0)
+            ),
+            aging_hard_min_net_profit_bps=float(
+                cfg.get('aging_hard_min_net_profit_bps', 20.0)
+            ),
             tiers=[
                 {
                     'hold_value_min_bps': float(row.get('hold_value_min_bps', 0.0)),

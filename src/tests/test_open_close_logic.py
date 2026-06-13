@@ -2237,6 +2237,60 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             {'close_basis_p20': 45.0},
         ))
 
+    def test_dynamic_take_profit_aging_caps_high_threshold_after_five_days(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'BANK',
+            'open_spread_bps': 240.0,
+            'funding_rate_24h': 0.0080,
+            'opened_at': datetime.now() - timedelta(days=5, minutes=10),
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([60, 65, 70, 75, 80, 85, 90])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            100.0,
+            {'close_basis_p20': 50.0},
+        )
+        self.assertEqual(eval_.pre_aging_threshold_bps, 200.0)
+        self.assertEqual(eval_.aging_stage, 'aging')
+        self.assertEqual(eval_.threshold_bps, 100.0)
+        self.assertTrue(self.ce._check_take_profit(
+            self.pos,
+            100.0,
+            {'close_basis_p20': 50.0},
+        ))
+
+    def test_dynamic_take_profit_hard_aging_caps_threshold_after_eight_days(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'BANK',
+            'open_spread_bps': 180.0,
+            'funding_rate_24h': 0.0060,
+            'opened_at': datetime.now() - timedelta(days=8, minutes=10),
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([40, 45, 50, 55, 60, 65, 70])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            95.0,
+            {'close_basis_p20': 50.0},
+        )
+        self.assertEqual(eval_.pre_aging_threshold_bps, 200.0)
+        self.assertEqual(eval_.aging_stage, 'hard')
+        self.assertEqual(eval_.threshold_bps, 60.0)
+        self.assertTrue(self.ce._check_take_profit(
+            self.pos,
+            95.0,
+            {'close_basis_p20': 50.0},
+        ))
+
     def test_live_close_order_group_adds_future_maker_params(self):
         self.ce.executor_client.channel = 'Live'
         self.ce.future_maker_close_enabled = True

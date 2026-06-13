@@ -7,6 +7,7 @@ basis, and threshold metadata, then returns a decision snapshot. Trading
 execution and orderbook access stay in ClosingExecutor.
 """
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, Iterable, List, Optional
 
 
@@ -27,6 +28,13 @@ class DynamicTakeProfitConfig:
     basis_score_cap_bps: float = 30.0
     low_confidence_min_take_profit_bps: float = 110.0
     medium_confidence_min_take_profit_bps: float = 60.0
+    aging_enabled: bool = True
+    aging_start_days: float = 5.0
+    aging_max_threshold_bps: float = 100.0
+    aging_min_net_profit_bps: float = 30.0
+    aging_hard_days: float = 8.0
+    aging_hard_max_threshold_bps: float = 60.0
+    aging_hard_min_net_profit_bps: float = 20.0
     tiers: List[Dict[str, float]] = field(default_factory=lambda: [
         {'hold_value_min_bps': 60.0, 'take_profit_bps': 200.0},
         {'hold_value_min_bps': 40.0, 'take_profit_bps': 150.0},
@@ -60,6 +68,11 @@ class DynamicTakeProfitEvaluation:
     spread_profit_bps: float
     funding_earned_bps: float
     fee_full_bps: float
+    age_days: Optional[float]
+    pre_aging_threshold_bps: float
+    aging_stage: Optional[str]
+    aging_cap_bps: Optional[float]
+    aging_min_profit_bps: Optional[float]
 
     @property
     def passed(self) -> bool:
@@ -101,9 +114,31 @@ def evaluate_dynamic_take_profit(
     elif funding['confidence'] == 'medium':
         dynamic_threshold = max(dynamic_threshold, cfg.medium_confidence_min_take_profit_bps)
     threshold = min(float(fixed_take_profit_bps), dynamic_threshold)
+    pre_aging_threshold = threshold
+    age_days = _position_age_days(position)
+    aging_stage = None
+    aging_cap = None
+    aging_min_profit = None
+
+    if cfg.enabled and cfg.aging_enabled and age_days is not None:
+        if age_days >= max(float(cfg.aging_hard_days or 0.0), 0.0):
+            aging_stage = 'hard'
+            aging_cap = float(cfg.aging_hard_max_threshold_bps)
+            aging_min_profit = float(cfg.aging_hard_min_net_profit_bps)
+        elif age_days >= max(float(cfg.aging_start_days or 0.0), 0.0):
+            aging_stage = 'aging'
+            aging_cap = float(cfg.aging_max_threshold_bps)
+            aging_min_profit = float(cfg.aging_min_net_profit_bps)
+
+        if aging_stage:
+            threshold = max(min(threshold, aging_cap), max(0.0, aging_min_profit))
 
     if not cfg.enabled:
         threshold = float(fixed_take_profit_bps)
+        pre_aging_threshold = threshold
+        aging_stage = None
+        aging_cap = None
+        aging_min_profit = None
 
     return DynamicTakeProfitEvaluation(
         enabled=bool(cfg.enabled),
@@ -127,6 +162,11 @@ def evaluate_dynamic_take_profit(
         spread_profit_bps=spread_profit,
         funding_earned_bps=funding_earned,
         fee_full_bps=float(fee_full_bps or 0.0),
+        age_days=age_days,
+        pre_aging_threshold_bps=pre_aging_threshold,
+        aging_stage=aging_stage,
+        aging_cap_bps=aging_cap,
+        aging_min_profit_bps=aging_min_profit,
     )
 
 
@@ -136,9 +176,18 @@ def format_dynamic_take_profit(eval_: DynamicTakeProfitEvaluation) -> str:
             return 'NA'
         return f'{value:.1f}{suffix}'
 
+    aging = ''
+    if eval_.aging_stage:
+        aging = (
+            f"|aging({eval_.aging_stage},age={eval_.age_days:.1f}d,"
+            f"raw={eval_.pre_aging_threshold_bps:.1f},"
+            f"cap={eval_.aging_cap_bps:.1f},min={eval_.aging_min_profit_bps:.1f})"
+        )
+
     return (
         f"动态止盈|净{eval_.net_profit_bps:.1f}bps"
         f">={eval_.threshold_bps:.1f}bps"
+        f"{aging}"
         f"|hold={eval_.hold_value_bps:.1f}bps"
         f"(funding={eval_.funding_potential_bps:.1f},"
         f"basis={eval_.basis_remaining_bps:.1f}×{eval_.basis_discount:.2f}"
@@ -263,6 +312,56 @@ def _threshold_from_hold_value(hold_value_bps: float, cfg: DynamicTakeProfitConf
         if hold_value_bps >= float(row.get('hold_value_min_bps', 0.0)):
             return float(row.get('take_profit_bps', 45.0))
     return 45.0
+
+
+def _position_age_days(position: Dict) -> Optional[float]:
+    opened_at = (
+        position.get('opened_at')
+        or position.get('open_time')
+        or position.get('created_at')
+    )
+    opened_dt = _as_datetime(opened_at)
+    if opened_dt is None:
+        return None
+    now = datetime.now(tz=opened_dt.tzinfo) if opened_dt.tzinfo else datetime.now()
+    age_sec = (now - opened_dt).total_seconds()
+    return max(0.0, age_sec / 86400.0)
+
+
+def _as_datetime(value) -> Optional[datetime]:
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        # Millisecond timestamps are common in frontend/API snapshots.
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith('Z'):
+            text = f'{text[:-1]}+00:00'
+        for fmt in (
+            None,
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M:%S.%f',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%dT%H:%M:%S.%f',
+        ):
+            try:
+                if fmt is None:
+                    return datetime.fromisoformat(text)
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+    return None
 
 
 def _percentile(values: Iterable[float], q: float) -> float:
