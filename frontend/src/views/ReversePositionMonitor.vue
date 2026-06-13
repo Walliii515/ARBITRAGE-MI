@@ -169,14 +169,44 @@ function sumRows(rows: ReversePositionRow[], field: keyof ReversePositionRow): n
   }, 0)
 }
 
+function numericValue(value: unknown): number | null {
+  if (value == null || value === '') return null
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
 function rowNotional(row: ReversePositionRow): number {
-  return Number(row.open_amount_usdt || row.spot_open_amount || row.future_open_amount || 0)
+  return numericValue(row.open_amount_usdt) ?? numericValue(row.spot_open_amount) ?? numericValue(row.future_open_amount) ?? 0
 }
 
 function bpsFromTotalAmount(rows: ReversePositionRow[], field: keyof ReversePositionRow): number {
-  const notional = rows.reduce((sum, row) => sum + rowNotional(row), 0)
+  let amount = 0
+  let notional = 0
+  for (const row of rows) {
+    const rowAmount = numericValue(row[field])
+    if (rowAmount == null) continue
+    const rowNotionalValue = rowNotional(row)
+    if (!Number.isFinite(rowNotionalValue) || rowNotionalValue <= 0) continue
+    amount += rowAmount
+    notional += rowNotionalValue
+  }
   if (!Number.isFinite(notional) || notional <= 0) return 0
-  return sumRows(rows, field) / notional * 10000
+  return amount / notional * 10000
+}
+
+function weightedAverage(rows: ReversePositionRow[], getter: (row: ReversePositionRow) => unknown): number | null {
+  let weighted = 0
+  let notional = 0
+  for (const row of rows) {
+    const value = numericValue(getter(row))
+    if (value == null) continue
+    const rowNotionalValue = rowNotional(row)
+    if (!Number.isFinite(rowNotionalValue) || rowNotionalValue <= 0) continue
+    weighted += value * rowNotionalValue
+    notional += rowNotionalValue
+  }
+  if (!Number.isFinite(notional) || notional <= 0) return null
+  return weighted / notional
 }
 
 function formatDecimal(value: number | null | undefined, maxDecimals = 12): string {
@@ -283,7 +313,7 @@ const fundingCellStyle = (params: ValueFormatterParams) => {
 
 const columnDefs = computed<ColDef<ReversePositionRow>[]>(() => [
   { headerName: '开仓时间', field: 'opened_at', width: 180, valueFormatter: timeFormatter },
-  { headerName: '标的资产', field: 'base_asset', width: 100, pinned: 'left' },
+  { headerName: '标的资产', field: 'base_asset', width: 100, pinned: 'left', lockPinned: true, lockPosition: 'left', suppressMovable: true },
   { headerName: '现货', field: 'spot_symbol', width: 105 },
   { headerName: '期货', field: 'future_contract', width: 115 },
   { headerName: '状态', field: 'status', width: 90, valueFormatter: (p) => statusLabel(p.value), cellStyle: statusCellStyle },
@@ -432,6 +462,7 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
   const realizedPnl = sumRows(rows, 'realized_pnl_usdt')
   const floatingPnl = sumRows(rows, 'floating_pnl_total')
   const totalPnl = sumRows(rows, 'total_pnl')
+  const displayOpenBasis = weightedAverage(rows, (row) => row.actual_basis_bps ?? row.reverse_open_basis_bps)
   return [{
     id: -1,
     order_uuid: null,
@@ -449,11 +480,11 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     borrow_qty: sumRows(rows, 'borrow_qty'),
     borrow_repaid_qty: sumRows(rows, 'borrow_repaid_qty'),
     borrow_hourly_rate: null,
-    open_borrow_24h_bps: null,
+    open_borrow_24h_bps: weightedAverage(rows, (row) => row.open_borrow_24h_bps),
     borrow_interest_usdt: borrowInterest,
     borrow_interest_bps: bpsFromTotalAmount(rows, 'borrow_interest_usdt'),
     borrow_interest_realtime_usdt: rows.reduce((sum, row) => sum + Number(row.borrow_interest_realtime_usdt ?? row.borrow_interest_usdt ?? 0), 0),
-    borrow_interest_realtime_bps: sumRows(rows, 'borrow_interest_realtime_bps'),
+    borrow_interest_realtime_bps: bpsFromTotalAmount(rows, 'borrow_interest_realtime_usdt'),
     spot_open_qty: sumRows(rows, 'spot_open_qty'),
     spot_open_price: null,
     spot_open_amount: sumRows(rows, 'spot_open_amount'),
@@ -466,15 +497,15 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     future_close_qty: sumRows(rows, 'future_close_qty'),
     future_close_price: null,
     future_close_amount: sumRows(rows, 'future_close_amount'),
-    reverse_open_basis_bps: null,
-    reverse_close_basis_bps: null,
+    reverse_open_basis_bps: weightedAverage(rows, (row) => row.reverse_open_basis_bps),
+    reverse_close_basis_bps: weightedAverage(rows, (row) => row.reverse_close_basis_bps),
     reverse_open_basis_p20: null,
     reverse_close_basis_p20: null,
-    signal_basis_bps: null,
-    pre_gate_basis_bps: null,
-    actual_basis_bps: null,
-    execution_drift_bps: null,
-    open_funding_rate_24h: null,
+    signal_basis_bps: weightedAverage(rows, (row) => row.signal_basis_bps),
+    pre_gate_basis_bps: weightedAverage(rows, (row) => row.pre_gate_basis_bps),
+    actual_basis_bps: displayOpenBasis,
+    execution_drift_bps: weightedAverage(rows, (row) => row.execution_drift_bps),
+    open_funding_rate_24h: weightedAverage(rows, (row) => row.open_funding_rate_24h),
     funding_pnl_usdt: fundingPnl,
     funding_pnl_bps: bpsFromTotalAmount(rows, 'funding_pnl_usdt'),
     fee_total_usdt: feeAmount,
@@ -483,7 +514,7 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     realized_pnl_bps: bpsFromTotalAmount(rows, 'realized_pnl_usdt'),
     current_spot_price: null,
     current_future_price: null,
-    current_spread_bps: null,
+    current_spread_bps: weightedAverage(rows, (row) => row.current_spread_bps),
     floating_spot_pnl: sumRows(rows, 'floating_spot_pnl'),
     floating_future_pnl: sumRows(rows, 'floating_future_pnl'),
     floating_pnl_total: floatingPnl,
@@ -651,19 +682,39 @@ function refreshColumnVisibilities() {
       const state = states.find((item) => item.colId === colId)
       return { colId, headerName: col.headerName ?? colId, visible: state?.hide !== true }
     })
+    .filter((col) => col.colId !== 'base_asset')
 }
 
 function toggleColumnVisibility(colId: string, visible: boolean) {
   if (!gridApi) return
+  if (colId === 'base_asset') return
   gridApi.setColumnsVisible([colId], visible)
   const col = columnVisibilities.value.find((item) => item.colId === colId)
   if (col) col.visible = visible
 }
 
+function normalizeColumnState(state: any[]) {
+  const baseState = state.find((item) => item.colId === 'base_asset') || { colId: 'base_asset' }
+  return [
+    { ...baseState, colId: 'base_asset', pinned: 'left', hide: false },
+    ...state.filter((item) => item.colId !== 'base_asset'),
+  ]
+}
+
+function enforceBaseAssetPinned() {
+  if (!gridApi) return
+  gridApi.applyColumnState({
+    state: [{ colId: 'base_asset', pinned: 'left', hide: false }],
+    applyOrder: false,
+  })
+  const apiWithMove = gridApi as GridApi<ReversePositionRow> & { moveColumns?: (keys: string[], toIndex: number) => void }
+  apiWithMove.moveColumns?.(['base_asset'], 0)
+}
+
 async function saveColumnState() {
   if (!gridApi) return
   try {
-    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState: gridApi.getColumnState() })
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState: normalizeColumnState(gridApi.getColumnState()) })
     const data = await res.json()
     if (data?.success) showSuccess('列配置已保存')
     else showError(data?.message || '保存列配置失败')
@@ -677,15 +728,20 @@ async function loadColumnState() {
   try {
     const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
     const data = await res.json()
-    if (Array.isArray(data?.columnState)) gridApi.applyColumnState({ state: data.columnState, applyOrder: true })
+    if (Array.isArray(data?.columnState)) {
+      gridApi.applyColumnState({ state: normalizeColumnState(data.columnState), applyOrder: true })
+    }
+    enforceBaseAssetPinned()
   } catch {
     /* ignore */
+    enforceBaseAssetPinned()
   }
 }
 
 function onGridReady(params: GridReadyEvent<ReversePositionRow>) {
   gridApi = params.api
   setupGridCopy(params.api)
+  enforceBaseAssetPinned()
   loadColumnState()
 }
 
