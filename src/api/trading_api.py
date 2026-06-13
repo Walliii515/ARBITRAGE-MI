@@ -25,7 +25,12 @@ from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
-from calc.reverse_trade_store import list_reverse_orders, list_reverse_positions
+from calc.reverse_trade_store import (
+    list_reverse_orders,
+    list_reverse_position_orders,
+    list_reverse_positions,
+    summarize_reverse_positions,
+)
 
 logger = get_logger(__name__)
 
@@ -1243,14 +1248,23 @@ async def get_reverse_signals(
 @router.get('/reverse-positions')
 async def get_reverse_positions(
     status: Optional[str] = Query(None, description="状态过滤: holding/closing/closed/risk/desynced"),
+    order_side: Optional[str] = Query(None, description="方向过滤(open=持仓中/close=已平仓)"),
+    exchange_risk: bool = Query(False, description="仅展示交易所风险持仓"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
     days: int = Query(30, ge=1, le=365, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
     """查询反向套利持仓（独立于正向 mi_trade_position）。"""
+    summary = summarize_reverse_positions(
+        exchange_risk=exchange_risk,
+        base_asset=base_asset,
+        days=days,
+    )
     result = list_reverse_positions(
         status=status,
+        order_side=order_side,
+        exchange_risk=exchange_risk,
         base_asset=base_asset,
         days=days,
         page=page,
@@ -1264,7 +1278,15 @@ async def get_reverse_positions(
             'total': result.total,
             'total_pages': result.total_pages,
         },
+        'summary': summary,
     }
+
+
+@router.get('/reverse-positions/{position_id}/orders')
+async def get_reverse_position_orders(position_id: int):
+    """获取指定反向持仓的全部订单明细（弹窗用）。"""
+    rows = list_reverse_position_orders(position_id)
+    return {'orders': _serialize_rows(rows), 'topup_logs': []}
 
 
 @router.get('/reverse-orders')

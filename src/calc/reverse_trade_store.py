@@ -181,6 +181,8 @@ def _append_exact_filter(
 def list_reverse_positions(
     *,
     status: Optional[str] = None,
+    order_side: Optional[str] = None,
+    exchange_risk: bool = False,
     base_asset: Optional[str] = None,
     days: int = 30,
     page: int = 1,
@@ -193,6 +195,12 @@ def list_reverse_positions(
     where = ["opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
     params: List[Any] = [days]
     _append_exact_filter(where, params, 'status', status, ALLOWED_POSITION_STATUSES)
+    if order_side == 'open':
+        where.append("status IN ('holding','closing','risk','desynced')")
+    elif order_side == 'close':
+        where.append("status = 'closed'")
+    if exchange_risk:
+        where.append("exchange_risk_status IS NOT NULL AND exchange_risk_status <> 'normal'")
     _append_like_filter(where, params, 'UPPER(base_asset)', base_asset)
     where_sql = " AND ".join(where)
 
@@ -205,16 +213,75 @@ def list_reverse_positions(
         query_params.extend([page_size, (page - 1) * page_size])
         cursor.execute(
             f"""
-            SELECT *
-            FROM mi_reverse_trade_position
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM mi_reverse_trade_order o WHERE o.position_id = p.id) AS order_count
+            FROM mi_reverse_trade_position p
             WHERE {where_sql}
-            ORDER BY opened_at DESC, id DESC
+            ORDER BY p.opened_at DESC, p.id DESC
             LIMIT %s OFFSET %s
             """,
             query_params,
         )
         rows = cursor.fetchall()
     return PageResult(rows=list(rows or []), total=total, page=page, page_size=page_size)
+
+
+def summarize_reverse_positions(
+    *,
+    exchange_risk: bool = False,
+    base_asset: Optional[str] = None,
+    days: int = 30,
+) -> Dict[str, int]:
+    """Return reverse position summary for the current page filters.
+
+    Keep this reverse-owned: it only reads mi_reverse_trade_position.
+    """
+    ensure_reverse_trade_tables()
+    days = max(min(int(days or 30), 365), 1)
+    where = ["opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
+    params: List[Any] = [days]
+    if exchange_risk:
+        where.append("exchange_risk_status IS NOT NULL AND exchange_risk_status <> 'normal'")
+    _append_like_filter(where, params, 'UPPER(base_asset)', base_asset)
+    where_sql = " AND ".join(where)
+
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status IN ('holding','closing','risk','desynced') THEN 1 ELSE 0 END) AS open_count,
+                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS close_count,
+                SUM(CASE WHEN exchange_risk_status IS NOT NULL AND exchange_risk_status <> 'normal' THEN 1 ELSE 0 END) AS exchange_risk_count
+            FROM mi_reverse_trade_position
+            WHERE {where_sql}
+            """,
+            params,
+        )
+        row = cursor.fetchone() or {}
+    return {
+        'total': int(row.get('total') or 0),
+        'open': int(row.get('open_count') or 0),
+        'close': int(row.get('close_count') or 0),
+        'exchange_risk': int(row.get('exchange_risk_count') or 0),
+    }
+
+
+def list_reverse_position_orders(position_id: int) -> List[Dict[str, Any]]:
+    """Return all reverse order legs for a reverse position."""
+    ensure_reverse_trade_tables()
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT *
+            FROM mi_reverse_trade_order
+            WHERE position_id = %s
+            ORDER BY id ASC
+            """,
+            [int(position_id)],
+        )
+        rows = cursor.fetchall()
+    return list(rows or [])
 
 
 def list_reverse_orders(
