@@ -166,7 +166,7 @@ class TradingExecutorConfig:
     capital_required: bool = False
     capital_max_age_sec: int = 180
     capital_gate_leverage: float = 2.0
-    binance_margin_required: bool = True
+    binance_margin_required: bool = False
     binance_margin_min_open_level: float = 2.5
 
 

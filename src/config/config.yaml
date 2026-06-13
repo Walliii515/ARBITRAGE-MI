@@ -303,11 +303,18 @@ account_capital:
 # 基础持仓对账配置（Binance 现货 + Gate 期货；可识别 Gate ADL/断腿并标记持仓风险）
 reconciliation:
   enabled: true
-  interval_sec: 300
+  interval_sec: 60
   retention_days: 30
   ignored_binance_spot_assets: [BNB]        # BNB 用作 Binance 手续费抵扣燃料，不参与套利持仓对账
-  mark_exchange_risk: true                  # Gate 实仓少于本地持仓时，标记 mi_trade_position.exchange_risk_*
+  mark_exchange_risk: true                  # Gate 实仓少于本地持仓时标记 position 风险；多余实仓写风险事件
   adl_lookback_sec: 86400                   # 回查 Gate my_trades 识别 auto_deleveraging 的窗口（24小时）
+  auto_remediate:
+    enabled: true                           # 对账连续确认断腿后自动 reduce-only 处置裸腿
+    confirm_runs: 2                         # 当前快照 + 上一轮同方向异常才允许实盘动作，避免单次 API 抖动
+    confirm_window_sec: 900                 # 上一轮确认快照最大年龄
+    max_positions_per_run: 20               # Gate 缺腿时最多自动卖出多少个本地 holding spot
+    min_spot_qty: 0.0
+    close_extra_gate_position: true         # Gate 多出 forward 空头时，自动 reduce-only 买回多余合约
 
 # 反向资金费率套利（short spot + long future）
 # 反向策略独立于正向策略；正向策略配置不复用这里的状态。

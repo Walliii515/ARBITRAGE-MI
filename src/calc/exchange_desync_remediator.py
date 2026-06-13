@@ -24,6 +24,7 @@ class ExchangeDesyncRemediationConfig:
     action: str = 'sell_spot'
     max_positions_per_run: int = 20
     min_spot_qty: float = 0.0
+    close_extra_gate_position: bool = True
     spot_open_fee: float = 0.00075
     spot_close_fee: float = 0.00075
     future_open_fee: float = 0.0002
@@ -100,12 +101,79 @@ class ExchangeDesyncRemediator:
         return {
             'attempted': True,
             'success': failure_count == 0 and success_count == len(selected_positions),
+            'action': 'sell_spot',
             'base_asset': base_asset,
             'positions': len(selected_positions),
             'matching_positions': len(positions),
             'success_count': success_count,
             'failure_count': failure_count,
             'results': results,
+        }
+
+    def remediate_gate_extra_position(
+        self,
+        base_asset: str,
+        extra_contracts: float,
+        risk: Dict,
+    ) -> Dict:
+        """Gate 比本地多出空头时，直接 reduce-only 买回多出的合约腿。"""
+        base_asset = str(base_asset or '').upper()
+        if not self.cfg.enabled:
+            return {'attempted': False, 'reason': 'disabled'}
+        if not self.cfg.close_extra_gate_position:
+            return {'attempted': False, 'reason': 'close_extra_gate_position_disabled'}
+        if extra_contracts <= 0:
+            return {'attempted': False, 'reason': 'extra_contracts<=0'}
+
+        exchange_size = _float(risk.get('exchange_size'))
+        if exchange_size >= 0:
+            return {
+                'attempted': False,
+                'reason': 'extra_gate_position_not_confirmed_short',
+                'exchange_size': exchange_size,
+            }
+
+        quanto_multiplier = self._quanto_multiplier(base_asset)
+        target_qty = float(extra_contracts) * quanto_multiplier
+        if target_qty <= 0:
+            return {'attempted': False, 'reason': 'target_qty<=0'}
+
+        order_uuid = str(uuid.uuid4())
+        order = {
+            'order_uuid': order_uuid,
+            'base_asset': base_asset,
+            'spot_symbol': None,
+            'future_contract': risk.get('contract') or f'{base_asset}_USDT',
+            'order_side': 'close',
+            'market_type': 'future',
+            'trade_direction': 'buy',
+            'status': 'pending',
+            'target_qty': target_qty,
+            'target_amount': target_qty * _float(risk.get('mark_price') or risk.get('future_close_price')),
+        }
+        result = self.executor.place_gate_futures_order(order)
+        success = bool(result.get('success'))
+        if success:
+            logger.warning(
+                "Gate 多余空头自动 reduce-only 处置完成 | %s | contracts=%s | qty=%s | px=%s",
+                base_asset, extra_contracts, result.get('exec_qty'), result.get('exec_price'),
+            )
+        else:
+            logger.error(
+                "Gate 多余空头自动 reduce-only 处置失败 | %s | contracts=%s | reason=%s",
+                base_asset, extra_contracts, result.get('reason'),
+            )
+        return {
+            'attempted': True,
+            'success': success,
+            'action': 'close_extra_gate_future',
+            'base_asset': base_asset,
+            'order_uuid': order_uuid,
+            'future_contract': order['future_contract'],
+            'extra_contracts': extra_contracts,
+            'target_qty': target_qty,
+            'future_result': result,
+            'reason': result.get('reason') if not success else None,
         }
 
     def _load_positions_to_remediate(
@@ -146,6 +214,13 @@ class ExchangeDesyncRemediator:
             if remaining <= 1e-9:
                 break
         return selected
+
+    def _quanto_multiplier(self, base_asset: str) -> float:
+        meta = getattr(self.executor, 'contract_meta', {}) or {}
+        try:
+            return float((meta.get(base_asset) or {}).get('quanto_multiplier') or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
 
     def _load_binance_available_qty(self, base_asset: str) -> float:
         balances = self.executor.fetch_binance_account_balances()

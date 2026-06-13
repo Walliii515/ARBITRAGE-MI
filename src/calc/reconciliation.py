@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
+from calc.exchange_desync_remediator import (
+    ExchangeDesyncRemediationConfig,
+    ExchangeDesyncRemediator,
+)
 from calc.real_executor import ExchangeConfig, RealExecutor
 from common.config import config
 from common.database import db_manager
@@ -34,6 +38,12 @@ class ReconciliationConfig:
     ignored_binance_spot_assets: Set[str] = field(default_factory=lambda: {'BNB'})
     mark_exchange_risk: bool = True
     adl_lookback_sec: int = 24 * 3600
+    auto_remediate_enabled: bool = True
+    auto_remediate_confirm_runs: int = 2
+    auto_remediate_confirm_window_sec: int = 900
+    auto_remediate_max_positions_per_run: int = 20
+    auto_remediate_min_spot_qty: float = 0.0
+    auto_remediate_close_extra_gate_position: bool = True
 
 
 def normalize_asset_set(values) -> Set[str]:
@@ -103,6 +113,14 @@ def build_default_reconciler() -> 'Reconciler':
         ignored_binance_spot_assets=get_ignored_binance_spot_assets(),
         mark_exchange_risk=config.get_bool('reconciliation.mark_exchange_risk', True),
         adl_lookback_sec=config.get_int('reconciliation.adl_lookback_sec', 24 * 3600),
+        auto_remediate_enabled=config.get_bool('reconciliation.auto_remediate.enabled', True),
+        auto_remediate_confirm_runs=config.get_int('reconciliation.auto_remediate.confirm_runs', 2),
+        auto_remediate_confirm_window_sec=config.get_int('reconciliation.auto_remediate.confirm_window_sec', 900),
+        auto_remediate_max_positions_per_run=config.get_int('reconciliation.auto_remediate.max_positions_per_run', 20),
+        auto_remediate_min_spot_qty=config.get_float('reconciliation.auto_remediate.min_spot_qty', 0.0),
+        auto_remediate_close_extra_gate_position=config.get_bool(
+            'reconciliation.auto_remediate.close_extra_gate_position', True
+        ),
     )
     return Reconciler(executor, cfg)
 
@@ -113,11 +131,27 @@ class Reconciler:
     def __init__(self, executor: RealExecutor, cfg: Optional[ReconciliationConfig] = None):
         self.executor = executor
         self.cfg = cfg or ReconciliationConfig()
+        self.remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(
+                enabled=self.cfg.auto_remediate_enabled,
+                max_positions_per_run=self.cfg.auto_remediate_max_positions_per_run,
+                min_spot_qty=self.cfg.auto_remediate_min_spot_qty,
+                close_extra_gate_position=self.cfg.auto_remediate_close_extra_gate_position,
+                spot_open_fee=config.get_float('trade.fee.spot_open', 0.00075),
+                spot_close_fee=config.get_float('trade.fee.spot_close', 0.00075),
+                future_open_fee=config.get_float('trade.fee.future_open', 0.0002),
+                future_close_fee=config.get_float('trade.fee.future_close', 0.0002),
+                future_taker_open_fee=config.get_float('trade.fee.future_taker_open', 0.0005),
+                future_taker_close_fee=config.get_float('trade.fee.future_taker_close', 0.0005),
+            ),
+        )
 
     def run_once(self) -> Dict:
         """执行一轮对账并落库，返回本轮摘要。"""
         snapshot_at = datetime.now()
         rows: List[Dict] = []
+        remediation_results: List[Dict] = []
 
         local_spot = self._load_local_spot_positions()
         local_gate = self._load_local_gate_positions()
@@ -132,8 +166,11 @@ class Reconciler:
         try:
             gate_positions = self.executor.fetch_gate_futures_positions()
             gate_rows = self._compare_gate(snapshot_at, local_gate, gate_positions)
+            gate_risks: List[Dict] = []
             if self.cfg.mark_exchange_risk:
-                self._mark_gate_desync_risks(snapshot_at, gate_rows)
+                gate_risks = self._mark_gate_desync_risks(snapshot_at, gate_rows)
+            if self.cfg.auto_remediate_enabled:
+                remediation_results.extend(self._auto_remediate_gate_risks(snapshot_at, gate_risks))
             rows.extend(gate_rows)
         except Exception as e:
             logger.warning(f'Gate 期货对账拉取失败: {e}', exc_info=True)
@@ -155,6 +192,8 @@ class Reconciler:
             'rows': len(rows),
             'mismatch_count': mismatch_count,
             'error_count': error_count,
+            'remediation_count': sum(1 for r in remediation_results if r.get('attempted')),
+            'remediation_success_count': sum(1 for r in remediation_results if r.get('success')),
         }
 
     def cleanup_old_snapshots(self):
@@ -224,29 +263,98 @@ class Reconciler:
             for asset in assets
         ]
 
-    def _mark_gate_desync_risks(self, snapshot_at: datetime, rows: List[Dict]):
-        """Gate 实仓小于本地 holding 时标记持仓；ADL 通过 Gate my_trades text 识别。"""
+    def _mark_gate_desync_risks(self, snapshot_at: datetime, rows: List[Dict]) -> List[Dict]:
+        """Gate 实仓不匹配时生成风险项；实仓小于本地时同步标记本地持仓。"""
+        risks: List[Dict] = []
         for row in rows:
             if row.get('exchange') != 'gate' or row.get('dimension') != 'position':
                 continue
             local_value = float(row.get('local_value') or 0)
             exchange_value = float(row.get('exchange_value') or 0)
-            if local_value <= 0 or exchange_value + GATE_FUTURE_CONTRACT_TOLERANCE >= local_value:
+            if abs(exchange_value - local_value) <= GATE_FUTURE_CONTRACT_TOLERANCE:
                 continue
 
             base_asset = str(row.get('base_asset') or '').upper()
             if not base_asset:
                 continue
 
-            risk = self._detect_gate_desync_risk(base_asset, snapshot_at, local_value, exchange_value)
+            if exchange_value + GATE_FUTURE_CONTRACT_TOLERANCE < local_value:
+                risk = self._detect_gate_desync_risk(base_asset, snapshot_at, local_value, exchange_value)
+                updated = self._mark_positions_exchange_risk(base_asset, risk)
+            elif exchange_value > local_value + GATE_FUTURE_CONTRACT_TOLERANCE:
+                risk = self._detect_gate_extra_risk(base_asset, snapshot_at, local_value, exchange_value, row)
+                updated = 0
+            else:
+                continue
+
+            confirmed = self._is_gate_risk_confirmed(
+                base_asset=base_asset,
+                risk_type=self._gate_risk_type_from_values(local_value, exchange_value) or str(risk.get('type') or ''),
+                snapshot_at=snapshot_at,
+            )
+            risk['confirmed'] = confirmed
             row.setdefault('detail', {})
             row['detail']['exchange_risk'] = risk
-            updated = self._mark_positions_exchange_risk(base_asset, risk)
             if updated:
                 logger.warning(
                     "Gate 持仓对账发现断腿风险 | asset=%s | type=%s | local=%s | exchange=%s | marked=%s",
                     base_asset, risk.get('type'), local_value, exchange_value, updated,
                 )
+            elif risk.get('type') == 'extra_gate_position':
+                logger.warning(
+                    "Gate 持仓对账发现多余合约风险 | asset=%s | local=%s | exchange=%s | confirmed=%s",
+                    base_asset, local_value, exchange_value, confirmed,
+                )
+            risks.append({
+                'base_asset': base_asset,
+                'risk': risk,
+                'local_contracts': local_value,
+                'exchange_contracts': exchange_value,
+                'missing_contracts': max(0.0, local_value - exchange_value),
+                'extra_contracts': max(0.0, exchange_value - local_value),
+                'confirmed': confirmed,
+            })
+        return risks
+
+    def _detect_gate_extra_risk(
+        self,
+        base_asset: str,
+        snapshot_at: datetime,
+        local_contracts: float,
+        exchange_contracts: float,
+        row: Dict,
+    ) -> Dict:
+        contract = f"{base_asset}_USDT"
+        detail = row.get('detail') or {}
+        exchange_size = None
+        try:
+            exchange_size = float(detail.get('size')) if detail.get('size') is not None else None
+        except (TypeError, ValueError):
+            exchange_size = None
+        mark_price = None
+        for key in ('mark_price', 'mark_price_usdt'):
+            try:
+                if detail.get(key) is not None:
+                    mark_price = float(detail.get(key))
+                    break
+            except (TypeError, ValueError):
+                continue
+        extra_contracts = max(0.0, exchange_contracts - local_contracts)
+        return {
+            'status': 'desynced',
+            'type': 'extra_gate_position',
+            'event_at': snapshot_at,
+            'contract': contract,
+            'detail': (
+                f"Gate多余实仓|contract={contract}|local={local_contracts:g}|"
+                f"exchange={exchange_contracts:g}|extra={extra_contracts:g}|size={exchange_size}"
+            ),
+            'exchange_size': exchange_size,
+            'mark_price': mark_price,
+            'future_close_size': extra_contracts,
+            'future_close_price': mark_price,
+            'future_liquidity_role': 'taker',
+        }
 
     def _detect_gate_desync_risk(
         self,
@@ -315,6 +423,149 @@ class Reconciler:
             'future_close_size': missing_contracts,
             'future_pnl': None,
         }
+
+    def _is_gate_risk_confirmed(self, base_asset: str, risk_type: str, snapshot_at: datetime) -> bool:
+        """要求当前异常在历史快照中至少出现过，避免单次 API 抖动触发实盘动作。"""
+        confirm_runs = max(int(self.cfg.auto_remediate_confirm_runs or 1), 1)
+        if confirm_runs <= 1:
+            return True
+
+        cutoff = snapshot_at - timedelta(seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 60), 60))
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT local_value, exchange_value
+                FROM mi_recon_snapshot
+                WHERE exchange = 'gate'
+                  AND dimension = 'position'
+                  AND UPPER(base_asset) = %s
+                  AND snapshot_at >= %s
+                  AND is_match = 0
+                ORDER BY snapshot_at DESC
+                LIMIT %s
+                """,
+                (base_asset.upper(), cutoff, confirm_runs - 1),
+            )
+            rows = cursor.fetchall()
+
+        if len(rows) < confirm_runs - 1:
+            return False
+        for row in rows:
+            previous_type = self._gate_risk_type_from_values(
+                float(row.get('local_value') or 0),
+                float(row.get('exchange_value') or 0),
+            )
+            if previous_type != risk_type:
+                return False
+        return True
+
+    @staticmethod
+    def _gate_risk_type_from_values(local_value: float, exchange_value: float) -> Optional[str]:
+        if exchange_value + GATE_FUTURE_CONTRACT_TOLERANCE < local_value:
+            return 'missing_gate_position' if exchange_value <= GATE_FUTURE_CONTRACT_TOLERANCE else 'qty_mismatch'
+        if exchange_value > local_value + GATE_FUTURE_CONTRACT_TOLERANCE:
+            return 'extra_gate_position'
+        return None
+
+    def _auto_remediate_gate_risks(self, snapshot_at: datetime, risks: List[Dict]) -> List[Dict]:
+        results: List[Dict] = []
+        if not risks:
+            return results
+
+        for item in risks:
+            risk = item.get('risk') or {}
+            if not item.get('confirmed'):
+                result = {'attempted': False, 'reason': 'waiting_for_reconciliation_confirmation'}
+                self._record_reconciliation_risk_event(snapshot_at, item, result)
+                results.append(result)
+                continue
+
+            risk_type = str(risk.get('type') or '')
+            if risk_type in {'adl', 'liquidation', 'missing_gate_position', 'qty_mismatch'}:
+                result = self.remediator.remediate_gate_short_desync(
+                    base_asset=item.get('base_asset'),
+                    missing_contracts=float(item.get('missing_contracts') or 0),
+                    risk=risk,
+                    require_desynced=True,
+                )
+            elif risk_type == 'extra_gate_position':
+                result = self.remediator.remediate_gate_extra_position(
+                    base_asset=item.get('base_asset'),
+                    extra_contracts=float(item.get('extra_contracts') or 0),
+                    risk=risk,
+                )
+            else:
+                result = {'attempted': False, 'reason': f'unsupported_gate_risk:{risk_type}'}
+
+            self._record_reconciliation_risk_event(snapshot_at, item, result)
+            results.append(result)
+        return results
+
+    def _record_reconciliation_risk_event(self, snapshot_at: datetime, item: Dict, result: Dict):
+        risk = item.get('risk') or {}
+        base_asset = str(item.get('base_asset') or '').upper()
+        risk_type = str(risk.get('type') or 'unknown')[:40]
+        status = 'ignored'
+        if result.get('attempted'):
+            status = 'remediated' if result.get('success') else 'failed'
+        event_key = (
+            f"recon:gate:{risk_type}:{base_asset}:"
+            f"{int(snapshot_at.timestamp())}:"
+            f"{float(item.get('local_contracts') or 0):g}:"
+            f"{float(item.get('exchange_contracts') or 0):g}"
+        )[:160]
+        raw = {
+            'source': 'reconciliation',
+            'risk': risk,
+            'local_contracts': item.get('local_contracts'),
+            'exchange_contracts': item.get('exchange_contracts'),
+            'missing_contracts': item.get('missing_contracts'),
+            'extra_contracts': item.get('extra_contracts'),
+            'confirmed': item.get('confirmed'),
+        }
+        remediation_action = result.get('action')
+        sql = """
+            INSERT INTO mi_exchange_risk_event (
+                event_key, exchange, market_type, risk_type, base_asset, contract, event_at,
+                exchange_order_id, exchange_trade_id, side, size, fill_price, entry_price,
+                mark_price, liq_price, pnl, raw_json, status, remediation_action, remediation_result
+            ) VALUES (
+                %(event_key)s, 'gate', 'future', %(risk_type)s, %(base_asset)s, %(contract)s, %(event_at)s,
+                %(exchange_order_id)s, %(exchange_trade_id)s, %(side)s, %(size)s, %(fill_price)s, NULL,
+                %(mark_price)s, NULL, %(pnl)s, %(raw_json)s, %(status)s, %(remediation_action)s,
+                %(remediation_result)s
+            )
+            ON DUPLICATE KEY UPDATE
+                status = VALUES(status),
+                remediation_action = VALUES(remediation_action),
+                remediation_result = VALUES(remediation_result),
+                raw_json = VALUES(raw_json),
+                updated_at = CURRENT_TIMESTAMP
+        """
+        future_result = result.get('future_result') or {}
+        payload = {
+            'event_key': event_key,
+            'risk_type': risk_type,
+            'base_asset': base_asset,
+            'contract': risk.get('contract') or f'{base_asset}_USDT',
+            'event_at': risk.get('event_at') or snapshot_at,
+            'exchange_order_id': future_result.get('exchange_order_id') or risk.get('future_exchange_order_id'),
+            'exchange_trade_id': risk.get('future_trade_id'),
+            'side': 'reconciliation',
+            'size': risk.get('future_close_size') or item.get('missing_contracts') or item.get('extra_contracts'),
+            'fill_price': future_result.get('exec_price') or risk.get('future_close_price'),
+            'mark_price': risk.get('mark_price'),
+            'pnl': risk.get('future_pnl'),
+            'raw_json': json.dumps(raw, ensure_ascii=False, default=str),
+            'status': status,
+            'remediation_action': remediation_action,
+            'remediation_result': json.dumps(result, ensure_ascii=False, default=str),
+        }
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, payload)
+        except Exception as e:
+            logger.warning("对账风险事件落库失败 | %s | %s", event_key, e, exc_info=True)
 
     def _load_gate_pnl_near_event(self, contract: str, event_at: datetime) -> Optional[float]:
         """Gate ADL 的 PnL 通常在 account_book 中，而不是 my_trades 中。"""

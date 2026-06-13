@@ -1571,7 +1571,7 @@ def _run_open_position_check_once():
                 capital_required=config.get_trade_mode() != 'virtual',
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
                 capital_gate_leverage=config.get_float('margin.leverage', 2.0),
-                binance_margin_required=config.get_bool('account_capital.binance_margin.enabled', True),
+                binance_margin_required=config.get_bool('account_capital.binance_margin.enabled', False),
                 binance_margin_min_open_level=config.get_float(
                     'account_capital.binance_margin.min_open_margin_level',
                     2.5,

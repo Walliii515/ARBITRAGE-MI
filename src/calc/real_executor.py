@@ -771,6 +771,10 @@ class RealExecutor:
         """公开的 Binance 现货单腿执行入口，用于交易所断腿自动处置。"""
         return self._place_binance_spot_order(order)
 
+    def place_gate_futures_order(self, order: Dict) -> Dict:
+        """公开的 Gate 合约单腿执行入口，用于交易所断腿 reduce-only 处置。"""
+        return self._place_gate_futures_order(order)
+
     def _binance_signed_post(self, path: str, params: Dict) -> Dict:
         payload = dict(params)
         payload.setdefault('recvWindow', 5000)
