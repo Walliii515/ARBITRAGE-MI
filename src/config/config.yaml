@@ -295,6 +295,10 @@ account_capital:
   retention_days: 30
   pnl_lookback_days: 90
   max_age_sec: 180
+  binance_margin:
+    enabled: true
+    warning_margin_level: 3.0
+    min_open_margin_level: 2.5
 
 # 基础持仓对账配置（Binance 现货 + Gate 期货；可识别 Gate ADL/断腿并标记持仓风险）
 reconciliation:

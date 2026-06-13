@@ -20,6 +20,32 @@ interface CapitalRow {
   fee_cost_usdt: number | null
   total_pnl_usdt: number | null
   gross_total_pnl_usdt: number | null
+  binance_cross_margin?: BinanceCrossMargin | string | null
+}
+
+interface MarginAsset {
+  asset: string
+  free: number | null
+  locked: number | null
+  borrowed: number | null
+  interest: number | null
+  netAsset: number | null
+}
+
+interface BinanceCrossMargin {
+  enabled?: boolean
+  status?: 'ok' | 'warning' | 'blocked' | 'unknown' | 'disabled'
+  open_allowed?: boolean
+  marginLevel?: number | null
+  warning_margin_level?: number | null
+  min_open_margin_level?: number | null
+  borrowEnabled?: boolean | null
+  tradeEnabled?: boolean | null
+  totalAssetOfBtc?: number | null
+  totalLiabilityOfBtc?: number | null
+  totalNetAssetOfBtc?: number | null
+  USDT?: MarginAsset
+  error?: string
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -82,6 +108,42 @@ const chartSeries = computed(() => {
 function formatAmount(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+function formatRatio(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return Number(value).toFixed(3)
+}
+
+function marginInfo(exchange: string): BinanceCrossMargin | null {
+  const raw = latestByExchange.value[exchange]?.binance_cross_margin
+  if (!raw) return null
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === 'object' ? parsed : null
+    } catch {
+      return null
+    }
+  }
+  return raw
+}
+
+function marginStatusText(info: BinanceCrossMargin | null): string {
+  if (!info) return '-'
+  if (info.error) return '读取失败'
+  if (info.enabled === false) return '未启用'
+  if (info.status === 'blocked') return '暂停开仓'
+  if (info.status === 'warning') return '预警'
+  if (info.status === 'ok') return '正常'
+  return '未知'
+}
+
+function marginStatusClass(info: BinanceCrossMargin | null): string {
+  if (!info || info.enabled === false) return ''
+  if (info.error || info.status === 'blocked') return 'risk-danger'
+  if (info.status === 'warning' || info.status === 'unknown') return 'risk-warning'
+  return 'risk-ok'
 }
 
 function exchangeLabel(exchange: string): string {
@@ -345,6 +407,33 @@ onBeforeUnmount(() => {
             {{ formatAmount(latestByExchange[exchange]?.gross_total_pnl_usdt) }}
           </strong>
         </div>
+        <template v-if="exchange !== 'gate' && marginInfo(exchange)">
+          <div class="metric-divider"></div>
+          <div class="metric-row">
+            <span>Margin 状态</span>
+            <strong :class="marginStatusClass(marginInfo(exchange))">
+              {{ marginStatusText(marginInfo(exchange)) }}
+            </strong>
+          </div>
+          <div class="metric-row">
+            <span>Margin Level</span>
+            <strong :class="marginStatusClass(marginInfo(exchange))">
+              {{ formatRatio(marginInfo(exchange)?.marginLevel) }}
+            </strong>
+          </div>
+          <div class="metric-row">
+            <span>USDT 借款</span>
+            <strong>{{ formatAmount(marginInfo(exchange)?.USDT?.borrowed) }}</strong>
+          </div>
+          <div class="metric-row">
+            <span>USDT 利息</span>
+            <strong>{{ formatAmount(marginInfo(exchange)?.USDT?.interest) }}</strong>
+          </div>
+          <div class="metric-row">
+            <span>开仓阈值</span>
+            <strong>{{ formatRatio(marginInfo(exchange)?.min_open_margin_level) }}</strong>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -443,11 +532,28 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
 }
 
+.metric-divider {
+  border-top: 1px solid var(--app-border);
+  margin: 8px 0 4px;
+}
+
 .pnl-positive {
   color: #67c23a !important;
 }
 
 .pnl-negative {
+  color: #f56c6c !important;
+}
+
+.risk-ok {
+  color: #67c23a !important;
+}
+
+.risk-warning {
+  color: #e6a23c !important;
+}
+
+.risk-danger {
   color: #f56c6c !important;
 }
 

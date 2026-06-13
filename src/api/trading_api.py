@@ -56,7 +56,7 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = value.strftime('%Y-%m-%d %H:%M:%S')
         elif isinstance(value, date):
             result[key] = value.strftime('%Y-%m-%d')
-        elif key == 'detail' and isinstance(value, str):
+        elif key in ('detail', 'binance_cross_margin') and isinstance(value, str):
             try:
                 result[key] = json.loads(value)
             except Exception:
@@ -620,7 +620,8 @@ async def get_capital_latest():
             funding_pnl_usdt,
             fee_cost_usdt,
             total_pnl_usdt,
-            COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt
+            COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
+            JSON_EXTRACT(detail, '$.binance_cross_margin') AS binance_cross_margin
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
@@ -669,7 +670,8 @@ async def get_capital_history(
             s.funding_pnl_usdt,
             s.fee_cost_usdt,
             s.total_pnl_usdt,
-            COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt
+            COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
+            JSON_EXTRACT(s.detail, '$.binance_cross_margin') AS binance_cross_margin
         FROM mi_capital_snapshot s
         INNER JOIN (
             SELECT

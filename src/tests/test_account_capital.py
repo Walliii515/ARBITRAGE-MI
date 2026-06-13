@@ -10,10 +10,11 @@ from calc.account_capital import AccountCapitalSnapshotter, AccountCapitalConfig
 
 
 class FakeCapitalExecutor:
-    def __init__(self, gate_account=None, binance_balances=None, binance_prices=None):
+    def __init__(self, gate_account=None, binance_balances=None, binance_prices=None, margin_account=None):
         self.gate_account = gate_account or {}
         self.binance_balances = binance_balances or []
         self.binance_prices = binance_prices or {}
+        self.margin_account = margin_account
 
     def fetch_gate_futures_account(self):
         return dict(self.gate_account)
@@ -23,6 +24,11 @@ class FakeCapitalExecutor:
 
     def fetch_binance_ticker_prices(self, assets):
         return dict(self.binance_prices)
+
+    def fetch_binance_cross_margin_account(self):
+        if self.margin_account is None:
+            raise RuntimeError('margin unavailable')
+        return dict(self.margin_account)
 
 
 class TestAccountCapitalSnapshotter(unittest.TestCase):
@@ -58,6 +64,7 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'available_usdt': 480.0,
             'locked_usdt': 0.0,
             'position_value_usdt': 20.0,
+            'unrealized_pnl_usdt': 0.0,
         }
         gate = {
             'equity_usdt': 127.5,
@@ -112,6 +119,50 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(row['total_pnl_usdt'], 11.7)
         self.assertEqual(row['detail']['binance_spot_realized']['closed_count'], 2)
 
+    def test_binance_row_includes_cross_margin_risk_detail(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(
+                binance_balances=[{'asset': 'USDT', 'free': '100', 'locked': '0', 'total': '100'}],
+                margin_account={
+                    'borrowEnabled': True,
+                    'tradeEnabled': True,
+                    'marginLevel': '2.7',
+                    'totalAssetOfBtc': '0.12',
+                    'totalLiabilityOfBtc': '0.04',
+                    'totalNetAssetOfBtc': '0.08',
+                    'userAssets': [
+                        {
+                            'asset': 'USDT',
+                            'free': '5',
+                            'locked': '0',
+                            'borrowed': '1000',
+                            'interest': '1.23',
+                            'netAsset': '-996.23',
+                        }
+                    ],
+                },
+            ),
+            AccountCapitalConfig(
+                binance_margin_warning_level=3.0,
+                binance_margin_min_open_level=2.5,
+            ),
+        )
+        pnl = {
+            'binance_realized_pnl': 0.0,
+            'binance_fee_cost': 0.0,
+            'window': {},
+            'binance_spot_realized': {},
+        }
+
+        row = snapshotter._build_binance_row(datetime(2026, 6, 13, 12, 0, 0), pnl)
+        margin = row['detail']['binance_cross_margin']
+
+        self.assertEqual(margin['status'], 'warning')
+        self.assertTrue(margin['open_allowed'])
+        self.assertEqual(margin['marginLevel'], 2.7)
+        self.assertEqual(margin['USDT']['borrowed'], 1000.0)
+        self.assertEqual(margin['USDT']['interest'], 1.23)
+
     def test_total_pnl_includes_binance_spot_realized_pnl(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
         binance = {
@@ -119,6 +170,7 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'available_usdt': 480.0,
             'locked_usdt': 0.0,
             'position_value_usdt': 20.0,
+            'unrealized_pnl_usdt': 0.0,
         }
         gate = {
             'equity_usdt': 120.0,

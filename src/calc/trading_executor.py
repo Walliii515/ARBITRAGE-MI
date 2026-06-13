@@ -166,6 +166,8 @@ class TradingExecutorConfig:
     capital_required: bool = False
     capital_max_age_sec: int = 180
     capital_gate_leverage: float = 2.0
+    binance_margin_required: bool = True
+    binance_margin_min_open_level: float = 2.5
 
 
 class TradingExecutor:
@@ -408,6 +410,8 @@ class TradingExecutor:
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
         self.capital_gate_leverage = max(float(cfg.capital_gate_leverage or 1.0), 1.0)
+        self.binance_margin_required = bool(cfg.binance_margin_required)
+        self.binance_margin_min_open_level = float(cfg.binance_margin_min_open_level or 0.0)
         self._account_summary: Optional[Dict] = None
         self._account_summary_ts: float = 0.0
     
@@ -1749,6 +1753,33 @@ class TradingExecutor:
                     f"资金风控(Gate下单后可用{gate_after:.2f}<"
                     f"总资金{self.min_available_ratio:.0%}={min_gate_available:.2f}USDT)"
                 )
+        margin_ok, margin_reason = self._check_binance_margin_level()
+        if not margin_ok:
+            return False, margin_reason
+        return True, ''
+
+    def _check_binance_margin_level(self) -> tuple:
+        if not self.capital_required or not self.binance_margin_required:
+            return True, ''
+        if self.binance_margin_min_open_level <= 0:
+            return True, ''
+        binance = self._account_summary.get('binance') if self._account_summary else {}
+        margin = (binance or {}).get('margin') or {}
+        if not margin:
+            return False, '资金风控(Binance Margin无快照)'
+        if margin.get('enabled') is False:
+            return True, ''
+        if margin.get('error'):
+            return False, f"资金风控(Binance Margin读取失败:{str(margin.get('error'))[:80]})"
+        margin_level = self._float_or_none(margin.get('marginLevel'))
+        if margin_level is None:
+            return False, '资金风控(Binance Margin Level缺失)'
+        if margin_level < self.binance_margin_min_open_level:
+            return (
+                False,
+                f"资金风控(Binance Margin Level {margin_level:.3f}<"
+                f"{self.binance_margin_min_open_level:.3f})"
+            )
         return True, ''
 
     def _check_asset_exposure(self, base_asset: str, amount_usdt: Optional[float] = None) -> tuple:

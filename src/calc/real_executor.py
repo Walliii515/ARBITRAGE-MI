@@ -788,6 +788,24 @@ class RealExecutor:
             raise RuntimeError(f"Binance {path} HTTP {resp.status_code}: {resp.text[:200]}")
         return resp.json()
 
+    def _binance_signed_get(self, path: str, params: Optional[Dict] = None) -> Dict:
+        payload = dict(params or {})
+        payload.setdefault('recvWindow', 5000)
+        payload['timestamp'] = int(time.time() * 1000)
+        query_string = urlencode(payload)
+        payload['signature'] = self._binance_sign(query_string)
+        headers = {'X-MBX-APIKEY': self.config.binance_api_key}
+        resp = self._session.get(
+            f"{self.config.binance_base_url}{path}",
+            params=payload,
+            headers=headers,
+            timeout=self.config.timeout_sec,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Binance {path} HTTP {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+
     def _place_binance_margin_borrow(self, asset: str, amount: float) -> Dict:
         """Binance Cross Margin 借币。"""
         asset = str(asset or '').upper()
@@ -1068,6 +1086,10 @@ class RealExecutor:
                 'total': total,
             })
         return result
+
+    def fetch_binance_cross_margin_account(self) -> Dict:
+        """拉取 Binance Cross Margin 账户摘要（只读，正向融资风控使用）。"""
+        return self._binance_signed_get('/sapi/v1/margin/account')
 
     def fetch_binance_spot_balances(self) -> List[Dict]:
         """拉取 Binance 非 USDT 现货余额（对账使用）。"""

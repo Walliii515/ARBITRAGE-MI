@@ -20,6 +20,9 @@ from common.meta_loader import fetch_contract_meta, fetch_spot_meta
 class AccountCapitalConfig:
     retention_days: int = 30
     pnl_lookback_days: int = 90
+    binance_margin_enabled: bool = True
+    binance_margin_warning_level: float = 3.0
+    binance_margin_min_open_level: float = 2.5
 
 
 def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
@@ -36,6 +39,15 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
         AccountCapitalConfig(
             retention_days=config.get_int('account_capital.retention_days', 30),
             pnl_lookback_days=config.get_int('account_capital.pnl_lookback_days', 90),
+            binance_margin_enabled=config.get_bool('account_capital.binance_margin.enabled', True),
+            binance_margin_warning_level=config.get_float(
+                'account_capital.binance_margin.warning_margin_level',
+                3.0,
+            ),
+            binance_margin_min_open_level=config.get_float(
+                'account_capital.binance_margin.min_open_margin_level',
+                2.5,
+            ),
         ),
     )
 
@@ -91,6 +103,7 @@ class AccountCapitalSnapshotter:
                 'realized_pnl': binance.get('realized_pnl_usdt', 0),
                 'fees': binance.get('fee_cost_usdt', 0),
                 'net_value': binance.get('equity_usdt', 0),
+                'margin': _capital_detail(binance).get('binance_cross_margin'),
             },
             'gate': {
                 'available': gate.get('available_usdt', 0),
@@ -131,6 +144,7 @@ class AccountCapitalSnapshotter:
         available = float(usdt.get('free') or 0)
         locked = float(usdt.get('locked') or 0)
         equity = available + locked + spot_value
+        margin_detail = self._build_binance_margin_detail()
         return {
             'snapshot_at': snapshot_at,
             'exchange': 'binance',
@@ -152,6 +166,7 @@ class AccountCapitalSnapshotter:
                 'binance_spot_realized': pnl.get('binance_spot_realized'),
                 'pnl_source': pnl.get('source'),
                 'spot_floating_pnl': pnl.get('binance_spot_floating_pnl', 0.0),
+                'binance_cross_margin': margin_detail,
             },
         }
 
@@ -221,9 +236,53 @@ class AccountCapitalSnapshotter:
                 'source': 'exchange_api',
                 'components': 'binance/gate account equity + local strategy positions/orders PnL',
                 'equity_formula': 'binance_equity_plus_gate_equity',
+                'binance_cross_margin': _capital_detail(binance).get('binance_cross_margin'),
                 'pnl_window': pnl.get('window'),
                 'pnl_source': pnl.get('source'),
             },
+        }
+
+    def _build_binance_margin_detail(self) -> Dict:
+        if not self.cfg.binance_margin_enabled:
+            return {'enabled': False}
+        try:
+            account = self.executor.fetch_binance_cross_margin_account()
+        except AttributeError:
+            return {'enabled': False, 'error': 'executor_missing_cross_margin_reader'}
+        except Exception as exc:
+            return {'enabled': True, 'error': str(exc)[:300]}
+
+        assets = _margin_assets_by_symbol(account)
+        usdt = assets.get('USDT', _empty_margin_asset('USDT'))
+        margin_level = _float_or_none(account.get('marginLevel'))
+        warning_level = float(self.cfg.binance_margin_warning_level or 0)
+        min_open_level = float(self.cfg.binance_margin_min_open_level or 0)
+        open_allowed = margin_level is not None and (
+            min_open_level <= 0 or margin_level >= min_open_level
+        )
+        if margin_level is None:
+            status = 'unknown'
+        elif min_open_level > 0 and margin_level < min_open_level:
+            status = 'blocked'
+        elif warning_level > 0 and margin_level < warning_level:
+            status = 'warning'
+        else:
+            status = 'ok'
+
+        return {
+            'enabled': True,
+            'status': status,
+            'open_allowed': open_allowed,
+            'marginLevel': margin_level,
+            'warning_margin_level': warning_level,
+            'min_open_margin_level': min_open_level,
+            'borrowEnabled': account.get('borrowEnabled'),
+            'tradeEnabled': account.get('tradeEnabled'),
+            'totalAssetOfBtc': _float_or_none(account.get('totalAssetOfBtc')),
+            'totalLiabilityOfBtc': _float_or_none(account.get('totalLiabilityOfBtc')),
+            'totalNetAssetOfBtc': _float_or_none(account.get('totalNetAssetOfBtc')),
+            'USDT': usdt,
+            'nonzero_assets': _nonzero_margin_assets(account),
         }
 
     def _load_exchange_pnl_summary(
@@ -428,6 +487,58 @@ def _float_or_none(value) -> Optional[float]:
 
 def _has_value(value) -> bool:
     return value is not None and str(value).strip() != ''
+
+
+def _empty_margin_asset(asset: str) -> Dict:
+    return {
+        'asset': asset,
+        'free': 0.0,
+        'locked': 0.0,
+        'borrowed': 0.0,
+        'interest': 0.0,
+        'netAsset': 0.0,
+    }
+
+
+def _margin_assets_by_symbol(margin_account: Dict) -> Dict[str, Dict]:
+    result: Dict[str, Dict] = {}
+    for item in margin_account.get('userAssets') or []:
+        asset = str(item.get('asset') or '').upper()
+        if not asset:
+            continue
+        result[asset] = {
+            'asset': asset,
+            'free': _float(item.get('free')),
+            'locked': _float(item.get('locked')),
+            'borrowed': _float(item.get('borrowed')),
+            'interest': _float(item.get('interest')),
+            'netAsset': _float(item.get('netAsset')),
+        }
+    return result
+
+
+def _nonzero_margin_assets(margin_account: Dict) -> List[Dict]:
+    assets = []
+    for item in _margin_assets_by_symbol(margin_account).values():
+        if any(
+            abs(float(item.get(key) or 0)) > 1e-12
+            for key in ('free', 'locked', 'borrowed', 'interest', 'netAsset')
+        ):
+            assets.append(item)
+    return sorted(assets, key=lambda row: row['asset'])
+
+
+def _capital_detail(row: Dict) -> Dict:
+    detail = row.get('detail')
+    if isinstance(detail, dict):
+        return detail
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _serialize_capital_row(row: Dict) -> Dict:
