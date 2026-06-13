@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -15,6 +15,7 @@ import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
+import { getToken } from '../utils/auth'
 
 interface ReversePositionRow {
   id: number
@@ -36,6 +37,8 @@ interface ReversePositionRow {
   open_borrow_24h_bps: number | null
   borrow_interest_usdt: number | null
   borrow_interest_bps: number | null
+  borrow_interest_realtime_usdt: number | null
+  borrow_interest_realtime_bps: number | null
   spot_open_qty: number | null
   spot_open_price: number | null
   spot_open_amount: number | null
@@ -63,6 +66,17 @@ interface ReversePositionRow {
   fee_total_bps: number | null
   realized_pnl_usdt: number | null
   realized_pnl_bps: number | null
+  current_spot_price: number | null
+  current_future_price: number | null
+  current_spread_bps: number | null
+  floating_spot_pnl: number | null
+  floating_future_pnl: number | null
+  floating_pnl_total: number | null
+  floating_pnl_bps: number | null
+  funding_total_pnl: number | null
+  fee_cost: number | null
+  total_pnl: number | null
+  total_pnl_bps: number | null
   exchange_risk_status: string | null
   exchange_risk_type: string | null
   exchange_risk_at: string | null
@@ -88,7 +102,12 @@ void gridContainerRef
 
 const rowData = shallowRef<ReversePositionRow[]>([])
 let gridApi: GridApi<ReversePositionRow> | null = null
+let socket: WebSocket | null = null
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let pingInterval: ReturnType<typeof setInterval> | null = null
 const loading = ref(false)
+const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
+const wsLatencyMs = ref<number | null>(null)
 const statusFilter = ref('')
 const baseAssetFilter = ref('')
 const exchangeRiskOnly = ref(false)
@@ -124,19 +143,22 @@ const summaryStats = computed(() => {
   const closedCount = rows.filter((row) => row.status === 'closed').length
   const riskCount = rows.filter((row) => row.exchange_risk_status && row.exchange_risk_status !== 'normal').length
   const totalFundingPnl = sumRows(rows, 'funding_pnl_usdt')
-  const totalBorrowInterest = sumRows(rows, 'borrow_interest_usdt')
+  const totalBorrowInterest = rows.reduce((sum, row) => sum + Number(row.borrow_interest_realtime_usdt ?? row.borrow_interest_usdt ?? 0), 0)
   const totalFees = sumRows(rows, 'fee_total_usdt')
   const totalRealizedPnl = sumRows(rows, 'realized_pnl_usdt')
+  const totalFloatingPnl = sumRows(rows, 'floating_pnl_total')
+  const totalPnl = rows.reduce((sum, row) => sum + Number(row.total_pnl ?? 0), 0)
   return {
     holdingCount,
     closedCount,
     riskCount,
     totalCount: rows.length,
+    totalFloatingPnl,
     totalFundingPnl,
     totalBorrowInterest,
     totalFees,
     totalRealizedPnl,
-    totalPnl: totalRealizedPnl + totalFundingPnl - totalBorrowInterest - totalFees,
+    totalPnl,
   }
 })
 
@@ -265,13 +287,19 @@ const columnDefs = computed<ColDef<ReversePositionRow>[]>(() => [
     tooltipComponent: LongTextTooltip,
   },
   { headerName: '开仓金额', field: 'open_amount_usdt', width: 120, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: amountFormatter },
-  { headerName: '平仓金额', field: 'close_amount_usdt', width: 120, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: amountFormatter },
+  { headerName: '实时现货平仓VWAP', field: 'current_spot_price', width: 145, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
+  { headerName: '实时合约平仓VWAP', field: 'current_future_price', width: 145, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
+  { headerName: '实时平仓VWAP基差(bps)', field: 'current_spread_bps', width: 165, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
+  { headerName: '实时浮动盈亏', field: 'floating_pnl_total', width: 125, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
+  { headerName: '实时浮动盈亏(bps)', field: 'floating_pnl_bps', width: 145, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
+  { headerName: '总盈亏(bps)', field: 'total_pnl_bps', width: 120, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
+  { headerName: '总盈亏', field: 'total_pnl', width: 115, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
   { headerName: '借币资产', field: 'borrow_asset', width: 95 },
   { headerName: '借币数量', field: 'borrow_qty', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
   { headerName: '已还数量', field: 'borrow_repaid_qty', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
   { headerName: '借币小时利率', field: 'borrow_hourly_rate', width: 130, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: rateFormatter },
   { headerName: '借币24h成本(bps)', field: 'open_borrow_24h_bps', width: 140, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
-  { headerName: '借币利息', field: 'borrow_interest_usdt', width: 115, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
+  { headerName: '实时借币利息', field: 'borrow_interest_realtime_usdt', width: 125, type: 'numericColumn', enableCellChangeFlash: true, cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
   { headerName: '开仓24h资金费', field: 'open_funding_rate_24h', width: 135, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: rateFormatter, cellStyle: fundingCellStyle },
   { headerName: '资金费收益(bps)', field: 'funding_pnl_bps', width: 130, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter, cellStyle: pnlCellStyle },
   { headerName: '资金费收益', field: 'funding_pnl_usdt', width: 120, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
@@ -281,8 +309,8 @@ const columnDefs = computed<ColDef<ReversePositionRow>[]>(() => [
   { headerName: '实现盈亏', field: 'realized_pnl_usdt', width: 115, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: pnlFormatter, cellStyle: pnlCellStyle },
   { headerName: '现货开仓VWAP', field: 'spot_open_price', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
   { headerName: '合约开仓VWAP', field: 'future_open_price', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
-  { headerName: '现货平仓VWAP', field: 'spot_close_price', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
-  { headerName: '合约平仓VWAP', field: 'future_close_price', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
+  { headerName: '成交现货平仓VWAP', field: 'spot_close_price', width: 145, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
+  { headerName: '成交合约平仓VWAP', field: 'future_close_price', width: 145, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: decimalFormatter },
   { headerName: '开仓基差(bps)', field: 'reverse_open_basis_bps', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
   { headerName: '开仓VWAP阈值', field: 'reverse_open_basis_p20', width: 130, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
   { headerName: '平仓基差(bps)', field: 'reverse_close_basis_bps', width: 125, type: 'numericColumn', cellClass: 'ag-right-aligned-cell', headerClass: 'ag-right-aligned-header', valueFormatter: bpsFormatter },
@@ -376,6 +404,8 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     open_borrow_24h_bps: null,
     borrow_interest_usdt: sumRows(rows, 'borrow_interest_usdt'),
     borrow_interest_bps: sumRows(rows, 'borrow_interest_bps'),
+    borrow_interest_realtime_usdt: rows.reduce((sum, row) => sum + Number(row.borrow_interest_realtime_usdt ?? row.borrow_interest_usdt ?? 0), 0),
+    borrow_interest_realtime_bps: sumRows(rows, 'borrow_interest_realtime_bps'),
     spot_open_qty: sumRows(rows, 'spot_open_qty'),
     spot_open_price: null,
     spot_open_amount: sumRows(rows, 'spot_open_amount'),
@@ -403,12 +433,98 @@ const pinnedBottomRowData = computed<ReversePositionRow[]>(() => {
     fee_total_bps: sumRows(rows, 'fee_total_bps'),
     realized_pnl_usdt: sumRows(rows, 'realized_pnl_usdt'),
     realized_pnl_bps: sumRows(rows, 'realized_pnl_bps'),
+    current_spot_price: null,
+    current_future_price: null,
+    current_spread_bps: null,
+    floating_spot_pnl: sumRows(rows, 'floating_spot_pnl'),
+    floating_future_pnl: sumRows(rows, 'floating_future_pnl'),
+    floating_pnl_total: sumRows(rows, 'floating_pnl_total'),
+    floating_pnl_bps: sumRows(rows, 'floating_pnl_bps'),
+    funding_total_pnl: sumRows(rows, 'funding_total_pnl'),
+    fee_cost: sumRows(rows, 'fee_cost'),
+    total_pnl: sumRows(rows, 'total_pnl'),
+    total_pnl_bps: sumRows(rows, 'total_pnl_bps'),
     exchange_risk_status: null,
     exchange_risk_type: null,
     exchange_risk_at: null,
     exchange_risk_detail: null,
   }]
 })
+
+function getWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = getToken()
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}&mode=events`
+}
+
+function matchesActiveFilter(row: ReversePositionRow): boolean {
+  if (statusFilter.value && row.status !== statusFilter.value) return false
+  if (baseAssetFilter.value && row.base_asset !== baseAssetFilter.value) return false
+  if (exchangeRiskOnly.value && (!row.exchange_risk_status || row.exchange_risk_status === 'normal')) return false
+  return true
+}
+
+function applyRealtimeUpdates(updates: ReversePositionRow[], summary?: any) {
+  const filtered = updates.filter(matchesActiveFilter)
+  paginationTotal.value = filtered.length
+  if (summary) {
+    positionSummary.value = {
+      total: Number(summary.total || 0),
+      holding: Number(summary.open || summary.holding || 0),
+      closed: Number(summary.close || summary.closed || 0),
+      exchange_risk: Number(summary.exchange_risk || 0),
+    }
+  }
+  const offset = (paginationCurrentPage.value - 1) * paginationPageSize.value
+  rowData.value = filtered.slice(offset, offset + paginationPageSize.value)
+}
+
+function connectWs() {
+  if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return
+  wsStatus.value = 'connecting'
+  socket = new WebSocket(getWsUrl())
+
+  socket.onopen = () => {
+    wsStatus.value = 'connected'
+    wsLatencyMs.value = null
+    if (pingInterval) clearInterval(pingInterval)
+    pingInterval = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+    }, 10000)
+    socket?.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+  }
+
+  socket.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data)
+      if (msg.type === 'pong' && msg.ts) {
+        wsLatencyMs.value = Date.now() - msg.ts
+        return
+      }
+      if (msg.type === 'reverse_position_update' && Array.isArray(msg.positions)) {
+        applyRealtimeUpdates(msg.positions, msg.summary)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  socket.onclose = () => {
+    wsStatus.value = 'disconnected'
+    wsLatencyMs.value = null
+    if (pingInterval) {
+      clearInterval(pingInterval)
+      pingInterval = null
+    }
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    reconnectTimer = setTimeout(connectWs, 3000)
+  }
+
+  socket.onerror = () => {
+    wsStatus.value = 'disconnected'
+    wsLatencyMs.value = null
+  }
+}
 
 async function fetchPositions(resetPage = false) {
   if (loading.value) return
@@ -423,7 +539,7 @@ async function fetchPositions(resetPage = false) {
     if (baseAssetFilter.value) params.set('base_asset', baseAssetFilter.value.trim())
     if (exchangeRiskOnly.value) params.set('exchange_risk', 'true')
 
-    const res = await get(`/api/trading/reverse-positions?${params.toString()}`)
+    const res = await get(`/api/trading/reverse-positions/realtime?${params.toString()}`)
     const data = await res.json()
     if (!res.ok) {
       showError(data?.detail || '获取反向持仓数据失败')
@@ -527,6 +643,16 @@ function onGridReady(params: GridReadyEvent<ReversePositionRow>) {
 
 onMounted(() => {
   fetchPositions()
+  connectWs()
+})
+
+onUnmounted(() => {
+  if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (pingInterval) clearInterval(pingInterval)
+  if (socket) {
+    socket.onclose = null
+    socket.close()
+  }
 })
 </script>
 
@@ -556,6 +682,21 @@ onMounted(() => {
       </div>
       <div class="summary-group">
         <span class="summary-item">
+          <span class="summary-label">WS</span>
+          <span class="summary-value" :class="wsStatus === 'connected' ? 'pnl-positive' : 'warning'">
+            {{ wsStatus === 'connected' ? '已连接' : wsStatus === 'connecting' ? '连接中' : '未连接' }}
+          </span>
+          <span v-if="wsLatencyMs != null" class="summary-label">{{ wsLatencyMs }}ms</span>
+        </span>
+      </div>
+      <div class="summary-group">
+        <span class="summary-item">
+          <span class="summary-label">实时浮动盈亏</span>
+          <span class="summary-value" :class="summaryStats.totalFloatingPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalFloatingPnl) }}</span>
+        </span>
+      </div>
+      <div class="summary-group">
+        <span class="summary-item">
           <span class="summary-label">累计资金费</span>
           <span class="summary-value" :class="summaryStats.totalFundingPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalFundingPnl) }}</span>
         </span>
@@ -568,19 +709,7 @@ onMounted(() => {
       </div>
       <div class="summary-group">
         <span class="summary-item">
-          <span class="summary-label">手续费</span>
-          <span class="summary-value pnl-negative">{{ formatPnl(-summaryStats.totalFees) }}</span>
-        </span>
-      </div>
-      <div class="summary-group">
-        <span class="summary-item">
-          <span class="summary-label">实现盈亏</span>
-          <span class="summary-value" :class="summaryStats.totalRealizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalRealizedPnl) }}</span>
-        </span>
-      </div>
-      <div class="summary-group">
-        <span class="summary-item">
-          <span class="summary-label">估算总盈亏</span>
+          <span class="summary-label">总盈亏</span>
           <span class="summary-value" :class="summaryStats.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'">{{ formatPnl(summaryStats.totalPnl) }}</span>
         </span>
       </div>

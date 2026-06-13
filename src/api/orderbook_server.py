@@ -46,6 +46,7 @@ from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+from calc.reverse_position_pnl_calculator import ReversePnlConfig, calculate_reverse_realtime_pnl
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
@@ -58,6 +59,7 @@ from calc.reverse_research_store import (
     record_reverse_research_snapshot,
 )
 from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
+from calc.reverse_trade_store import list_reverse_positions, summarize_reverse_positions
 from calc.executor_client import ExecutorClient
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
@@ -203,6 +205,7 @@ _pnl_cfg = PnlConfig(
     margin_leverage=config.get_float('margin.leverage', 2.0),
     margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
 )
+_reverse_pnl_cfg = ReversePnlConfig(open_amount_usdt=OPEN_AMOUNT_USDT)
 
 _reverse_cfg = ReverseArbitrageConfig(
     open_amount_usdt=OPEN_AMOUNT_USDT,
@@ -863,6 +866,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_position_funding_loop())
     asyncio.create_task(_account_capital_snapshot_loop())
     asyncio.create_task(_position_realtime_push())
+    asyncio.create_task(_reverse_position_realtime_push())
     asyncio.create_task(_reconciliation_loop())
     asyncio.create_task(_vwap_snapshot_loop())
     asyncio.create_task(_reverse_research_snapshot_loop())
@@ -1145,6 +1149,28 @@ async def reverse_open_status():
         'max_total_positions': config.get_int('reverse_arbitrage.execution.max_total_positions', 10),
         'max_positions_per_asset': config.get_int('reverse_arbitrage.execution.max_positions_per_asset', 1),
     }
+
+
+@app.get('/api/trading/reverse-positions/realtime', dependencies=[Depends(verify_token_dependency)])
+async def reverse_positions_realtime(
+    status: Optional[str] = Query(None),
+    order_side: Optional[str] = Query(None),
+    exchange_risk: bool = Query(False),
+    base_asset: Optional[str] = Query(None),
+    days: int = Query(90, ge=1, le=365),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=5000),
+):
+    """反向持仓实时监控视图：持久化持仓 + 当前平仓 VWAP + 浮动/总盈亏。"""
+    return _load_reverse_positions_with_realtime_pnl(
+        status=status,
+        order_side=order_side,
+        exchange_risk=exchange_risk,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
 
 
 def _find_orderbook_row_by_base_asset(base_asset: str) -> Optional[Dict]:
@@ -1916,6 +1942,61 @@ def _build_position_close_vwaps() -> Dict[str, Dict]:
     return close_vwaps
 
 
+def _build_orderbook_rows_by_asset() -> Dict[str, Dict]:
+    if not svc or not svc.gate_manager or not svc.spot_manager:
+        return {}
+    rows = _get_merged_rows()
+    return {
+        str(row.get('base_asset') or '').upper(): row
+        for row in rows
+        if row.get('base_asset')
+    }
+
+
+def _load_reverse_positions_with_realtime_pnl(
+    *,
+    status: Optional[str] = None,
+    order_side: Optional[str] = None,
+    exchange_risk: bool = False,
+    base_asset: Optional[str] = None,
+    days: int = 90,
+    page: int = 1,
+    page_size: int = 100,
+) -> Dict:
+    summary = summarize_reverse_positions(
+        exchange_risk=exchange_risk,
+        base_asset=base_asset,
+        days=days,
+    )
+    result = list_reverse_positions(
+        status=status,
+        order_side=order_side,
+        exchange_risk=exchange_risk,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
+    positions = result.rows
+    calculate_reverse_realtime_pnl(
+        positions,
+        _build_orderbook_rows_by_asset(),
+        _contract_meta,
+        _reverse_pnl_cfg,
+    )
+    return {
+        'positions': positions,
+        'pagination': {
+            'page': result.page,
+            'page_size': result.page_size,
+            'total': result.total,
+            'total_pages': result.total_pages,
+        },
+        'summary': summary,
+        'open_amount_usdt': OPEN_AMOUNT_USDT,
+    }
+
+
 def _build_strategy_position_pnl_summary() -> Dict:
     positions = PositionTracker(_contract_meta).get_all_positions()
     if not positions:
@@ -1997,6 +2078,38 @@ async def _position_realtime_push():
 
         except Exception as e:
             logger.error(f"持仓实时推送失败: {e}")
+
+
+async def _reverse_position_realtime_push():
+    """定时推送反向持仓实时数据。"""
+    interval = config.get_float(
+        'reverse_arbitrage.position.push_interval_sec',
+        config.get_float('trade.position.push_interval_sec', 5.0),
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+
+            if not svc or svc.state != SERVICE_RUNNING:
+                continue
+
+            payload = _load_reverse_positions_with_realtime_pnl(
+                days=365,
+                page=1,
+                page_size=5000,
+            )
+            if not payload.get('positions'):
+                continue
+
+            payload.update({
+                'type': 'reverse_position_update',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            })
+            await broadcast_queue.put(payload)
+
+        except Exception as e:
+            logger.error(f"反向持仓实时推送失败: {e}", exc_info=True)
 
 
 async def _account_capital_snapshot_loop():
