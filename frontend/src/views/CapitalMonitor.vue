@@ -41,6 +41,7 @@ const filterDays = ref(7)
 const selectedMetric = ref<ChartMetric>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
+const showSummaryDetails = ref(false)
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -86,6 +87,11 @@ function formatAmount(value: number | null | undefined): string {
 
 function exchangeLabel(exchange: string): string {
   return exchange === 'total' ? '合计' : exchange
+}
+
+function occupiedAmount(row: CapitalRow | undefined, exchange: string): number | null | undefined {
+  if (exchange === 'gate') return row?.margin_used_usdt
+  return row?.position_value_usdt
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -288,6 +294,9 @@ onBeforeUnmount(() => {
         <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDays(90)">90天</el-button>
       </el-button-group>
       <el-button size="small" :loading="loading" @click="fetchCapital">刷新</el-button>
+      <el-button size="small" @click="showSummaryDetails = !showSummaryDetails">
+        {{ showSummaryDetails ? '收起详情' : '详细' }}
+      </el-button>
     </div>
 
     <div class="summary-grid">
@@ -306,40 +315,40 @@ onBeforeUnmount(() => {
           <strong>{{ formatAmount(latestByExchange[exchange]?.available_usdt) }}</strong>
         </div>
         <div class="metric-row">
-          <span>{{ exchange === 'gate' ? '保证金占用' : '持仓/占用' }}</span>
-          <strong>{{ formatAmount(exchange === 'gate' ? latestByExchange[exchange]?.margin_used_usdt : latestByExchange[exchange]?.position_value_usdt) }}</strong>
+          <span>占用</span>
+          <strong>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</strong>
         </div>
-        <div class="metric-row">
+        <div v-if="showSummaryDetails" class="metric-row">
           <span>未实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.unrealized_pnl_usdt) }}
           </strong>
         </div>
-        <div class="metric-row">
+        <div v-if="showSummaryDetails" class="metric-row">
           <span>已实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.realized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.realized_pnl_usdt) }}
           </strong>
         </div>
-        <div class="metric-row">
+        <div v-if="showSummaryDetails" class="metric-row">
           <span>资金费收益</span>
           <strong :class="Number(latestByExchange[exchange]?.funding_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.funding_pnl_usdt) }}
           </strong>
         </div>
-        <div class="metric-row">
+        <div v-if="showSummaryDetails" class="metric-row">
           <span>手续费成本</span>
           <strong :class="Number(latestByExchange[exchange]?.fee_cost_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.fee_cost_usdt) }}
           </strong>
         </div>
-        <div class="metric-row">
+        <div v-if="showSummaryDetails" class="metric-row">
           <span>净已实现收益</span>
           <strong :class="Number(latestByExchange[exchange]?.total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.total_pnl_usdt) }}
           </strong>
         </div>
-        <div class="metric-row">
+        <div v-if="showSummaryDetails" class="metric-row">
           <span>总盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.gross_total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             {{ formatAmount(latestByExchange[exchange]?.gross_total_pnl_usdt) }}
