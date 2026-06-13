@@ -7,6 +7,7 @@ import type {
   GridApi,
   GridReadyEvent,
   ValueFormatterParams,
+  ValueGetterParams,
 } from 'ag-grid-community'
 import { ElPopover } from 'element-plus'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -369,9 +370,10 @@ const columnDefs = computed((): ColDef<ReversePositionRow>[] => [
     },
   },
   {
-    headerName: '开仓基差',
-    field: 'reverse_open_basis_bps',
-    width: 115,
+    headerName: '实际开仓基差',
+    colId: 'display_open_basis_bps',
+    valueGetter: (params: ValueGetterParams<ReverseOrderRow>) => params.data?.actual_basis_bps ?? params.data?.reverse_open_basis_bps,
+    width: 130,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',

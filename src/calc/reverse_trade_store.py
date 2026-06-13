@@ -489,7 +489,7 @@ def record_reverse_open_execution(
                     'future_qty': future_result.get('exec_qty'),
                     'future_price': future_result.get('exec_price'),
                     'future_amount': future_result.get('exec_amount'),
-                    'reverse_open_basis': orderbook_row.get('reverse_basis_bps'),
+                    'reverse_open_basis': actual_basis if actual_basis is not None else orderbook_row.get('reverse_basis_bps'),
                     'reverse_open_basis_p20': order_group.get('reverse_open_basis_p20'),
                     'reverse_close_basis_p20': order_group.get('reverse_close_basis_p20'),
                     'signal_basis': order_group.get('signal_basis_bps'),
