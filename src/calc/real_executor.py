@@ -850,54 +850,6 @@ class RealExecutor:
             logger.warning(f"Binance margin 还币失败 | {asset} | amount={qty} | {e}")
             return {'success': False, 'asset': asset, 'amount': float(amount or 0), 'reason': str(e)[:200]}
 
-    def borrow_binance_cross_margin_asset(self, asset: str, amount: float) -> Dict:
-        """公开的 Binance Cross Margin 借币入口，用于受保护的手动资金操作。"""
-        return self._place_binance_margin_borrow(asset, amount)
-
-    def repay_binance_cross_margin_asset(self, asset: str, amount: float) -> Dict:
-        """公开的 Binance Cross Margin 还币入口，用于受保护的手动资金操作。"""
-        return self._place_binance_margin_repay(asset, amount)
-
-    def transfer_binance_cross_margin_asset(self, asset: str, amount: float, direction: str) -> Dict:
-        """Binance Spot 与 Cross Margin 之间划转。
-
-        direction:
-        - spot_to_margin: Spot -> Cross Margin
-        - margin_to_spot: Cross Margin -> Spot
-        """
-        asset = str(asset or '').upper()
-        if asset != 'USDT':
-            return {'success': False, 'asset': asset, 'amount': float(amount or 0), 'reason': '仅允许 USDT 划转'}
-        if float(amount or 0) <= 0:
-            return {'success': False, 'asset': asset, 'amount': float(amount or 0), 'reason': '划转金额必须大于0'}
-        transfer_type = {'spot_to_margin': 1, 'margin_to_spot': 2}.get(str(direction or '').lower())
-        if transfer_type is None:
-            return {'success': False, 'asset': asset, 'amount': float(amount or 0), 'reason': f'未知划转方向: {direction}'}
-        qty = self._format_decimal(amount, 12)
-        try:
-            data = self._binance_signed_post('/sapi/v1/margin/transfer', {
-                'asset': asset,
-                'amount': qty,
-                'type': transfer_type,
-            })
-            return {
-                'success': True,
-                'asset': asset,
-                'amount': float(qty),
-                'direction': direction,
-                'exchange_order_id': str(data.get('tranId') or ''),
-                'raw': data,
-            }
-        except Exception as e:
-            logger.warning(f"Binance margin 划转失败 | {asset} | amount={qty} | direction={direction} | {e}")
-            return {
-                'success': False,
-                'asset': asset,
-                'amount': float(amount or 0),
-                'direction': direction,
-                'reason': str(e)[:200],
-            }
-
     def _place_binance_margin_order(self, order: Dict) -> Dict:
         """Binance Cross Margin 市价/IOC 下单，用于反向现货腿。"""
         base_asset = order.get('base_asset', '')

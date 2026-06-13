@@ -13,17 +13,14 @@ import threading
 from decimal import Decimal
 from datetime import datetime, date
 from typing import Optional, Any, List, Dict
-from fastapi import APIRouter, Query, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Query
 
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
-from api.auth import verify_token_dependency
 from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
-from calc.forward_margin_account import build_default_forward_margin_operator
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
@@ -503,13 +500,6 @@ _capital_running = False
 _capital_lock = threading.Lock()
 
 
-class BinanceMarginAmountRequest(BaseModel):
-    amount: float
-
-
-class BinanceMarginTransferRequest(BaseModel):
-    amount: float
-    direction: str
 _CAPITAL_HISTORY_INTERVALS = {
     '1m': 60,
     '10m': 600,
@@ -632,8 +622,7 @@ async def get_capital_latest():
             funding_pnl_usdt,
             fee_cost_usdt,
             total_pnl_usdt,
-            COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
-            JSON_EXTRACT(detail, '$.binance_cross_margin') AS binance_cross_margin
+            COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
@@ -682,8 +671,7 @@ async def get_capital_history(
             s.funding_pnl_usdt,
             s.fee_cost_usdt,
             s.total_pnl_usdt,
-            COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
-            JSON_EXTRACT(s.detail, '$.binance_cross_margin') AS binance_cross_margin
+            COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt
         FROM mi_capital_snapshot s
         INNER JOIN (
             SELECT
@@ -729,57 +717,6 @@ async def run_capital_snapshot_now():
     finally:
         with _capital_lock:
             _capital_running = False
-
-
-@router.post('/capital/binance-margin/borrow', dependencies=[Depends(verify_token_dependency)])
-async def borrow_forward_binance_margin_usdt(req: BinanceMarginAmountRequest):
-    """FORWARD Binance Cross Margin 手动借入 USDT。"""
-    return await _run_forward_margin_operation(lambda: build_default_forward_margin_operator().borrow_usdt(req.amount))
-
-
-@router.post('/capital/binance-margin/repay', dependencies=[Depends(verify_token_dependency)])
-async def repay_forward_binance_margin_usdt(req: BinanceMarginAmountRequest):
-    """FORWARD Binance Cross Margin 手动还款 USDT。"""
-    return await _run_forward_margin_operation(lambda: build_default_forward_margin_operator().repay_usdt(req.amount))
-
-
-@router.post('/capital/binance-margin/transfer', dependencies=[Depends(verify_token_dependency)])
-async def transfer_forward_binance_margin_usdt(req: BinanceMarginTransferRequest):
-    """FORWARD Binance Spot 与 Cross Margin 手动划转 USDT。"""
-    direction = str(req.direction or '').strip().lower()
-    if direction not in ('spot_to_margin', 'margin_to_spot'):
-        return {'success': False, 'message': f'未知划转方向: {req.direction}'}
-    return await _run_forward_margin_operation(
-        lambda: build_default_forward_margin_operator().transfer_usdt(req.amount, direction)
-    )
-
-
-async def _run_forward_margin_operation(operation):
-    if config.get_trade_mode() == 'virtual':
-        return {'success': False, 'message': 'virtual 模式不执行 Binance Margin 真实操作'}
-    try:
-        result = await asyncio.to_thread(operation)
-    except ValueError as exc:
-        return {'success': False, 'message': str(exc)}
-    except Exception as exc:
-        logger.error('FORWARD Binance Margin 手动操作失败: %s', exc, exc_info=True)
-        return {'success': False, 'message': f'操作失败: {exc}'}
-
-    payload = {
-        'success': result.success,
-        'message': result.message,
-        'operation': result.operation,
-        'asset': result.asset,
-        'amount': result.amount,
-        'result': result.result,
-    }
-    try:
-        snapshot = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
-        payload['capital_snapshot'] = snapshot
-    except Exception as exc:
-        logger.warning('FORWARD Binance Margin 操作后资金快照刷新失败: %s', exc, exc_info=True)
-        payload['snapshot_error'] = str(exc)
-    return payload
 
 
 # ─── VWAP 基差阈值 ────────────────────────────────────────────────────────────

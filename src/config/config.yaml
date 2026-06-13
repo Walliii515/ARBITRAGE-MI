@@ -296,7 +296,7 @@ account_capital:
   pnl_lookback_days: 90
   max_age_sec: 180
   binance_margin:
-    enabled: true
+    enabled: false
     warning_margin_level: 3.0
     min_open_margin_level: 2.5
 
