@@ -65,6 +65,15 @@ def _notional(pos: Dict, cfg: ReversePnlConfig) -> float:
     return max(float(cfg.open_amount_usdt or 0), 1.0)
 
 
+def _bps_from_amount(pos: Dict, amount: Optional[float], cfg: ReversePnlConfig) -> Optional[float]:
+    if amount is None:
+        return None
+    notional = _notional(pos, cfg)
+    if notional <= 0:
+        return None
+    return float(amount) / notional * 10000
+
+
 def _fee_cost(pos: Dict) -> float:
     return _as_float(pos.get('fee_total_usdt'), 0.0) or 0.0
 
@@ -138,9 +147,9 @@ def _inject_totals(pos: Dict, floating_bps: Optional[float], floating_usdt: Opti
         pos['total_pnl'] = None
         return
 
-    total_bps = floating_bps + realized_bps + _funding_bps(pos) - borrow_bps + _fee_bps(pos)
     total_usdt = floating_usdt + realized_usdt + _funding_pnl(pos) - borrow_interest + fee_cost
-    pos['total_pnl_bps'] = round(total_bps, 4)
+    total_bps = _bps_from_amount(pos, total_usdt, cfg)
+    pos['total_pnl_bps'] = round(total_bps, 4) if total_bps is not None else None
     pos['total_pnl'] = round(total_usdt, 8)
 
 
@@ -166,10 +175,22 @@ def calculate_reverse_realtime_pnl(
             pos['floating_future_pnl'] = 0.0
             pos['floating_pnl_total'] = 0.0
             pos['floating_pnl_bps'] = 0.0
-            if pos.get('realized_pnl_usdt') is None and current_basis is not None:
-                open_basis = _as_float(pos.get('reverse_open_basis_bps'), 0.0) or 0.0
-                pos['realized_pnl_bps'] = round(current_basis - open_basis, 4)
-                pos['realized_pnl_usdt'] = round((current_basis - open_basis) / 10000 * _notional(pos, cfg), 8)
+            if pos.get('realized_pnl_usdt') is None:
+                spot_open = _as_float(pos.get('spot_open_price'))
+                future_open = _as_float(pos.get('future_open_price'))
+                spot_qty = _as_float(pos.get('spot_open_qty')) or _position_qty(pos)
+                future_qty = _as_float(pos.get('future_open_qty')) or _position_qty(pos)
+                if spot_open and future_open and current_spot and current_future and spot_qty and future_qty:
+                    realized_spot = (spot_open - current_spot) * spot_qty
+                    realized_future = (current_future - future_open) * future_qty
+                    pos['realized_pnl_usdt'] = round(realized_spot + realized_future, 8)
+                elif current_basis is not None:
+                    open_basis = _as_float(pos.get('reverse_open_basis_bps'), 0.0) or 0.0
+                    pos['realized_pnl_usdt'] = round((current_basis - open_basis) / 10000 * _notional(pos, cfg), 8)
+            realized_usdt = _as_float(pos.get('realized_pnl_usdt'))
+            realized_bps = _bps_from_amount(pos, realized_usdt, cfg)
+            if realized_bps is not None:
+                pos['realized_pnl_bps'] = round(realized_bps, 4)
             _inject_totals(pos, 0.0, 0.0, cfg)
             continue
 
@@ -206,13 +227,12 @@ def calculate_reverse_realtime_pnl(
         floating_spot = (spot_open - spot_close) * spot_qty
         floating_future = (future_close - future_open) * future_qty
         floating_total = floating_spot + floating_future
-        open_basis = _as_float(pos.get('reverse_open_basis_bps'))
-        floating_bps = current_basis - open_basis if open_basis is not None else floating_total / _notional(pos, cfg) * 10000
+        floating_bps = _bps_from_amount(pos, floating_total, cfg)
 
         pos['floating_spot_pnl'] = round(floating_spot, 8)
         pos['floating_future_pnl'] = round(floating_future, 8)
         pos['floating_pnl_total'] = round(floating_total, 8)
-        pos['floating_pnl_bps'] = round(floating_bps, 4)
+        pos['floating_pnl_bps'] = round(floating_bps, 4) if floating_bps is not None else None
         _inject_totals(pos, pos['floating_pnl_bps'], pos['floating_pnl_total'], cfg)
 
     return positions
