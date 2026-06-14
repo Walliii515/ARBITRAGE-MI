@@ -30,19 +30,25 @@ type HistoryInterval = '1m' | '10m' | '1h'
 type TimeWindowKey = '1h' | '3h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
 type ChartMetric =
   | 'equity_usdt'
-  | 'available_usdt'
   | 'unrealized_pnl_usdt'
   | 'realized_pnl_usdt'
   | 'funding_pnl_usdt'
   | 'total_pnl_usdt'
   | 'gross_total_pnl_usdt'
+type ChartModeKey =
+  | 'equity_usdt'
+  | 'unrealized_pnl_usdt'
+  | 'realized_breakdown'
+  | 'gross_total_pnl_usdt'
+type ChartMetricOption = { key: ChartMetric; label: string; group: 'asset' | 'pnl'; color: string }
+type ChartModeOption = { key: ChartModeKey; label: string }
 
 const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
 const loading = ref(false)
 const running = ref(false)
 const selectedWindow = ref<TimeWindowKey>('7d')
-const selectedMetric = ref<ChartMetric>('equity_usdt')
+const selectedChartMode = ref<ChartModeKey>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
 const showSummaryDetails = ref(false)
@@ -51,14 +57,26 @@ const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
 
-const metricOptions: Array<{ key: ChartMetric; label: string; group: 'asset' | 'pnl'; color: string }> = [
+const metricOptions: ChartMetricOption[] = [
   { key: 'equity_usdt', label: '总资产', group: 'asset', color: '#67c23a' },
-  { key: 'available_usdt', label: '可用资金', group: 'asset', color: '#409eff' },
   { key: 'unrealized_pnl_usdt', label: '未实现盈亏', group: 'pnl', color: '#e6a23c' },
   { key: 'realized_pnl_usdt', label: '平仓盈亏', group: 'pnl', color: '#9b59b6' },
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
-  { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#303133' },
+  { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#409eff' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
+]
+
+const chartModeOptions: ChartModeOption[] = [
+  { key: 'equity_usdt', label: '总资产' },
+  { key: 'unrealized_pnl_usdt', label: '未实现盈亏' },
+  { key: 'realized_breakdown', label: '已实现收益' },
+  { key: 'gross_total_pnl_usdt', label: '总盈亏' },
+]
+
+const realizedBreakdownMetrics: ChartMetric[] = [
+  'realized_pnl_usdt',
+  'funding_pnl_usdt',
+  'total_pnl_usdt',
 ]
 
 const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
@@ -79,21 +97,26 @@ const latestByExchange = computed(() => {
 })
 
 const chartSeries = computed(() => {
-  const option = metricOptions.find((item) => item.key === selectedMetric.value)!
-  const points = historyRows.value
+  const metrics: ChartMetric[] = selectedChartMode.value === 'realized_breakdown'
+    ? realizedBreakdownMetrics
+    : [selectedChartMode.value]
+  const rows = historyRows.value
     .filter((row) => row.exchange === selectedExchange.value)
-    .map((row) => ({
+  return metrics.map((metric) => {
+    const option = metricOptions.find((item) => item.key === metric)!
+    const points = rows.map((row) => ({
       time: row.snapshot_at,
-      value: Number(row[selectedMetric.value] ?? 0),
+      value: Number(row[metric] ?? 0),
     }))
-  return [{
-    exchange: selectedExchange.value,
-    metric: selectedMetric.value,
-    label: `${exchangeLabel(selectedExchange.value)} ${option.label}`,
-    color: option.color,
-    group: option.group,
-    points,
-  }]
+    return {
+      exchange: selectedExchange.value,
+      metric,
+      label: `${exchangeLabel(selectedExchange.value)} ${option.label}`,
+      color: option.color,
+      group: option.group,
+      points,
+    }
+  })
 })
 
 function formatAmount(value: number | null | undefined): string {
@@ -356,7 +379,7 @@ onMounted(async () => {
   await initChart()
 })
 
-watch([historyRows, selectedMetric, selectedExchange], () => {
+watch([historyRows, selectedChartMode, selectedExchange], () => {
   updateChart()
 })
 
@@ -512,12 +535,12 @@ onBeforeUnmount(() => {
           <el-radio-button label="1h">1小时</el-radio-button>
         </el-radio-group>
         <el-radio-group
-          v-model="selectedMetric"
+          v-model="selectedChartMode"
           size="small"
           class="metric-selector"
         >
           <el-radio-button
-            v-for="metric in metricOptions"
+            v-for="metric in chartModeOptions"
             :key="metric.key"
             :label="metric.key"
           >
