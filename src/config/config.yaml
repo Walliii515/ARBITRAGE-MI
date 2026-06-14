@@ -287,6 +287,7 @@ trade:
     funding_sync_lookback_days: 7           # Gate fund 流水回看天数，用于重启/漏记回补
     funding_update_offset_sec: 10           # 每个整点后多少秒检查资金费入账
     push_interval_sec: 5                    # 实时数据推送间隔（秒）
+    gate_risk_cache_sec: 10                 # Gate 实仓风险快照缓存秒数；用于追保/风险平仓判断
 
 # 保证金风控配置（逐仓模式）
 margin:
