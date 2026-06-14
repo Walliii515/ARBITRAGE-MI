@@ -77,7 +77,6 @@ const realizedBreakdownMetrics: ChartMetric[] = [
   'realized_pnl_usdt',
   'funding_pnl_usdt',
   'total_pnl_usdt',
-  'gross_total_pnl_usdt',
 ]
 
 const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
@@ -103,7 +102,7 @@ const chartSeries = computed(() => {
     : [selectedChartMode.value]
   const rows = historyRows.value
     .filter((row) => row.exchange === selectedExchange.value)
-  return metrics.map((metric) => {
+  const series = metrics.map((metric) => {
     const option = metricOptions.find((item) => item.key === metric)!
     const points = rows.map((row) => ({
       time: row.snapshot_at,
@@ -116,9 +115,57 @@ const chartSeries = computed(() => {
       color: option.color,
       group: option.group,
       points,
+      lineType: 'solid' as const,
     }
   })
+  if (selectedChartMode.value === 'gross_total_pnl_usdt' && series[0]?.points.length > 1) {
+    series.push({
+      exchange: selectedExchange.value,
+      metric: 'gross_total_pnl_usdt',
+      label: `${exchangeLabel(selectedExchange.value)} 总盈亏趋势`,
+      color: '#ff8f1f',
+      group: 'pnl',
+      points: buildTrendPoints(series[0].points),
+      lineType: 'dashed' as const,
+    })
+  }
+  return series
 })
+
+function buildTrendPoints(points: Array<{ time: string; value: number }>): Array<{ time: string; value: number }> {
+  const samples = points
+    .map((point) => ({
+      time: point.time,
+      x: new Date(point.time).getTime(),
+      y: point.value,
+    }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+  if (samples.length < 2) return []
+
+  const firstX = samples[0].x
+  const normalized = samples.map((point) => ({
+    time: point.time,
+    x: point.x - firstX,
+    y: point.y,
+  }))
+  const count = normalized.length
+  const sumX = normalized.reduce((sum, point) => sum + point.x, 0)
+  const sumY = normalized.reduce((sum, point) => sum + point.y, 0)
+  const sumXX = normalized.reduce((sum, point) => sum + point.x * point.x, 0)
+  const sumXY = normalized.reduce((sum, point) => sum + point.x * point.y, 0)
+  const denominator = count * sumXX - sumX * sumX
+  if (denominator === 0) {
+    const average = sumY / count
+    return normalized.map((point) => ({ time: point.time, value: average }))
+  }
+
+  const slope = (count * sumXY - sumX * sumY) / denominator
+  const intercept = (sumY - slope * sumX) / count
+  return normalized.map((point) => ({
+    time: point.time,
+    value: intercept + slope * point.x,
+  }))
+}
 
 function formatAmount(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
@@ -243,7 +290,7 @@ function buildChartOption(): EChartsOption {
       yAxisIndex: series.group === 'asset' ? 0 : 1,
       emphasis: { focus: 'series' },
       data: series.points.map((point) => [point.time, point.value]),
-      lineStyle: { width: 2.2 },
+      lineStyle: { width: series.lineType === 'dashed' ? 2 : 2.2, type: series.lineType },
     })),
   }
 }
