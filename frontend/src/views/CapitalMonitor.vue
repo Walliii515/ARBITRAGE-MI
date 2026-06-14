@@ -69,7 +69,7 @@ const metricOptions: ChartMetricOption[] = [
 const chartModeOptions: ChartModeOption[] = [
   { key: 'equity_usdt', label: '总资产' },
   { key: 'unrealized_pnl_usdt', label: '未实现盈亏' },
-  { key: 'realized_breakdown', label: '已实现收益' },
+  { key: 'realized_breakdown', label: '收益趋势' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏' },
 ]
 
@@ -77,6 +77,7 @@ const realizedBreakdownMetrics: ChartMetric[] = [
   'realized_pnl_usdt',
   'funding_pnl_usdt',
   'total_pnl_usdt',
+  'gross_total_pnl_usdt',
 ]
 
 const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
