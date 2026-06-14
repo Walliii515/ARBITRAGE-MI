@@ -69,9 +69,9 @@ trade:
     # 资金费率阈值百分位（对应 mi_gate_future_funding_rate_threshold 表字段名）
     funding_rate_threshold_percentile: percentile_30
     # 现货24h成交额低于此值不开仓
-    min_spot_volume_24h_usdt: 100000
+    min_spot_volume_24h_usdt: 30000
     # 期货24h成交额低于此值不开仓
-    min_future_volume_24h_usdt: 50000
+    min_future_volume_24h_usdt: 15000
 
   # ─── 峰值回落 + sustain 确认（开仓回落通道） ───
   peak_pullback:
@@ -433,8 +433,8 @@ orderbook:
   strategy_tiers: [A, B]
   # 最大订阅合约数（从 mi_base_asset 加载的上限）
   max_contracts: 999
-  # Gate OBU WS 连接分片数；若 max_contracts=250 且 level=50，建议设为 5
-  gate_ws_shards: 5
+  # Gate OBU WS 连接分片数；约 300 个合约且 level=50 时建议设为 6
+  gate_ws_shards: 6
   # Gate OBU 深度，实测可用: 50 / 400；系统输出仍只取前20档
   gate_obu_level: 50
   # Gate WS 建连等待时间；高延迟网络下需要比默认 8 秒更宽松
@@ -443,8 +443,8 @@ orderbook:
   gate_subscribe_interval_ms: 100
   # Gate WS 自动重连随机抖动上限（秒），避免多个分片同频重连
   gate_reconnect_jitter_sec: 2.0
-  # Binance Spot WS 连接分片数；若 max_contracts=250 且 speed=100ms，建议设为 5
-  binance_ws_shards: 5
+  # Binance Spot WS 连接分片数；约 300 个合约且 speed=100ms 时建议设为 6
+  binance_ws_shards: 6
   # Binance Partial Depth 推送频率，可选: 100ms / 1000ms
   binance_ws_speed: 100ms
   # 盘口超过该秒数无更新时，不参与交易计算
