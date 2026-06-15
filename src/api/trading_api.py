@@ -101,6 +101,43 @@ def _position_pnl_config() -> PnlConfig:
     )
 
 
+def _build_signal_time_filter(time_range: Optional[str], days: int, prefix: str = "") -> tuple[str, List]:
+    column = f"{prefix}signal_time"
+    range_key = (time_range or "today").strip().lower()
+    if range_key in {"today", "date_today"}:
+        return f"{column} >= CURDATE() AND {column} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)", []
+    return f"{column} >= DATE_SUB(NOW(), INTERVAL %s DAY)", [days]
+
+
+def _build_forward_signal_filters(
+    *,
+    status: Optional[str],
+    exit_reason: Optional[str],
+    base_asset: Optional[str],
+    time_range: Optional[str],
+    days: int,
+    prefix: str = "",
+) -> tuple[str, List]:
+    field_prefix = prefix
+    conditions: List[str] = []
+    params: List = []
+    time_sql, time_params = _build_signal_time_filter(time_range, days, field_prefix)
+    conditions.append(time_sql)
+    params.extend(time_params)
+
+    if status:
+        conditions.append(f"{field_prefix}status = %s")
+        params.append(status)
+    if exit_reason:
+        conditions.append(f"{field_prefix}exit_reason LIKE %s")
+        params.append(f"%{exit_reason}%")
+    if base_asset:
+        conditions.append(f"{field_prefix}base_asset LIKE %s")
+        params.append(f"%{base_asset}%")
+
+    return " AND ".join(conditions), params
+
+
 def _inject_current_funding_fields(rows: List[Dict[str, Any]], contract_meta: Optional[Dict[str, Dict]] = None) -> None:
     """持仓列表展示实时合约 funding 元数据，不使用开仓时快照。"""
     contract_meta = contract_meta if contract_meta is not None else fetch_contract_meta()
@@ -1087,33 +1124,39 @@ async def get_signals(
     status: Optional[str] = Query(None, description="状态过滤: monitoring/opened/conditions_lost/rejected/gate_rejected"),
     exit_reason: Optional[str] = Query(None, description="结束原因模糊过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
-    days: int = Query(90, ge=1, le=90, description="最近N天"),
+    time_range: Optional[str] = Query("today", description="时间范围: today 或最近N天"),
+    days: int = Query(1, ge=1, le=90, description="最近N天（time_range非today时生效）"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
     """查询历史交易信号（支持分页）"""
-    # 查询总数
-    count_sql = "SELECT COUNT(*) as total FROM mi_trade_signal WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)"
-    count_params: List = [days]
+    where_sql, where_params = _build_forward_signal_filters(
+        status=status,
+        exit_reason=exit_reason,
+        base_asset=base_asset,
+        time_range=time_range,
+        days=days,
+    )
+    aliased_where_sql, aliased_where_params = _build_forward_signal_filters(
+        status=status,
+        exit_reason=exit_reason,
+        base_asset=base_asset,
+        time_range=time_range,
+        days=days,
+        prefix="s.",
+    )
 
-    if status:
-        count_sql += " AND status = %s"
-        count_params.append(status)
-    if exit_reason:
-        count_sql += " AND exit_reason LIKE %s"
-        count_params.append(f"%{exit_reason}%")
-    if base_asset:
-        count_sql += " AND base_asset LIKE %s"
-        count_params.append(f"%{base_asset}%")
+    # 查询总数
+    count_sql = f"SELECT COUNT(*) as total FROM mi_trade_signal WHERE {where_sql}"
 
     with db_manager.get_cursor() as cursor:
-        cursor.execute(count_sql, count_params)
+        cursor.execute(count_sql, where_params)
         total_row = cursor.fetchone()
         total = total_row['total'] if total_row else 0
 
     # 查询分页数据
     offset = (page - 1) * page_size
-    sql = """
+    sql = f"""
         SELECT
             s.*,
             COALESCE(b.strategy_tier, 'C') AS strategy_tier,
@@ -1121,20 +1164,9 @@ async def get_signals(
         FROM mi_trade_signal s
         LEFT JOIN mi_base_asset b
           ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))
-        WHERE s.signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)
+        WHERE {aliased_where_sql}
     """
-    params: List = [days]
-
-    if status:
-        sql += " AND s.status = %s"
-        params.append(status)
-    if exit_reason:
-        sql += " AND s.exit_reason LIKE %s"
-        params.append(f"%{exit_reason}%")
-    if base_asset:
-        sql += " AND s.base_asset LIKE %s"
-        params.append(f"%{base_asset}%")
-
+    params = list(aliased_where_params)
     sql += " ORDER BY s.signal_time DESC LIMIT %s OFFSET %s"
     params.extend([page_size, offset])
 
@@ -1145,7 +1177,7 @@ async def get_signals(
     data = _serialize_rows(rows)
 
     # 计算汇总统计（基于全量数据，需要单独查询）
-    summary_sql = """
+    summary_sql = f"""
         SELECT 
             COUNT(*) as total,
             SUM(CASE WHEN status = 'opened' THEN 1 ELSE 0 END) as opened,
@@ -1154,22 +1186,11 @@ async def get_signals(
             SUM(CASE WHEN status = 'monitoring' THEN 1 ELSE 0 END) as monitoring,
             MAX(signal_time) as latest_signal_time
         FROM mi_trade_signal 
-        WHERE signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)
+        WHERE {where_sql}
     """
-    summary_params: List = [days]
-
-    if status:
-        summary_sql += " AND status = %s"
-        summary_params.append(status)
-    if exit_reason:
-        summary_sql += " AND exit_reason LIKE %s"
-        summary_params.append(f"%{exit_reason}%")
-    if base_asset:
-        summary_sql += " AND base_asset LIKE %s"
-        summary_params.append(f"%{base_asset}%")
 
     with db_manager.get_cursor() as cursor:
-        cursor.execute(summary_sql, summary_params)
+        cursor.execute(summary_sql, where_params)
         summary_row = cursor.fetchone()
 
     summary_data = _serialize_row(summary_row) if summary_row else {}

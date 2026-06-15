@@ -46,9 +46,10 @@ const summary = ref<Summary>({ total: 0, opened: 0, rejected: 0, conditions_lost
 const loading = ref(false)
 
 // 筛选条件
+type TimeRange = 'today' | '3' | '7' | '30' | '90'
 const filterStatus = ref<string>('')
 const filterExitReason = ref<string>('')
-const filterDays = ref<number>(90) // 默认90天，与持仓监控一致
+const filterTimeRange = ref<TimeRange>('today')
 const filterAsset = ref<string>('')
 
 // 分页配置
@@ -118,12 +119,6 @@ async function loadColumnState() {
     console.warn('Failed to load column config from server:', e)
   }
 }
-
-/** 从当前数据中提取唯一标的资产列表，供下拉快速选择 */
-const assetOptions = computed(() => {
-  const assets = new Set(rowData.value.map(r => r.base_asset))
-  return Array.from(assets).sort()
-})
 
 /* ───── 列配置 ───── */
 const statusMap: Record<string, { label: string; color: string }> = {
@@ -273,7 +268,10 @@ async function fetchSignals() {
   loading.value = true
   try {
     const params = new URLSearchParams()
-    params.set('days', String(filterDays.value))
+    params.set('time_range', filterTimeRange.value)
+    if (filterTimeRange.value !== 'today') {
+      params.set('days', filterTimeRange.value)
+    }
     params.set('page', String(paginationCurrentPage.value))
     params.set('page_size', String(paginationPageSize.value))
     if (filterStatus.value) params.set('status', filterStatus.value)
@@ -328,8 +326,13 @@ function setExitReasonFilter(reason: string) {
   fetchSignals()
 }
 
-function setDaysFilter(days: number) {
-  filterDays.value = days
+function resetAndFetch() {
+  paginationCurrentPage.value = 1
+  fetchSignals()
+}
+
+function setTimeRangeFilter(timeRange: TimeRange) {
+  filterTimeRange.value = timeRange
   paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
   fetchSignals()
 }
@@ -431,31 +434,24 @@ onUnmounted(() => {
       <div class="filter-group">
         <span class="filter-label">时间：</span>
         <el-button-group size="small">
-          <el-button :type="filterDays === 1 ? 'primary' : 'default'" @click="setDaysFilter(1)">今日</el-button>
-          <el-button :type="filterDays === 3 ? 'primary' : 'default'" @click="setDaysFilter(3)">3天</el-button>
-          <el-button :type="filterDays === 7 ? 'primary' : 'default'" @click="setDaysFilter(7)">7天</el-button>
-          <el-button :type="filterDays === 30 ? 'primary' : 'default'" @click="setDaysFilter(30)">30天</el-button>
-          <el-button :type="filterDays === 90 ? 'primary' : 'default'" @click="setDaysFilter(90)">90天</el-button>
+          <el-button :type="filterTimeRange === 'today' ? 'primary' : 'default'" @click="setTimeRangeFilter('today')">今日</el-button>
+          <el-button :type="filterTimeRange === '3' ? 'primary' : 'default'" @click="setTimeRangeFilter('3')">3天</el-button>
+          <el-button :type="filterTimeRange === '7' ? 'primary' : 'default'" @click="setTimeRangeFilter('7')">7天</el-button>
+          <el-button :type="filterTimeRange === '30' ? 'primary' : 'default'" @click="setTimeRangeFilter('30')">30天</el-button>
+          <el-button :type="filterTimeRange === '90' ? 'primary' : 'default'" @click="setTimeRangeFilter('90')">90天</el-button>
         </el-button-group>
       </div>
 
       <div class="filter-group">
-        <el-select
+        <el-input
           v-model="filterAsset"
           placeholder="标的资产"
           size="small"
-          filterable
           clearable
           style="width: 150px"
-          @change="fetchSignals"
-        >
-          <el-option
-            v-for="asset in assetOptions"
-            :key="asset"
-            :label="asset"
-            :value="asset"
-          />
-        </el-select>
+          @change="resetAndFetch"
+          @clear="resetAndFetch"
+        />
       </div>
 
       <el-button size="small" :loading="loading" @click="fetchSignals">刷新</el-button>
