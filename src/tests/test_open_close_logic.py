@@ -83,6 +83,12 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           funding_carry_enabled=False,
                           min_available_ratio=0.10,
                           max_asset_exposure_ratio=0.10,
+                          quality_scale_in_enabled=False,
+                          quality_scale_in_enhanced_ratio=0.20,
+                          quality_scale_in_min_funding_24h_bps=50.0,
+                          quality_scale_in_min_basis_improvement_bps=20.0,
+                          quality_scale_in_min_gate_margin_rate_pct=500.0,
+                          quality_scale_in_cooldown_sec=300,
                           contract_meta=None,
                           spot_meta=None,
                           asset_profile_meta=None):
@@ -105,6 +111,12 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_carry_enabled=funding_carry_enabled,
         min_available_ratio=min_available_ratio,
         max_asset_exposure_ratio=max_asset_exposure_ratio,
+        quality_scale_in_enabled=quality_scale_in_enabled,
+        quality_scale_in_enhanced_ratio=quality_scale_in_enhanced_ratio,
+        quality_scale_in_min_funding_24h_bps=quality_scale_in_min_funding_24h_bps,
+        quality_scale_in_min_basis_improvement_bps=quality_scale_in_min_basis_improvement_bps,
+        quality_scale_in_min_gate_margin_rate_pct=quality_scale_in_min_gate_margin_rate_pct,
+        quality_scale_in_cooldown_sec=quality_scale_in_cooldown_sec,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
@@ -1197,6 +1209,115 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertFalse(te._pass_risk_check(row))
         self.assertIn('Gate保证金', te._get_risk_fail_reason(row))
+
+    def test_asset_exposure_uses_normal_limit_when_quality_scale_in_disabled(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=False,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_weighted_basis_by_asset['ALLO'] = 20.0
+        te._holding_margin_rate['ALLO'] = 800.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertNotIn('_quality_scale_in_used', row)
+        self.assertIn('Binance spot', te._get_risk_fail_reason(row))
+        self.assertNotIn('优质加仓', te._get_risk_fail_reason(row))
+
+    def test_quality_scale_in_allows_exposure_to_enhanced_20_percent_limit(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_weighted_basis_by_asset['ALLO'] = 20.0
+        te._holding_margin_rate['ALLO'] = 800.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertTrue(row.get('_quality_scale_in_used'))
+        self.assertIn('10%->20%', row.get('_quality_scale_in_reason', ''))
+
+    def test_quality_scale_in_rejects_when_basis_not_enough_better(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_weighted_basis_by_asset['ALLO'] = 40.0
+        te._holding_margin_rate['ALLO'] = 800.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('优质加仓拒绝', reason)
+        self.assertIn('基差改善10.0<20.0bps', reason)
+
+    def test_quality_scale_in_rejects_without_existing_weighted_basis(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_margin_rate['ALLO'] = 800.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('优质加仓拒绝', reason)
+        self.assertIn('缺少已有仓位均价', reason)
 
     def test_low_funding_negative_p20_requires_positive_carry_floor(self):
         te = make_trading_executor(

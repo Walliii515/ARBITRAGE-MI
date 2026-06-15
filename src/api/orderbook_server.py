@@ -1449,6 +1449,22 @@ def _run_open_position_check_once():
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
                 min_available_ratio=config.get_float('trade.open.min_available_ratio', 0.10),
                 max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
+                quality_scale_in_enabled=config.get_bool('trade.open.quality_scale_in.enabled', False),
+                quality_scale_in_enhanced_ratio=config.get_float(
+                    'trade.open.quality_scale_in.enhanced_ratio', 0.20
+                ),
+                quality_scale_in_min_funding_24h_bps=config.get_float(
+                    'trade.open.quality_scale_in.min_funding_24h_bps', 50.0
+                ),
+                quality_scale_in_min_basis_improvement_bps=config.get_float(
+                    'trade.open.quality_scale_in.min_basis_improvement_bps', 20.0
+                ),
+                quality_scale_in_min_gate_margin_rate_pct=config.get_float(
+                    'trade.open.quality_scale_in.min_gate_margin_rate_pct', 500.0
+                ),
+                quality_scale_in_cooldown_sec=config.get_int(
+                    'trade.open.quality_scale_in.cooldown_sec', 300
+                ),
                 reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 60),
                 max_orderbook_lag_ms=config.get_float('trade.open.max_orderbook_lag_ms', 1000.0),
                 fee_spot_open=config.get_float('trade.fee.spot_open', 0.00075),

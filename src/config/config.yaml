@@ -52,12 +52,19 @@ trade:
 
   # ─── 开仓策略 ───
   open:
-    amount_usdt: 10                        # 单笔开仓金额（USDT）
+    amount_usdt: 20                        # 单笔开仓金额（USDT）
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
     min_available_ratio: 0.10               # Binance/Gate 下单后可用资金不得低于各自总资金的比例
     max_asset_exposure_ratio: 0.10          # 单标的 spot开仓额 / future当前保证金 均不得超过各自总资金比例
+    quality_scale_in:
+      enabled: true                         # 普通单标的额度用完后，极优机会允许进入增强额度
+      enhanced_ratio: 0.20                  # 增强后单标的 spot/future 占用上限
+      min_funding_24h_bps: 50               # 24h funding 足够厚才允许加仓
+      min_basis_improvement_bps: 20         # 当前入场基差需比同币已有持仓加权均价更好
+      min_gate_margin_rate_pct: 500         # Gate 保证金/维持保证金足够安全才允许加仓
+      cooldown_sec: 300                     # 同标的增强加仓成功后的冷却
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
@@ -157,7 +164,7 @@ trade:
   market_profile:
     thin_bursty:
       enabled: true                         # 薄盘/跳动式更新标的启用专用参数
-      open_amount_multiplier: 0.8           # 单笔金额为普通开仓的80%，避免触碰最低开仓金额
+      open_amount_multiplier: 0.6           # 单笔金额为普通开仓的60%，避免触碰最低开仓金额
       max_orderbook_lag_ms: 1500            # 最终旁路仍检查新鲜度，但允许比 normal 更宽
       max_book_skew_ms: 1500                # Gate/Binance 两边最近更新相差过大仍拒单
 

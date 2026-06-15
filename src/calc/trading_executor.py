@@ -44,6 +44,12 @@ class TradingExecutorConfig:
     open_amount_usdt: float = 5.0
     min_available_ratio: float = 0.10
     max_asset_exposure_ratio: float = 0.10
+    quality_scale_in_enabled: bool = False
+    quality_scale_in_enhanced_ratio: float = 0.20
+    quality_scale_in_min_funding_24h_bps: float = 50.0
+    quality_scale_in_min_basis_improvement_bps: float = 20.0
+    quality_scale_in_min_gate_margin_rate_pct: float = 500.0
+    quality_scale_in_cooldown_sec: int = 300
     reject_cooldown_sec: int = 60
     # 旁路风控新鲜度硬约束：本地接收最近一次 WS 盘口与当前下单时刻的允许最大延迟（毫秒）
     # 阐释：update_time(交易所时间戳) 不可靠，只以本地 last_update_time 判定“现在距上次收到行情多久”
@@ -251,8 +257,21 @@ class TradingExecutor:
         self._holding_spot_amount_by_asset: Dict[str, float] = {}
         self._holding_future_margin_by_asset: Dict[str, float] = {}
         self._holding_future_margin_cache_by_asset: Dict[str, float] = {}
+        self._holding_weighted_basis_by_asset: Dict[str, float] = {}
+        self._holding_exchange_risk_by_asset: Dict[str, bool] = {}
         self.min_available_ratio = max(float(cfg.min_available_ratio or 0), 0.0)
         self.max_asset_exposure_ratio = max(float(cfg.max_asset_exposure_ratio or 0), 0.0)
+        self.quality_scale_in_enabled = bool(cfg.quality_scale_in_enabled)
+        self.quality_scale_in_enhanced_ratio = max(float(cfg.quality_scale_in_enhanced_ratio or 0), 0.0)
+        self.quality_scale_in_min_funding_24h_bps = float(cfg.quality_scale_in_min_funding_24h_bps or 0)
+        self.quality_scale_in_min_basis_improvement_bps = float(
+            cfg.quality_scale_in_min_basis_improvement_bps or 0
+        )
+        self.quality_scale_in_min_gate_margin_rate_pct = float(
+            cfg.quality_scale_in_min_gate_margin_rate_pct or 0
+        )
+        self.quality_scale_in_cooldown_sec = max(int(cfg.quality_scale_in_cooldown_sec or 0), 0)
+        self._quality_scale_in_last_time: Dict[str, datetime] = {}
 
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
         self.reject_cooldown_sec = cfg.reject_cooldown_sec
@@ -486,7 +505,30 @@ class TradingExecutor:
                     COALESCE(SUM(
                         COALESCE(ABS(future_open_price * future_open_qty), spot_open_amount, 0) / %s
                         + COALESCE(margin_topup_total, 0)
-                    ), 0) AS future_margin
+                    ), 0) AS future_margin,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN COALESCE(actual_basis_bps, open_spread_bps) IS NOT NULL
+                                THEN COALESCE(actual_basis_bps, open_spread_bps)
+                                     * COALESCE(spot_open_amount, 0)
+                                ELSE 0
+                            END
+                        ) / NULLIF(SUM(
+                            CASE
+                                WHEN COALESCE(actual_basis_bps, open_spread_bps) IS NOT NULL
+                                THEN COALESCE(spot_open_amount, 0)
+                                ELSE 0
+                            END
+                        ), 0),
+                        NULL
+                    ) AS weighted_basis_bps,
+                    MAX(
+                        CASE
+                            WHEN COALESCE(exchange_risk_status, 'normal') <> 'normal' THEN 1
+                            ELSE 0
+                        END
+                    ) AS has_exchange_risk
                 FROM mi_trade_position
                 WHERE status = 'holding'
                 GROUP BY base_asset
@@ -496,16 +538,23 @@ class TradingExecutor:
                 rows = cursor.fetchall()
             spot_amounts: Dict[str, float] = {}
             future_margins: Dict[str, float] = {}
+            weighted_basis: Dict[str, float] = {}
+            exchange_risk: Dict[str, bool] = {}
             for r in rows:
                 ba = str(r.get('base_asset') or '').upper()
                 if not ba:
                     continue
                 spot_amounts[ba] = float(r.get('spot_amount') or 0.0)
                 future_margins[ba] = float(r.get('future_margin') or 0.0)
+                if r.get('weighted_basis_bps') is not None:
+                    weighted_basis[ba] = float(r.get('weighted_basis_bps'))
+                exchange_risk[ba] = bool(int(r.get('has_exchange_risk') or 0))
             for ba, margin in self._holding_future_margin_cache_by_asset.items():
                 future_margins[ba] = max(future_margins.get(ba, 0.0), float(margin or 0.0))
             self._holding_spot_amount_by_asset = spot_amounts
             self._holding_future_margin_by_asset = future_margins
+            self._holding_weighted_basis_by_asset = weighted_basis
+            self._holding_exchange_risk_by_asset = exchange_risk
         except Exception as e:
             # 查询失败时保留旧资金占用（保守策略：宁可拦截过多也不绕过上限）
             logger.error(f"刷新持仓资金占用失败，沿用旧缓存: {e}")
@@ -755,6 +804,8 @@ class TradingExecutor:
                         self._holding_future_margin_by_asset.get(ba, 0.0) + max(future_margin, 0.0)
                     )
                     self._last_open_time[base_asset] = datetime.now()
+                    if row.get('_quality_scale_in_used'):
+                        self._quality_scale_in_last_time[ba] = datetime.now()
                     logger.info(
                         f"开仓成功 | {base_asset} | "
                         f"spot_vwap={exec_result['spot_order']['exec_price']} | "
@@ -1642,7 +1693,7 @@ class TradingExecutor:
         active_amount = self._active_open_amount_usdt(row)
         if not self._pass_account_capital_check(active_amount):
             return False
-        if not self._pass_asset_exposure_check(base_asset, active_amount):
+        if not self._pass_asset_exposure_check(base_asset, active_amount, row):
             return False
 
         # 最小名义价值检查：开仓金额低于交易所最低要求时直接过滤
@@ -1703,9 +1754,14 @@ class TradingExecutor:
         """真实资金检查：下单后 Binance/Gate 可用资金不能低于各自总资金阈值。"""
         return self._check_account_capital(amount_usdt)[0]
 
-    def _pass_asset_exposure_check(self, base_asset: str, amount_usdt: Optional[float] = None) -> bool:
+    def _pass_asset_exposure_check(
+        self,
+        base_asset: str,
+        amount_usdt: Optional[float] = None,
+        row: Optional[Dict] = None,
+    ) -> bool:
         """单标的资金占用检查：spot 开仓额、future 当前保证金分别不超过各自账户阈值。"""
-        return self._check_asset_exposure(base_asset, amount_usdt)[0]
+        return self._check_asset_exposure(base_asset, amount_usdt, row)[0]
 
     def _check_account_capital(self, amount_usdt: Optional[float] = None) -> tuple:
         if not self.capital_required:
@@ -1782,7 +1838,15 @@ class TradingExecutor:
             )
         return True, ''
 
-    def _check_asset_exposure(self, base_asset: str, amount_usdt: Optional[float] = None) -> tuple:
+    def _check_asset_exposure(
+        self,
+        base_asset: str,
+        amount_usdt: Optional[float] = None,
+        row: Optional[Dict] = None,
+    ) -> tuple:
+        if row is not None:
+            row.pop('_quality_scale_in_used', None)
+            row.pop('_quality_scale_in_reason', None)
         if not self.capital_required or self.max_asset_exposure_ratio <= 0:
             return True, ''
         if not self._account_summary or not self._account_summary_ts:
@@ -1809,19 +1873,128 @@ class TradingExecutor:
         )
         spot_limit = binance_total * self.max_asset_exposure_ratio
         future_limit = gate_total * self.max_asset_exposure_ratio
+        spot_over = spot_after > spot_limit
+        future_over = future_margin_after > future_limit
+        if not spot_over and not future_over:
+            return True, ''
+
+        quality_ok, quality_reason = self._check_quality_scale_in(
+            ba,
+            row,
+            spot_after,
+            future_margin_after,
+            binance_total,
+            gate_total,
+        )
+        if quality_ok:
+            if row is not None:
+                row['_quality_scale_in_used'] = True
+                row['_quality_scale_in_reason'] = quality_reason
+            return True, ''
+
         if spot_after > spot_limit:
             return (
                 False,
                 f"单标的资金占用(Binance spot {spot_after:.2f}>"
-                f"总资金{self.max_asset_exposure_ratio:.0%}={spot_limit:.2f}USDT)"
+                f"总资金{self.max_asset_exposure_ratio:.0%}={spot_limit:.2f}USDT"
+                f"{self._format_quality_scale_in_fail(quality_reason)})"
             )
         if future_margin_after > future_limit:
             return (
                 False,
                 f"单标的资金占用(Gate保证金 {future_margin_after:.2f}>"
-                f"总资金{self.max_asset_exposure_ratio:.0%}={future_limit:.2f}USDT)"
+                f"总资金{self.max_asset_exposure_ratio:.0%}={future_limit:.2f}USDT"
+                f"{self._format_quality_scale_in_fail(quality_reason)})"
             )
         return True, ''
+
+    def _format_quality_scale_in_fail(self, reason: str) -> str:
+        if not self.quality_scale_in_enabled:
+            return ''
+        if not reason:
+            return ''
+        return f"|优质加仓拒绝:{reason}"
+
+    def _check_quality_scale_in(
+        self,
+        base_asset: str,
+        row: Optional[Dict],
+        spot_after: float,
+        future_margin_after: float,
+        binance_total: float,
+        gate_total: float,
+    ) -> tuple:
+        """普通单币 10% 额度用完后，允许极优机会进入增强额度。"""
+        if not self.quality_scale_in_enabled:
+            return False, '未启用'
+        if row is None:
+            return False, '缺少行情上下文'
+        if self.quality_scale_in_enhanced_ratio <= self.max_asset_exposure_ratio:
+            return False, '增强额度未高于普通额度'
+
+        enhanced_spot_limit = binance_total * self.quality_scale_in_enhanced_ratio
+        enhanced_future_limit = gate_total * self.quality_scale_in_enhanced_ratio
+        if spot_after > enhanced_spot_limit:
+            return (
+                False,
+                f"Binance spot {spot_after:.2f}>"
+                f"增强{self.quality_scale_in_enhanced_ratio:.0%}={enhanced_spot_limit:.2f}"
+            )
+        if future_margin_after > enhanced_future_limit:
+            return (
+                False,
+                f"Gate保证金 {future_margin_after:.2f}>"
+                f"增强{self.quality_scale_in_enhanced_ratio:.0%}={enhanced_future_limit:.2f}"
+            )
+
+        now = datetime.now()
+        last_time = self._quality_scale_in_last_time.get(base_asset)
+        if last_time and self.quality_scale_in_cooldown_sec > 0:
+            remain = self.quality_scale_in_cooldown_sec - (now - last_time).total_seconds()
+            if remain > 0:
+                return False, f"冷却{remain:.0f}s"
+
+        if self._holding_exchange_risk_by_asset.get(base_asset):
+            return False, '存在交易所仓位风险'
+
+        margin_rate = self._holding_margin_rate.get(base_asset)
+        if margin_rate is None:
+            return False, '缺少Gate MMR'
+        if margin_rate < self.quality_scale_in_min_gate_margin_rate_pct:
+            return (
+                False,
+                f"MMR {margin_rate:.1f}%<{self.quality_scale_in_min_gate_margin_rate_pct:.1f}%"
+            )
+
+        funding_bps = self._funding_24h_bps(base_asset, row)
+        if funding_bps < self.quality_scale_in_min_funding_24h_bps:
+            return (
+                False,
+                f"funding24h {funding_bps:.1f}<"
+                f"{self.quality_scale_in_min_funding_24h_bps:.1f}bps"
+            )
+
+        current_basis = self._float_or_none(row.get('open_vwap_basis_bps'))
+        if current_basis is None:
+            return False, '缺少当前基差'
+        existing_basis = self._holding_weighted_basis_by_asset.get(base_asset)
+        if existing_basis is None:
+            return False, '缺少已有仓位均价'
+        improvement = current_basis - float(existing_basis)
+        if improvement < self.quality_scale_in_min_basis_improvement_bps:
+            return (
+                False,
+                f"基差改善{improvement:.1f}<"
+                f"{self.quality_scale_in_min_basis_improvement_bps:.1f}bps"
+            )
+
+        return (
+            True,
+            f"优质加仓额度({self.max_asset_exposure_ratio:.0%}->{self.quality_scale_in_enhanced_ratio:.0%},"
+            f"funding={funding_bps:.1f}bps,"
+            f"basis_improve={improvement:.1f}bps,"
+            f"MMR={margin_rate:.0f}%)"
+        )
 
     def _apply_realtime_funding_info(self, base_asset: str, row: Optional[Dict]) -> None:
         """
@@ -2297,7 +2470,7 @@ class TradingExecutor:
         capital_ok, capital_reason = self._check_account_capital(active_amount)
         if not capital_ok:
             return capital_reason
-        exposure_ok, exposure_reason = self._check_asset_exposure(base_asset, active_amount)
+        exposure_ok, exposure_reason = self._check_asset_exposure(base_asset, active_amount, row)
         if not exposure_ok:
             return exposure_reason
 
@@ -2382,6 +2555,9 @@ class TradingExecutor:
                 f"画像({profile},amount={self._active_open_amount_usdt(row):.1f}U,"
                 f"lag_max={float(profile_params.get('max_orderbook_lag_ms', self._max_orderbook_lag_ms)):.0f}ms)"
             )
+        quality_reason = row.get('_quality_scale_in_reason')
+        if quality_reason:
+            parts.append(quality_reason)
         parts.append(
             f"carry(funding24h={float(entry_snapshot.get('funding_24h_bps', 0)):.1f}bps,"
             f"预期={float(entry_snapshot.get('expected_funding_bps', 0)):.1f}bps,"
