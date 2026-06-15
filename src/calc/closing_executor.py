@@ -149,6 +149,13 @@ class ClosingExecutor:
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
         self._margin_topup_attempt_cooldown: Dict[int, datetime] = {}
         self._margin_topup_contract_cooldown: Dict[str, datetime] = {}
+        self.take_profit_batch_guard_enabled = config.get_bool(
+            'trade.close.take_profit_batch_guard.enabled', True
+        )
+        self.take_profit_batch_guard_max_close_basis_slip_bps = max(
+            config.get_float('trade.close.take_profit_batch_guard.max_close_basis_slip_bps', 8.0),
+            0.0,
+        )
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
@@ -288,6 +295,7 @@ class ClosingExecutor:
         """
         results = []
         topup_contracts_this_run: Set[str] = set()
+        take_profit_quality_blocked_assets: Set[str] = set()
         self._active_close_vwap_threshold_meta = close_vwap_threshold_meta or {}
 
         for pos in positions:
@@ -373,6 +381,10 @@ class ClosingExecutor:
 
             if not close_reason:
                 continue
+            ba_key = str(ba or '').upper()
+            if close_reason == 'take_profit' and ba_key in take_profit_quality_blocked_assets:
+                logger.info(f"止盈批量保护跳过 | {ba} | 等待下一轮重新观察成交质量")
+                continue
 
             # ── 最终风控旁路：止盈复核盈利性；风险平仓复核新鲜度/同步/深度 ──
             guarded_reasons = {'take_profit', 'negative_funding_exit', 'funding_count'}
@@ -444,6 +456,12 @@ class ClosingExecutor:
                         f"平仓成功 | {ba} | reason={close_reason} | "
                         f"spread_bps={current_spread_bps:.2f}"
                     )
+                    if close_reason == 'take_profit':
+                        self._update_take_profit_batch_guard(
+                            ba_key,
+                            result,
+                            take_profit_quality_blocked_assets,
+                        )
                 else:
                     # 平仓失败，进入冷却期
                     self._close_cooldown[ba] = datetime.now()
@@ -459,6 +477,32 @@ class ClosingExecutor:
                 results.append({'base_asset': ba, 'success': False, 'message': str(e)})
 
         return results
+
+    def _update_take_profit_batch_guard(
+        self,
+        base_asset: str,
+        result: Dict,
+        blocked_assets: Set[str],
+    ) -> None:
+        if not self.take_profit_batch_guard_enabled:
+            return
+        slip_bps = result.get('close_basis_slip_bps')
+        if slip_bps is None:
+            return
+        slip_bps = float(slip_bps)
+        threshold = self.take_profit_batch_guard_max_close_basis_slip_bps
+        if slip_bps > threshold:
+            blocked_assets.add(base_asset)
+            logger.warning(
+                f"止盈批量保护触发 | {base_asset} | "
+                f"close_basis_slip={slip_bps:.1f}bps>{threshold:.1f}bps | "
+                f"本轮暂停同标的后续止盈"
+            )
+            return
+        logger.info(
+            f"止盈批量保护通过 | {base_asset} | "
+            f"close_basis_slip={slip_bps:.1f}bps<={threshold:.1f}bps"
+        )
 
     def _valley_key(self, base_asset: str, pos: Optional[Dict] = None):
         """止盈谷底状态按持仓隔离；无 position_id 时兼容旧测试/降级为 base_asset。"""
@@ -1497,6 +1541,12 @@ class ClosingExecutor:
             f"actual={_fmt(actual_basis_bps)})"
         )
 
+    @staticmethod
+    def _close_basis_slip_bps(pre_gate_basis_bps, actual_basis_bps) -> Optional[float]:
+        if pre_gate_basis_bps is None or actual_basis_bps is None:
+            return None
+        return float(actual_basis_bps) - float(pre_gate_basis_bps)
+
     # ──────────────────────────────────────────────────────────────────
     # 手动平仓（外部调用入口）
     # ──────────────────────────────────────────────────────────────────
@@ -1578,7 +1628,7 @@ class ClosingExecutor:
                 f"ttl={future_order.get('maker_ttl_ms')}ms)"
             )
         exec_result = self.executor_client.execute(order_group, orderbook_row)
-        self._save_close(
+        actual_close_basis_bps = self._save_close(
             pos,
             order_group,
             exec_result,
@@ -1586,12 +1636,19 @@ class ClosingExecutor:
             close_reason_detail,
             pre_gate_basis_bps=pre_gate_basis_bps,
         )
+        close_basis_slip_bps = self._close_basis_slip_bps(
+            pre_gate_basis_bps,
+            actual_close_basis_bps,
+        )
         return {
             'base_asset': ba,
             'success': exec_result['success'],
             'order_uuid': order_group['order_uuid'],
             'close_reason': close_reason,
             'message': exec_result.get('message'),
+            'pre_gate_basis_bps': pre_gate_basis_bps,
+            'actual_close_basis_bps': actual_close_basis_bps,
+            'close_basis_slip_bps': close_basis_slip_bps,
         }
 
     def _build_close_order_group(
@@ -1721,7 +1778,7 @@ class ClosingExecutor:
         self, pos: Dict, order_group: Dict, exec_result: Dict,
         close_reason: str, close_reason_detail: str,
         pre_gate_basis_bps: Optional[float] = None,
-    ):
+    ) -> Optional[float]:
         """插入 2 笔平仓订单到 mi_trade_order，成功时更新 mi_trade_position 状态"""
         position_id = pos.get('id')
 
@@ -1856,6 +1913,7 @@ class ClosingExecutor:
                 f"持仓状态更新为 closed | position_id={position_id} | "
                 f"close_spread_bps={close_spread_bps}"
             )
+        return close_spread_bps
 
     @staticmethod
     def _position_close_reason(close_reason_detail: str) -> str:

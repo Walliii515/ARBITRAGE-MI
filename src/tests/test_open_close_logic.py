@@ -2220,6 +2220,116 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertNotIn('鲜度(NA)', detail)
         self.assertIn('旁路✓', detail)
 
+    def test_take_profit_batch_guard_stops_same_asset_after_bad_probe(self):
+        """同标的多笔止盈时，首笔成交质量差则本轮不继续批量平仓。"""
+        positions = [
+            {
+                'id': 1,
+                'status': 'holding',
+                'base_asset': 'BTC',
+                'future_contract': 'BTC_USDT',
+                'spot_symbol': 'BTCUSDT',
+                'open_spread_bps': 100.0,
+                'current_spread_bps': 35.0,
+            },
+            {
+                'id': 2,
+                'status': 'holding',
+                'base_asset': 'BTC',
+                'future_contract': 'BTC_USDT',
+                'spot_symbol': 'BTCUSDT',
+                'open_spread_bps': 90.0,
+                'current_spread_bps': 30.0,
+            },
+        ]
+        execute_mock = MagicMock(return_value={
+            'base_asset': 'BTC',
+            'success': True,
+            'order_uuid': 'probe-order',
+            'close_reason': 'take_profit',
+            'message': None,
+            'close_basis_slip_bps': 12.0,
+        })
+        gate_mock = MagicMock(return_value=(True, {'fresh': 'row'}, 10.0, ''))
+
+        with (
+            patch.object(self.ce, '_check_and_topup_margin', return_value=None),
+            patch.object(self.ce, '_check_margin_liquidation', return_value=False),
+            patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
+            patch.object(self.ce, '_check_funding_count', return_value=False),
+            patch.object(self.ce, '_check_take_profit', return_value=True),
+            patch.object(self.ce, '_pass_valley_check', return_value=True),
+            patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
+            patch.object(self.ce, '_pre_execution_gate', gate_mock),
+            patch.object(self.ce, '_build_take_profit_detail', return_value='动态止盈'),
+            patch.object(self.ce, '_execute_close', execute_mock),
+        ):
+            results = self.ce.check_and_close(positions, {}, {'BTC': {'old': 'row'}})
+
+        self.assertEqual(len(results), 1)
+        execute_mock.assert_called_once()
+        gate_mock.assert_called_once()
+
+    def test_take_profit_batch_guard_continues_same_asset_after_good_probe(self):
+        """首笔成交质量好时，本轮可继续处理同标的其它止盈仓位。"""
+        positions = [
+            {
+                'id': 1,
+                'status': 'holding',
+                'base_asset': 'BTC',
+                'future_contract': 'BTC_USDT',
+                'spot_symbol': 'BTCUSDT',
+                'open_spread_bps': 100.0,
+                'current_spread_bps': 35.0,
+            },
+            {
+                'id': 2,
+                'status': 'holding',
+                'base_asset': 'BTC',
+                'future_contract': 'BTC_USDT',
+                'spot_symbol': 'BTCUSDT',
+                'open_spread_bps': 90.0,
+                'current_spread_bps': 30.0,
+            },
+        ]
+        execute_mock = MagicMock(side_effect=[
+            {
+                'base_asset': 'BTC',
+                'success': True,
+                'order_uuid': 'probe-order',
+                'close_reason': 'take_profit',
+                'message': None,
+                'close_basis_slip_bps': 3.0,
+            },
+            {
+                'base_asset': 'BTC',
+                'success': True,
+                'order_uuid': 'batch-order',
+                'close_reason': 'take_profit',
+                'message': None,
+                'close_basis_slip_bps': 2.0,
+            },
+        ])
+        gate_mock = MagicMock(return_value=(True, {'fresh': 'row'}, 10.0, ''))
+
+        with (
+            patch.object(self.ce, '_check_and_topup_margin', return_value=None),
+            patch.object(self.ce, '_check_margin_liquidation', return_value=False),
+            patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
+            patch.object(self.ce, '_check_funding_count', return_value=False),
+            patch.object(self.ce, '_check_take_profit', return_value=True),
+            patch.object(self.ce, '_pass_valley_check', return_value=True),
+            patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
+            patch.object(self.ce, '_pre_execution_gate', gate_mock),
+            patch.object(self.ce, '_build_take_profit_detail', return_value='动态止盈'),
+            patch.object(self.ce, '_execute_close', execute_mock),
+        ):
+            results = self.ce.check_and_close(positions, {}, {'BTC': {'old': 'row'}})
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(execute_mock.call_count, 2)
+        self.assertEqual(gate_mock.call_count, 2)
+
 
 class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     """固定净止盈 + funding-aware 平仓触发。"""
@@ -2351,8 +2461,8 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         )
         self.assertEqual(eval_.confidence, 'high')
         self.assertLessEqual(eval_.funding_potential_bps, 6.0)
-        self.assertEqual(eval_.threshold_bps, 60.0)
-        self.assertTrue(self.ce._check_take_profit(
+        self.assertEqual(eval_.threshold_bps, 80.0)
+        self.assertFalse(self.ce._check_take_profit(
             self.pos,
             70.0,
             {'close_basis_p20': 45.0},

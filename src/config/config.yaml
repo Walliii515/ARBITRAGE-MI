@@ -241,8 +241,11 @@ trade:
         - { hold_value_min_bps: 40, take_profit_bps: 150 }
         - { hold_value_min_bps: 25, take_profit_bps: 110 }
         - { hold_value_min_bps: 15, take_profit_bps: 80 }
-        - { hold_value_min_bps: 5, take_profit_bps: 60 }
+        - { hold_value_min_bps: 5, take_profit_bps: 80 }
         - { hold_value_min_bps: 0, take_profit_bps: 45 }
+    take_profit_batch_guard:
+      enabled: true                         # 同标的多笔止盈时，先用首笔成交质量决定本轮是否继续批量平
+      max_close_basis_slip_bps: 8           # actual close basis - pre_gate basis 超过该值则暂停本轮同标的后续止盈
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
     positive_funding_hold_window_min: 30    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈

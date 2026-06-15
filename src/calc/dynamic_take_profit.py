@@ -40,7 +40,7 @@ class DynamicTakeProfitConfig:
         {'hold_value_min_bps': 40.0, 'take_profit_bps': 150.0},
         {'hold_value_min_bps': 25.0, 'take_profit_bps': 110.0},
         {'hold_value_min_bps': 15.0, 'take_profit_bps': 80.0},
-        {'hold_value_min_bps': 5.0, 'take_profit_bps': 60.0},
+        {'hold_value_min_bps': 5.0, 'take_profit_bps': 80.0},
         {'hold_value_min_bps': 0.0, 'take_profit_bps': 45.0},
     ])
 
