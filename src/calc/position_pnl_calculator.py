@@ -77,6 +77,18 @@ def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
     return future_open_fee, future_close_fee
 
 
+def _position_open_notional(pos: Dict, cfg: PnlConfig) -> float:
+    configured_at_open = _float_or_none(pos.get('open_amount_usdt'))
+    if configured_at_open is not None and configured_at_open > 0:
+        return configured_at_open
+
+    spot_amount = _float_or_none(pos.get('spot_open_amount'))
+    if spot_amount is not None and spot_amount > 0:
+        return spot_amount
+
+    return float(cfg.open_amount_usdt or 0.0)
+
+
 def _leg_fee_cost(
     actual_fee_amount: Optional[float],
     estimated_fee_amount: Optional[float],
@@ -133,6 +145,7 @@ def _combine_fee_sources(sources: List[str]) -> str:
 
 def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float, float, float, str, str]:
     future_open_fee, future_close_fee = _position_fee_rates(pos, cfg)
+    open_notional = _position_open_notional(pos, cfg)
     spot_open_actual = _float_or_none(pos.get('spot_open_fee_amount_usdt'))
     future_open_actual = _float_or_none(pos.get('future_open_fee_amount_usdt'))
     spot_close_actual = _float_or_none(pos.get('spot_close_fee_amount_usdt'))
@@ -148,7 +161,7 @@ def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float,
         future_open_estimated,
         cfg.spot_open_fee,
         future_open_fee,
-        cfg.open_amount_usdt,
+        open_notional,
     )
     close_fee_bps, close_fee_cost = _fee_cost_from_actual_or_rate(
         spot_close_actual,
@@ -157,7 +170,7 @@ def _position_fee_bps_and_cost(pos: Dict, cfg: PnlConfig) -> Tuple[float, float,
         future_close_estimated,
         cfg.spot_close_fee,
         future_close_fee,
-        cfg.open_amount_usdt,
+        open_notional,
     )
     open_source = _combine_fee_sources([
         _fee_source_for_leg(pos, 'spot_open'),
