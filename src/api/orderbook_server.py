@@ -64,6 +64,7 @@ from calc.reverse_position_cost_sync import refresh_reverse_position_costs
 from calc.executor_client import ExecutorClient
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
+from calc.server_metrics import get_latest_server_metrics, list_server_metrics, record_server_metrics
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
 
 setup_logging()
@@ -872,6 +873,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_vwap_snapshot_loop())
     asyncio.create_task(_reverse_research_snapshot_loop())
     asyncio.create_task(_stale_signal_cleanup_loop())
+    asyncio.create_task(_server_metric_snapshot_loop())
     _start_gate_risk_event_monitor()
 
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
@@ -964,6 +966,20 @@ async def service_diagnostics():
     if hasattr(svc, 'get_diagnostics'):
         return svc.get_diagnostics()
     return {'state': svc.state}
+
+
+@app.get('/api/service/server-metrics', dependencies=[Depends(verify_token_dependency)])
+async def server_metrics(days: int = Query(7, ge=1, le=30)):
+    """获取服务器关键指标历史快照。"""
+    rows = await asyncio.to_thread(lambda: list_server_metrics(days=days))
+    latest = rows[-1] if rows else await asyncio.to_thread(get_latest_server_metrics)
+    return {
+        'ok': True,
+        'days': days,
+        'latest': latest,
+        'items': rows,
+        'sample_interval_sec': config.get_int('server_metrics.interval_sec', 3600),
+    }
 
 
 @app.get('/api/service/exchange-connectivity')
@@ -2160,6 +2176,33 @@ async def _account_capital_snapshot_loop():
             logger.info(f"交易所资金快照完成: snapshot_at={result.get('snapshot_at')}")
         except Exception as e:
             logger.error(f"交易所资金快照失败: {e}", exc_info=True)
+        await asyncio.sleep(interval)
+
+
+async def _server_metric_snapshot_loop():
+    """小时级采集 ECS CPU/内存/硬盘等服务器指标。"""
+    if not config.get_bool('server_metrics.enabled', True):
+        logger.info('服务器指标采集已关闭')
+        return
+
+    interval = max(300, config.get_int('server_metrics.interval_sec', 3600))
+    retention_days = max(7, config.get_int('server_metrics.retention_days', 14))
+    disk_path = config.get_str('server_metrics.disk_path', '/')
+
+    while True:
+        try:
+            result = await asyncio.to_thread(
+                lambda: record_server_metrics(disk_path=disk_path, retention_days=retention_days)
+            )
+            logger.info(
+                '服务器指标快照完成: '
+                f"snapshot_at={result.get('snapshot_at')}, "
+                f"cpu={result.get('cpu_usage_percent')}, "
+                f"memory={result.get('memory_usage_percent')}, "
+                f"disk={result.get('disk_usage_percent')}"
+            )
+        except Exception as e:
+            logger.error(f'服务器指标快照失败: {e}', exc_info=True)
         await asyncio.sleep(interval)
 
 

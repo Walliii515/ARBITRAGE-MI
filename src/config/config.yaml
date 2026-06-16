@@ -437,6 +437,13 @@ exchange_risk_monitor:
     action: sell_spot                       # ADL/强平导致 Gate short 缺腿后，自动卖出裸 Binance spot
     max_positions_per_event: 20
 
+# ECS 服务器状态采样：用于“设置 / 服务器状态”页面。
+server_metrics:
+  enabled: true
+  interval_sec: 3600                        # 每 1 小时采样一次
+  retention_days: 14                        # 保留时间需覆盖页面最近 7 天展示
+  disk_path: /                              # 硬盘使用率采样路径
+
 orderbook:
   # 永续合约结算币种（小写），用于拼接 Gate 合约名（如 BTC_USDT）
   settle: usdt

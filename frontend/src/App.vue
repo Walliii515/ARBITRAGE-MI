@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch, VideoPause, VideoPlay, Cpu } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { removeToken } from './utils/auth'
 import { ElMessage } from 'element-plus'
@@ -261,6 +261,10 @@ function toggleMenu() {
           <el-menu-item index="/settings/threshold">
             <el-icon><DataAnalysis /></el-icon>
             <template #title>VWAP基差阈值设置</template>
+          </el-menu-item>
+          <el-menu-item index="/settings/server-status">
+            <el-icon><Cpu /></el-icon>
+            <template #title>服务器状态</template>
           </el-menu-item>
           <el-menu-item index="/connections">
             <el-icon><Connection /></el-icon>

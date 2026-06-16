@@ -90,6 +90,11 @@ const router = createRouter({
       name: 'threshold',
       component: () => import('../views/VwapThreshold.vue'),
     },
+    {
+      path: '/settings/server-status',
+      name: 'server-status',
+      component: () => import('../views/ServerStatus.vue'),
+    },
   ],
 })
 
