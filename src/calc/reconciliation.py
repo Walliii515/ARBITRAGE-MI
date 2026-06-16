@@ -264,7 +264,7 @@ class Reconciler:
         ]
 
     def _mark_gate_desync_risks(self, snapshot_at: datetime, rows: List[Dict]) -> List[Dict]:
-        """Gate 实仓不匹配时生成风险项；实仓小于本地时同步标记本地持仓。"""
+        """Gate 实仓不匹配时生成风险项；确认后才同步标记本地持仓。"""
         risks: List[Dict] = []
         for row in rows:
             if row.get('exchange') != 'gate' or row.get('dimension') != 'position':
@@ -280,19 +280,27 @@ class Reconciler:
 
             if exchange_value + GATE_FUTURE_CONTRACT_TOLERANCE < local_value:
                 risk = self._detect_gate_desync_risk(base_asset, snapshot_at, local_value, exchange_value)
-                updated = self._mark_positions_exchange_risk(base_asset, risk)
             elif exchange_value > local_value + GATE_FUTURE_CONTRACT_TOLERANCE:
                 risk = self._detect_gate_extra_risk(base_asset, snapshot_at, local_value, exchange_value, row)
-                updated = 0
             else:
                 continue
 
+            risk_type = self._gate_risk_type_from_values(local_value, exchange_value) or str(risk.get('type') or '')
             confirmed = self._is_gate_risk_confirmed(
                 base_asset=base_asset,
-                risk_type=self._gate_risk_type_from_values(local_value, exchange_value) or str(risk.get('type') or ''),
+                risk_type=risk_type,
                 snapshot_at=snapshot_at,
             )
             risk['confirmed'] = confirmed
+            updated = 0
+            if risk.get('type') in {'adl', 'liquidation', 'missing_gate_position', 'qty_mismatch'}:
+                if confirmed:
+                    updated = self._mark_positions_exchange_risk(base_asset, risk)
+                else:
+                    logger.warning(
+                        "Gate 持仓对账发现疑似断腿，等待连续确认 | asset=%s | type=%s | local=%s | exchange=%s",
+                        base_asset, risk.get('type'), local_value, exchange_value,
+                    )
             row.setdefault('detail', {})
             row['detail']['exchange_risk'] = risk
             if updated:

@@ -69,6 +69,81 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(risk['future_close_size'], 12)
         self.assertEqual(risk['mark_price'], 0.1234)
 
+    def test_unconfirmed_gate_qty_mismatch_does_not_mark_position_risk(self):
+        class TrackingReconciler(Reconciler):
+            def __init__(self):
+                super().__init__(executor=object(), cfg=ReconciliationConfig(auto_remediate_enabled=False))
+                self.mark_calls = []
+
+            def _detect_gate_desync_risk(self, base_asset, snapshot_at, local_contracts, exchange_contracts):
+                return {
+                    'status': 'desynced',
+                    'type': 'qty_mismatch',
+                    'event_at': snapshot_at,
+                    'detail': f'{base_asset}:{local_contracts}:{exchange_contracts}',
+                }
+
+            def _is_gate_risk_confirmed(self, base_asset, risk_type, snapshot_at):
+                return False
+
+            def _mark_positions_exchange_risk(self, base_asset, risk):
+                self.mark_calls.append((base_asset, risk))
+                return 1
+
+        reconciler = TrackingReconciler()
+        row = {
+            'exchange': 'gate',
+            'dimension': 'position',
+            'base_asset': 'HEI',
+            'local_value': 241,
+            'exchange_value': 120,
+        }
+
+        risks = reconciler._mark_gate_desync_risks(datetime(2026, 6, 16, 0, 8, 50), [row])
+
+        self.assertEqual(len(risks), 1)
+        self.assertFalse(risks[0]['confirmed'])
+        self.assertEqual(reconciler.mark_calls, [])
+        self.assertFalse(row['detail']['exchange_risk']['confirmed'])
+
+    def test_confirmed_gate_qty_mismatch_marks_position_risk(self):
+        class TrackingReconciler(Reconciler):
+            def __init__(self):
+                super().__init__(executor=object(), cfg=ReconciliationConfig(auto_remediate_enabled=False))
+                self.mark_calls = []
+
+            def _detect_gate_desync_risk(self, base_asset, snapshot_at, local_contracts, exchange_contracts):
+                return {
+                    'status': 'desynced',
+                    'type': 'qty_mismatch',
+                    'event_at': snapshot_at,
+                    'detail': f'{base_asset}:{local_contracts}:{exchange_contracts}',
+                }
+
+            def _is_gate_risk_confirmed(self, base_asset, risk_type, snapshot_at):
+                return True
+
+            def _mark_positions_exchange_risk(self, base_asset, risk):
+                self.mark_calls.append((base_asset, risk))
+                return 1
+
+        reconciler = TrackingReconciler()
+        row = {
+            'exchange': 'gate',
+            'dimension': 'position',
+            'base_asset': 'HEI',
+            'local_value': 241,
+            'exchange_value': 120,
+        }
+
+        risks = reconciler._mark_gate_desync_risks(datetime(2026, 6, 16, 0, 8, 50), [row])
+
+        self.assertEqual(len(risks), 1)
+        self.assertTrue(risks[0]['confirmed'])
+        self.assertEqual(len(reconciler.mark_calls), 1)
+        self.assertEqual(reconciler.mark_calls[0][0], 'HEI')
+        self.assertTrue(reconciler.mark_calls[0][1]['confirmed'])
+
 
 class TestExchangeDesyncRemediator(unittest.TestCase):
     def test_extra_gate_short_uses_reduce_only_close_buy(self):
