@@ -245,9 +245,10 @@ def _attach_delist_risks(rows: List[Dict[str, Any]]) -> None:
     for row in rows:
         asset = str(row.get('base_asset') or '').strip().upper()
         items = grouped.get(asset, [])
+        levels = {item.get('severity') or item.get('risk_level') for item in items}
         row['delist_risks'] = items
         row['delist_risk_level'] = (
-            'critical' if any(item.get('severity') == 'critical' for item in items)
+            'critical' if 'critical' in levels
             else 'warning' if items else None
         )
         row['delist_risk_summary'] = _format_delist_risk_summary(items) if items else None
