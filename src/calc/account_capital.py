@@ -218,6 +218,9 @@ class AccountCapitalSnapshotter:
         }
 
     def _build_total_row(self, snapshot_at: datetime, binance: Dict, gate: Dict, pnl: Dict) -> Dict:
+        realized_pnl = _float(binance.get('realized_pnl_usdt')) + _float(gate.get('realized_pnl_usdt'))
+        funding_pnl = _float(binance.get('funding_pnl_usdt')) + _float(gate.get('funding_pnl_usdt'))
+        fee_cost = _float(binance.get('fee_cost_usdt')) + _float(gate.get('fee_cost_usdt'))
         return {
             'snapshot_at': snapshot_at,
             'exchange': 'total',
@@ -230,10 +233,10 @@ class AccountCapitalSnapshotter:
                 'floating_pnl',
                 gate['unrealized_pnl_usdt'] + binance['unrealized_pnl_usdt'],
             ),
-            'realized_pnl_usdt': pnl['realized_pnl'],
-            'funding_pnl_usdt': pnl['funding_pnl'],
-            'fee_cost_usdt': pnl['fee_cost'],
-            'total_pnl_usdt': pnl['total_pnl'],
+            'realized_pnl_usdt': realized_pnl,
+            'funding_pnl_usdt': funding_pnl,
+            'fee_cost_usdt': fee_cost,
+            'total_pnl_usdt': realized_pnl + funding_pnl + fee_cost,
             'detail': {
                 'source': 'exchange_api',
                 'components': 'binance/gate account equity + local strategy positions/orders PnL',

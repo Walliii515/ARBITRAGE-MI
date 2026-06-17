@@ -65,6 +65,9 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'locked_usdt': 0.0,
             'position_value_usdt': 20.0,
             'unrealized_pnl_usdt': 0.0,
+            'realized_pnl_usdt': 0.0,
+            'funding_pnl_usdt': 0.0,
+            'fee_cost_usdt': 0.0,
         }
         gate = {
             'equity_usdt': 127.5,
@@ -73,6 +76,9 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'position_value_usdt': 20.0,
             'margin_used_usdt': 20.0,
             'unrealized_pnl_usdt': 7.5,
+            'realized_pnl_usdt': 0.0,
+            'funding_pnl_usdt': 0.0,
+            'fee_cost_usdt': 0.0,
         }
         pnl = {
             'realized_pnl': 0.0,
@@ -174,6 +180,9 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'locked_usdt': 0.0,
             'position_value_usdt': 20.0,
             'unrealized_pnl_usdt': 0.0,
+            'realized_pnl_usdt': 15.0,
+            'funding_pnl_usdt': 0.0,
+            'fee_cost_usdt': -0.8,
         }
         gate = {
             'equity_usdt': 120.0,
@@ -182,12 +191,15 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'position_value_usdt': 40.0,
             'margin_used_usdt': 40.0,
             'unrealized_pnl_usdt': -3.0,
+            'realized_pnl_usdt': -35.0,
+            'funding_pnl_usdt': 4.0,
+            'fee_cost_usdt': -1.2,
         }
         pnl = {
-            'realized_pnl': -20.0,  # gate -35 + binance +15
-            'funding_pnl': 4.0,
-            'fee_cost': -2.0,
-            'total_pnl': -18.0,
+            'realized_pnl': 999.0,
+            'funding_pnl': 999.0,
+            'fee_cost': 999.0,
+            'total_pnl': 999.0,
             'window': {},
         }
 
