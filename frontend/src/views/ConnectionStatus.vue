@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, shallowRef, onMounted, onUnmounted } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -28,6 +29,7 @@ const {
   gateWsLatencyMs,
   binanceWsLatencyMs,
   exchangeRiskMonitor,
+  delistRiskReport,
   fetchConnectionStatus,
 } = useConnectionMonitor()
 
@@ -47,6 +49,38 @@ function formatRiskWsStatus(status: string) {
   if (status === 'pending') return '订阅中'
   if (status === 'fail') return '失败'
   return status || '未知'
+}
+
+function delistRiskText(data: ConnectionRow) {
+  const risks = data.delist_risks || []
+  if (!risks.length) return ''
+  return risks.map((risk) => {
+    const due = risk.delist_at ? ` ${risk.delist_at}` : ''
+    return `${risk.exchange}:${risk.message || risk.status || risk.risk_type}${due}`
+  }).join(' | ')
+}
+
+function maybeShowDelistRiskAlert() {
+  const risks = delistRiskReport.value.items || []
+  if (!risks.length) return
+  const fingerprint = risks
+    .map((risk) => `${risk.risk_key}:${risk.delist_at || ''}:${risk.status || ''}`)
+    .sort()
+    .join('|')
+  const storageKey = 'connection_delist_risk_alert'
+  const now = Date.now()
+  const previous = JSON.parse(localStorage.getItem(storageKey) || '{}')
+  if (previous.fingerprint === fingerprint && now - Number(previous.at || 0) < 24 * 60 * 60 * 1000) return
+
+  localStorage.setItem(storageKey, JSON.stringify({ fingerprint, at: now }))
+  const preview = risks.slice(0, 8).map((risk) => {
+    const due = risk.delist_at ? `，时间 ${risk.delist_at}` : ''
+    return `${risk.base_asset} ${risk.exchange} ${risk.message || risk.status || risk.risk_type}${due}`
+  }).join('\n')
+  ElMessageBox.alert(preview, `监控标的下架风险 ${risks.length} 个`, {
+    type: 'warning',
+    confirmButtonText: '知道了',
+  }).catch(() => {})
 }
 
 /* ───── 复制功能 ───── */
@@ -115,7 +149,7 @@ async function loadColumnState() {
 }
 
 /* ───── 过滤 ───── */
-type FilterType = 'all' | 'gate_no_data' | 'gate_ws_unsub' | 'binance_no_data' | 'any_issue'
+type FilterType = 'all' | 'gate_no_data' | 'gate_ws_unsub' | 'binance_no_data' | 'delist_risk' | 'any_issue'
 const activeFilter = ref<FilterType>('all')
 const searchKeyword = ref('')
 
@@ -136,7 +170,8 @@ function applyFilter(filter?: FilterType) {
       case 'gate_no_data': return !data.gate_receiving_data
       case 'gate_ws_unsub': return !data.gate_ws_subscribed
       case 'binance_no_data': return !data.binance_receiving_data
-      case 'any_issue': return !data.gate_receiving_data || !data.binance_receiving_data
+      case 'delist_risk': return !!(data.delist_risks && data.delist_risks.length > 0)
+      case 'any_issue': return !data.gate_receiving_data || !data.binance_receiving_data || !!(data.delist_risks && data.delist_risks.length > 0)
       default: return true
     }
   })
@@ -231,6 +266,18 @@ const columnDefs: ColDef[] = [
     },
   },
   {
+    headerName: '下架风险',
+    field: 'delist_risk_summary',
+    width: 240,
+    cellRenderer: (params: ICellRendererParams) => {
+      const data = params.data as ConnectionRow
+      const text = delistRiskText(data)
+      if (!text) return '<span style="color:#67c23a">正常</span>'
+      const color = data.delist_risk_level === 'critical' ? '#f56c6c' : '#e6a23c'
+      return `<span title="${text.replace(/"/g, '&quot;')}" style="color:${color}">${text}</span>`
+    },
+  },
+  {
     headerName: '操作',
     field: '_action',
     width: 100,
@@ -307,6 +354,7 @@ async function fetchData() {
   try {
     loading.value = true
     await fetchConnectionStatus()
+    maybeShowDelistRiskAlert()
   } catch (e: any) {
     showError(e?.message || '获取连接状态失败')
   } finally {
@@ -376,6 +424,10 @@ onUnmounted(() => {
         </span>
         <span>风险事件: <b>{{ exchangeRiskMonitor?.event_count ?? 0 }}</b></span>
         <span>队列: <b>{{ exchangeRiskMonitor?.queue_size ?? 0 }}</b></span>
+        <span>
+          下架风险:
+          <b :class="{ fail: stats.delistRisk > 0 }">{{ stats.delistRisk }}</b>
+        </span>
       </div>
 
       <div class="filter-row">
@@ -393,6 +445,7 @@ onUnmounted(() => {
           <el-radio-button value="gate_no_data">Gate无数据</el-radio-button>
           <el-radio-button value="gate_ws_unsub">Gate未订阅</el-radio-button>
           <el-radio-button value="binance_no_data">Binance无数据</el-radio-button>
+          <el-radio-button value="delist_risk">下架风险</el-radio-button>
         </el-radio-group>
         <el-button size="small" @click="fetchData" :loading="loading" style="margin-left: 12px">
           刷新

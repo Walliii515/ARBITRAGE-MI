@@ -23,6 +23,7 @@ from api.auth import verify_token_dependency
 from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
+from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.position_order_fees import attach_position_order_fee_summary
@@ -1020,6 +1021,15 @@ async def trigger_threshold_calculate():
 async def get_threshold_calculate_status():
     """获取手动 VWAP 阈值计算进度"""
     return _get_threshold_calc_status()
+
+
+@router.get('/delist-risks')
+async def get_delist_risks(
+    lookahead_days: int = Query(30, ge=1, le=180, description="下架计划预警窗口（天）"),
+):
+    """检查当前监控/持仓标的的交易所下架风险。"""
+    monitor = DelistRiskMonitor(DelistRiskConfig(lookahead_days=lookahead_days))
+    return monitor.build_report()
 
 
 # ─── AG Grid 列配置管理 ───────────────────────────────────────────────────────

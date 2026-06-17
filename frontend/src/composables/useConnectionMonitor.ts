@@ -13,6 +13,35 @@ export interface ConnectionRow {
   binance_receiving_data: boolean
   binance_last_update: number
   binance_stale_sec: number | null
+  delist_risk_level?: string | null
+  delist_risk_summary?: string | null
+  delist_risks?: DelistRiskItem[]
+}
+
+export interface DelistRiskItem {
+  risk_key: string
+  base_asset: string
+  exchange: string
+  market_type: string
+  symbol: string
+  risk_type: string
+  risk_level: string
+  status?: string | null
+  delist_at?: string | null
+  days_left?: number | null
+  message?: string | null
+}
+
+export interface DelistRiskReport {
+  items: DelistRiskItem[]
+  summary: {
+    total: number
+    critical: number
+    warning: number
+  }
+  source_errors?: Record<string, string>
+  checked_at?: string
+  lookahead_days?: number
 }
 
 export interface ExchangeRiskMonitorStatus {
@@ -32,12 +61,20 @@ export interface ExchangeRiskMonitorStatus {
   event_age_sec?: number | null
 }
 
+const DELIST_REFRESH_MS = 15 * 60 * 1000
+let delistFetchedAt = 0
+let delistReportCache: DelistRiskReport = {
+  items: [],
+  summary: { total: 0, critical: 0, warning: 0 },
+}
+
 export function buildConnectionStats(rows: ConnectionRow[]) {
   const total = rows.length
   const gateSubscribed = rows.filter((r) => r.gate_ws_subscribed).length
   const gateReceiving = rows.filter((r) => r.gate_receiving_data).length
   const binanceSubscribed = rows.filter((r) => r.binance_ws_subscribed).length
   const binanceReceiving = rows.filter((r) => r.binance_receiving_data).length
+  const delistRisk = rows.filter((r) => r.delist_risks && r.delist_risks.length > 0).length
 
   return {
     total,
@@ -45,7 +82,35 @@ export function buildConnectionStats(rows: ConnectionRow[]) {
     gateReceiving,
     binanceSubscribed,
     binanceReceiving,
+    delistRisk,
   }
+}
+
+function mergeDelistRisks(rows: ConnectionRow[], report: DelistRiskReport): ConnectionRow[] {
+  const byAsset = new Map<string, DelistRiskItem[]>()
+  for (const item of report.items || []) {
+    const key = (item.base_asset || '').toUpperCase()
+    if (!key) continue
+    const list = byAsset.get(key) || []
+    list.push(item)
+    byAsset.set(key, list)
+  }
+  return rows.map((row) => {
+    const risks = byAsset.get((row.base_asset || '').toUpperCase()) || []
+    const level = risks.some((r) => r.risk_level === 'critical')
+      ? 'critical'
+      : risks.some((r) => r.risk_level === 'warning') ? 'warning' : null
+    const summary = risks.map((risk) => {
+      const due = risk.delist_at ? ` ${risk.delist_at}` : ''
+      return `${risk.exchange}:${risk.message || risk.status || risk.risk_type}${due}`
+    }).join(' | ')
+    return {
+      ...row,
+      delist_risks: risks,
+      delist_risk_level: level,
+      delist_risk_summary: summary || null,
+    }
+  })
 }
 
 export function useConnectionMonitor() {
@@ -56,14 +121,36 @@ export function useConnectionMonitor() {
   const gateWsLatencyMs = ref<number | null>(null)
   const binanceWsLatencyMs = ref<number | null>(null)
   const exchangeRiskMonitor = ref<ExchangeRiskMonitorStatus | null>(null)
+  const delistRiskReport = ref<DelistRiskReport>(delistReportCache)
 
   const connectionStats = computed(() => buildConnectionStats(connectionRows.value))
+
+  async function fetchDelistRisks(force = false) {
+    const now = Date.now()
+    if (!force && now - delistFetchedAt < DELIST_REFRESH_MS) {
+      return delistReportCache
+    }
+    const res = await get('/api/trading/delist-risks?lookahead_days=30')
+    if (!res.ok) throw new Error('获取下架风险失败')
+    const data = await res.json()
+    delistReportCache = {
+      items: Array.isArray(data.items) ? data.items : [],
+      summary: data.summary || { total: 0, critical: 0, warning: 0 },
+      source_errors: data.source_errors || {},
+      checked_at: data.checked_at,
+      lookahead_days: data.lookahead_days,
+    }
+    delistFetchedAt = now
+    delistRiskReport.value = delistReportCache
+    return delistReportCache
+  }
 
   async function fetchConnectionStatus() {
     const res = await get('/api/service/connections')
     if (!res.ok) throw new Error('获取连接状态失败')
     const data = await res.json()
-    connectionRows.value = data.items || []
+    const report = await fetchDelistRisks().catch(() => delistReportCache)
+    connectionRows.value = mergeDelistRisks(data.items || [], report)
     serviceState.value = data.state || 'idle'
     gateWsConnected.value = data.gate_ws_connected || false
     binanceWsConnected.value = data.binance_ws_connected || false
@@ -82,6 +169,8 @@ export function useConnectionMonitor() {
     gateWsLatencyMs,
     binanceWsLatencyMs,
     exchangeRiskMonitor,
+    delistRiskReport,
+    fetchDelistRisks,
     fetchConnectionStatus,
   }
 }
