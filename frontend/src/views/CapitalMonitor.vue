@@ -35,12 +35,15 @@ type ChartMetric =
   | 'funding_pnl_usdt'
   | 'total_pnl_usdt'
   | 'gross_total_pnl_usdt'
+  | 'net_realized_return_pct'
 type ChartModeKey =
   | 'equity_usdt'
   | 'unrealized_pnl_usdt'
   | 'realized_breakdown'
   | 'gross_total_pnl_usdt'
-type ChartMetricOption = { key: ChartMetric; label: string; group: 'asset' | 'pnl'; color: string }
+  | 'net_realized_return_pct'
+type ChartSeriesGroup = 'asset' | 'pnl' | 'ratio'
+type ChartMetricOption = { key: ChartMetric; label: string; group: ChartSeriesGroup; color: string }
 type ChartModeOption = { key: ChartModeKey; label: string }
 type ChartLineType = 'solid' | 'dashed'
 type ChartSeries = {
@@ -48,7 +51,7 @@ type ChartSeries = {
   metric: ChartMetric
   label: string
   color: string
-  group: 'asset' | 'pnl'
+  group: ChartSeriesGroup
   points: Array<{ time: string; value: number }>
   lineType: ChartLineType
 }
@@ -74,6 +77,7 @@ const metricOptions: ChartMetricOption[] = [
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
   { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#409eff' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
+  { key: 'net_realized_return_pct', label: '净实现收益率', group: 'ratio', color: '#14b8a6' },
 ]
 
 const chartModeOptions: ChartModeOption[] = [
@@ -81,6 +85,7 @@ const chartModeOptions: ChartModeOption[] = [
   { key: 'unrealized_pnl_usdt', label: '未实现盈亏' },
   { key: 'realized_breakdown', label: '收益趋势' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏' },
+  { key: 'net_realized_return_pct', label: '净实现收益率' },
 ]
 
 const realizedBreakdownMetrics: ChartMetric[] = [
@@ -116,7 +121,7 @@ const chartSeries = computed<ChartSeries[]>(() => {
     const option = metricOptions.find((item) => item.key === metric)!
     const points = rows.map((row) => ({
       time: row.snapshot_at,
-      value: Number(row[metric] ?? 0),
+      value: chartMetricValue(row, metric),
     }))
     return {
       exchange: selectedExchange.value,
@@ -182,8 +187,35 @@ function formatAmount(value: number | null | undefined): string {
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
+function formatPercent(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
+}
+
 function hasAmount(value: number | null | undefined): boolean {
   return value != null && Number.isFinite(Number(value))
+}
+
+function netRealizedReturnPct(row: CapitalRow | undefined): number | null {
+  const equity = Number(row?.equity_usdt ?? NaN)
+  const netRealized = Number(row?.total_pnl_usdt ?? NaN)
+  if (!Number.isFinite(equity) || Math.abs(equity) <= 1e-9 || !Number.isFinite(netRealized)) return null
+  return (netRealized / equity) * 100
+}
+
+function chartMetricValue(row: CapitalRow, metric: ChartMetric): number {
+  if (metric === 'net_realized_return_pct') return netRealizedReturnPct(row) ?? 0
+  return Number(row[metric] ?? 0)
+}
+
+function formatSeriesValue(value: number, group: ChartSeriesGroup): string {
+  return group === 'ratio' ? formatPercent(value) : `${formatAmount(value)} USDT`
+}
+
+function chartYAxisIndex(group: ChartSeriesGroup): number {
+  if (group === 'asset') return 0
+  if (group === 'ratio') return 2
+  return 1
 }
 
 function formatToken(value: number | null | undefined, digits = 6): string {
@@ -236,7 +268,7 @@ function buildChartOption(): EChartsOption {
   return {
     color: chartSeries.value.map((series) => series.color),
     animation: false,
-    grid: { top: 44, right: 82, bottom: 56, left: 72 },
+    grid: { top: 44, right: 112, bottom: 56, left: 72 },
     legend: {
       type: 'scroll',
       top: 0,
@@ -250,14 +282,14 @@ function buildChartOption(): EChartsOption {
       backgroundColor: surfaceColor,
       borderColor,
       textStyle: { color: textColor },
-      valueFormatter: (value) => `${formatAmount(Number(value))} USDT`,
       axisPointer: { type: 'cross', label: { backgroundColor: '#606266' } },
       formatter: (params) => {
         const items: any[] = Array.isArray(params) ? params : [params]
         const title = formatTooltipTime(items[0]?.axisValue)
         const rows = items.map((item: any) => {
           const value = Array.isArray(item.value) ? item.value[1] : item.value
-          return `${item.marker}${item.seriesName}: ${formatAmount(Number(value))} USDT`
+          const meta = chartSeries.value.find((series) => series.label === item.seriesName)
+          return `${item.marker}${item.seriesName}: ${formatSeriesValue(Number(value), meta?.group || 'pnl')}`
         })
         return [title, ...rows].join('<br/>')
       },
@@ -290,6 +322,18 @@ function buildChartOption(): EChartsOption {
         },
         splitLine: { show: false },
       },
+      {
+        type: 'value',
+        name: '收益率',
+        scale: true,
+        position: 'right',
+        offset: 54,
+        axisLabel: {
+          color: mutedColor,
+          formatter: (value: number) => formatPercent(value),
+        },
+        splitLine: { show: false },
+      },
     ],
     series: chartSeries.value.map((series) => ({
       name: series.label,
@@ -297,7 +341,7 @@ function buildChartOption(): EChartsOption {
       smooth: true,
       showSymbol: false,
       symbolSize: 7,
-      yAxisIndex: series.group === 'asset' ? 0 : 1,
+      yAxisIndex: chartYAxisIndex(series.group),
       emphasis: { focus: 'series' },
       data: series.points.map((point) => [point.time, point.value]),
       lineStyle: { width: series.lineType === 'dashed' ? 2 : 2.2, type: series.lineType },
@@ -557,6 +601,12 @@ onBeforeUnmount(() => {
           <strong :class="Number(latestByExchange[exchange]?.total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             <span>{{ formatAmount(latestByExchange[exchange]?.total_pnl_usdt) }}</span>
             <span v-if="hasAmount(latestByExchange[exchange]?.total_pnl_usdt)" class="metric-unit">USDT</span>
+          </strong>
+        </div>
+        <div v-if="showSummaryDetails" class="metric-row">
+          <span>净实现收益率</span>
+          <strong :class="Number(netRealizedReturnPct(latestByExchange[exchange]) || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+            <span>{{ formatPercent(netRealizedReturnPct(latestByExchange[exchange])) }}</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
