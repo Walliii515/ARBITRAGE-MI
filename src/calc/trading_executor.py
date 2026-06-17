@@ -45,6 +45,7 @@ class TradingExecutorConfig:
     funding_support_min_samples: int = 2
     realtime_min_funding_rate_bps: Optional[float] = None
     open_amount_usdt: float = 5.0
+    reduced_open_amount_multiplier: float = 0.6
     min_available_ratio: float = 0.10
     max_asset_exposure_ratio: float = 0.10
     quality_scale_in_enabled: bool = False
@@ -139,11 +140,9 @@ class TradingExecutorConfig:
     funding_carry_min_24h_bps: float = 30.0
     funding_carry_basis_relax_bps: float = 15.0
     funding_carry_max_next_funding_min: float = 30.0
-    funding_carry_amount_usdt: float = 0.0
 
     # ─── 行情画像参数覆盖 ───
     thin_bursty_enabled: bool = True
-    thin_bursty_open_amount_multiplier: float = 0.8
     thin_bursty_max_orderbook_lag_ms: float = 1500.0
     thin_bursty_max_book_skew_ms: float = 1500.0
 
@@ -304,6 +303,10 @@ class TradingExecutor:
 
         # 开仓金额（用于 min_notional 前置校验）
         self.open_amount_usdt = cfg.open_amount_usdt
+        self.reduced_open_amount_multiplier = max(
+            min(float(cfg.reduced_open_amount_multiplier or 1.0), 1.0),
+            0.05,
+        )
 
         # 旁路风控新鲜度硬约束：以本地 last_update_time 为准，超过阈值判为“行情滞后”拒开
         self._max_orderbook_lag_ms = float(cfg.max_orderbook_lag_ms)
@@ -392,13 +395,9 @@ class TradingExecutor:
         self.funding_carry_min_24h_bps = float(cfg.funding_carry_min_24h_bps)
         self.funding_carry_basis_relax_bps = float(cfg.funding_carry_basis_relax_bps)
         self.funding_carry_max_next_funding_min = float(cfg.funding_carry_max_next_funding_min)
-        self.funding_carry_amount_usdt = float(cfg.funding_carry_amount_usdt or 0.0)
 
         self.thin_bursty_enabled = bool(cfg.thin_bursty_enabled)
-        self.thin_bursty_open_amount_multiplier = max(
-            min(float(cfg.thin_bursty_open_amount_multiplier or 1.0), 1.0),
-            0.05,
-        )
+        self.thin_bursty_open_amount_multiplier = self.reduced_open_amount_multiplier
         self.thin_bursty_max_orderbook_lag_ms = float(cfg.thin_bursty_max_orderbook_lag_ms)
         self.thin_bursty_max_book_skew_ms = float(cfg.thin_bursty_max_book_skew_ms)
 
@@ -1032,9 +1031,11 @@ class TradingExecutor:
         params = self._profile_params(base_asset)
         return max(float(amount_usdt) * float(params.get('open_amount_multiplier', 1.0)), 0.0)
 
+    def _reduced_open_amount_usdt(self) -> float:
+        return max(float(self.open_amount_usdt) * float(self.reduced_open_amount_multiplier), 0.0)
+
     def _funding_carry_amount(self, base_asset: Optional[str] = None) -> float:
-        amount = self.funding_carry_amount_usdt if self.funding_carry_amount_usdt > 0 else self.open_amount_usdt
-        return self._profile_open_amount(base_asset or '', amount)
+        return self._reduced_open_amount_usdt()
 
     def _active_open_amount_usdt(self, row: Optional[Dict] = None) -> float:
         if row and row.get('open_amount_usdt') is not None:

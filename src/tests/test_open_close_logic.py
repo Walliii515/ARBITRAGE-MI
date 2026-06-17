@@ -110,6 +110,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_support_min_samples=funding_support_min_samples,
         realtime_min_funding_rate_bps=realtime_min_funding_rate_bps,
         max_orderbook_lag_ms=max_orderbook_lag_ms,
+        reduced_open_amount_multiplier=0.6,
         momentum_enabled=momentum_enabled,
         momentum_allowed_tiers=momentum_allowed_tiers or ['A'],
         momentum_tier_overrides=momentum_tier_overrides or {},
@@ -129,8 +130,6 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
         funding_carry_max_next_funding_min=30.0,
-        funding_carry_amount_usdt=10.0,
-        thin_bursty_open_amount_multiplier=0.8,
         thin_bursty_max_orderbook_lag_ms=1500.0,
         thin_bursty_max_book_skew_ms=1500.0,
     )
@@ -1075,7 +1074,16 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         """thin_bursty 单笔金额按配置缩小。"""
         self.te.asset_profile_meta = {'BTC': {'market_profile': 'thin_bursty'}}
         self.te.open_amount_usdt = 10.0
-        self.assertEqual(self.te._active_open_amount_usdt({'base_asset': 'BTC'}), 8.0)
+        self.assertEqual(self.te._active_open_amount_usdt({'base_asset': 'BTC'}), 6.0)
+
+    def test_funding_carry_and_thin_bursty_use_one_reduced_amount(self):
+        """funding carry 与 thin_bursty 共用降档金额，不重复乘倍率。"""
+        self.te.open_amount_usdt = 10.0
+        self.assertEqual(self.te._funding_carry_amount('ETH'), 6.0)
+
+        self.te.asset_profile_meta = {'BTC': {'market_profile': 'thin_bursty'}}
+        self.assertEqual(self.te._active_open_amount_usdt({'base_asset': 'BTC'}), 6.0)
+        self.assertEqual(self.te._funding_carry_amount('BTC'), 6.0)
 
     def test_live_pre_gate_uses_realtime_funding_snapshot(self):
         """实盘旁路用下单前实时 funding 覆盖缓存 funding，并重算 entry snapshot。"""

@@ -52,7 +52,8 @@ trade:
 
   # ─── 开仓策略 ───
   open:
-    amount_usdt: 20                        # 单笔开仓金额（USDT）
+    amount_usdt: 50                        # 单笔开仓金额（USDT）
+    reduced_amount_multiplier: 0.6         # 降档开仓倍率；funding carry/薄盘金额 = amount_usdt * 该倍率
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
@@ -160,7 +161,6 @@ trade:
     min_24h_bps: 30                         # 当前实时24h资金费率 >= 30bps
     basis_relax_bps: 15                     # current_basis >= max(开仓p20, 平仓p20) - 15bps
     max_next_funding_min: 30                # 距离下次资金费结算 <= 30分钟
-    amount_usdt: 10                         # 单笔小仓位金额；设0则跟随 trade.open.amount_usdt
 
   # ─── 行情画像参数覆盖 ───
   # market_profile 不替代 A/B/C 分层：A/B/C 决定是否进交易池，
@@ -168,7 +168,6 @@ trade:
   market_profile:
     thin_bursty:
       enabled: true                         # 薄盘/跳动式更新标的启用专用参数
-      open_amount_multiplier: 0.6           # 单笔金额为普通开仓的60%，避免触碰最低开仓金额
       max_orderbook_lag_ms: 1500            # 最终旁路仍检查新鲜度，但允许比 normal 更宽
       max_book_skew_ms: 1500                # Gate/Binance 两边最近更新相差过大仍拒单
 

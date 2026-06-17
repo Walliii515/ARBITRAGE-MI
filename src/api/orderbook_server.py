@@ -1529,6 +1529,10 @@ def _run_open_position_check_once():
                     'trade.open.realtime_min_funding_rate_bps', 5.0
                 ),
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
+                reduced_open_amount_multiplier=config.get_float(
+                    'trade.open.reduced_amount_multiplier',
+                    config.get_float('trade.market_profile.thin_bursty.open_amount_multiplier', 0.6),
+                ),
                 min_available_ratio=config.get_float('trade.open.min_available_ratio', 0.10),
                 max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
                 quality_scale_in_enabled=config.get_bool('trade.open.quality_scale_in.enabled', False),
@@ -1623,11 +1627,7 @@ def _run_open_position_check_once():
                 funding_carry_max_next_funding_min=config.get_float(
                     'trade.funding_carry_open.max_next_funding_min', 30.0
                 ),
-                funding_carry_amount_usdt=config.get_float('trade.funding_carry_open.amount_usdt', 0.0),
                 thin_bursty_enabled=config.get_bool('trade.market_profile.thin_bursty.enabled', True),
-                thin_bursty_open_amount_multiplier=config.get_float(
-                    'trade.market_profile.thin_bursty.open_amount_multiplier', 0.8
-                ),
                 thin_bursty_max_orderbook_lag_ms=config.get_float(
                     'trade.market_profile.thin_bursty.max_orderbook_lag_ms', 1500.0
                 ),
