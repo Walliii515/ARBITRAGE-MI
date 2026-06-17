@@ -262,6 +262,9 @@ trade:
     negative_funding_exit_next_bps: 7       # 下一期预计资金费 <= -7bps 才强制退出
     negative_funding_exit_extreme_24h_bps: 45 # 当前24h负资金费率达到极端阈值时进入监控，不再立即平仓
     negative_funding_exit_paid_bps: 7       # 历史实际已支付负资金费累计达到该阈值进入监控
+    delist_risk_exit_enabled: true          # 标的临近下架窗口时走风险平仓，不等待止盈/正资金费
+    delist_risk_exit_days: 2                # 距下架时间小于等于该天数时触发下架风险平仓
+    delist_risk_refresh_interval_sec: 900   # 后台刷新下架风险报告间隔；平仓关键路径只读内存缓存
     protective_ioc_enabled: true            # 平仓Gate期货腿使用 reduce_only 保护限价 IOC
     protective_ioc_take_profit_slippage_bps: 5 # 止盈平仓期货买回保护价允许高于旁路VWAP的bps
     protective_ioc_risk_slippage_bps: 12    # 风险平仓期货买回保护价允许高于旁路VWAP的bps

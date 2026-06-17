@@ -779,6 +779,36 @@ def record_reverse_research_snapshot_once(sample_source: str = 'manual') -> dict
     }
 
 
+def _refresh_delist_risk_report_once() -> Dict:
+    """刷新下架风险报告；在后台线程执行，平仓关键路径只读结果。"""
+    global _delist_risk_report, _delist_risk_report_ts
+    lookahead_days = max(config.get_int('trade.close.delist_risk_lookahead_days', 30), 1)
+    timeout_sec = max(config.get_int('trade.close.delist_risk_timeout_sec', 8), 1)
+    report = DelistRiskMonitor(
+        DelistRiskConfig(lookahead_days=lookahead_days, timeout_sec=timeout_sec)
+    ).build_report()
+    _delist_risk_report = report
+    _delist_risk_report_ts = time.time()
+    summary = report.get('summary') or {}
+    logger.info(
+        '下架风险缓存刷新完成: total=%s critical=%s warning=%s',
+        summary.get('total', 0),
+        summary.get('critical', 0),
+        summary.get('warning', 0),
+    )
+    return report
+
+
+async def _delist_risk_refresh_loop():
+    interval = max(config.get_int('trade.close.delist_risk_refresh_interval_sec', 900), 60)
+    while True:
+        try:
+            await asyncio.to_thread(_refresh_delist_risk_report_once)
+        except Exception as e:
+            logger.warning(f'下架风险缓存刷新失败: {e}', exc_info=True)
+        await asyncio.sleep(interval)
+
+
 def build_payload_json() -> str:
     """构建并预序列化广播载荷 JSON 字符串（缓存复用，避免重复序列化）"""
     global _cached_payload_json, _cached_payload_ts
@@ -973,6 +1003,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_reverse_research_snapshot_loop())
     asyncio.create_task(_stale_signal_cleanup_loop())
     asyncio.create_task(_server_metric_snapshot_loop())
+    asyncio.create_task(_delist_risk_refresh_loop())
     _start_gate_risk_event_monitor()
 
     # 启动所有 daily 类型任务的定时调度器（如 VWAP 基差分位阈值每日 00:00 计算）
@@ -1330,6 +1361,14 @@ async def _ensure_orderbook_row_for_close(base_asset: str) -> Dict:
     raise HTTPException(status_code=503, detail=f'标的 {ba} 已补订阅但暂未收到完整盘口，无法执行平仓: {message}')
 
 
+def _configure_closing_executor(executor):
+    if svc:
+        executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
+    if hasattr(executor, 'set_delist_risk_report'):
+        executor.set_delist_risk_report(_delist_risk_report)
+    return executor
+
+
 @app.post('/api/trading/positions/{position_id}/manual-close', dependencies=[Depends(verify_token_dependency)])
 async def manual_close_position(position_id: int):
     """手动一键平仓：跳过条件检查，直接对指定持仓执行平仓"""
@@ -1364,8 +1403,7 @@ async def manual_close_position(position_id: int):
         if _closing_executor is None:
             from calc.closing_executor import ClosingExecutor
             _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
-            if svc:
-                _closing_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
+        _configure_closing_executor(_closing_executor)
         return _closing_executor.manual_close(pos, orderbook_row)
 
     result = await asyncio.get_running_loop().run_in_executor(
@@ -1438,8 +1476,7 @@ async def close_all_positions():
                 if _closing_executor is None:
                     from calc.closing_executor import ClosingExecutor
                     _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
-                    if svc:
-                        _closing_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
+                _configure_closing_executor(_closing_executor)
                 return _closing_executor.manual_close(pos, orderbook_row)
 
             result = await loop.run_in_executor(_critical_close_executor, _manual_close_one)
@@ -2023,7 +2060,7 @@ def _run_close_position_check_once():
         if _closing_executor is None:
             from calc.closing_executor import ClosingExecutor
             _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
-            _closing_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
+        _configure_closing_executor(_closing_executor)
         results = _closing_executor.check_and_close(
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )

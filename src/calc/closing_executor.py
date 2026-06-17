@@ -6,8 +6,9 @@
 
 平仓触发条件（按优先级）：
   0. 保证金爆仓风控（保证金/维持保证金 < 阈值）
-  1. 当前负24h资金费率临近结算且下一期仍明显为负
-  2. 动态净收益止盈（含老仓退出；下单前有最终风控旁路复核）
+  1. 下架风险临近窗口退出
+  2. 当前负24h资金费率临近结算且下一期仍明显为负
+  3. 动态净收益止盈（含老仓退出；下单前有最终风控旁路复核）
 """
 import time
 import uuid
@@ -96,6 +97,13 @@ class ClosingExecutor:
         )
         self.negative_funding_exit_paid_bps = config.get_float(
             'trade.close.negative_funding_exit_paid_bps', 7.0
+        )
+        self.delist_risk_exit_enabled = config.get_bool(
+            'trade.close.delist_risk_exit_enabled', True
+        )
+        self.delist_risk_exit_days = max(
+            config.get_float('trade.close.delist_risk_exit_days', 2.0),
+            0.0,
         )
         self.protective_ioc_enabled = config.get_bool('trade.close.protective_ioc_enabled', True)
         self.protective_ioc_take_profit_slippage_bps = config.get_float(
@@ -194,6 +202,7 @@ class ClosingExecutor:
         self._last_orderbook_lag_ms: Dict[str, tuple] = {}
         self._last_take_profit_eval: Dict[object, object] = {}
         self._active_close_vwap_threshold_meta: Dict[str, Dict] = {}
+        self._delist_risk_by_asset: Dict[str, List[Dict]] = {}
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -282,9 +291,21 @@ class ClosingExecutor:
             gate_manager: Gate 期货 OrderBookManager 实例
             spot_manager: Binance 现货 OrderBookManager 实例
         """
+        changed = self._gate_manager is not gate_manager or self._spot_manager is not spot_manager
         self._gate_manager = gate_manager
         self._spot_manager = spot_manager
-        logger.info('OrderBookManager 已注入 ClosingExecutor（平仓最终风控旁路就绪）')
+        if changed:
+            logger.info('OrderBookManager 已注入 ClosingExecutor（平仓最终风控旁路就绪）')
+
+    def set_delist_risk_report(self, report: Optional[Dict]):
+        """注入异步刷新得到的下架风险报告；平仓关键路径只读内存。"""
+        grouped: Dict[str, List[Dict]] = {}
+        for item in (report or {}).get('items', []) or []:
+            asset = str(item.get('base_asset') or '').strip().upper()
+            if not asset:
+                continue
+            grouped.setdefault(asset, []).append(item)
+        self._delist_risk_by_asset = grouped
 
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
@@ -357,6 +378,10 @@ class ClosingExecutor:
                     close_reason_detail += f"|维持保证金{float(gate_maintenance or 0):.4f}"
                 # 紧急平仓，清除谷底状态
                 self._clear_position_close_state(ba, pos)
+            elif self._check_delist_risk_exit(pos):
+                close_reason = 'delist_risk_exit'
+                close_reason_detail = self._build_delist_risk_exit_detail(pos)
+                self._clear_position_close_state(ba, pos)
             elif self._check_negative_funding_exit(pos):
                 close_reason = 'negative_funding_exit'
                 close_reason_detail = self._build_negative_funding_exit_detail(pos)
@@ -393,7 +418,7 @@ class ClosingExecutor:
                 continue
 
             # ── 最终风控旁路：止盈复核盈利性；风险平仓复核新鲜度/同步/深度 ──
-            guarded_reasons = {'take_profit', 'negative_funding_exit'}
+            guarded_reasons = {'take_profit', 'negative_funding_exit', 'delist_risk_exit'}
             if close_reason in guarded_reasons:
                 contract = pos.get('future_contract', '')
                 symbol = pos.get('spot_symbol') or f"{ba}USDT"
@@ -678,6 +703,58 @@ class ClosingExecutor:
     def _check_negative_funding_exit(self, pos: Dict) -> bool:
         """负 funding 强制退出：临近结算且下一期仍明显为负才触发。"""
         return self._negative_funding_state(pos) == 'force_exit'
+
+    def _delist_exit_risks(self, pos: Dict) -> List[Dict]:
+        if not self.delist_risk_exit_enabled:
+            return []
+        asset = str(pos.get('base_asset') or '').strip().upper()
+        if not asset:
+            return []
+        return [
+            item for item in self._delist_risk_by_asset.get(asset, [])
+            if self._is_delist_exit_risk(item)
+        ]
+
+    def _check_delist_risk_exit(self, pos: Dict) -> bool:
+        """下架风险退出：临近下架窗口时不等待止盈/正资金费继续持有。"""
+        return bool(self._delist_exit_risks(pos))
+
+    def _is_delist_exit_risk(self, item: Dict) -> bool:
+        status = str(item.get('status') or '').strip().lower()
+        risk_key = str(item.get('risk_key') or '').strip().lower()
+        message = str(item.get('message') or '')
+        if status in {'delisting', 'delisted'} or 'in_delisting' in risk_key or '已进入下架流程' in message:
+            return True
+
+        delist_at = self._parse_delist_at(item.get('delist_at'))
+        if delist_at is not None:
+            return delist_at <= datetime.now() + timedelta(days=self.delist_risk_exit_days)
+
+        try:
+            days_left = item.get('days_left')
+            if days_left is not None:
+                return float(days_left) <= self.delist_risk_exit_days
+        except (TypeError, ValueError):
+            return False
+        return False
+
+    @staticmethod
+    def _parse_delist_at(value) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(text[:19], fmt)
+            except ValueError:
+                continue
+        try:
+            parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            return None
 
     def _negative_funding_state(self, pos: Dict) -> str:
         """返回负 funding 状态：none / watch / force_exit。"""
@@ -1551,6 +1628,28 @@ class ClosingExecutor:
             f"next≤-{next_threshold:.1f},极端监控{extreme_threshold:.1f},"
             f"已付监控{paid_threshold:.1f})"
             f"|next={next_text}|距结算{next_min_text}"
+        )
+
+    def _build_delist_risk_exit_detail(self, pos: Dict) -> str:
+        """构建下架风险平仓原因。"""
+        risks = self._delist_exit_risks(pos)
+        if not risks:
+            return f"下架风险退出|阈值{self.delist_risk_exit_days:.1f}天|风险详情缺失"
+        fragments = []
+        for item in risks[:3]:
+            exchange = item.get('exchange') or 'unknown'
+            market_type = item.get('market_type') or ''
+            status = item.get('status') or item.get('risk_type') or ''
+            delist_at = item.get('delist_at') or 'NA'
+            days_left = item.get('days_left')
+            message = item.get('message') or ''
+            days_text = 'NA' if days_left is None else str(days_left)
+            fragments.append(
+                f"{exchange}/{market_type}:{status}|delist_at={delist_at}|days_left={days_text}|{message}"
+            )
+        return (
+            f"下架风险退出|阈值{self.delist_risk_exit_days:.1f}天|"
+            + ' || '.join(fragments)
         )
 
     def _negative_funding_context(self, pos: Dict) -> str:

@@ -2330,6 +2330,47 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertEqual(basis, 105)
         self.assertEqual(reason, '')
 
+    def test_delist_risk_exit_does_not_require_profit(self):
+        """临近下架退出复用风险平仓旁路，不被盈利性复核挡住。"""
+        self._setup_books()
+        self.ce.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'BTC',
+                'exchange': 'binance',
+                'market_type': 'spot',
+                'risk_type': 'delist_schedule',
+                'status': 'scheduled',
+                'risk_level': 'critical',
+                'delist_at': (datetime.now() + timedelta(hours=36)).strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 1,
+                'message': 'Binance现货已进入下架计划',
+            }],
+        })
+        pos = dict(self.pos)
+        pos.update({'status': 'holding'})
+        execute_mock = MagicMock(return_value={
+            'base_asset': 'BTC',
+            'success': True,
+            'order_uuid': 'delist-close',
+            'close_reason': 'delist_risk_exit',
+            'message': None,
+        })
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(vwap_basis_bps=105)
+        with (
+            patch.object(self.ce, '_check_and_topup_margin', return_value=None),
+            patch.object(self.ce, '_check_margin_liquidation', return_value=False),
+            patch.object(self.ce, '_check_take_profit', return_value=True) as take_profit_mock,
+            patch.object(self.ce, '_execute_close', execute_mock),
+            m_merge, m_hedge, m_vwap,
+        ):
+            results = self.ce.check_and_close([pos], {}, {'BTC': {'old': 'row'}})
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(execute_mock.call_args.args[1], 'delist_risk_exit')
+        self.assertIn('下架风险退出', execute_mock.call_args.args[2])
+        self.assertIn('旁路✓', execute_mock.call_args.args[2])
+        take_profit_mock.assert_not_called()
+
     def test_full_pass_writes_lag_cache(self):
         """全部通过 → 返回 True + 写入 _last_orderbook_lag_ms（bug 修复验证）"""
         self._setup_books(gate_lag_sec=0.05, spot_lag_sec=0.06)
@@ -2598,6 +2639,55 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             'funding_rate_sum_bps': 6.9,
         })
         self.assertFalse(self.ce._check_negative_funding_exit(self.pos))
+
+    def test_delist_risk_exit_triggers_inside_two_day_window(self):
+        self.ce.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'BTC',
+                'exchange': 'binance',
+                'market_type': 'spot',
+                'risk_type': 'delist_schedule',
+                'status': 'scheduled',
+                'risk_level': 'critical',
+                'delist_at': (datetime.now() + timedelta(hours=47)).strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 1,
+                'message': 'Binance现货已进入下架计划',
+            }],
+        })
+        self.assertTrue(self.ce._check_delist_risk_exit(self.pos))
+        self.assertIn('下架风险退出', self.ce._build_delist_risk_exit_detail(self.pos))
+
+    def test_delist_risk_exit_ignores_schedule_outside_window(self):
+        self.ce.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'BTC',
+                'exchange': 'binance',
+                'market_type': 'spot',
+                'risk_type': 'delist_schedule',
+                'status': 'scheduled',
+                'risk_level': 'warning',
+                'delist_at': (datetime.now() + timedelta(days=4)).strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 4,
+                'message': 'Binance现货已进入下架计划',
+            }],
+        })
+        self.assertFalse(self.ce._check_delist_risk_exit(self.pos))
+
+    def test_delist_risk_exit_triggers_gate_in_delisting_without_date(self):
+        self.ce.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'BTC',
+                'exchange': 'gate',
+                'market_type': 'future',
+                'risk_type': 'contract_status',
+                'status': 'delisting',
+                'risk_level': 'critical',
+                'delist_at': None,
+                'days_left': None,
+                'message': 'Gate合约状态=delisting，已进入下架流程',
+            }],
+        })
+        self.assertTrue(self.ce._check_delist_risk_exit(self.pos))
 
     def test_close_order_group_carries_future_protective_price(self):
         group = self.ce._build_close_order_group({
