@@ -519,24 +519,25 @@ class TradingExecutor:
         try:
             sql = """
                 SELECT
-                    base_asset,
-                    COALESCE(SUM(spot_open_amount), 0) AS spot_amount,
+                    p.base_asset,
+                    COALESCE(SUM(p.spot_open_amount), 0) AS spot_amount,
                     COALESCE(SUM(
-                        COALESCE(ABS(future_open_price * future_open_qty), spot_open_amount, 0) / %s
-                        + COALESCE(margin_topup_total, 0)
+                        COALESCE(ABS(p.future_open_price * p.future_open_qty), p.spot_open_amount, 0)
+                        / GREATEST(COALESCE(fo.future_open_leverage, %s), 1)
+                        + COALESCE(p.margin_topup_total, 0)
                     ), 0) AS future_margin,
                     COALESCE(
                         SUM(
                             CASE
-                                WHEN COALESCE(actual_basis_bps, open_spread_bps) IS NOT NULL
-                                THEN COALESCE(actual_basis_bps, open_spread_bps)
-                                     * COALESCE(spot_open_amount, 0)
+                                WHEN COALESCE(p.actual_basis_bps, p.open_spread_bps) IS NOT NULL
+                                THEN COALESCE(p.actual_basis_bps, p.open_spread_bps)
+                                     * COALESCE(p.spot_open_amount, 0)
                                 ELSE 0
                             END
                         ) / NULLIF(SUM(
                             CASE
-                                WHEN COALESCE(actual_basis_bps, open_spread_bps) IS NOT NULL
-                                THEN COALESCE(spot_open_amount, 0)
+                                WHEN COALESCE(p.actual_basis_bps, p.open_spread_bps) IS NOT NULL
+                                THEN COALESCE(p.spot_open_amount, 0)
                                 ELSE 0
                             END
                         ), 0),
@@ -544,13 +545,21 @@ class TradingExecutor:
                     ) AS weighted_basis_bps,
                     MAX(
                         CASE
-                            WHEN COALESCE(exchange_risk_status, 'normal') <> 'normal' THEN 1
+                            WHEN COALESCE(p.exchange_risk_status, 'normal') <> 'normal' THEN 1
                             ELSE 0
                         END
                     ) AS has_exchange_risk
-                FROM mi_trade_position
-                WHERE status = 'holding'
-                GROUP BY base_asset
+                FROM mi_trade_position p
+                LEFT JOIN (
+                    SELECT position_id, MAX(leverage) AS future_open_leverage
+                    FROM mi_trade_order
+                    WHERE order_side = 'open'
+                      AND market_type = 'future'
+                      AND status = 'executed'
+                    GROUP BY position_id
+                ) fo ON fo.position_id = p.id
+                WHERE p.status = 'holding'
+                GROUP BY p.base_asset
             """
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, (self.capital_gate_leverage,))

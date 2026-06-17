@@ -107,6 +107,14 @@ class RealExecutor:
             if self._is_future_maker_order(future_order):
                 return self._execute_future_maker_then_spot(order_group, orderbook_row)
 
+            leverage_ok, leverage_reason = self._ensure_open_leverage(future_order)
+            if not leverage_ok:
+                result['message'] = leverage_reason
+                logger.warning(
+                    f"真实开仓预检失败 | {future_order.get('future_contract')} | {leverage_reason}"
+                )
+                return result
+
             # ── 并发下单：同时向 Binance 和 Gate 发送市价单 ──
             with ThreadPoolExecutor(max_workers=2) as pool:
                 spot_future = pool.submit(self._place_binance_spot_order, spot_order)
@@ -189,6 +197,14 @@ class RealExecutor:
         target_qty = float(spot_order.get('target_qty') or future_order.get('target_qty') or 0)
         if not base_asset or target_qty <= 0:
             result['message'] = f'反向开仓参数无效(base={base_asset}, qty={target_qty})'
+            return result
+
+        leverage_ok, leverage_reason = self._ensure_open_leverage(future_order)
+        if not leverage_ok:
+            result['message'] = leverage_reason
+            logger.warning(
+                f"反向真实开仓预检失败 | {future_order.get('future_contract')} | {leverage_reason}"
+            )
             return result
 
         borrow_result = self._place_binance_margin_borrow(base_asset, target_qty)
@@ -1175,7 +1191,15 @@ class RealExecutor:
     # Gate 期货
     # ──────────────────────────────────────────────────────────────────
 
-    def _ensure_leverage(self, contract: str):
+    def _ensure_open_leverage(self, future_order: Dict) -> tuple[bool, str]:
+        """开仓前确认 Gate 逐仓杠杆；已有仓位杠杆不匹配时拒单，避免改动历史仓位。"""
+        if future_order.get('order_side') != 'open':
+            return True, ''
+        base_asset = future_order.get('base_asset', '')
+        contract = future_order.get('future_contract') or f"{base_asset}_USDT"
+        return self._ensure_leverage(contract)
+
+    def _ensure_leverage(self, contract: str) -> tuple[bool, str]:
         """
         确保合约已设置为逐仓模式 + 指定杠杆倍数
 
@@ -1186,7 +1210,26 @@ class RealExecutor:
         仅在每个合约首次下单前调用一次，后续通过缓存跳过。
         """
         if contract in self._leverage_set:
-            return
+            return True, ''
+
+        existing = self._gate_existing_position(contract)
+        if existing is None:
+            msg = f"Gate杠杆设置跳过({contract}:无法确认是否已有仓位)"
+            logger.warning(msg)
+            return False, msg
+        if existing:
+            current_leverage = self._float_or_none(existing.get('leverage'))
+            if current_leverage is not None and abs(current_leverage - float(self.leverage)) < 1e-9:
+                self._leverage_set.add(contract)
+                logger.info(f"Gate 已有仓位杠杆匹配 | {contract} | 逐仓 {self.leverage}x")
+                return True, ''
+            msg = (
+                f"Gate已有仓位，禁止修改杠杆 | {contract} | "
+                f"current={current_leverage if current_leverage is not None else 'unknown'}x,"
+                f"target={self.leverage}x"
+            )
+            logger.warning(msg)
+            return False, msg
 
         api_path = f'/api/v4/futures/usdt/positions/{contract}/leverage'
         query_string = f'leverage={self.leverage}'
@@ -1198,12 +1241,35 @@ class RealExecutor:
             if resp.status_code == 200:
                 self._leverage_set.add(contract)
                 logger.info(f"Gate 杠杆设置成功 | {contract} | 逐仓 {self.leverage}x")
+                return True, ''
             else:
-                logger.warning(
-                    f"Gate 杠杆设置失败 | {contract} | HTTP {resp.status_code}: {resp.text[:150]}"
-                )
+                msg = f"Gate 杠杆设置失败 | {contract} | HTTP {resp.status_code}: {resp.text[:150]}"
+                logger.warning(msg)
+                return False, msg
         except Exception as e:
-            logger.warning(f"Gate 杠杆设置异常 | {contract} | {e}")
+            msg = f"Gate 杠杆设置异常 | {contract} | {e}"
+            logger.warning(msg)
+            return False, msg
+
+    def _gate_existing_position(self, contract: str) -> Optional[Dict]:
+        """返回指定合约的 Gate 实仓；拉取失败返回 None，无持仓返回空 dict。"""
+        try:
+            for pos in self.fetch_gate_futures_positions():
+                if str(pos.get('contract') or '').upper() == str(contract or '').upper():
+                    return pos
+            return {}
+        except Exception as e:
+            logger.warning(f"Gate 持仓检查失败 | {contract} | {e}")
+            return None
+
+    @staticmethod
+    def _float_or_none(value) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _place_gate_futures_order(self, order: Dict) -> Dict:
         """
@@ -1216,8 +1282,10 @@ class RealExecutor:
         contract = order.get('future_contract') or f"{base_asset}_USDT"
         target_qty = float(order.get('target_qty', 0))
 
-        # 首次下单前确保逐仓 + 杠杆设置
-        self._ensure_leverage(contract)
+        # 开仓前确保逐仓 + 杠杆设置；平仓/reduce-only 不修改已有仓位杠杆。
+        leverage_ok, leverage_reason = self._ensure_open_leverage(order)
+        if not leverage_ok:
+            return {'success': False, 'reason': leverage_reason}
 
         # 计算期货张数（空头为负数）
         quanto_multiplier = self._get_quanto_multiplier(base_asset)

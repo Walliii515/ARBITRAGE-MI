@@ -339,6 +339,65 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertIn('IOC未成交', parsed['reason'])
         self.assertNotIn('成交数据异常', parsed['reason'])
 
+    def test_gate_open_sets_leverage_when_contract_has_no_position(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(gate_base_url='https://gate.test'), leverage=10)
+        executor.fetch_gate_futures_positions = MagicMock(return_value=[])
+        executor._gate_sign = MagicMock(return_value={})
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = '{}'
+        executor._session = MagicMock()
+        executor._session.post.return_value = resp
+
+        ok, reason = executor._ensure_leverage('AI_USDT')
+
+        self.assertTrue(ok, reason)
+        called_url = executor._session.post.call_args.args[0]
+        self.assertIn('/positions/AI_USDT/leverage', called_url)
+        self.assertIn('leverage=10', called_url)
+
+    def test_gate_open_skips_leverage_change_when_existing_position_matches(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(gate_base_url='https://gate.test'), leverage=10)
+        executor.fetch_gate_futures_positions = MagicMock(return_value=[
+            {'contract': 'AI_USDT', 'size': -10, 'leverage': '10'},
+        ])
+        executor._session = MagicMock()
+
+        ok, reason = executor._ensure_leverage('AI_USDT')
+
+        self.assertTrue(ok, reason)
+        executor._session.post.assert_not_called()
+
+    def test_forward_execute_rejects_before_spot_when_existing_leverage_differs(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(gate_base_url='https://gate.test'), leverage=10)
+        executor.fetch_gate_futures_positions = MagicMock(return_value=[
+            {'contract': 'AI_USDT', 'size': -10, 'leverage': '5'},
+        ])
+        executor._place_binance_spot_order = MagicMock()
+        executor._place_gate_futures_order = MagicMock()
+
+        result = executor.execute({
+            'spot_order': {'base_asset': 'AI', 'trade_direction': 'buy'},
+            'future_order': {
+                'base_asset': 'AI',
+                'future_contract': 'AI_USDT',
+                'order_side': 'open',
+                'trade_direction': 'sell',
+                'target_qty': 10,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIn('Gate已有仓位，禁止修改杠杆', result['message'])
+        executor._place_binance_spot_order.assert_not_called()
+        executor._place_gate_futures_order.assert_not_called()
+
     def test_binance_spot_protective_ioc_uses_limit_ioc_params(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 

@@ -99,7 +99,10 @@ def _load_meta_and_init():
 
     if _executor is None:
         _exchange_config = _build_exchange_config('forward')
-        leverage = config.get_int('margin.leverage', 2)
+        leverage = config.get_int(
+            'margin.forward_open_leverage',
+            config.get_int('margin.leverage', 2),
+        )
         _executor = RealExecutor(_exchange_config, _contract_meta, spot_meta=_spot_meta, leverage=leverage)
     else:
         _executor.reload_meta(_contract_meta, _spot_meta)
