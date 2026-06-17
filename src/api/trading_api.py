@@ -348,7 +348,8 @@ async def get_orders(
             "p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal' "
             f"OR UPPER(TRIM(p.base_asset)) IN ({risk_placeholders})"
         )
-        summary_params = list(base_params) + delist_risk_assets
+        # SELECT 中的 risk_expr 占位符会先于 WHERE 被绑定。
+        summary_params = list(delist_risk_assets) + list(base_params)
     else:
         summary_risk_expr = "p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal'"
         summary_params = list(base_params)
