@@ -6,13 +6,12 @@
 
 平仓触发条件（按优先级）：
   0. 保证金爆仓风控（保证金/维持保证金 < 阈值）
-  1. 当前负24h资金费率临近结算/极端恶化，或历史实际负资金费成本超阈值
-  2. 资金费次数 >= max_funding_payments
-  3. 固定净收益止盈（下单前有最终风控旁路复核）
+  1. 当前负24h资金费率临近结算且下一期仍明显为负
+  2. 动态净收益止盈（含老仓退出；下单前有最终风控旁路复核）
 """
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set
 
 from common.database import db_manager
@@ -87,10 +86,13 @@ class ClosingExecutor:
             'trade.close.negative_funding_exit_current_24h_bps', 21.0
         )
         self.negative_funding_exit_current_window_min = config.get_float(
-            'trade.close.negative_funding_exit_current_window_min', 30.0
+            'trade.close.negative_funding_exit_current_window_min', 5.0
         )
         self.negative_funding_exit_extreme_24h_bps = config.get_float(
             'trade.close.negative_funding_exit_extreme_24h_bps', 45.0
+        )
+        self.negative_funding_exit_next_bps = config.get_float(
+            'trade.close.negative_funding_exit_next_bps', 7.0
         )
         self.negative_funding_exit_paid_bps = config.get_float(
             'trade.close.negative_funding_exit_paid_bps', 7.0
@@ -149,13 +151,22 @@ class ClosingExecutor:
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
         self._margin_topup_attempt_cooldown: Dict[int, datetime] = {}
         self._margin_topup_contract_cooldown: Dict[str, datetime] = {}
-        self.take_profit_batch_guard_enabled = config.get_bool(
-            'trade.close.take_profit_batch_guard.enabled', True
+        self.close_quality_guard_enabled = config.get_bool(
+            'trade.close.close_quality_guard.enabled',
+            config.get_bool('trade.close.take_profit_batch_guard.enabled', True),
         )
-        self.take_profit_batch_guard_max_close_basis_slip_bps = max(
-            config.get_float('trade.close.take_profit_batch_guard.max_close_basis_slip_bps', 8.0),
+        self.close_quality_guard_max_close_basis_slip_bps = max(
+            config.get_float(
+                'trade.close.close_quality_guard.max_close_basis_slip_bps',
+                config.get_float('trade.close.take_profit_batch_guard.max_close_basis_slip_bps', 8.0),
+            ),
             0.0,
         )
+        self.close_quality_guard_cooldown_sec = max(
+            config.get_int('trade.close.close_quality_guard.cooldown_sec', 60),
+            0,
+        )
+        self._close_quality_guard_cooldown: Dict[tuple, datetime] = {}
 
         # 保证金风控配置
         self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
@@ -235,23 +246,28 @@ class ClosingExecutor:
                 cfg.get('low_confidence_min_take_profit_bps', 110.0)
             ),
             medium_confidence_min_take_profit_bps=float(
-                cfg.get('medium_confidence_min_take_profit_bps', 60.0)
+                cfg.get('medium_confidence_min_take_profit_bps', 80.0)
             ),
             aging_enabled=bool(cfg.get('aging_enabled', True)),
-            aging_start_days=float(cfg.get('aging_start_days', 5.0)),
+            aging_start_days=float(cfg.get('aging_start_days', 6.0)),
+            aging_start_funding_count=int(cfg.get('aging_start_funding_count', 32)),
             aging_max_threshold_bps=float(cfg.get('aging_max_threshold_bps', 100.0)),
-            aging_min_net_profit_bps=float(cfg.get('aging_min_net_profit_bps', 30.0)),
-            aging_hard_days=float(cfg.get('aging_hard_days', 8.0)),
+            aging_min_net_profit_bps=float(cfg.get('aging_min_net_profit_bps', 80.0)),
+            aging_hard_days=float(cfg.get('aging_hard_days', 10.0)),
+            aging_hard_funding_count=int(cfg.get('aging_hard_funding_count', 50)),
             aging_hard_max_threshold_bps=float(
-                cfg.get('aging_hard_max_threshold_bps', 60.0)
+                cfg.get('aging_hard_max_threshold_bps', 80.0)
             ),
             aging_hard_min_net_profit_bps=float(
-                cfg.get('aging_hard_min_net_profit_bps', 20.0)
+                cfg.get('aging_hard_min_net_profit_bps', 80.0)
+            ),
+            aging_hold_funding_bps=float(
+                cfg.get('aging_hold_funding_bps', 20.0)
             ),
             tiers=[
                 {
                     'hold_value_min_bps': float(row.get('hold_value_min_bps', 0.0)),
-                    'take_profit_bps': float(row.get('take_profit_bps', 45.0)),
+                    'take_profit_bps': float(row.get('take_profit_bps', 80.0)),
                 }
                 for row in raw_tiers
                 if isinstance(row, dict)
@@ -295,7 +311,6 @@ class ClosingExecutor:
         """
         results = []
         topup_contracts_this_run: Set[str] = set()
-        take_profit_quality_blocked_assets: Set[str] = set()
         self._active_close_vwap_threshold_meta = close_vwap_threshold_meta or {}
 
         for pos in positions:
@@ -346,15 +361,6 @@ class ClosingExecutor:
                 close_reason = 'negative_funding_exit'
                 close_reason_detail = self._build_negative_funding_exit_detail(pos)
                 self._clear_position_close_state(ba, pos)
-            elif self._check_funding_count(pos):
-                close_reason = 'funding_count'
-                count = int(pos.get('funding_payments_count') or 0)
-                close_reason_detail = (
-                    f"资金费次数|{count}次/{self.max_funding_payments}次"
-                    f"(~{count // 3}天)"
-                )
-                # 强制平仓，清除谷底状态
-                self._clear_position_close_state(ba, pos)
             elif self._check_take_profit(
                 pos,
                 current_spread_bps,
@@ -382,12 +388,12 @@ class ClosingExecutor:
             if not close_reason:
                 continue
             ba_key = str(ba or '').upper()
-            if close_reason == 'take_profit' and ba_key in take_profit_quality_blocked_assets:
-                logger.info(f"止盈批量保护跳过 | {ba} | 等待下一轮重新观察成交质量")
+            if self._is_close_quality_guard_blocked(ba_key, close_reason):
+                logger.info(f"平仓质量保护跳过 | {ba} | reason={close_reason} | 等待冷却后重新观察")
                 continue
 
             # ── 最终风控旁路：止盈复核盈利性；风险平仓复核新鲜度/同步/深度 ──
-            guarded_reasons = {'take_profit', 'negative_funding_exit', 'funding_count'}
+            guarded_reasons = {'take_profit', 'negative_funding_exit'}
             if close_reason in guarded_reasons:
                 contract = pos.get('future_contract', '')
                 symbol = pos.get('spot_symbol') or f"{ba}USDT"
@@ -457,10 +463,10 @@ class ClosingExecutor:
                         f"spread_bps={current_spread_bps:.2f}"
                     )
                     if close_reason == 'take_profit':
-                        self._update_take_profit_batch_guard(
+                        self._update_close_quality_guard(
                             ba_key,
+                            close_reason,
                             result,
-                            take_profit_quality_blocked_assets,
                         )
                 else:
                     # 平仓失败，进入冷却期
@@ -478,29 +484,52 @@ class ClosingExecutor:
 
         return results
 
-    def _update_take_profit_batch_guard(
+    def _close_quality_guard_key(self, base_asset: str, close_reason: str) -> tuple:
+        return (str(base_asset or '').upper(), str(close_reason or '').strip())
+
+    def _is_close_quality_guard_blocked(self, base_asset: str, close_reason: str) -> bool:
+        if close_reason != 'take_profit':
+            return False
+        if not self.close_quality_guard_enabled:
+            return False
+        key = self._close_quality_guard_key(base_asset, close_reason)
+        cooldown_until = self._close_quality_guard_cooldown.get(key)
+        if cooldown_until is None:
+            return False
+        if datetime.now() >= cooldown_until:
+            self._close_quality_guard_cooldown.pop(key, None)
+            return False
+        return True
+
+    def _update_close_quality_guard(
         self,
         base_asset: str,
+        close_reason: str,
         result: Dict,
-        blocked_assets: Set[str],
     ) -> None:
-        if not self.take_profit_batch_guard_enabled:
+        if not self.close_quality_guard_enabled:
+            return
+        if close_reason != 'take_profit':
             return
         slip_bps = result.get('close_basis_slip_bps')
         if slip_bps is None:
             return
         slip_bps = float(slip_bps)
-        threshold = self.take_profit_batch_guard_max_close_basis_slip_bps
+        threshold = self.close_quality_guard_max_close_basis_slip_bps
         if slip_bps > threshold:
-            blocked_assets.add(base_asset)
+            key = self._close_quality_guard_key(base_asset, close_reason)
+            if self.close_quality_guard_cooldown_sec > 0:
+                self._close_quality_guard_cooldown[key] = (
+                    datetime.now() + timedelta(seconds=self.close_quality_guard_cooldown_sec)
+                )
             logger.warning(
-                f"止盈批量保护触发 | {base_asset} | "
+                f"平仓质量保护触发 | {base_asset} | reason={close_reason} | "
                 f"close_basis_slip={slip_bps:.1f}bps>{threshold:.1f}bps | "
-                f"本轮暂停同标的后续止盈"
+                f"暂停同标的后续平仓{self.close_quality_guard_cooldown_sec}s"
             )
             return
         logger.info(
-            f"止盈批量保护通过 | {base_asset} | "
+            f"平仓质量保护通过 | {base_asset} | reason={close_reason} | "
             f"close_basis_slip={slip_bps:.1f}bps<={threshold:.1f}bps"
         )
 
@@ -647,22 +676,42 @@ class ClosingExecutor:
         return max(0.0, float(pos.get('funding_rate_sum_bps') or 0.0))
 
     def _check_negative_funding_exit(self, pos: Dict) -> bool:
-        """负 funding 风险触发：已付成本立即；当前负费率临近结算或极端恶化才触发。"""
+        """负 funding 强制退出：临近结算且下一期仍明显为负才触发。"""
+        return self._negative_funding_state(pos) == 'force_exit'
+
+    def _negative_funding_state(self, pos: Dict) -> str:
+        """返回负 funding 状态：none / watch / force_exit。"""
         if not self.negative_funding_exit_enabled:
-            return False
+            return 'none'
         current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
         current_window_min = abs(float(self.negative_funding_exit_current_window_min or 0.0))
         extreme_threshold = abs(float(self.negative_funding_exit_extreme_24h_bps or 0.0))
+        next_threshold = abs(float(self.negative_funding_exit_next_bps or 0.0))
         paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         current_neg = self._negative_current_24h_bps(pos)
         paid_neg = self._negative_paid_bps(pos)
-        if paid_threshold > 0 and paid_neg >= paid_threshold:
-            return True
-        if extreme_threshold > 0 and current_neg >= extreme_threshold:
-            return True
         next_min = self._time_to_next_funding_min(pos)
+        next_bps = self._next_funding_bps(pos)
         near_next_funding = next_min is not None and 0 <= next_min <= current_window_min
-        return current_threshold > 0 and current_neg >= current_threshold and near_next_funding
+        next_still_negative = (
+            next_bps is not None
+            and (next_threshold <= 0 or next_bps <= -next_threshold)
+        )
+        if (
+            current_threshold > 0
+            and current_neg >= current_threshold
+            and near_next_funding
+            and next_still_negative
+        ):
+            return 'force_exit'
+
+        if paid_threshold > 0 and paid_neg >= paid_threshold:
+            return 'watch'
+        if extreme_threshold > 0 and current_neg >= extreme_threshold:
+            return 'watch'
+        if current_threshold > 0 and current_neg >= current_threshold:
+            return 'watch'
+        return 'none'
 
     def _check_margin_liquidation(self, pos: Dict) -> bool:
         """
@@ -1064,9 +1113,8 @@ class ClosingExecutor:
             })
 
     def _check_funding_count(self, pos: Dict) -> bool:
-        """检查资金费次数是否达到上限"""
-        count = int(pos.get('funding_payments_count') or 0)
-        return count >= self.max_funding_payments
+        """兼容旧测试/外部调用：资金费次数不再作为强制平仓条件。"""
+        return False
 
     def _check_take_profit(
         self,
@@ -1454,6 +1502,9 @@ class ClosingExecutor:
                 f"(p40={funding_rate_bps:.1f}×{self.take_profit_multiplier:.0f}+{fee_cost_bps:.0f}费)"
             )
 
+        if self._negative_funding_state(pos) == 'watch':
+            detail += f"|负费监控({self._negative_funding_context(pos)})"
+
         # 附加谷底反弹信息
         valley_state = self._valley_state.get(self._valley_key(ba, pos))
         if valley_state:
@@ -1481,22 +1532,38 @@ class ClosingExecutor:
 
     def _build_negative_funding_exit_detail(self, pos: Dict) -> str:
         """构建负资金费风险平仓原因。"""
+        state = self._negative_funding_state(pos)
         current_neg = self._negative_current_24h_bps(pos)
         paid_neg = self._negative_paid_bps(pos)
         current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
         current_window_min = abs(float(self.negative_funding_exit_current_window_min or 0.0))
         extreme_threshold = abs(float(self.negative_funding_exit_extreme_24h_bps or 0.0))
+        next_threshold = abs(float(self.negative_funding_exit_next_bps or 0.0))
         paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         next_bps = self._next_funding_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
         next_text = 'NA' if next_bps is None else f'{next_bps:+.1f}bps'
         next_min_text = 'NA' if next_min is None else f'{next_min:.1f}min'
         return (
-            f"负资金费风险|当前24h负费{current_neg:.1f}bps"
+            f"负资金费风险|state={state}|当前24h负费{current_neg:.1f}bps"
             f"|已付负费{paid_neg:.1f}bps"
             f"|阈值(当前{current_threshold:.1f}@{current_window_min:.0f}min,"
-            f"极端{extreme_threshold:.1f},已付{paid_threshold:.1f})"
+            f"next≤-{next_threshold:.1f},极端监控{extreme_threshold:.1f},"
+            f"已付监控{paid_threshold:.1f})"
             f"|next={next_text}|距结算{next_min_text}"
+        )
+
+    def _negative_funding_context(self, pos: Dict) -> str:
+        current_neg = self._negative_current_24h_bps(pos)
+        paid_neg = self._negative_paid_bps(pos)
+        next_bps = self._next_funding_bps(pos)
+        next_min = self._time_to_next_funding_min(pos)
+        next_text = 'NA' if next_bps is None else f'{next_bps:+.1f}bps'
+        next_min_text = 'NA' if next_min is None else f'{next_min:.0f}min'
+        return (
+            f"当前24h负费{current_neg:.1f}bps,"
+            f"已付负费{paid_neg:.1f}bps,"
+            f"next={next_text},距结算{next_min_text}"
         )
 
     def _append_lag_detail(self, base_asset: str, detail: str) -> str:

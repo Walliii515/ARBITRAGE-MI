@@ -27,21 +27,24 @@ class DynamicTakeProfitConfig:
     basis_discount_thin_bursty: float = 0.25
     basis_score_cap_bps: float = 30.0
     low_confidence_min_take_profit_bps: float = 110.0
-    medium_confidence_min_take_profit_bps: float = 60.0
+    medium_confidence_min_take_profit_bps: float = 80.0
     aging_enabled: bool = True
-    aging_start_days: float = 5.0
+    aging_start_days: float = 6.0
+    aging_start_funding_count: int = 32
     aging_max_threshold_bps: float = 100.0
-    aging_min_net_profit_bps: float = 30.0
-    aging_hard_days: float = 8.0
-    aging_hard_max_threshold_bps: float = 60.0
-    aging_hard_min_net_profit_bps: float = 20.0
+    aging_min_net_profit_bps: float = 80.0
+    aging_hard_days: float = 10.0
+    aging_hard_funding_count: int = 50
+    aging_hard_max_threshold_bps: float = 80.0
+    aging_hard_min_net_profit_bps: float = 80.0
+    aging_hold_funding_bps: float = 20.0
     tiers: List[Dict[str, float]] = field(default_factory=lambda: [
         {'hold_value_min_bps': 60.0, 'take_profit_bps': 200.0},
         {'hold_value_min_bps': 40.0, 'take_profit_bps': 150.0},
         {'hold_value_min_bps': 25.0, 'take_profit_bps': 110.0},
         {'hold_value_min_bps': 15.0, 'take_profit_bps': 80.0},
         {'hold_value_min_bps': 5.0, 'take_profit_bps': 80.0},
-        {'hold_value_min_bps': 0.0, 'take_profit_bps': 45.0},
+        {'hold_value_min_bps': 0.0, 'take_profit_bps': 80.0},
     ])
 
 
@@ -69,10 +72,14 @@ class DynamicTakeProfitEvaluation:
     funding_earned_bps: float
     fee_full_bps: float
     age_days: Optional[float]
+    funding_count: int
     pre_aging_threshold_bps: float
     aging_stage: Optional[str]
+    aging_trigger: Optional[str]
     aging_cap_bps: Optional[float]
     aging_min_profit_bps: Optional[float]
+    aging_blocked_by_funding: bool
+    aging_hold_funding_bps: Optional[float]
 
     @property
     def passed(self) -> bool:
@@ -116,29 +123,46 @@ def evaluate_dynamic_take_profit(
     threshold = min(float(fixed_take_profit_bps), dynamic_threshold)
     pre_aging_threshold = threshold
     age_days = _position_age_days(position)
+    funding_count = _funding_count(position)
     aging_stage = None
+    aging_trigger = None
     aging_cap = None
     aging_min_profit = None
+    aging_blocked_by_funding = False
+    aging_hold_funding = None
 
-    if cfg.enabled and cfg.aging_enabled and age_days is not None:
-        if age_days >= max(float(cfg.aging_hard_days or 0.0), 0.0):
-            aging_stage = 'hard'
-            aging_cap = float(cfg.aging_hard_max_threshold_bps)
-            aging_min_profit = float(cfg.aging_hard_min_net_profit_bps)
-        elif age_days >= max(float(cfg.aging_start_days or 0.0), 0.0):
-            aging_stage = 'aging'
-            aging_cap = float(cfg.aging_max_threshold_bps)
-            aging_min_profit = float(cfg.aging_min_net_profit_bps)
+    if cfg.enabled and cfg.aging_enabled:
+        aging_stage, aging_trigger = _aging_stage(position, age_days, funding_count, cfg)
 
         if aging_stage:
-            threshold = max(min(threshold, aging_cap), max(0.0, aging_min_profit))
+            funding_strength = max(
+                float(funding['potential_bps'] or 0.0),
+                float(funding['current_24h_bps'] or 0.0),
+            )
+            hold_threshold = max(float(cfg.aging_hold_funding_bps or 0.0), 0.0)
+            if hold_threshold > 0 and funding_strength >= hold_threshold:
+                aging_blocked_by_funding = True
+                aging_hold_funding = hold_threshold
+                aging_stage = None
+                aging_trigger = None
+            else:
+                if aging_stage == 'hard':
+                    aging_cap = float(cfg.aging_hard_max_threshold_bps)
+                    aging_min_profit = float(cfg.aging_hard_min_net_profit_bps)
+                else:
+                    aging_cap = float(cfg.aging_max_threshold_bps)
+                    aging_min_profit = float(cfg.aging_min_net_profit_bps)
+                threshold = max(min(threshold, aging_cap), max(0.0, aging_min_profit))
 
     if not cfg.enabled:
         threshold = float(fixed_take_profit_bps)
         pre_aging_threshold = threshold
         aging_stage = None
+        aging_trigger = None
         aging_cap = None
         aging_min_profit = None
+        aging_blocked_by_funding = False
+        aging_hold_funding = None
 
     return DynamicTakeProfitEvaluation(
         enabled=bool(cfg.enabled),
@@ -163,10 +187,14 @@ def evaluate_dynamic_take_profit(
         funding_earned_bps=funding_earned,
         fee_full_bps=float(fee_full_bps or 0.0),
         age_days=age_days,
+        funding_count=funding_count,
         pre_aging_threshold_bps=pre_aging_threshold,
         aging_stage=aging_stage,
+        aging_trigger=aging_trigger,
         aging_cap_bps=aging_cap,
         aging_min_profit_bps=aging_min_profit,
+        aging_blocked_by_funding=aging_blocked_by_funding,
+        aging_hold_funding_bps=aging_hold_funding,
     )
 
 
@@ -178,10 +206,17 @@ def format_dynamic_take_profit(eval_: DynamicTakeProfitEvaluation) -> str:
 
     aging = ''
     if eval_.aging_stage:
+        age_text = 'NA' if eval_.age_days is None else f'{eval_.age_days:.1f}d'
         aging = (
-            f"|aging({eval_.aging_stage},age={eval_.age_days:.1f}d,"
+            f"|aging({eval_.aging_stage},trigger={eval_.aging_trigger},"
+            f"age={age_text},count={eval_.funding_count},"
             f"raw={eval_.pre_aging_threshold_bps:.1f},"
             f"cap={eval_.aging_cap_bps:.1f},min={eval_.aging_min_profit_bps:.1f})"
+        )
+    elif eval_.aging_blocked_by_funding:
+        aging = (
+            f"|aging_hold(funding={max(eval_.funding_potential_bps, eval_.funding_current_24h_bps):.1f}"
+            f">={eval_.aging_hold_funding_bps:.1f},count={eval_.funding_count})"
         )
 
     return (
@@ -310,8 +345,39 @@ def _threshold_from_hold_value(hold_value_bps: float, cfg: DynamicTakeProfitConf
     )
     for row in tiers:
         if hold_value_bps >= float(row.get('hold_value_min_bps', 0.0)):
-            return float(row.get('take_profit_bps', 45.0))
-    return 45.0
+            return float(row.get('take_profit_bps', 80.0))
+    return 80.0
+
+
+def _funding_count(position: Dict) -> int:
+    try:
+        return max(0, int(position.get('funding_payments_count') or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _aging_stage(
+    position: Dict,
+    age_days: Optional[float],
+    funding_count: int,
+    cfg: DynamicTakeProfitConfig,
+) -> tuple:
+    hard_reasons = []
+    if age_days is not None and age_days >= max(float(cfg.aging_hard_days or 0.0), 0.0):
+        hard_reasons.append('age')
+    if int(cfg.aging_hard_funding_count or 0) > 0 and funding_count >= int(cfg.aging_hard_funding_count):
+        hard_reasons.append('funding_count')
+    if hard_reasons:
+        return 'hard', '+'.join(hard_reasons)
+
+    aging_reasons = []
+    if age_days is not None and age_days >= max(float(cfg.aging_start_days or 0.0), 0.0):
+        aging_reasons.append('age')
+    if int(cfg.aging_start_funding_count or 0) > 0 and funding_count >= int(cfg.aging_start_funding_count):
+        aging_reasons.append('funding_count')
+    if aging_reasons:
+        return 'aging', '+'.join(aging_reasons)
+    return None, None
 
 
 def _position_age_days(position: Dict) -> Optional[float]:

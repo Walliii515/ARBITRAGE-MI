@@ -228,39 +228,43 @@ trade:
       basis_discount_thin_bursty: 0.25      # thin_bursty 剩余基差潜力折扣
       basis_score_cap_bps: 30               # 基差潜力最多给止盈阈值贡献30bps，防止极端p20抬得过高
       low_confidence_min_take_profit_bps: 110 # 低置信不把止盈阈值降得过低
-      medium_confidence_min_take_profit_bps: 60
+      medium_confidence_min_take_profit_bps: 80
       aging_enabled: true                   # 持仓老化后降低止盈阈值上限，但仍要求净收益为正
-      aging_start_days: 5                   # 持仓>=5天进入老化止盈
+      aging_start_days: 6                   # 持仓>=6天进入普通老仓止盈
+      aging_start_funding_count: 32         # 或资金费结算>=32次进入普通老仓止盈
       aging_max_threshold_bps: 100          # 老化后动态止盈阈值最高100bps
-      aging_min_net_profit_bps: 30          # 老化后至少净赚30bps才允许退出
-      aging_hard_days: 8                    # 持仓>=8天进入更积极释放仓位
-      aging_hard_max_threshold_bps: 60      # 深度老化后动态止盈阈值最高60bps
-      aging_hard_min_net_profit_bps: 20     # 深度老化后至少净赚20bps才允许退出
+      aging_min_net_profit_bps: 80          # 普通老仓至少净赚80bps才允许退出
+      aging_hard_days: 10                   # 持仓>=10天进入深度老仓止盈
+      aging_hard_funding_count: 50          # 或资金费结算>=50次进入深度老仓止盈
+      aging_hard_max_threshold_bps: 80      # 深度老仓动态止盈阈值最高80bps
+      aging_hard_min_net_profit_bps: 80     # 深度老仓也不低于80bps，避免过早释放好仓
+      aging_hold_funding_bps: 20            # 当前/潜在24h funding仍>=20bps时，不因老仓降低止盈阈值
       tiers:
         - { hold_value_min_bps: 60, take_profit_bps: 200 }
         - { hold_value_min_bps: 40, take_profit_bps: 150 }
         - { hold_value_min_bps: 25, take_profit_bps: 110 }
         - { hold_value_min_bps: 15, take_profit_bps: 80 }
         - { hold_value_min_bps: 5, take_profit_bps: 80 }
-        - { hold_value_min_bps: 0, take_profit_bps: 45 }
-    take_profit_batch_guard:
-      enabled: true                         # 同标的多笔止盈时，先用首笔成交质量决定本轮是否继续批量平
-      max_close_basis_slip_bps: 8           # actual close basis - pre_gate basis 超过该值则暂停本轮同标的后续止盈
+        - { hold_value_min_bps: 0, take_profit_bps: 80 }
+    close_quality_guard:
+      enabled: true                         # 同标的多笔平仓时，先用首笔成交质量决定是否继续批量平
+      max_close_basis_slip_bps: 8           # actual close basis - pre_gate basis 超过该值则暂停同标的后续自动平仓
+      cooldown_sec: 60                      # 成交质量差时，同标的同原因暂停自动平仓秒数
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
     positive_funding_hold_window_min: 30    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
-    negative_funding_exit_enabled: true     # 当前负24h费率临近结算/极端恶化，或历史实际负资金费成本过高时风险平仓
+    negative_funding_exit_enabled: true     # 当前负24h费率临近结算且下一期仍明显为负时风险平仓
     negative_funding_exit_current_24h_bps: 21 # 当前24h负资金费率达到该阈值且临近结算才进入平仓
-    negative_funding_exit_current_window_min: 30 # 距下一次资金费结算多少分钟内才触发当前负费率平仓
-    negative_funding_exit_extreme_24h_bps: 45 # 当前24h负资金费率达到极端阈值时立即平仓
-    negative_funding_exit_paid_bps: 7       # 历史实际已支付负资金费累计达到该阈值即进入平仓
+    negative_funding_exit_current_window_min: 5 # 距下一次资金费结算5分钟内才允许强制负费平仓
+    negative_funding_exit_next_bps: 7       # 下一期预计资金费 <= -7bps 才强制退出
+    negative_funding_exit_extreme_24h_bps: 45 # 当前24h负资金费率达到极端阈值时进入监控，不再立即平仓
+    negative_funding_exit_paid_bps: 7       # 历史实际已支付负资金费累计达到该阈值进入监控
     protective_ioc_enabled: true            # 平仓Gate期货腿使用 reduce_only 保护限价 IOC
     protective_ioc_take_profit_slippage_bps: 5 # 止盈平仓期货买回保护价允许高于旁路VWAP的bps
     protective_ioc_risk_slippage_bps: 12    # 风险平仓期货买回保护价允许高于旁路VWAP的bps
     take_profit_days_multiplier: 10         # legacy_p40模式止盈倍数
     # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
-    max_funding_payments: 30                # 最大资金费支付次数，超过强制平仓
-    # max_funding_payments: 2                # 最大资金费支付次数，超过强制平仓
+    max_funding_payments: 30                # 已废弃：资金费次数不再强制平仓，改由 dynamic_take_profit aging_*_funding_count 接管
     max_orderbook_lag_ms: 500               # 旁路风控新鲜度硬约束：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 谷底反弹策略（平仓确认） ───

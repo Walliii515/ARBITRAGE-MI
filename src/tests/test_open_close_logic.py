@@ -2265,8 +2265,12 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
             patch.object(self.ce, '_execute_close', execute_mock),
         ):
             results = self.ce.check_and_close(positions, {}, {'BTC': {'old': 'row'}})
+            results_again = self.ce.check_and_close(positions, {}, {'BTC': {'old': 'row'}})
 
         self.assertEqual(len(results), 1)
+        execute_mock.assert_called_once()
+        gate_mock.assert_called_once()
+        self.assertEqual(results_again, [])
         execute_mock.assert_called_once()
         gate_mock.assert_called_once()
 
@@ -2373,14 +2377,14 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.pos.update({
             'open_spread_bps': 60.0,
             'current_spread_bps': 60.0,
-            'funding_rate_24h': -0.0021,  # 24h -21bps
+            'funding_rate_24h': -0.0024,  # 24h -24bps, next约-8bps
             'funding_next_apply': (
-                datetime.now() + timedelta(minutes=20)
+                datetime.now() + timedelta(minutes=4)
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
         self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
 
-    def test_negative_funding_exit_triggers_immediately_on_extreme_current_24h_rate(self):
+    def test_negative_funding_exit_watches_extreme_current_24h_rate_far_from_settlement(self):
         self.pos.update({
             'open_spread_bps': 60.0,
             'current_spread_bps': 60.0,
@@ -2389,14 +2393,16 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
                 datetime.now() + timedelta(minutes=180)
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
-        self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
+        self.assertFalse(self.ce._check_negative_funding_exit(self.pos))
+        self.assertEqual(self.ce._negative_funding_state(self.pos), 'watch')
 
-    def test_negative_funding_exit_triggers_on_paid_funding_cost(self):
+    def test_negative_funding_exit_watches_paid_funding_cost(self):
         self.pos.update({
             'funding_rate_24h': 0.001,
             'funding_rate_sum_bps': 7.0,
         })
-        self.assertTrue(self.ce._check_negative_funding_exit(self.pos))
+        self.assertFalse(self.ce._check_negative_funding_exit(self.pos))
+        self.assertEqual(self.ce._negative_funding_state(self.pos), 'watch')
 
     def test_negative_funding_exit_ignores_positive_and_small_negative(self):
         self.pos.update({
@@ -2468,13 +2474,92 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             {'close_basis_p20': 45.0},
         ))
 
-    def test_dynamic_take_profit_aging_caps_high_threshold_after_five_days(self):
+    def test_dynamic_take_profit_aging_caps_high_threshold_after_six_days(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'BANK',
+            'open_spread_bps': 270.0,
+            'funding_rate_24h': 0.0019,
+            'opened_at': datetime.now() - timedelta(days=6, minutes=10),
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([15, 16, 17, 18, 18, 19, 19])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            140.0,
+            {'close_basis_p20': 50.0},
+        )
+        self.assertEqual(eval_.pre_aging_threshold_bps, 150.0)
+        self.assertEqual(eval_.aging_stage, 'aging')
+        self.assertEqual(eval_.aging_trigger, 'age')
+        self.assertEqual(eval_.threshold_bps, 100.0)
+        self.assertTrue(self.ce._check_take_profit(
+            self.pos,
+            140.0,
+            {'close_basis_p20': 50.0},
+        ))
+
+    def test_dynamic_take_profit_hard_aging_caps_threshold_after_ten_days(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'BANK',
+            'open_spread_bps': 240.0,
+            'funding_rate_24h': 0.0019,
+            'opened_at': datetime.now() - timedelta(days=10, minutes=10),
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([15, 16, 17, 18, 18, 19, 19])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            140.0,
+            {'close_basis_p20': 50.0},
+        )
+        self.assertEqual(eval_.pre_aging_threshold_bps, 150.0)
+        self.assertEqual(eval_.aging_stage, 'hard')
+        self.assertEqual(eval_.aging_trigger, 'age')
+        self.assertEqual(eval_.threshold_bps, 80.0)
+        self.assertTrue(self.ce._check_take_profit(
+            self.pos,
+            140.0,
+            {'close_basis_p20': 50.0},
+        ))
+
+    def test_dynamic_take_profit_funding_count_enters_aging_without_age(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.pos.update({
+            'base_asset': 'BANK',
+            'open_spread_bps': 270.0,
+            'funding_rate_24h': 0.0019,
+            'funding_payments_count': 32,
+            'asset_funding_history': [
+                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
+                for i, v in enumerate([15, 16, 17, 18, 18, 19, 19])
+            ],
+            'market_profile': 'normal',
+        })
+        eval_ = self.ce._take_profit_eval(
+            self.pos,
+            140.0,
+            {'close_basis_p20': 50.0},
+        )
+        self.assertEqual(eval_.aging_stage, 'aging')
+        self.assertEqual(eval_.aging_trigger, 'funding_count')
+        self.assertEqual(eval_.threshold_bps, 100.0)
+
+    def test_dynamic_take_profit_good_funding_skips_aging_discount(self):
         self.ce.fixed_take_profit_bps = 200.0
         self.pos.update({
             'base_asset': 'BANK',
             'open_spread_bps': 240.0,
             'funding_rate_24h': 0.0080,
-            'opened_at': datetime.now() - timedelta(days=5, minutes=10),
+            'opened_at': datetime.now() - timedelta(days=10, minutes=10),
+            'funding_payments_count': 50,
             'asset_funding_history': [
                 {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
                 for i, v in enumerate([60, 65, 70, 75, 80, 85, 90])
@@ -2487,40 +2572,9 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             {'close_basis_p20': 50.0},
         )
         self.assertEqual(eval_.pre_aging_threshold_bps, 200.0)
-        self.assertEqual(eval_.aging_stage, 'aging')
-        self.assertEqual(eval_.threshold_bps, 100.0)
-        self.assertTrue(self.ce._check_take_profit(
-            self.pos,
-            100.0,
-            {'close_basis_p20': 50.0},
-        ))
-
-    def test_dynamic_take_profit_hard_aging_caps_threshold_after_eight_days(self):
-        self.ce.fixed_take_profit_bps = 200.0
-        self.pos.update({
-            'base_asset': 'BANK',
-            'open_spread_bps': 180.0,
-            'funding_rate_24h': 0.0060,
-            'opened_at': datetime.now() - timedelta(days=8, minutes=10),
-            'asset_funding_history': [
-                {'rate_24h': v / 10000, 'time': f'06-13 {i:02d}:00'}
-                for i, v in enumerate([40, 45, 50, 55, 60, 65, 70])
-            ],
-            'market_profile': 'normal',
-        })
-        eval_ = self.ce._take_profit_eval(
-            self.pos,
-            95.0,
-            {'close_basis_p20': 50.0},
-        )
-        self.assertEqual(eval_.pre_aging_threshold_bps, 200.0)
-        self.assertEqual(eval_.aging_stage, 'hard')
-        self.assertEqual(eval_.threshold_bps, 60.0)
-        self.assertTrue(self.ce._check_take_profit(
-            self.pos,
-            95.0,
-            {'close_basis_p20': 50.0},
-        ))
+        self.assertIsNone(eval_.aging_stage)
+        self.assertTrue(eval_.aging_blocked_by_funding)
+        self.assertEqual(eval_.threshold_bps, 200.0)
 
     def test_live_close_order_group_adds_future_maker_params(self):
         self.ce.executor_client.channel = 'Live'
