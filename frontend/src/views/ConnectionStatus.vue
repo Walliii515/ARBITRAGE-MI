@@ -280,21 +280,30 @@ const columnDefs: ColDef[] = [
   {
     headerName: '操作',
     field: '_action',
-    width: 100,
+    width: 170,
     pinned: 'right',
     sortable: false,
     cellRenderer: (params: ICellRendererParams) => {
       const data = params.data as ConnectionRow
+      const asset = String(data.base_asset || '').replace(/"/g, '&quot;')
+      const buttons: string[] = []
       if (!data.gate_receiving_data || !data.binance_receiving_data || !data.gate_ws_subscribed || !data.binance_ws_subscribed) {
-        return `<button class="retry-btn" data-asset="${data.base_asset}">重试</button>`
+        buttons.push(`<button class="retry-btn" data-asset="${asset}">重试</button>`)
       }
-      return ''
+      if (data.delist_risks && data.delist_risks.length > 0) {
+        buttons.push(`<button class="disable-btn" data-asset="${asset}">设失效</button>`)
+      }
+      return buttons.join('')
     },
     onCellClicked: (params: any) => {
       const target = params.event?.target as HTMLElement
       if (target?.classList?.contains('retry-btn')) {
         const asset = target.getAttribute('data-asset')
         if (asset) retryConnection(asset)
+      }
+      if (target?.classList?.contains('disable-btn')) {
+        const asset = target.getAttribute('data-asset')
+        if (asset) disableBaseAsset(asset)
       }
     },
   },
@@ -310,6 +319,7 @@ const defaultColDef: ColDef = {
 /* ───── 数据加载 ───── */
 const retrying = ref<Set<string>>(new Set())
 const retryingAll = ref(false)
+const disablingAssets = ref<Set<string>>(new Set())
 
 async function retryConnection(baseAsset: string) {
   if (retrying.value.has(baseAsset)) return
@@ -347,6 +357,41 @@ async function retryAllFailed() {
     // request.ts 已处理
   } finally {
     retryingAll.value = false
+  }
+}
+
+async function disableBaseAsset(baseAsset: string) {
+  if (disablingAssets.value.has(baseAsset)) return
+  try {
+    await ElMessageBox.confirm(
+      `确认将 ${baseAsset} 设为失效？之后它不会再进入常规订阅和监控候选；如仍有持仓，系统会保留必要持仓风险监控直到平仓。`,
+      '设为失效',
+      {
+        type: 'warning',
+        confirmButtonText: '确认',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+
+  disablingAssets.value.add(baseAsset)
+  try {
+    const res = await post(`/api/trading/base-assets/${encodeURIComponent(baseAsset)}/disable`, {
+      reason: 'connection_status_delist_risk',
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data?.success) {
+      showError(data?.detail || data?.message || '设为失效失败')
+      return
+    }
+    showSuccess(data.message || `${baseAsset} 已设为失效`)
+    await fetchData()
+  } catch (e: any) {
+    // request.ts 已处理
+  } finally {
+    disablingAssets.value.delete(baseAsset)
   }
 }
 
@@ -518,6 +563,7 @@ onUnmounted(() => {
   display: flex;
   gap: 12px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .status-badge {
@@ -596,8 +642,10 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-:deep(.retry-btn) {
+:deep(.retry-btn),
+:deep(.disable-btn) {
   padding: 2px 10px;
+  margin-right: 6px;
   border: 1px solid #e6a23c;
   border-radius: 4px;
   background: rgba(230, 162, 60, 0.12);
@@ -608,5 +656,13 @@ onUnmounted(() => {
 }
 :deep(.retry-btn:hover) {
   background: rgba(230, 162, 60, 0.25);
+}
+:deep(.disable-btn) {
+  border-color: #f56c6c;
+  background: rgba(245, 108, 108, 0.12);
+  color: #f56c6c;
+}
+:deep(.disable-btn:hover) {
+  background: rgba(245, 108, 108, 0.25);
 }
 </style>

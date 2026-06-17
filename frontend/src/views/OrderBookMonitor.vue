@@ -12,7 +12,7 @@ import type {
 import { ElDrawer } from 'element-plus'
 import { Search, Refresh } from '@element-plus/icons-vue'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
-import { showError, showSuccess, showWarning } from '../utils/message'
+import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import type { OrderBookRow } from './orderbookTypes'
 import { get, post } from '../utils/request'
@@ -357,8 +357,8 @@ function combinedFilterFunc(params: any): boolean {
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let statusInterval: ReturnType<typeof setInterval> | null = null
-/** 标记是否已初始化过，HMR 时复用连接 */
-let wsInitialized = false
+/** 前端快照订阅默认关闭，避免登录后订单簿页面持续压住 Chrome 主线程 */
+const frontendWsSubscribed = ref(false)
 /** 页面可见性：页面隐藏时跳过 WS 消息处理，降低 CPU 开销 */
 let pageVisible = true
 
@@ -1069,17 +1069,6 @@ async function fetchOrderbookSnapshot(forceFull = false) {
   }
 }
 
-const canStart = computed(
-  () => !serviceBusy.value && (serviceState.value === 'idle' || serviceState.value === 'error'),
-)
-const canStop = computed(
-  () =>
-    serviceState.value === 'running' ||
-    serviceState.value === 'starting' ||
-    serviceState.value === 'stopping' ||
-    serviceState.value === 'error',
-)
-
 function getWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = getToken()
@@ -1087,6 +1076,9 @@ function getWsUrl(): string {
 }
 
 function connectWs() {
+  if (!frontendWsSubscribed.value) {
+    return
+  }
   if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
     return
   }
@@ -1126,17 +1118,41 @@ function connectWs() {
   }
 
   socket.onclose = () => {
-    scheduleReconnect()
+    socket = null
+    if (frontendWsSubscribed.value) {
+      scheduleReconnect()
+    }
   }
 
   socket.onerror = () => {}
 }
 
 function scheduleReconnect() {
+  if (!frontendWsSubscribed.value) {
+    return
+  }
   if (reconnectTimer) clearTimeout(reconnectTimer)
   reconnectTimer = setTimeout(() => {
     connectWs()
   }, 3000)
+}
+
+function startFrontendSubscription() {
+  if (frontendWsSubscribed.value) return
+  frontendWsSubscribed.value = true
+  connectWs()
+}
+
+function stopFrontendSubscription() {
+  frontendWsSubscribed.value = false
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  socket?.close()
+  socket = null
+  clearGridData()
+  lastUpdate.value = '--'
 }
 
 function applyServiceStatus(data: ServiceStatus) {
@@ -1149,6 +1165,7 @@ function applyServiceStatus(data: ServiceStatus) {
   const contractCount = data.contracts?.length ?? 0
   const rowCount = rowData.value.length
   if (
+    frontendWsSubscribed.value &&
     (data.state === 'running' || data.state === 'starting') &&
     contractCount > 0 &&
     (prevState !== data.state || rowCount === 0 || rowCount < contractCount)
@@ -1167,46 +1184,6 @@ async function fetchServiceStatus() {
   } catch {
     gateWsConnected.value = false
     binanceWsConnected.value = false
-  }
-}
-
-async function startService() {
-  try {
-    serviceBusy.value = true
-    serviceState.value = 'starting'
-    clearGridData()
-    const res = await post('/api/service/start')
-    const body = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      serviceBusy.value = false
-      showError(typeof body.detail === 'string' ? body.detail : '启动失败')
-      return
-    }
-    showSuccess('正在启动订单簿 WS 服务…')
-    await fetchServiceStatus()
-  } catch {
-    serviceBusy.value = false
-    showError('启动请求失败')
-  }
-}
-
-async function stopService() {
-  try {
-    serviceBusy.value = true
-    serviceState.value = 'stopping'
-    const res = await post('/api/service/stop')
-    const body = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      serviceBusy.value = false
-      showError(typeof body.detail === 'string' ? body.detail : '终止失败')
-      return
-    }
-    showWarning('正在终止订单簿 WS 服务…')
-    clearGridData()
-    await fetchServiceStatus()
-  } catch {
-    serviceBusy.value = false
-    showError('终止请求失败')
   }
 }
 
@@ -1257,23 +1234,13 @@ watch(assetFilterKeyword, () => {
 })
 
 onMounted(() => {
-  // HMR 时复用已有的 WebSocket 连接，不重新创建
-  if (!wsInitialized || socket?.readyState === WebSocket.CLOSED) {
-    connectWs()
-    wsInitialized = true
-  }
-  
   // 点击外部关闭资产下拉框
   document.addEventListener('click', handleOutsideClick)
   
   // 页面可见性监听：隐藏时跳过快照消息处理，降低 CPU 开销
   document.addEventListener('visibilitychange', handleVisibilityChange)
   
-  fetchServiceStatus().then(() => {
-    if (serviceState.value === 'running' || serviceState.value === 'starting') {
-      fetchOrderbookSnapshot()
-    }
-  })
+  fetchServiceStatus()
   restartStatusPolling()
 })
 
@@ -1284,9 +1251,9 @@ function handleVisibilityChange() {
 onUnmounted(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (statusInterval) clearInterval(statusInterval)
+  frontendWsSubscribed.value = false
   socket?.close()
   socket = null
-  wsInitialized = false
   
   // 清理事件监听
   document.removeEventListener('click', handleOutsideClick)
@@ -1311,13 +1278,30 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
     <el-card shadow="never" class="status-card">
       <div class="status-row">
         <div class="status-actions">
-          <el-button type="primary" size="small" :disabled="!canStart" @click="startService">
-            启动 WS 服务
+          <el-button
+            v-if="!frontendWsSubscribed"
+            type="success"
+            size="small"
+            :disabled="serviceState !== 'running'"
+            @click="startFrontendSubscription"
+          >
+            订阅前端行情
           </el-button>
-          <el-button type="danger" size="small" :disabled="!canStop" @click="stopService">
-            终止 WS 服务
+          <el-button
+            v-else
+            type="warning"
+            size="small"
+            @click="stopFrontendSubscription"
+          >
+            停止前端行情
           </el-button>
         </div>
+        <span class="status-item">
+          前端订阅：
+          <el-tag :type="frontendWsSubscribed ? 'success' : 'info'" size="small">
+            {{ frontendWsSubscribed ? '已开启' : '已关闭' }}
+          </el-tag>
+        </span>
         <span class="status-item">
           Gate WS p50：
           <el-tag v-if="gateWsConnected" type="success" size="small">

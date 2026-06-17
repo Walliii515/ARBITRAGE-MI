@@ -98,6 +98,9 @@ interface PositionRow {
   exchange_risk_type: string | null
   exchange_risk_at: string | null
   exchange_risk_detail: string | null
+  delist_risks?: Array<Record<string, any>>
+  delist_risk_level?: string | null
+  delist_risk_summary?: string | null
 }
 
 interface WsPositionMessage {
@@ -156,6 +159,7 @@ const baseAssetFilter = ref<string>('')
 const filterDays = ref<number>(90) // 默认90天
 const wsStatus = ref<'connecting' | 'connected' | 'disconnected'>('disconnected')
 const wsLatencyMs = ref<number | null>(null)
+const frontendWsSubscribed = ref(false)
 const accountSummary = ref<AccountSummary | null>(null)
 const positionSummary = ref<PositionSummary>({ total: 0, holding: 0, closed: 0 })
 
@@ -192,6 +196,9 @@ function getWsUrl(): string {
 }
 
 function connectWs() {
+  if (!frontendWsSubscribed.value) {
+    return
+  }
   if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
     return
   }
@@ -244,7 +251,10 @@ function connectWs() {
     wsStatus.value = 'disconnected'
     wsLatencyMs.value = null
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
-    scheduleReconnect()
+    socket = null
+    if (frontendWsSubscribed.value) {
+      scheduleReconnect()
+    }
   }
 
   socket.onerror = () => {
@@ -254,10 +264,35 @@ function connectWs() {
 }
 
 function scheduleReconnect() {
+  if (!frontendWsSubscribed.value) {
+    return
+  }
   if (reconnectTimer) clearTimeout(reconnectTimer)
   reconnectTimer = setTimeout(() => {
     connectWs()
   }, 3000)
+}
+
+function startFrontendSubscription() {
+  if (frontendWsSubscribed.value) return
+  frontendWsSubscribed.value = true
+  connectWs()
+}
+
+function stopFrontendSubscription() {
+  frontendWsSubscribed.value = false
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  if (pingInterval) {
+    clearInterval(pingInterval)
+    pingInterval = null
+  }
+  socket?.close()
+  socket = null
+  wsStatus.value = 'disconnected'
+  wsLatencyMs.value = null
 }
 
 /** 判断 WS 行是否匹配当前过滤条件，未通过的行不进入 grid，避免 WS 持续推送把已过滤的行带回页面 */
@@ -428,19 +463,33 @@ const statusCellStyle = (params: ValueFormatterParams) => {
 
 const exchangeRiskFormatter = (params: ValueFormatterParams) => {
   const row = params.data as PositionRow | undefined
-  if (!row || !row.exchange_risk_status || row.exchange_risk_status === 'normal') return ''
+  if (!row) return ''
+  const hasDelistRisk = !!(row.delist_risks && row.delist_risks.length > 0)
+  if ((!row.exchange_risk_status || row.exchange_risk_status === 'normal') && !hasDelistRisk) return ''
   const typeMap: Record<string, string> = {
     adl: 'ADL自动减仓',
+    delist_risk: '下架风险',
     missing_gate_position: 'Gate缺腿',
     qty_mismatch: '数量不匹配',
     unknown: '交易所风险',
   }
-  return typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status
+  const primary = typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status || ''
+  if (hasDelistRisk && primary !== '下架风险') return `${primary} + 下架风险`
+  return primary
+}
+
+const exchangeRiskTooltip = (row: PositionRow | undefined): string | null => {
+  if (!row) return null
+  const parts = [row.exchange_risk_detail, row.delist_risk_summary ? `下架风险: ${row.delist_risk_summary}` : null]
+    .filter(Boolean) as string[]
+  return parts.length ? Array.from(new Set(parts)).join(' | ') : null
 }
 
 const exchangeRiskCellStyle = (params: ValueFormatterParams) => {
   const row = params.data as PositionRow | undefined
   if (row?.exchange_risk_status === 'desynced') return { color: '#f56c6c', fontWeight: '700' }
+  if (row?.delist_risk_level === 'critical') return { color: '#f56c6c', fontWeight: '700' }
+  if (row?.delist_risk_level === 'warning') return { color: '#e6a23c', fontWeight: '700' }
   if (row?.exchange_risk_status === 'resolved') return { color: '#e6a23c', fontWeight: '400' }
   return { color: '#909399', fontWeight: '400' }
 }
@@ -509,7 +558,7 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     width: 130,
     valueFormatter: exchangeRiskFormatter,
     cellStyle: exchangeRiskCellStyle,
-    tooltipValueGetter: (params: any) => params.data?.exchange_risk_detail || null,
+    tooltipValueGetter: (params: any) => exchangeRiskTooltip(params.data as PositionRow),
     tooltipComponent: LongTextTooltip,
   },
   {
@@ -900,6 +949,7 @@ const getRowId = (params: GetRowIdParams<PositionRow>) =>
 
 const getRowClass = (params: any) => {
   if (params.data?.exchange_risk_status === 'desynced') return 'position-row-exchange-risk'
+  if (params.data?.delist_risks?.length) return 'position-row-exchange-risk'
   const count = Number(params.data?.margin_topup_count || 0)
   return count > 0 ? 'position-row-topup' : ''
 }
@@ -1060,6 +1110,9 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     exchange_risk_type: null,
     exchange_risk_at: null,
     exchange_risk_detail: null,
+    delist_risks: [],
+    delist_risk_level: null,
+    delist_risk_summary: null,
   }]
 })
 async function fetchPositions() {
@@ -1216,7 +1269,7 @@ function onGridReady(params: GridReadyEvent<PositionRow>) {
 /* ───── 生命周期 ───── */
 function handleVisibilityChange() {
   pageVisible = !document.hidden
-  if (pageVisible) {
+  if (pageVisible && frontendWsSubscribed.value) {
     // 恢复可见时重启 ping
     if (pingInterval) clearInterval(pingInterval)
     pingInterval = setInterval(() => {
@@ -1234,9 +1287,7 @@ function handleVisibilityChange() {
 }
 
 onMounted(() => {
-  fetchPositions().finally(() => {
-    requestAnimationFrame(connectWs)
-  })
+  fetchPositions()
   document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
@@ -1245,6 +1296,7 @@ onUnmounted(() => {
   if (pingInterval) clearInterval(pingInterval)
   if (derivedRowsTimer) clearTimeout(derivedRowsTimer)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
+  frontendWsSubscribed.value = false
   socket?.close()
   socket = null
 })
@@ -1397,13 +1449,30 @@ onUnmounted(() => {
           刷新
         </el-button>
 
+        <el-button
+          v-if="!frontendWsSubscribed"
+          size="small"
+          type="success"
+          @click="startFrontendSubscription"
+        >
+          订阅实时持仓
+        </el-button>
+        <el-button
+          v-else
+          size="small"
+          type="warning"
+          @click="stopFrontendSubscription"
+        >
+          停止实时持仓
+        </el-button>
+
         <span class="filter-label" style="margin-left: auto;">
-          WS：
+          实时订阅：
           <el-tag v-if="wsStatus === 'connected'" type="success" size="small">
             {{ wsLatencyMs != null ? `${wsLatencyMs}ms` : '已连接' }}
           </el-tag>
-          <el-tag v-else :type="wsStatus === 'connecting' ? 'warning' : 'danger'" size="small">
-            {{ wsStatus === 'connecting' ? '连接中' : '已断开' }}
+          <el-tag v-else :type="wsStatus === 'connecting' ? 'warning' : 'info'" size="small">
+            {{ wsStatus === 'connecting' ? '连接中' : '已关闭' }}
           </el-tag>
         </span>
       </div>

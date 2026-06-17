@@ -85,6 +85,9 @@ interface PositionRow {
   exchange_risk_type: string | null
   exchange_risk_at: string | null
   exchange_risk_detail: string | null
+  delist_risks?: Array<Record<string, any>>
+  delist_risk_level?: string | null
+  delist_risk_summary?: string | null
   // 子查询注入字段
   channel: string | null
   order_count: number | null
@@ -212,14 +215,26 @@ function formatLeverage(value: number | null | undefined): string {
 }
 
 function formatExchangeRisk(row: PositionRow | null | undefined): string {
-  if (!row || !row.exchange_risk_status || row.exchange_risk_status === 'normal') return ''
+  if (!row) return ''
+  const hasDelistRisk = !!(row.delist_risks && row.delist_risks.length > 0)
+  if ((!row.exchange_risk_status || row.exchange_risk_status === 'normal') && !hasDelistRisk) return ''
   const typeMap: Record<string, string> = {
     adl: 'ADL自动减仓',
+    delist_risk: '下架风险',
     missing_gate_position: 'Gate缺腿',
     qty_mismatch: '数量不匹配',
     unknown: '交易所风险',
   }
-  return typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status
+  const primary = typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status || ''
+  if (hasDelistRisk && primary !== '下架风险') return `${primary} + 下架风险`
+  return primary
+}
+
+function exchangeRiskTooltip(row: PositionRow | null | undefined): string | null {
+  if (!row) return null
+  const parts = [row.exchange_risk_detail, row.delist_risk_summary ? `下架风险: ${row.delist_risk_summary}` : null]
+    .filter(Boolean) as string[]
+  return parts.length ? Array.from(new Set(parts)).join(' | ') : null
 }
 
 const profileColorMap: Record<string, string> = {
@@ -283,9 +298,11 @@ const columnDefs = computed((): ColDef[] => [
     cellStyle: (params) => {
       const row = params.data as PositionRow | undefined
       if (row?.exchange_risk_status === 'desynced') return { color: '#f56c6c', fontWeight: '700' }
+      if (row?.delist_risk_level === 'critical') return { color: '#f56c6c', fontWeight: '700' }
+      if (row?.delist_risk_level === 'warning') return { color: '#e6a23c', fontWeight: '700' }
       return { color: '#909399', fontWeight: '400' }
     },
-    tooltipValueGetter: (params: any) => params.data?.exchange_risk_detail || null,
+    tooltipValueGetter: (params: any) => exchangeRiskTooltip(params.data as PositionRow),
     tooltipComponent: LongTextTooltip,
   },
   {
