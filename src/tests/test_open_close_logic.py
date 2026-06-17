@@ -70,6 +70,10 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           peak_monitor_timeout_sec=60,
                           basis_threshold_bps=-60,
                           coverage_threshold=0.8,
+                          min_funding_rate_bps=-6.0,
+                          min_funding_support_bps=None,
+                          funding_support_min_samples=2,
+                          realtime_min_funding_rate_bps=None,
                           max_orderbook_lag_ms=200.0,
                           vwap_threshold_meta=None,
                           close_vwap_threshold_meta=None,
@@ -101,6 +105,10 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         peak_monitor_timeout_sec=peak_monitor_timeout_sec,
         basis_threshold_bps=basis_threshold_bps,
         coverage_threshold=coverage_threshold,
+        min_funding_rate_bps=min_funding_rate_bps,
+        min_funding_support_bps=min_funding_support_bps,
+        funding_support_min_samples=funding_support_min_samples,
+        realtime_min_funding_rate_bps=realtime_min_funding_rate_bps,
         max_orderbook_lag_ms=max_orderbook_lag_ms,
         momentum_enabled=momentum_enabled,
         momentum_allowed_tiers=momentum_allowed_tiers or ['A'],
@@ -1147,6 +1155,119 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertAlmostEqual(snapshot['entry_floor_bps'], 16.9, places=1)
         self.assertFalse(te._pass_risk_check(self._row('ALLO', 10.0, 0.008646)))
         self.assertTrue(te._pass_risk_check(self._row('ALLO', 20.0, 0.008646)))
+
+    def test_funding_support_avg_allows_lower_realtime_open_floor(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=15.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 50.0, 0.0008)
+        row.update({
+            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+
+    def test_funding_support_avg_rejects_weak_settled_history(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=15.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 50.0, 0.0040)
+        row.update({
+            'funding_rate_24h_avg_bps': 9.5,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('资金费率均值不达标', te._get_risk_fail_reason(row))
+
+    def test_funding_support_avg_keeps_realtime_floor(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=15.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 50.0, 0.0003)
+        row.update({
+            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('实时资金费率低于兜底', te._get_risk_fail_reason(row))
+
+    def test_funding_support_samples_fallback_to_realtime_floor(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=15.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 50.0, 0.0012)
+        row.update({
+            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_samples': 1,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('资金费率样本不足', te._get_risk_fail_reason(row))
+
+    def test_realtime_funding_floor_uses_support_when_samples_enough(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=15.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+        )
+        te.funding_support_meta = {
+            'ALLO': {
+                'funding_rate_24h_avg_bps': 12.0,
+                'funding_rate_24h_avg_samples': 3,
+            }
+        }
+
+        with patch('calc.trading_executor.get_single_contract_funding_info', return_value={
+            'funding_rate_24h': 0.0006,
+        }):
+            self.assertTrue(te._verify_realtime_funding_rate('ALLO', 'ALLO_USDT'))
+
+    def test_realtime_funding_floor_falls_back_when_samples_not_enough(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=15.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+        )
+        te.funding_support_meta = {
+            'ALLO': {
+                'funding_rate_24h_avg_bps': 12.0,
+                'funding_rate_24h_avg_samples': 1,
+            }
+        }
+
+        with patch('calc.trading_executor.get_single_contract_funding_info', return_value={
+            'funding_rate_24h': 0.0006,
+        }):
+            self.assertFalse(te._verify_realtime_funding_rate('ALLO', 'ALLO_USDT'))
 
     def test_total_available_ratio_blocks_new_open(self):
         te = make_trading_executor(

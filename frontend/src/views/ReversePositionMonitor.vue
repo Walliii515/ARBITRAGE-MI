@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
+  CellStyle,
   ColDef,
   GetRowIdParams,
   GridApi,
@@ -201,11 +202,6 @@ function formatDecimal(value: number | null | undefined, maxDecimals = 12): stri
   return n.toFixed(maxDecimals).replace(/\.?0+$/, '')
 }
 
-function formatAmount(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(Number(value))) return '—'
-  return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
-
 function formatPnl(value: number): string {
   const prefix = value >= 0 ? '+' : ''
   return `${prefix}${value.toFixed(2)}`
@@ -252,7 +248,7 @@ function statusLabel(value: string | null | undefined): string {
   return value ? (map[value] || value) : ''
 }
 
-const statusCellStyle = (params: ValueFormatterParams) => {
+const statusCellStyle = (params: ValueFormatterParams): CellStyle => {
   if (params.value === 'holding') return { color: '#67c23a' }
   if (params.value === 'closing') return { color: '#e6a23c' }
   if (params.value === 'closed') return { color: '#909399' }
@@ -272,7 +268,7 @@ function riskLabel(row: ReversePositionRow | null | undefined): string {
   return typeMap[row.exchange_risk_type || 'unknown'] || row.exchange_risk_type || row.exchange_risk_status
 }
 
-const exchangeRiskCellStyle = (params: ValueFormatterParams) => {
+const exchangeRiskCellStyle = (params: ValueFormatterParams): CellStyle => {
   const row = params.data as ReversePositionRow | undefined
   if (row?.exchange_risk_status && row.exchange_risk_status !== 'normal') {
     return { color: '#f56c6c', fontWeight: '700' }
@@ -280,7 +276,7 @@ const exchangeRiskCellStyle = (params: ValueFormatterParams) => {
   return { color: '#909399', fontWeight: '400' }
 }
 
-const pnlCellStyle = (params: ValueFormatterParams) => {
+const pnlCellStyle = (params: ValueFormatterParams): CellStyle => {
   const value = Number(params.value)
   if (!Number.isFinite(value)) return { color: '#909399' }
   if (value > 0) return { color: '#f56c6c' }
@@ -288,7 +284,7 @@ const pnlCellStyle = (params: ValueFormatterParams) => {
   return { color: '#e8eaed' }
 }
 
-const fundingCellStyle = (params: ValueFormatterParams) => {
+const fundingCellStyle = (params: ValueFormatterParams): CellStyle => {
   const value = Number(params.value)
   if (!Number.isFinite(value)) return { color: '#909399' }
   if (value < 0) return { color: '#67c23a' }

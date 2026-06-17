@@ -42,6 +42,16 @@ type ChartModeKey =
   | 'gross_total_pnl_usdt'
 type ChartMetricOption = { key: ChartMetric; label: string; group: 'asset' | 'pnl'; color: string }
 type ChartModeOption = { key: ChartModeKey; label: string }
+type ChartLineType = 'solid' | 'dashed'
+type ChartSeries = {
+  exchange: ExchangeKey
+  metric: ChartMetric
+  label: string
+  color: string
+  group: 'asset' | 'pnl'
+  points: Array<{ time: string; value: number }>
+  lineType: ChartLineType
+}
 
 const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
@@ -96,13 +106,13 @@ const latestByExchange = computed(() => {
   return result
 })
 
-const chartSeries = computed(() => {
+const chartSeries = computed<ChartSeries[]>(() => {
   const metrics: ChartMetric[] = selectedChartMode.value === 'realized_breakdown'
     ? realizedBreakdownMetrics
     : [selectedChartMode.value]
   const rows = historyRows.value
     .filter((row) => row.exchange === selectedExchange.value)
-  const series = metrics.map((metric) => {
+  const series: ChartSeries[] = metrics.map((metric): ChartSeries => {
     const option = metricOptions.find((item) => item.key === metric)!
     const points = rows.map((row) => ({
       time: row.snapshot_at,

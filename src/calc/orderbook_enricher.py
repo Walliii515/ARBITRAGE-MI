@@ -175,9 +175,18 @@ def calc_entry_snapshot_bps(base_asset: str, basis_bps: Optional[float],
     }
 
 
+def _attach_funding_support_fields(row: Dict, base_asset: str,
+                                   funding_support_meta: Dict[str, Dict]) -> None:
+    support = funding_support_meta.get(str(base_asset or '').strip().upper()) or {}
+    row['funding_rate_24h_avg_bps'] = support.get('funding_rate_24h_avg_bps')
+    row['funding_rate_24h_avg_samples'] = support.get('funding_rate_24h_avg_samples')
+    row['funding_rate_24h_avg_window_hours'] = support.get('funding_rate_24h_avg_window_hours')
+
+
 def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                           threshold_meta: Dict[str, float], cfg: EnrichConfig,
-                          asset_profile_meta: Optional[Dict[str, Dict]] = None) -> None:
+                          asset_profile_meta: Optional[Dict[str, Dict]] = None,
+                          funding_support_meta: Optional[Dict[str, Dict]] = None) -> None:
     """
     为开仓检查富化行数据（就地修改 rows）
 
@@ -191,6 +200,7 @@ def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
     """
     open_fee_bps = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
     asset_profile_meta = asset_profile_meta or {}
+    funding_support_meta = funding_support_meta or {}
 
     for row in rows:
         base_asset = row.get('base_asset', '')
@@ -222,6 +232,7 @@ def enrich_trading_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
             row['funding_rate_24h'] = contract_meta[base_asset].get('funding_rate_24h')
         else:
             row['funding_rate_24h'] = None
+        _attach_funding_support_fields(row, base_asset, funding_support_meta)
 
         # 6. 资金费率阈值
         if contract in threshold_meta:
@@ -233,7 +244,8 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                            vwap_threshold_meta: Dict[str, Dict],
                            cfg: EnrichConfig, meta_update_time: str,
                            close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None,
-                           asset_profile_meta: Optional[Dict[str, Dict]] = None) -> None:
+                           asset_profile_meta: Optional[Dict[str, Dict]] = None,
+                           funding_support_meta: Optional[Dict[str, Dict]] = None) -> None:
     """
     为 WS 快照推送富化完整字段（就地修改 rows）
 
@@ -247,6 +259,7 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
     open_fee_bps = calc_open_fee_bps(cfg.spot_open_fee, cfg.future_open_fee)
     close_fee_bps = round(-(cfg.spot_close_fee + cfg.future_close_fee) * 10000, 2)
     asset_profile_meta = asset_profile_meta or {}
+    funding_support_meta = funding_support_meta or {}
 
     for row in rows:
         base_asset = row.get('base_asset', '')
@@ -272,6 +285,7 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
             row['funding_rate_24h'] = None
             row['volume_24h_settle'] = None
             row['funding_next_apply'] = None
+        _attach_funding_support_fields(row, base_asset, funding_support_meta)
 
         # --- 从 spot_meta 注入 ---
         if base_asset in spot_meta:

@@ -147,6 +147,13 @@ OPEN_AMOUNT_USDT = config.get_float('trade.open.amount_usdt', 5000.0)
 FUNDING_THRESHOLD_PERCENTILE = config.get_str('trade.filter.funding_rate_threshold_percentile', 'percentile_30')
 # 资金费率下限(bps)，开仓过滤用
 MIN_FUNDING_RATE_BPS = config.get_float('trade.open.min_funding_rate_bps', -6.0)
+MIN_FUNDING_SUPPORT_BPS = config.get_float('trade.open.min_funding_support_bps', MIN_FUNDING_RATE_BPS)
+FUNDING_SUPPORT_WINDOW_HOURS = config.get_float('trade.open.funding_support_window_hours', 24.0)
+FUNDING_SUPPORT_MIN_SAMPLES = config.get_int('trade.open.funding_support_min_samples', 2)
+REALTIME_MIN_FUNDING_RATE_BPS = config.get_float(
+    'trade.open.realtime_min_funding_rate_bps',
+    MIN_FUNDING_RATE_BPS,
+)
 # 盘口覆盖阈值
 ORDERBOOK_COVERAGE_THRESHOLD = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)
 # 风险缓释（bps）
@@ -249,6 +256,7 @@ _vwap_threshold_meta: Dict[str, float] = {}  # base_asset -> threshold_bps
 _close_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {close_basis_p10..p40}
 _reverse_vwap_threshold_meta: Dict[str, Dict] = {}  # base_asset -> {reverse_open_basis_p20, reverse_close_basis_p20}
 _funding_rate_p40_meta: Dict[str, float] = {}  # base_asset -> percentile_40费率(止盈用)
+_funding_support_meta: Dict[str, Dict] = {}  # base_asset -> 最近已结算 funding 均值
 _asset_tier_meta: Dict[str, str] = {}  # base_asset -> strategy_tier
 _asset_profile_meta: Dict[str, Dict] = {}  # base_asset -> market_profile metadata
 _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇总
@@ -467,6 +475,44 @@ def fetch_threshold_meta() -> tuple:
         return {}, {}
 
 
+def fetch_funding_support_meta(window_hours: float) -> Dict[str, Dict]:
+    """加载最近已结算 funding_rate_24h 均值，供普通开仓门槛和监控页展示使用。"""
+    cutoff_ts = int(time.time() - max(float(window_hours or 0), 1.0) * 3600)
+    sql = """
+        SELECT contract, AVG(funding_rate_24h) AS avg_rate_24h, COUNT(*) AS samples
+        FROM mi_gate_future_his_funding_rates
+        WHERE funding_rate_24h IS NOT NULL
+          AND timestamp >= %s
+          AND timestamp <= UNIX_TIMESTAMP(NOW())
+        GROUP BY contract
+    """
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (cutoff_ts,))
+            rows = cursor.fetchall()
+            result: Dict[str, Dict] = {}
+            for row in rows:
+                avg_rate = row.get('avg_rate_24h')
+                if avg_rate is None:
+                    continue
+                contract = str(row.get('contract') or '')
+                base_asset = _normalize_base_asset(
+                    contract.replace('_USDT', '').replace('_usdt', '')
+                )
+                if not base_asset:
+                    continue
+                result[base_asset] = {
+                    'funding_rate_24h_avg_bps': float(avg_rate) * 10000.0,
+                    'funding_rate_24h_avg_samples': int(row.get('samples') or 0),
+                    'funding_rate_24h_avg_window_hours': float(window_hours),
+                }
+            logger.info(f'已加载已结算资金费率均值 {len(result)} 条（窗口={window_hours:g}h）')
+            return result
+    except Exception as e:
+        logger.error(f'加载已结算资金费率均值失败: {e}', exc_info=True)
+        return {}
+
+
 def fetch_vwap_threshold_meta() -> Dict[str, Dict[str, float]]:
     """从 mi_vwap_basis_threshold 加载最新一天的按标的VWAP开仓基差阈值（p10 + p20）
 
@@ -594,6 +640,7 @@ def build_payload() -> dict:
         _vwap_threshold_meta, _enrich_cfg, _meta_update_time,
         _close_vwap_threshold_meta,
         _asset_profile_meta,
+        _funding_support_meta,
     )
 
     return {
@@ -602,6 +649,10 @@ def build_payload() -> dict:
         'open_amount_usdt': OPEN_AMOUNT_USDT,
         'funding_threshold_percentile': FUNDING_THRESHOLD_PERCENTILE,
         'min_funding_rate_bps': MIN_FUNDING_RATE_BPS,
+        'min_funding_support_bps': MIN_FUNDING_SUPPORT_BPS,
+        'funding_support_window_hours': FUNDING_SUPPORT_WINDOW_HOURS,
+        'funding_support_min_samples': FUNDING_SUPPORT_MIN_SAMPLES,
+        'realtime_min_funding_rate_bps': REALTIME_MIN_FUNDING_RATE_BPS,
         'orderbook_coverage_threshold': ORDERBOOK_COVERAGE_THRESHOLD,
         'risk_relief_bps': RISK_RELIEF_BPS,
         'open_vwap_basis_threshold_bps': OPEN_VWAP_BASIS_THRESHOLD_BPS,
@@ -621,6 +672,7 @@ def _build_reverse_enriched_rows() -> tuple[List[Dict], Dict[str, Dict], str]:
         _vwap_threshold_meta, _enrich_cfg, _meta_update_time,
         _close_vwap_threshold_meta,
         _asset_profile_meta,
+        _funding_support_meta,
     )
     negative_assets = [
         row.get('base_asset')
@@ -789,12 +841,14 @@ async def lifespan(app: FastAPI):
 
     global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
     global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
+    global _funding_support_meta
     global _asset_tier_meta, _asset_profile_meta, _meta_update_time
     _contract_meta = fetch_contract_meta()
     _spot_meta = fetch_spot_meta()
     _asset_tier_meta = fetch_asset_tier_meta()
     _asset_profile_meta = fetch_asset_market_profile_meta()
     _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
+    _funding_support_meta = fetch_funding_support_meta(FUNDING_SUPPORT_WINDOW_HOURS)
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
     _reverse_vwap_threshold_meta = fetch_reverse_vwap_threshold_meta()
@@ -805,7 +859,8 @@ async def lifespan(app: FastAPI):
         f'阈値元数据 {len(_threshold_meta)} 条，'
         f'VWAP阈値 {len(_vwap_threshold_meta)} 条，平仓阈値 {len(_close_vwap_threshold_meta)} 条，'
         f'反向阈値 {len(_reverse_vwap_threshold_meta)} 条，'
-        f'费率p40 {len(_funding_rate_p40_meta)} 条'
+        f'费率p40 {len(_funding_rate_p40_meta)} 条，'
+        f'已结算均费 {len(_funding_support_meta)} 条'
     )
 
     async def _refresh_meta_cache_loop():
@@ -826,12 +881,14 @@ async def lifespan(app: FastAPI):
                 # 刷新内存缓存
                 global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
                 global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
+                global _funding_support_meta
                 global _asset_tier_meta, _asset_profile_meta, _meta_update_time
                 _contract_meta = fetch_contract_meta()
                 _spot_meta = fetch_spot_meta()
                 _asset_tier_meta = fetch_asset_tier_meta()
                 _asset_profile_meta = fetch_asset_market_profile_meta()
                 _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
+                _funding_support_meta = fetch_funding_support_meta(FUNDING_SUPPORT_WINDOW_HOURS)
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
                 new_close_meta = fetch_close_vwap_threshold_meta()
                 if new_close_meta:
@@ -850,7 +907,8 @@ async def lifespan(app: FastAPI):
                     f'阈値 {len(_threshold_meta)} 条, '
                     f'VWAP阈値 {len(_vwap_threshold_meta)} 条, 平仓阈値 {len(_close_vwap_threshold_meta)} 条, '
                     f'反向阈値 {len(_reverse_vwap_threshold_meta)} 条, '
-                    f'费率p40 {len(_funding_rate_p40_meta)} 条'
+                    f'费率p40 {len(_funding_rate_p40_meta)} 条, '
+                    f'已结算均费 {len(_funding_support_meta)} 条'
                 )
                 # 重置执行器单例，下次循环用新元数据重建
                 global _trading_executor, _closing_executor, _reverse_signal_monitor
@@ -1424,7 +1482,10 @@ def _get_fresh_trading_rows() -> List[Dict]:
 
     rows = _get_merged_rows()
     rows = calculate_hedge_metrics(rows, _contract_meta, _spot_meta, OPEN_AMOUNT_USDT)
-    enrich_trading_fields(rows, _contract_meta, _threshold_meta, _enrich_cfg, _asset_profile_meta)
+    enrich_trading_fields(
+        rows, _contract_meta, _threshold_meta, _enrich_cfg,
+        _asset_profile_meta, _funding_support_meta,
+    )
     _cached_trading_rows = [dict(row) for row in rows]
     _cached_trading_ts = now
     return [dict(row) for row in _cached_trading_rows]
@@ -1462,6 +1523,11 @@ def _run_open_position_check_once():
                 basis_threshold_bps=config.get_float('trade.open.vwap_basis_threshold_bps', -60),
                 cooldown_sec=config.get_int('trade.open.cooldown_sec', 3600),
                 min_funding_rate_bps=config.get_float('trade.open.min_funding_rate_bps', -6.0),
+                min_funding_support_bps=config.get_float('trade.open.min_funding_support_bps', 10.0),
+                funding_support_min_samples=config.get_int('trade.open.funding_support_min_samples', 2),
+                realtime_min_funding_rate_bps=config.get_float(
+                    'trade.open.realtime_min_funding_rate_bps', 5.0
+                ),
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
                 min_available_ratio=config.get_float('trade.open.min_available_ratio', 0.10),
                 max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
@@ -1612,7 +1678,7 @@ def _run_open_position_check_once():
             _trading_executor = TradingExecutor(
                 _trading_cfg, _contract_meta, _spot_meta,
                 _vwap_threshold_meta, _close_vwap_threshold_meta, _asset_tier_meta,
-                _asset_profile_meta
+                _asset_profile_meta, _funding_support_meta
             )
             _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
 

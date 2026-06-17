@@ -31,6 +31,10 @@ interface WsMessage {
   binance_ws_latency_ms?: number | null
   funding_threshold_percentile?: string
   min_funding_rate_bps?: number
+  min_funding_support_bps?: number
+  funding_support_window_hours?: number
+  funding_support_min_samples?: number
+  realtime_min_funding_rate_bps?: number
   orderbook_coverage_threshold?: number
   open_vwap_basis_threshold_bps?: number
   min_spot_volume_24h_usdt?: number
@@ -166,6 +170,10 @@ const serviceBusy = ref(false)
 const displayedRowCount = ref(0)
 /** 资金费率下限(bps)，从后端动态获取 */
 const minFundingRateBps = ref<number>(-6)
+/** 已结算资金费率均值下限(bps)，从后端动态获取 */
+const minFundingSupportBps = ref<number>(10)
+const fundingSupportMinSamples = ref<number>(2)
+const realtimeMinFundingRateBps = ref<number>(5)
 /** 资金费率过滤开关（默认开启） */
 const filterByFundingRate = ref<boolean>(true)
 /** 盘口覆盖阈值，从后端动态获取 */
@@ -247,13 +255,19 @@ function fundingRateFilterFunc(params: any): boolean {
   if (!data) return true
   
   const fundingRate = data.funding_rate_24h
-  
-  // 如果值为空，不排除（保持显示）
-  if (fundingRate == null) {
-    return true
+  const avgBps = data.funding_rate_24h_avg_bps
+  const avgSamples = Number(data.funding_rate_24h_avg_samples ?? 0)
+
+  if (avgBps != null && avgSamples >= fundingSupportMinSamples.value) {
+    const currentBps = fundingRate == null ? null : fundingRate * 10000
+    return (
+      avgBps >= minFundingSupportBps.value &&
+      (currentBps == null || currentBps >= realtimeMinFundingRateBps.value)
+    )
   }
-  
-  // 资金费率(bps) >= 下限
+
+  // 样本不足时保持旧兜底；值为空则不排除，避免隐藏无法判断的数据。
+  if (fundingRate == null) return true
   return fundingRate * 10000 >= minFundingRateBps.value
 }
 
@@ -482,13 +496,31 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       cellStyle: (params) => {
         const value = params.value as number | null
         if (value == null) return { color: '#909399' }
-        
-        // >= 下限(bps)：绿色
-        if (value * 10000 >= minFundingRateBps.value) {
+
+        const row = params.data
+        const avgSamples = Number(row?.funding_rate_24h_avg_samples ?? 0)
+        const hasAvgSupport = row?.funding_rate_24h_avg_bps != null && avgSamples >= fundingSupportMinSamples.value
+        const floor = hasAvgSupport ? realtimeMinFundingRateBps.value : minFundingRateBps.value
+        if (value * 10000 >= floor) {
           return { color: '#67c23a' }
         }
-        // < 下限：红色
         return { color: '#f56c6c' }
+      },
+    },
+    {
+      headerName: '已结算24h均费(bps)',
+      field: 'funding_rate_24h_avg_bps',
+      width: 150,
+      type: 'numericColumn',
+      cellClass: 'ag-right-aligned-cell',
+      headerClass: 'ag-right-aligned-header',
+      valueFormatter: (p) => p.value == null ? '—' : Number(p.value).toFixed(2),
+      cellStyle: (params) => {
+        const value = params.value as number | null
+        if (value == null) return { color: '#909399' }
+        const samples = Number(params.data?.funding_rate_24h_avg_samples ?? 0)
+        if (samples < fundingSupportMinSamples.value) return { color: '#909399', fontStyle: 'italic' }
+        return value >= minFundingSupportBps.value ? { color: '#67c23a' } : { color: '#f56c6c' }
       },
     },
     {
@@ -508,12 +540,12 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
       },
     },
     {
-      headerName: '费率下限(bps)',
+      headerName: '均费门槛(bps)',
       width: 110,
       type: 'numericColumn',
       cellClass: 'ag-right-aligned-cell',
       headerClass: 'ag-right-aligned-header',
-      valueGetter: () => minFundingRateBps.value,
+      valueGetter: () => minFundingSupportBps.value,
       valueFormatter: (p) => p.value != null ? p.value.toFixed(1) : '—',
     },
   {
@@ -957,6 +989,33 @@ function clearGridData() {
   refreshDisplayedRowCount()
 }
 
+function applyRuntimeConfig(msg: Partial<WsMessage>) {
+  if (msg.min_funding_rate_bps != null) {
+    minFundingRateBps.value = msg.min_funding_rate_bps
+  }
+  if (msg.min_funding_support_bps != null) {
+    minFundingSupportBps.value = msg.min_funding_support_bps
+  }
+  if (msg.funding_support_min_samples != null) {
+    fundingSupportMinSamples.value = msg.funding_support_min_samples
+  }
+  if (msg.realtime_min_funding_rate_bps != null) {
+    realtimeMinFundingRateBps.value = msg.realtime_min_funding_rate_bps
+  }
+  if (msg.orderbook_coverage_threshold != null) {
+    orderbookCoverageThreshold.value = msg.orderbook_coverage_threshold
+  }
+  if (msg.open_vwap_basis_threshold_bps != null) {
+    openVwapBasisThresholdBps.value = msg.open_vwap_basis_threshold_bps
+  }
+  if (msg.min_spot_volume_24h_usdt != null) {
+    minSpotVolume24h.value = msg.min_spot_volume_24h_usdt
+  }
+  if (msg.min_future_volume_24h_usdt != null) {
+    minFutureVolume24h.value = msg.min_future_volume_24h_usdt
+  }
+}
+
 /** 全量快照 → diff 后 applyTransaction，保留滚动位置；仅清空/首次加载时整表重置 */
 function applySnapshotRows(rows: unknown, serverTime?: string, forceFull = false) {
   const normalized = normalizeSnapshotRows(rows)
@@ -1001,6 +1060,7 @@ async function fetchOrderbookSnapshot(forceFull = false) {
     const res = await get('/api/orderbook/snapshot')
     if (!res.ok) return
     const data = await res.json()
+    applyRuntimeConfig(data)
     if (Array.isArray(data.rows)) {
       applySnapshotRows(data.rows, data.server_time, forceFull)
     }
@@ -1060,25 +1120,7 @@ function connectWs() {
       // 更新交易所 WS 延迟
       if (msg.gate_ws_latency_ms !== undefined) gateWsLatencyMs.value = msg.gate_ws_latency_ms
       if (msg.binance_ws_latency_ms !== undefined) binanceWsLatencyMs.value = msg.binance_ws_latency_ms
-      // 更新资金费率下限配置
-      if (msg.min_funding_rate_bps != null) {
-        minFundingRateBps.value = msg.min_funding_rate_bps
-      }
-      // 更新盘口覆盖阈值配置
-      if (msg.orderbook_coverage_threshold != null) {
-        orderbookCoverageThreshold.value = msg.orderbook_coverage_threshold
-      }
-      // 更新开仓边际基差阈值配置
-      if (msg.open_vwap_basis_threshold_bps != null) {
-        openVwapBasisThresholdBps.value = msg.open_vwap_basis_threshold_bps
-      }
-      // 更新成交量阈值配置
-      if (msg.min_spot_volume_24h_usdt != null) {
-        minSpotVolume24h.value = msg.min_spot_volume_24h_usdt
-      }
-      if (msg.min_future_volume_24h_usdt != null) {
-        minFutureVolume24h.value = msg.min_future_volume_24h_usdt
-      }
+      applyRuntimeConfig(msg)
       applySnapshotRows(msg.rows, msg.server_time ?? '--')
     }
   }

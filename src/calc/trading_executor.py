@@ -41,6 +41,9 @@ class TradingExecutorConfig:
     basis_threshold_bps: float = -60
     cooldown_sec: int = 3600
     min_funding_rate_bps: float = -6.0
+    min_funding_support_bps: Optional[float] = None
+    funding_support_min_samples: int = 2
+    realtime_min_funding_rate_bps: Optional[float] = None
     open_amount_usdt: float = 5.0
     min_available_ratio: float = 0.10
     max_asset_exposure_ratio: float = 0.10
@@ -183,7 +186,8 @@ class TradingExecutor:
                  vwap_threshold_meta: Optional[Dict[str, float]] = None,
                  close_vwap_threshold_meta: Optional[Dict[str, Dict]] = None,
                  asset_tier_meta: Optional[Dict[str, str]] = None,
-                 asset_profile_meta: Optional[Dict[str, Dict]] = None):
+                 asset_profile_meta: Optional[Dict[str, Dict]] = None,
+                 funding_support_meta: Optional[Dict[str, Dict]] = None):
         """
         Args:
             cfg: 配置 dataclass（由 api/ 层构造后注入）
@@ -208,6 +212,11 @@ class TradingExecutor:
             for k, v in (asset_profile_meta or {}).items()
             if k and isinstance(v, dict)
         }
+        self.funding_support_meta = {
+            str(k).strip().upper(): dict(v)
+            for k, v in (funding_support_meta or {}).items()
+            if k and isinstance(v, dict)
+        }
         
         # 通过 HTTP 客户端调用独立的成交引擎服务（虚拟/实盘），实现虚实分离
         self.executor_client = ExecutorClient(cfg.executor_url, timeout=cfg.executor_timeout)
@@ -217,6 +226,17 @@ class TradingExecutor:
         self.basis_threshold_bps = cfg.basis_threshold_bps
         self.cooldown_sec = cfg.cooldown_sec
         self.min_funding_rate_bps = cfg.min_funding_rate_bps
+        self.min_funding_support_bps = (
+            cfg.min_funding_support_bps
+            if cfg.min_funding_support_bps is not None
+            else cfg.min_funding_rate_bps
+        )
+        self.funding_support_min_samples = max(1, int(cfg.funding_support_min_samples or 1))
+        self.realtime_min_funding_rate_bps = (
+            cfg.realtime_min_funding_rate_bps
+            if cfg.realtime_min_funding_rate_bps is not None
+            else cfg.min_funding_rate_bps
+        )
 
         # 手续费率（用于 entry_floor / 旧盈利性守卫计算）
         self.fee_cost_bps = -calc_full_fee_bps(
@@ -889,6 +909,77 @@ class TradingExecutor:
         if funding_rate is None:
             return 0.0
         return float(funding_rate) * 10000.0
+
+    def _attach_funding_support_to_row(self, row: Optional[Dict], base_asset: str) -> None:
+        if row is None:
+            return
+        support = self.funding_support_meta.get(str(base_asset or '').strip().upper()) or {}
+        for key in (
+            'funding_rate_24h_avg_bps',
+            'funding_rate_24h_avg_samples',
+            'funding_rate_24h_avg_window_hours',
+        ):
+            if key not in row:
+                row[key] = support.get(key)
+
+    def _funding_support_context(self, row: Dict) -> Dict[str, object]:
+        base_asset = str(row.get('base_asset') or '').strip().upper()
+        self._attach_funding_support_to_row(row, base_asset)
+        samples = 0
+        try:
+            samples = int(row.get('funding_rate_24h_avg_samples') or 0)
+        except (TypeError, ValueError):
+            samples = 0
+        return {
+            'base_asset': base_asset,
+            'current_bps': self._funding_24h_bps(base_asset, row),
+            'support_bps': self._float_or_none(row.get('funding_rate_24h_avg_bps')),
+            'samples': samples,
+            'window_hours': self._float_or_none(row.get('funding_rate_24h_avg_window_hours')),
+            'has_current': row.get('funding_rate_24h') is not None,
+        }
+
+    def _check_funding_support(self, row: Dict) -> tuple[bool, str]:
+        ctx = self._funding_support_context(row)
+        support_bps = ctx['support_bps']
+        samples = int(ctx['samples'])
+        current_bps = float(ctx['current_bps'])
+
+        if support_bps is not None and samples >= self.funding_support_min_samples:
+            support_bps = float(support_bps)
+            if support_bps < self.min_funding_support_bps:
+                return (
+                    False,
+                    f"资金费率均值不达标(avg24={support_bps:.2f}bps<"
+                    f"{self.min_funding_support_bps:.1f}bps,n={samples})",
+                )
+            if ctx['has_current'] and current_bps < self.realtime_min_funding_rate_bps:
+                return (
+                    False,
+                    f"实时资金费率低于兜底({current_bps:.2f}bps<"
+                    f"{self.realtime_min_funding_rate_bps:.1f}bps,"
+                    f"avg24={support_bps:.2f}bps,n={samples})",
+                )
+            return True, ''
+
+        if ctx['has_current'] and current_bps < self.min_funding_rate_bps:
+            return (
+                False,
+                f"资金费率样本不足({samples}<{self.funding_support_min_samples})且实时不达标"
+                f"({current_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)",
+            )
+        return True, ''
+
+    def _realtime_funding_floor_bps(self, base_asset: str) -> tuple[float, str]:
+        support = self.funding_support_meta.get(str(base_asset or '').strip().upper()) or {}
+        support_bps = self._float_or_none(support.get('funding_rate_24h_avg_bps'))
+        try:
+            samples = int(support.get('funding_rate_24h_avg_samples') or 0)
+        except (TypeError, ValueError):
+            samples = 0
+        if support_bps is not None and samples >= self.funding_support_min_samples:
+            return float(self.realtime_min_funding_rate_bps), '兜底'
+        return float(self.min_funding_rate_bps), '样本不足下限'
 
     @staticmethod
     def _float_or_none(value) -> Optional[float]:
@@ -1678,7 +1769,7 @@ class TradingExecutor:
         """
         风控规则检查:
         0. 保证金风控: 该标的现有持仓 保证金/维持保证金 < warning_pct 时禁止开仓
-        1. 资金费率 >= 下限(min_funding_rate_bps)
+        1. 最近已结算 funding 均值达标；样本不足时回退实时 funding 下限
         2. 开仓盘口覆盖 <= 阈值
         3. 开仓基差 >= funding-adjusted entry_floor
         4. 旧模式下保留盈利性守卫；新模式下 entry_floor 已合并 funding、手续费和滑点缓冲
@@ -1702,11 +1793,9 @@ class TradingExecutor:
             if min_notional is not None and active_amount < min_notional:
                 return False
 
-        # 资金费率下限检查：24h费率(bps) >= min_funding_rate_bps
-        funding_rate = row.get('funding_rate_24h')
-        if funding_rate is not None:
-            if float(funding_rate) * 10000 < self.min_funding_rate_bps:
-                return False
+        funding_ok, _funding_reason = self._check_funding_support(row)
+        if not funding_ok:
+            return False
         
         # 盘口覆盖检查
         open_coverage = row.get('open_coverage')
@@ -2047,12 +2136,13 @@ class TradingExecutor:
                 logger.debug(f"实时费率校验跳过(获取失败) | {base_asset}")
                 return True
             
-            # 校验费率 >= 下限(min_funding_rate_bps)
+            # 均值门槛已在普通风控层判断；实盘最终旁路只做实时 funding 兜底。
             rate_bps = float(info['funding_rate_24h']) * 10000
-            if rate_bps < self.min_funding_rate_bps:
+            realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
+            if rate_bps < realtime_floor:
                 logger.info(
                     f"实时费率校验拦截 | {base_asset} | "
-                    f"实时费率={rate_bps:.2f}bps < 下限{self.min_funding_rate_bps:.1f}bps"
+                    f"实时费率={rate_bps:.2f}bps < {floor_label}{realtime_floor:.1f}bps"
                 )
                 return False
 
@@ -2163,6 +2253,7 @@ class TradingExecutor:
             row['funding_interval'] = c_meta.get('funding_interval')
             row['funding_next_apply'] = c_meta.get('funding_next_apply')
             row['funding_last_apply'] = c_meta.get('funding_last_apply')
+            self._attach_funding_support_to_row(row, base_asset)
 
             # ── 4. 计算VWAP基差 ──
             gate_basis_bps = calc_vwap_basis_bps(
@@ -2479,12 +2570,9 @@ class TradingExecutor:
             min_notional = self.spot_meta[base_asset].get('min_notional')
             if min_notional is not None and active_amount < min_notional:
                 return f"开仓金额低于最小名义值({active_amount}<{min_notional}USDT)"
-        # 资金费率下限检查
-        funding_rate = row.get('funding_rate_24h')
-        if funding_rate is not None:
-            rate_bps = float(funding_rate) * 10000
-            if rate_bps < self.min_funding_rate_bps:
-                return f"资金费率不达标({rate_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)"
+        funding_ok, funding_reason = self._check_funding_support(row)
+        if not funding_ok:
+            return funding_reason
 
         # 盘口覆盖检查
         open_coverage = row.get('open_coverage')
@@ -2570,6 +2658,17 @@ class TradingExecutor:
             rate_pct = float(funding_rate) * 100
             parts.append(f"实时24h费率{rate_pct:.4f}%")
 
+        support_ctx = self._funding_support_context(row)
+        support_bps = support_ctx.get('support_bps')
+        if support_bps is not None:
+            window = support_ctx.get('window_hours')
+            window_text = f"{float(window):.0f}h" if window is not None else "24h"
+            parts.append(
+                f"已结算均费{window_text}={float(support_bps):.1f}bps"
+                f"(n={int(support_ctx.get('samples') or 0)},"
+                f"门槛={self.min_funding_support_bps:.1f})"
+            )
+
         cached_rate = row.get('_cached_funding_rate_24h')
         if cached_rate is not None and funding_rate is not None:
             cached_bps = float(cached_rate) * 10000
@@ -2583,8 +2682,9 @@ class TradingExecutor:
         # 3. 实时费率校验结果
         rt_rate = self._last_realtime_rate_bps.pop(base_asset, None)
         if rt_rate is not None:
+            realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
             parts.append(
-                f"实时24h校验✓({rt_rate:.2f}bps≥{self.min_funding_rate_bps:.1f})"
+                f"实时24h{floor_label}✓({rt_rate:.2f}bps≥{realtime_floor:.1f})"
             )
 
         # 4. 峰值回落 / 超时信息

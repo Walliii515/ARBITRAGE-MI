@@ -372,7 +372,7 @@ const columnDefs = computed((): ColDef<ReversePositionRow>[] => [
   {
     headerName: '实际开仓基差',
     colId: 'display_open_basis_bps',
-    valueGetter: (params: ValueGetterParams<ReverseOrderRow>) => params.data?.actual_basis_bps ?? params.data?.reverse_open_basis_bps,
+    valueGetter: (params: ValueGetterParams<ReversePositionRow>) => params.data?.actual_basis_bps ?? params.data?.reverse_open_basis_bps,
     width: 130,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',

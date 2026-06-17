@@ -15,6 +15,9 @@ export interface OrderBookRow {
   spot_qty?: number | null
   future_qty?: number | null
   funding_rate_24h?: number | null
+  funding_rate_24h_avg_bps?: number | null
+  funding_rate_24h_avg_samples?: number | null
+  funding_rate_24h_avg_window_hours?: number | null
   funding_next_apply?: string | null
   percentile_30?: number | null
   meta_update_time?: string | null
