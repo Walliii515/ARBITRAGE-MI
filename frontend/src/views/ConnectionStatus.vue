@@ -12,13 +12,14 @@ import type {
 } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
-import { showError, showSuccess } from '../utils/message'
+import { showError, showSuccess, showWarning } from '../utils/message'
 import { get, post } from '../utils/request'
 import { useConnectionMonitor, type ConnectionRow } from '../composables/useConnectionMonitor'
 
 /* ───── 响应式状态 ───── */
 const gridApi = shallowRef<GridApi | null>(null)
 const loading = ref(false)
+const serviceBusy = ref(false)
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 const {
   connectionRows: rowData,
@@ -42,6 +43,19 @@ const riskWsHealthy = computed(() =>
   riskWsConnected.value
   && riskWsAdlStatus.value === 'success'
   && riskWsLiquidationStatus.value === 'success'
+)
+const canStartService = computed(
+  () => !serviceBusy.value && (serviceState.value === 'idle' || serviceState.value === 'error'),
+)
+const canStopService = computed(
+  () =>
+    !serviceBusy.value &&
+    (
+      serviceState.value === 'running' ||
+      serviceState.value === 'starting' ||
+      serviceState.value === 'stopping' ||
+      serviceState.value === 'error'
+    ),
 )
 
 function formatRiskWsStatus(status: string) {
@@ -399,11 +413,50 @@ async function fetchData() {
   try {
     loading.value = true
     await fetchConnectionStatus()
+    serviceBusy.value = serviceState.value === 'starting' || serviceState.value === 'stopping'
     maybeShowDelistRiskAlert()
   } catch (e: any) {
     showError(e?.message || '获取连接状态失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function startService() {
+  try {
+    serviceBusy.value = true
+    serviceState.value = 'starting'
+    const res = await post('/api/service/start')
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      serviceBusy.value = false
+      showError(typeof body.detail === 'string' ? body.detail : '启动失败')
+      return
+    }
+    showSuccess('正在启动后端 WS 服务…')
+    await fetchData()
+  } catch {
+    serviceBusy.value = false
+    showError('启动请求失败')
+  }
+}
+
+async function stopService() {
+  try {
+    serviceBusy.value = true
+    serviceState.value = 'stopping'
+    const res = await post('/api/service/stop')
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      serviceBusy.value = false
+      showError(typeof body.detail === 'string' ? body.detail : '终止失败')
+      return
+    }
+    showWarning('正在终止后端 WS 服务…')
+    await fetchData()
+  } catch {
+    serviceBusy.value = false
+    showError('终止请求失败')
   }
 }
 
@@ -449,6 +502,26 @@ onUnmounted(() => {
           Gate风险WS:
           {{ !riskWsEnabled ? '关闭' : riskWsConnected ? '已连接' : '未连接' }}
         </span>
+        <div class="service-actions">
+          <el-button
+            type="primary"
+            size="small"
+            :disabled="!canStartService"
+            :loading="serviceBusy && serviceState === 'starting'"
+            @click="startService"
+          >
+            启动后端 WS 服务
+          </el-button>
+          <el-button
+            type="danger"
+            size="small"
+            :disabled="!canStopService"
+            :loading="serviceBusy && serviceState === 'stopping'"
+            @click="stopService"
+          >
+            终止后端 WS 服务
+          </el-button>
+        </div>
       </div>
 
       <div class="stats-row">
@@ -564,6 +637,12 @@ onUnmounted(() => {
   gap: 12px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.service-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .status-badge {
