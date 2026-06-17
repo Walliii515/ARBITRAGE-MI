@@ -164,7 +164,7 @@ async function loadColumnState() {
 
 /* ───── 过滤 ───── */
 type FilterType = 'all' | 'gate_no_data' | 'gate_ws_unsub' | 'binance_no_data' | 'delist_risk' | 'any_issue'
-const activeFilter = ref<FilterType>('all')
+const activeFilter = ref<FilterType>('any_issue')
 const searchKeyword = ref('')
 
 function applyFilter(filter?: FilterType) {
@@ -464,6 +464,7 @@ function onGridReady(params: GridReadyEvent) {
   gridApi.value = params.api
   setupGridCopy(params.api)
   loadColumnState()
+  applyFilter()
 }
 
 function getRowId(params: GetRowIdParams) {
