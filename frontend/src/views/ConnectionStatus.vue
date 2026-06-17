@@ -14,7 +14,11 @@ import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import { showError, showSuccess, showWarning } from '../utils/message'
 import { get, post } from '../utils/request'
-import { useConnectionMonitor, type ConnectionRow } from '../composables/useConnectionMonitor'
+import {
+  isConnectionAssetEnabled,
+  useConnectionMonitor,
+  type ConnectionRow,
+} from '../composables/useConnectionMonitor'
 
 /* ───── 响应式状态 ───── */
 const gridApi = shallowRef<GridApi | null>(null)
@@ -31,6 +35,7 @@ const {
   binanceWsLatencyMs,
   exchangeRiskMonitor,
   delistRiskReport,
+  fetchDelistRisks,
   fetchConnectionStatus,
 } = useConnectionMonitor()
 
@@ -66,6 +71,7 @@ function formatRiskWsStatus(status: string) {
 }
 
 function delistRiskText(data: ConnectionRow) {
+  if (!isConnectionAssetEnabled(data)) return ''
   const risks = data.delist_risks || []
   if (!risks.length) return ''
   return risks.map((risk) => {
@@ -179,13 +185,14 @@ function applyFilter(filter?: FilterType) {
     if (kw && !data.base_asset.toUpperCase().includes(kw) && !data.contract.toUpperCase().includes(kw)) {
       return false
     }
+    const enabled = isConnectionAssetEnabled(data)
     // 状态过滤
     switch (f) {
-      case 'gate_no_data': return !data.gate_receiving_data
-      case 'gate_ws_unsub': return !data.gate_ws_subscribed
-      case 'binance_no_data': return !data.binance_receiving_data
-      case 'delist_risk': return !!(data.delist_risks && data.delist_risks.length > 0)
-      case 'any_issue': return !data.gate_receiving_data || !data.binance_receiving_data || !!(data.delist_risks && data.delist_risks.length > 0)
+      case 'gate_no_data': return enabled && !data.gate_receiving_data
+      case 'gate_ws_unsub': return enabled && !data.gate_ws_subscribed
+      case 'binance_no_data': return enabled && !data.binance_receiving_data
+      case 'delist_risk': return enabled && !!(data.delist_risks && data.delist_risks.length > 0)
+      case 'any_issue': return enabled && (!data.gate_receiving_data || !data.binance_receiving_data || !!(data.delist_risks && data.delist_risks.length > 0))
       default: return true
     }
   })
@@ -200,6 +207,18 @@ const columnDefs: ColDef[] = [
     width: 100,
     pinned: 'left',
     filter: 'agTextColumnFilter',
+  },
+  {
+    headerName: '状态',
+    field: 'asset_status',
+    width: 90,
+    pinned: 'left',
+    cellRenderer: (params: ICellRendererParams) => {
+      const data = params.data as ConnectionRow
+      return isConnectionAssetEnabled(data)
+        ? '<span style="color:#67c23a">有效</span>'
+        : '<span style="color:#909399">失效</span>'
+    },
   },
   {
     headerName: 'Gate合约',
@@ -301,10 +320,10 @@ const columnDefs: ColDef[] = [
       const data = params.data as ConnectionRow
       const asset = String(data.base_asset || '').replace(/"/g, '&quot;')
       const buttons: string[] = []
-      if (!data.gate_receiving_data || !data.binance_receiving_data || !data.gate_ws_subscribed || !data.binance_ws_subscribed) {
+      if (isConnectionAssetEnabled(data) && (!data.gate_receiving_data || !data.binance_receiving_data || !data.gate_ws_subscribed || !data.binance_ws_subscribed)) {
         buttons.push(`<button class="retry-btn" data-asset="${asset}">重试</button>`)
       }
-      if (data.delist_risks && data.delist_risks.length > 0) {
+      if (isConnectionAssetEnabled(data) && data.delist_risks && data.delist_risks.length > 0) {
         buttons.push(`<button class="disable-btn" data-asset="${asset}">设失效</button>`)
       }
       return buttons.join('')
@@ -401,7 +420,9 @@ async function disableBaseAsset(baseAsset: string) {
       return
     }
     showSuccess(data.message || `${baseAsset} 已设为失效`)
+    await fetchDelistRisks(true).catch(() => null)
     await fetchData()
+    gridApi.value?.onFilterChanged()
   } catch (e: any) {
     // request.ts 已处理
   } finally {

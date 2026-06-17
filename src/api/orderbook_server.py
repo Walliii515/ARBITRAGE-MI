@@ -52,6 +52,7 @@ from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
 from calc.account_capital import build_default_capital_snapshotter
+from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
 from calc.reverse_research_store import (
     ReverseResearchConfig,
@@ -135,6 +136,44 @@ def _gate_risk_event_monitor_status() -> dict:
     except Exception as e:
         logger.warning(f'Gate 风险事件监听状态读取失败: {e}', exc_info=True)
         return {'enabled': True, 'connected': False, 'channels': {}, 'last_error': str(e)[:200]}
+
+
+def _attach_base_asset_status(rows: List[Dict]) -> None:
+    """为连接状态补充 mi_base_asset 有效状态，便于前端区分运行时缓存与监控候选。"""
+    assets = sorted({
+        str(row.get('base_asset') or '').strip().upper()
+        for row in rows
+        if row.get('base_asset')
+    })
+    if not assets:
+        return
+
+    status_by_asset: Dict[str, str] = {}
+    try:
+        placeholders = ', '.join(['%s'] * len(assets))
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    UPPER(TRIM(base_asset)) AS base_asset,
+                    COALESCE(is_valid, 'Y') AS is_valid
+                FROM mi_base_asset
+                WHERE UPPER(TRIM(base_asset)) IN ({placeholders})
+                """,
+                assets,
+            )
+            for item in cursor.fetchall() or []:
+                asset = str(item.get('base_asset') or '').strip().upper()
+                if asset:
+                    status_by_asset[asset] = str(item.get('is_valid') or 'Y').strip().upper()
+    except Exception as e:
+        logger.warning(f'连接状态资产有效性读取失败: {e}', exc_info=True)
+
+    for row in rows:
+        asset = str(row.get('base_asset') or '').strip().upper()
+        is_valid = status_by_asset.get(asset, 'Y') == 'Y'
+        row['asset_is_valid'] = is_valid
+        row['asset_status'] = 'enabled' if is_valid else 'disabled'
 
 _meta_update_time: str = ''  # 上次缓存刷新时间
 
@@ -263,6 +302,8 @@ _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇
 _latest_account_summary_ts: float = 0.0
 _gate_position_risk_cache: List[Dict] = []
 _gate_position_risk_cache_ts: float = 0.0
+_delist_risk_report: Dict = {'items': [], 'summary': {'total': 0, 'critical': 0, 'warning': 0}}
+_delist_risk_report_ts: float = 0.0
 
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
@@ -999,8 +1040,10 @@ async def service_connections():
     """获取逐标的资产 OBU full 快照 / WS 订阅状态（无需认证，用于连接监控）"""
     if not svc:
         return {'items': [], 'state': SERVICE_IDLE}
+    items = svc.get_connection_status()
+    _attach_base_asset_status(items)
     return {
-        'items': svc.get_connection_status(),
+        'items': items,
         'state': svc.state,
         'gate_ws_connected': svc._gate_ws_connected(),
         'binance_ws_connected': svc._binance_ws_connected(),

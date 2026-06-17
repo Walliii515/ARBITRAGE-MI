@@ -13,6 +13,8 @@ export interface ConnectionRow {
   binance_receiving_data: boolean
   binance_last_update: number
   binance_stale_sec: number | null
+  asset_is_valid?: boolean
+  asset_status?: 'enabled' | 'disabled' | string | null
   delist_risk_level?: string | null
   delist_risk_summary?: string | null
   delist_risks?: DelistRiskItem[]
@@ -68,13 +70,17 @@ let delistReportCache: DelistRiskReport = {
   summary: { total: 0, critical: 0, warning: 0 },
 }
 
+export function isConnectionAssetEnabled(row: ConnectionRow) {
+  return row.asset_status !== 'disabled' && row.asset_is_valid !== false
+}
+
 export function buildConnectionStats(rows: ConnectionRow[]) {
   const total = rows.length
   const gateSubscribed = rows.filter((r) => r.gate_ws_subscribed).length
   const gateReceiving = rows.filter((r) => r.gate_receiving_data).length
   const binanceSubscribed = rows.filter((r) => r.binance_ws_subscribed).length
   const binanceReceiving = rows.filter((r) => r.binance_receiving_data).length
-  const delistRisk = rows.filter((r) => r.delist_risks && r.delist_risks.length > 0).length
+  const delistRisk = rows.filter((r) => isConnectionAssetEnabled(r) && r.delist_risks && r.delist_risks.length > 0).length
 
   return {
     total,
@@ -96,6 +102,14 @@ function mergeDelistRisks(rows: ConnectionRow[], report: DelistRiskReport): Conn
     byAsset.set(key, list)
   }
   return rows.map((row) => {
+    if (!isConnectionAssetEnabled(row)) {
+      return {
+        ...row,
+        delist_risks: [],
+        delist_risk_level: null,
+        delist_risk_summary: null,
+      }
+    }
     const risks = byAsset.get((row.base_asset || '').toUpperCase()) || []
     const level = risks.some((r) => r.risk_level === 'critical')
       ? 'critical'
