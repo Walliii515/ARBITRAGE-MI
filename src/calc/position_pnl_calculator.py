@@ -212,6 +212,7 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
     for pos in positions:
         ba = pos.get('base_asset', '')
         vwap_data = close_vwaps.get(ba)
+        open_notional = _position_open_notional(pos, cfg)
 
         # 注入费率 (bps) - 根据状态区分：持仓中只显示开仓费，已平仓显示全部费
         c_meta = contract_meta.get(ba, {})
@@ -248,7 +249,7 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         pos['funding_next_apply'] = _format_dt(c_meta.get('funding_next_apply'))
 
         funding_pnl, funding_pnl_bps = _calc_funding_bps(
-            pos.get('funding_total_pnl'), cfg.open_amount_usdt
+            pos.get('funding_total_pnl'), open_notional
         )
         pos['funding_pnl_bps'] = funding_pnl_bps
 
@@ -277,7 +278,7 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             spread_pnl_bps = open_spread - close_spread
             pos['realized_pnl_bps'] = round(spread_pnl_bps, 2)
             pos['realized_pnl'] = round(
-                spread_pnl_bps / 10000 * cfg.open_amount_usdt, 4
+                spread_pnl_bps / 10000 * open_notional, 4
             )
 
             # 总盈亏
