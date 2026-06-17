@@ -117,11 +117,13 @@ const chartSeries = computed<ChartSeries[]>(() => {
     : [selectedChartMode.value]
   const rows = historyRows.value
     .filter((row) => row.exchange === selectedExchange.value)
+  const latestEquity = latestByExchange.value[selectedExchange.value]?.equity_usdt
+    ?? rows[rows.length - 1]?.equity_usdt
   const series: ChartSeries[] = metrics.map((metric): ChartSeries => {
     const option = metricOptions.find((item) => item.key === metric)!
     const points = rows.map((row) => ({
       time: row.snapshot_at,
-      value: chartMetricValue(row, metric),
+      value: chartMetricValue(row, metric, latestEquity),
     }))
     return {
       exchange: selectedExchange.value,
@@ -196,15 +198,15 @@ function hasAmount(value: number | null | undefined): boolean {
   return value != null && Number.isFinite(Number(value))
 }
 
-function netRealizedReturnPct(row: CapitalRow | undefined): number | null {
-  const equity = Number(row?.equity_usdt ?? NaN)
+function netRealizedReturnPct(row: CapitalRow | undefined, equityOverride?: number | null): number | null {
+  const equity = Number(equityOverride ?? row?.equity_usdt ?? NaN)
   const netRealized = Number(row?.total_pnl_usdt ?? NaN)
   if (!Number.isFinite(equity) || Math.abs(equity) <= 1e-9 || !Number.isFinite(netRealized)) return null
   return (netRealized / equity) * 100
 }
 
-function chartMetricValue(row: CapitalRow, metric: ChartMetric): number {
-  if (metric === 'net_realized_return_pct') return netRealizedReturnPct(row) ?? 0
+function chartMetricValue(row: CapitalRow, metric: ChartMetric, latestEquity?: number | null): number {
+  if (metric === 'net_realized_return_pct') return netRealizedReturnPct(row, latestEquity) ?? 0
   return Number(row[metric] ?? 0)
 }
 
