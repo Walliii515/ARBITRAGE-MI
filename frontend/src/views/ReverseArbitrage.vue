@@ -15,6 +15,7 @@ import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
+import { getToken } from '../utils/auth'
 import type { OrderBookRow } from './orderbookTypes'
 
 interface ReversePayload {
@@ -32,6 +33,8 @@ interface ReversePayload {
   borrow_data_available?: boolean
   borrow_data_source?: string
   borrow_cache_age_sec?: number | null
+  gate_ws_latency_ms?: number | null
+  binance_ws_latency_ms?: number | null
 }
 
 interface ColumnVisibility {
@@ -67,11 +70,19 @@ const filterMarginEdge = ref(true)
 const filterCoverage = ref(true)
 const filterBorrowReady = ref(true)
 const columnVisibilities = ref<ColumnVisibility[]>([])
+const frontendWsSubscribed = ref(false)
+const gateWsConnected = ref(false)
+const binanceWsConnected = ref(false)
+const gateWsLatencyMs = ref<number | null>(null)
+const binanceWsLatencyMs = ref<number | null>(null)
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
 
 let gridApi: GridApi<OrderBookRow> | null = null
 let refreshTimer: ReturnType<typeof setInterval> | null = null
+let socket: WebSocket | null = null
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let pageVisible = true
 
 const uniqueAssets = computed(() => {
   void rowVersion.value
@@ -177,6 +188,32 @@ function applyRows(rows: unknown, serverTime?: string) {
   if (serverTime) lastUpdate.value = serverTime
 }
 
+function applyReversePayload(data: ReversePayload) {
+  borrowDataAvailable.value = !!data.borrow_data_available
+  borrowDataSource.value = data.borrow_data_source ?? 'none'
+  borrowCacheAgeSec.value = data.borrow_cache_age_sec ?? null
+  if (data.reverse_margin_edge_threshold_bps != null) marginEdgeThresholdBps.value = data.reverse_margin_edge_threshold_bps
+  if (data.orderbook_coverage_threshold != null) orderbookCoverageThreshold.value = data.orderbook_coverage_threshold
+  if (data.gate_ws_latency_ms !== undefined) {
+    gateWsLatencyMs.value = data.gate_ws_latency_ms ?? null
+    gateWsConnected.value = data.gate_ws_latency_ms != null
+  }
+  if (data.binance_ws_latency_ms !== undefined) {
+    binanceWsLatencyMs.value = data.binance_ws_latency_ms ?? null
+    binanceWsConnected.value = data.binance_ws_latency_ms != null
+  }
+  if (data.reverse_funding_carry) {
+    fundingCarryConfig.value = {
+      enabled: !!data.reverse_funding_carry.enabled,
+      min24hBps: Number(data.reverse_funding_carry.min_24h_bps ?? 80),
+      maxNextFundingMin: Number(data.reverse_funding_carry.max_next_funding_min ?? 60),
+      minMarginEdgeBps: Number(data.reverse_funding_carry.min_margin_edge_bps ?? 50),
+      basisRelaxBps: Number(data.reverse_funding_carry.basis_relax_bps ?? 30),
+    }
+  }
+  applyRows(data.rows ?? [], data.server_time)
+}
+
 async function fetchOpportunities() {
   if (loading.value) return
   loading.value = true
@@ -187,26 +224,78 @@ async function fetchOpportunities() {
       showError('反向机会加载失败')
       return
     }
-    borrowDataAvailable.value = !!data.borrow_data_available
-    borrowDataSource.value = data.borrow_data_source ?? 'none'
-    borrowCacheAgeSec.value = data.borrow_cache_age_sec ?? null
-    if (data.reverse_margin_edge_threshold_bps != null) marginEdgeThresholdBps.value = data.reverse_margin_edge_threshold_bps
-    if (data.orderbook_coverage_threshold != null) orderbookCoverageThreshold.value = data.orderbook_coverage_threshold
-    if (data.reverse_funding_carry) {
-      fundingCarryConfig.value = {
-        enabled: !!data.reverse_funding_carry.enabled,
-        min24hBps: Number(data.reverse_funding_carry.min_24h_bps ?? 80),
-        maxNextFundingMin: Number(data.reverse_funding_carry.max_next_funding_min ?? 60),
-        minMarginEdgeBps: Number(data.reverse_funding_carry.min_margin_edge_bps ?? 50),
-        basisRelaxBps: Number(data.reverse_funding_carry.basis_relax_bps ?? 30),
-      }
-    }
-    applyRows(data.rows ?? [], data.server_time)
+    applyReversePayload(data)
   } catch {
     showError('反向机会加载失败')
   } finally {
     loading.value = false
   }
+}
+
+function getWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = getToken()
+  return `${protocol}//${window.location.host}/ws/orderbook?token=${token}&mode=reverse`
+}
+
+function connectWs() {
+  if (!frontendWsSubscribed.value) return
+  if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return
+
+  socket = new WebSocket(getWsUrl())
+  socket.onopen = () => {
+    // 首包由后端推送 reverse_opportunities，这里不额外打 REST，避免重复刷新。
+  }
+  socket.onmessage = (ev) => {
+    if (!pageVisible) return
+    try {
+      const msg = JSON.parse(ev.data)
+      if (msg.type === 'ping') return
+      if (msg.type === 'reverse_opportunities') {
+        applyReversePayload(msg)
+      }
+    } catch {
+      /* ignore invalid WS payload */
+    }
+  }
+  socket.onclose = () => {
+    socket = null
+    gateWsConnected.value = false
+    binanceWsConnected.value = false
+    gateWsLatencyMs.value = null
+    binanceWsLatencyMs.value = null
+    if (frontendWsSubscribed.value) scheduleReconnect()
+  }
+  socket.onerror = () => {
+    gateWsConnected.value = false
+    binanceWsConnected.value = false
+  }
+}
+
+function scheduleReconnect() {
+  if (!frontendWsSubscribed.value) return
+  if (reconnectTimer) clearTimeout(reconnectTimer)
+  reconnectTimer = setTimeout(connectWs, 3000)
+}
+
+function startFrontendSubscription() {
+  if (frontendWsSubscribed.value) return
+  frontendWsSubscribed.value = true
+  connectWs()
+}
+
+function stopFrontendSubscription() {
+  frontendWsSubscribed.value = false
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  socket?.close()
+  socket = null
+  gateWsConnected.value = false
+  binanceWsConnected.value = false
+  gateWsLatencyMs.value = null
+  binanceWsLatencyMs.value = null
 }
 
 function negativeFundingFilter(params: { data?: OrderBookRow }) {
@@ -646,7 +735,13 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
 
 function restartTimer() {
   if (refreshTimer) clearInterval(refreshTimer)
-  refreshTimer = setInterval(fetchOpportunities, 3000)
+  refreshTimer = setInterval(() => {
+    if (!frontendWsSubscribed.value) fetchOpportunities()
+  }, 3000)
+}
+
+function handleVisibilityChange() {
+  pageVisible = !document.hidden
 }
 
 watch(
@@ -659,13 +754,19 @@ watch(
 
 onMounted(() => {
   document.addEventListener('click', handleOutsideClick)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   fetchOpportunities()
   restartTimer()
 })
 
 onUnmounted(() => {
+  if (reconnectTimer) clearTimeout(reconnectTimer)
   if (refreshTimer) clearInterval(refreshTimer)
+  frontendWsSubscribed.value = false
+  socket?.close()
+  socket = null
   document.removeEventListener('click', handleOutsideClick)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
 
@@ -673,6 +774,44 @@ onUnmounted(() => {
   <div class="reverse-page">
     <el-card shadow="never" class="status-card">
       <div class="status-row">
+        <div class="status-actions">
+          <el-button
+            v-if="!frontendWsSubscribed"
+            type="success"
+            size="small"
+            @click="startFrontendSubscription"
+          >
+            订阅前端行情
+          </el-button>
+          <el-button
+            v-else
+            type="warning"
+            size="small"
+            @click="stopFrontendSubscription"
+          >
+            停止前端行情
+          </el-button>
+        </div>
+        <span class="status-item">
+          前端订阅：
+          <el-tag :type="frontendWsSubscribed ? 'success' : 'info'" size="small">
+            {{ frontendWsSubscribed ? '已开启' : '已关闭' }}
+          </el-tag>
+        </span>
+        <span class="status-item">
+          Gate WS p50：
+          <el-tag v-if="gateWsConnected" type="success" size="small">
+            {{ gateWsLatencyMs != null ? `${gateWsLatencyMs}ms` : '已连接' }}
+          </el-tag>
+          <el-tag v-else type="danger" size="small">未连接</el-tag>
+        </span>
+        <span class="status-item">
+          Binance WS p50：
+          <el-tag v-if="binanceWsConnected" type="success" size="small">
+            {{ binanceWsLatencyMs != null ? `${binanceWsLatencyMs}ms` : '已连接' }}
+          </el-tag>
+          <el-tag v-else type="danger" size="small">未连接</el-tag>
+        </span>
         <span class="status-item">最后更新：{{ lastUpdate }}</span>
         <span class="status-item">借币数据：
           <el-tag :type="borrowDataAvailable ? 'success' : 'warning'" size="small">
@@ -847,6 +986,7 @@ onUnmounted(() => {
 }
 
 .status-row,
+.status-actions,
 .grid-header,
 .header-actions,
 .filter-group,

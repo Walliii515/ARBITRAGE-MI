@@ -283,6 +283,7 @@ svc: Optional[OrderBookDataClient] = None
 event_loop: Optional[asyncio.AbstractEventLoop] = None
 broadcast_queue: Optional[asyncio.Queue] = None
 ws_clients: Set[WebSocket] = set()
+reverse_ws_clients: Set[WebSocket] = set()
 event_ws_clients: Set[WebSocket] = set()
 last_broadcast_time = 0.0
 pending_broadcast = False
@@ -335,6 +336,8 @@ TRADING_SCAN_CACHE_SEC = config.get_float('orderbook.trading_scan_cache_sec', 1.
 # 完整广播 payload 缓存（预序列化 JSON 字符串，避免多客户端重复序列化）
 _cached_payload_json: str = ''
 _cached_payload_ts: float = 0.0
+_cached_reverse_payload_json: str = ''
+_cached_reverse_payload_ts: float = 0.0
 _reverse_borrow_cache: Dict[str, Dict] = {}
 _reverse_borrow_cache_ts: float = 0.0
 
@@ -822,6 +825,18 @@ def build_payload_json() -> str:
     return _cached_payload_json
 
 
+def build_reverse_opportunities_payload_json() -> str:
+    """构建并预序列化反向机会广播载荷，和正向快照客户端隔离。"""
+    global _cached_reverse_payload_json, _cached_reverse_payload_ts
+    now = time.time()
+    if _cached_reverse_payload_json and (now - _cached_reverse_payload_ts) < BROADCAST_THROTTLE_SEC:
+        return _cached_reverse_payload_json
+    payload = build_reverse_opportunities_payload()
+    _cached_reverse_payload_json = _json_dumps(payload)
+    _cached_reverse_payload_ts = now
+    return _cached_reverse_payload_json
+
+
 def schedule_broadcast():
     """调度盘口快照广播（启动阶段与运行阶段均推送，带节流）"""
     global pending_broadcast, last_broadcast_time
@@ -860,7 +875,12 @@ async def broadcast_worker():
     while True:
         payload = await broadcast_queue.get()
         payload_type = 'snapshot' if isinstance(payload, str) else payload.get('type')
-        targets = ws_clients if payload_type == 'snapshot' else (ws_clients | event_ws_clients)
+        if payload_type == 'snapshot':
+            targets = ws_clients
+        elif payload_type == 'reverse_opportunities':
+            targets = reverse_ws_clients
+        else:
+            targets = ws_clients | reverse_ws_clients | event_ws_clients
         # 预序列化一次，所有客户端共享同一份 JSON 字符串
         if isinstance(payload, str):
             text = payload  # 已经是预序列化的 JSON
@@ -874,6 +894,7 @@ async def broadcast_worker():
                 dead_clients.append(ws)
         for ws in dead_clients:
             ws_clients.discard(ws)
+            reverse_ws_clients.discard(ws)
             event_ws_clients.discard(ws)
 
 
@@ -892,11 +913,13 @@ async def _orderbook_broadcast_loop():
             if not svc or svc.state not in (SERVICE_RUNNING, SERVICE_STARTING):
                 continue
             # 无前端连接时跳过计算
-            if not ws_clients:
+            if not ws_clients and not reverse_ws_clients:
                 continue
             # 直接放入预序列化的 JSON 字符串，broadcast_worker 无需再次序列化
-            payload_json = build_payload_json()
-            await broadcast_queue.put(payload_json)
+            if ws_clients:
+                await broadcast_queue.put(build_payload_json())
+            if reverse_ws_clients:
+                await broadcast_queue.put(build_reverse_opportunities_payload_json())
         except Exception as e:
             logger.error(f"盘口广播失败: {e}")
 
@@ -1518,15 +1541,20 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None), mode: str
         return
     
     await websocket.accept()
-    snapshot_mode = mode != 'events'
+    reverse_mode = mode == 'reverse'
+    snapshot_mode = mode != 'events' and not reverse_mode
     if snapshot_mode:
         ws_clients.add(websocket)
+    if reverse_mode:
+        reverse_ws_clients.add(websocket)
     event_ws_clients.add(websocket)
 
     try:
         # 初始连接时发送当前快照（复用缓存的 JSON）
         if snapshot_mode:
             await websocket.send_text(build_payload_json())
+        if reverse_mode:
+            await websocket.send_text(build_reverse_opportunities_payload_json())
         if svc and svc.state in (SERVICE_STARTING, SERVICE_STOPPING):
             await websocket.send_text(_json_dumps(svc.get_progress_payload()))
 
@@ -1546,6 +1574,7 @@ async def ws_orderbook(websocket: WebSocket, token: str = Query(None), mode: str
         pass
     finally:
         ws_clients.discard(websocket)
+        reverse_ws_clients.discard(websocket)
         event_ws_clients.discard(websocket)
 
 
