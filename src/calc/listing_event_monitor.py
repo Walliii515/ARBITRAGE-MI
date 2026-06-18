@@ -233,7 +233,7 @@ def refresh_listing_events() -> Dict[str, Any]:
                 """
                 UPDATE mi_listing_event e
                 INNER JOIN mi_base_asset b
-                   ON UPPER(TRIM(b.base_asset)) = e.base_asset
+                   ON UPPER(TRIM(b.base_asset)) COLLATE utf8mb4_unicode_ci = e.base_asset
                 SET
                     e.action_status = CASE
                         WHEN b.is_valid = 'Y' THEN 'added_to_monitor'
@@ -302,7 +302,7 @@ def list_listing_events(
             COALESCE(b.strategy_tier, 'C') AS strategy_tier
         FROM mi_listing_event e
         LEFT JOIN mi_base_asset b
-          ON UPPER(TRIM(b.base_asset)) = e.base_asset
+          ON UPPER(TRIM(b.base_asset)) COLLATE utf8mb4_unicode_ci = e.base_asset
         {where}
         ORDER BY
             FIELD(e.action_status, 'pending', 'acknowledged', 'ignored', 'disabled', 'added_to_monitor'),
