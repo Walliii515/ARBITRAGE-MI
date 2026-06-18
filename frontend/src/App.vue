@@ -382,6 +382,10 @@ function toggleMenu() {
             <el-icon><DataAnalysis /></el-icon>
             <template #title>研究分析</template>
           </el-menu-item>
+          <el-menu-item index="/reverse-arbitrage/funding-prediction">
+            <el-icon><DataAnalysis /></el-icon>
+            <template #title>Funding预测</template>
+          </el-menu-item>
           <el-menu-item index="/reverse-arbitrage/orders">
             <el-icon><List /></el-icon>
             <template #title>订单管理</template>

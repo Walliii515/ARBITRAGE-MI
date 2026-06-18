@@ -59,6 +59,7 @@ from calc.reverse_research_store import (
     get_reverse_research_page,
     record_reverse_research_snapshot,
 )
+from calc.reverse_funding_predictor import get_reverse_funding_prediction_page
 from calc.reverse_signal_monitor import ReverseSignalMonitor, ReverseSignalMonitorConfig
 from calc.reverse_trade_store import list_reverse_positions, summarize_reverse_positions
 from calc.reverse_position_cost_sync import refresh_reverse_position_costs
@@ -1247,6 +1248,25 @@ async def reverse_research_collect():
     return await loop.run_in_executor(
         None,
         lambda: record_reverse_research_snapshot_once('manual'),
+    )
+
+
+@app.get('/api/reverse-funding/predictions', dependencies=[Depends(verify_token_dependency)])
+async def reverse_funding_predictions(
+    threshold: float = Query(-0.01, ge=-1.0, le=0.0),
+    lookback_days: int = Query(30, ge=3, le=90),
+    keyword: str = Query('', max_length=64),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=10, le=5000),
+):
+    return await asyncio.to_thread(
+        lambda: get_reverse_funding_prediction_page(
+            threshold_rate=threshold,
+            lookback_days=lookback_days,
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
     )
 
 
