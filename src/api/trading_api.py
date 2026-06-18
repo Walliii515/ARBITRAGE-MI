@@ -27,6 +27,14 @@ from calc.account_capital import build_default_capital_snapshotter
 from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
 from calc.gate_position_risk import attach_gate_position_risk
+from calc.listing_event_monitor import (
+    add_listing_asset_to_monitor,
+    disable_listing_asset,
+    listing_event_summary,
+    list_listing_events,
+    mark_listing_events,
+    refresh_listing_events,
+)
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
@@ -62,6 +70,10 @@ class DisableBaseAssetRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class ListingEventActionRequest(BaseModel):
+    reason: Optional[str] = None
+
+
 def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """将数据库行中的 Decimal/datetime 转换为 JSON 可序列化类型"""
     result = {}
@@ -72,7 +84,7 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = value.strftime('%Y-%m-%d %H:%M:%S')
         elif isinstance(value, date):
             result[key] = value.strftime('%Y-%m-%d')
-        elif key in ('detail', 'binance_cross_margin') and isinstance(value, str):
+        elif key in ('detail', 'binance_cross_margin', 'source_payload') and isinstance(value, str):
             try:
                 result[key] = json.loads(value)
             except Exception:
@@ -1161,6 +1173,84 @@ async def get_delist_risks(
 ):
     """检查当前监控/持仓标的的交易所下架风险。"""
     return _get_delist_risk_report_cached(lookahead_days=lookahead_days)
+
+
+@router.get('/listing-events')
+async def get_listing_events(
+    action_status: Optional[str] = Query(None, description="处理状态过滤：pending/acknowledged/ignored/disabled/added_to_monitor/all"),
+    candidate_status: Optional[str] = Query(None, description="候选状态过滤：matched/gate_only/binance_only/all"),
+    actionable_only: bool = Query(False, description="仅展示可提醒候选"),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """查询交易对上新事件。"""
+    rows = list_listing_events(
+        action_status=action_status,
+        candidate_status=candidate_status,
+        actionable_only=actionable_only,
+        limit=limit,
+    )
+    return {
+        'items': _serialize_rows(rows),
+        'summary': _serialize_row(listing_event_summary()),
+    }
+
+
+@router.get('/listing-events/summary')
+async def get_listing_events_summary():
+    """交易对上新事件摘要，用于固定时间弹窗提醒。"""
+    items = list_listing_events(
+        action_status='pending',
+        candidate_status='matched',
+        actionable_only=True,
+        limit=20,
+    )
+    return {
+        'summary': _serialize_row(listing_event_summary()),
+        'items': _serialize_rows(items),
+    }
+
+
+@router.post('/listing-events/refresh', dependencies=[Depends(verify_token_dependency)])
+async def refresh_listing_events_api():
+    """手动刷新交易对上新事件。"""
+    return refresh_listing_events()
+
+
+@router.post('/listing-events/{base_asset}/ack', dependencies=[Depends(verify_token_dependency)])
+async def ack_listing_event(base_asset: str, payload: ListingEventActionRequest | None = None):
+    """确认上新事件；保留在页面，但不再弹窗。"""
+    asset = (base_asset or '').strip().upper()
+    affected = mark_listing_events([asset], 'acknowledged', (payload.reason if payload else None) or 'acknowledged')
+    return {'success': True, 'base_asset': asset, 'affected': affected}
+
+
+@router.post('/listing-events/{base_asset}/ignore', dependencies=[Depends(verify_token_dependency)])
+async def ignore_listing_event(base_asset: str, payload: ListingEventActionRequest | None = None):
+    """忽略上新事件；不修改 mi_base_asset。"""
+    asset = (base_asset or '').strip().upper()
+    affected = mark_listing_events([asset], 'ignored', (payload.reason if payload else None) or 'ignored')
+    return {'success': True, 'base_asset': asset, 'affected': affected}
+
+
+@router.post('/listing-events/{base_asset}/add-to-monitor', dependencies=[Depends(verify_token_dependency)])
+async def add_listing_event_to_monitor(base_asset: str):
+    """将上新候选加入 mi_base_asset，后续按普通标的进入监控候选。"""
+    try:
+        return add_listing_asset_to_monitor(base_asset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post('/listing-events/{base_asset}/disable', dependencies=[Depends(verify_token_dependency)])
+async def disable_listing_event_asset(base_asset: str, payload: ListingEventActionRequest | None = None):
+    """将上新候选写入/更新为失效标的，后续不再弹窗。"""
+    try:
+        return disable_listing_asset(
+            base_asset,
+            (payload.reason if payload else None) or 'listing_event_disabled',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post('/base-assets/{base_asset}/disable', dependencies=[Depends(verify_token_dependency)])

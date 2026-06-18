@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch, VideoPause, VideoPlay, Cpu } from '@element-plus/icons-vue'
+import { Monitor, List, TrendCharts, DataAnalysis, Setting, SwitchButton, Fold, Expand, Connection, Stopwatch, VideoPause, VideoPlay, Cpu, Bell } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { removeToken } from './utils/auth'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { post, get } from './utils/request'
 
 const route = useRoute()
 const router = useRouter()
 const isCollapsed = ref(false)
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
+let listingAlertTimer: ReturnType<typeof setInterval> | null = null
+const LISTING_ALERT_STORAGE_KEY = 'listing_event_alert'
+const LISTING_ALERT_SNOOZE_MS = 6 * 60 * 60 * 1000
+const LISTING_ALERT_INTERVAL_MS = 15 * 60 * 1000
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
@@ -124,17 +128,69 @@ function stopOpenPauseStatusTimer() {
   }
 }
 
+async function maybeShowListingAlert() {
+  if (isLoginPage.value) return
+  try {
+    const res = await get('/api/trading/listing-events/summary')
+    if (!res.ok) return
+    const data = await res.json()
+    const items = Array.isArray(data.items) ? data.items : []
+    if (!items.length) return
+
+    const fingerprint = items
+      .map((item: any) => `${item.base_asset}:${item.gate_contract || ''}:${item.binance_symbol || ''}:${item.last_seen_at || ''}`)
+      .sort()
+      .join('|')
+    const previous = JSON.parse(localStorage.getItem(LISTING_ALERT_STORAGE_KEY) || '{}')
+    const now = Date.now()
+    if (previous.fingerprint === fingerprint && now - Number(previous.at || 0) < LISTING_ALERT_SNOOZE_MS) return
+
+    localStorage.setItem(LISTING_ALERT_STORAGE_KEY, JSON.stringify({ fingerprint, at: now }))
+    const preview = items.slice(0, 8).map((item: any) => {
+      const gateVol = Number(item.gate_volume_24h_settle || 0)
+      const spotVol = Number(item.binance_quote_volume || 0)
+      return `${item.base_asset} Gate:${item.gate_contract || '-'} Binance:${item.binance_symbol || '-'} 24h=${gateVol.toFixed(0)}/${spotVol.toFixed(0)}`
+    }).join('\n')
+    ElMessageBox.confirm(preview, `交易对上新候选 ${items.length} 个`, {
+      type: 'warning',
+      confirmButtonText: '去处理',
+      cancelButtonText: '稍后',
+    }).then(() => {
+      router.push('/settings/listings')
+    }).catch(() => {})
+  } catch {
+    // 上新提醒不影响主界面
+  }
+}
+
+function startListingAlertTimer() {
+  setTimeout(maybeShowListingAlert, 3000)
+  if (!listingAlertTimer) {
+    listingAlertTimer = setInterval(maybeShowListingAlert, LISTING_ALERT_INTERVAL_MS)
+  }
+}
+
+function stopListingAlertTimer() {
+  if (listingAlertTimer) {
+    clearInterval(listingAlertTimer)
+    listingAlertTimer = null
+  }
+}
+
 onMounted(() => {
   if (!isLoginPage.value) {
     startOpenPauseStatusTimer()
+    startListingAlertTimer()
   }
 })
 
 watch(isLoginPage, (loginPage) => {
   if (loginPage) {
     stopOpenPauseStatusTimer()
+    stopListingAlertTimer()
   } else {
     startOpenPauseStatusTimer()
+    startListingAlertTimer()
   }
 })
 
@@ -265,6 +321,10 @@ function toggleMenu() {
           <el-menu-item index="/settings/server-status">
             <el-icon><Cpu /></el-icon>
             <template #title>服务器状态</template>
+          </el-menu-item>
+          <el-menu-item index="/settings/listings">
+            <el-icon><Bell /></el-icon>
+            <template #title>交易对上新</template>
           </el-menu-item>
           <el-menu-item index="/connections">
             <el-icon><Connection /></el-icon>

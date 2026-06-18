@@ -95,6 +95,11 @@ const router = createRouter({
       name: 'server-status',
       component: () => import('../views/ServerStatus.vue'),
     },
+    {
+      path: '/settings/listings',
+      name: 'listing-events',
+      component: () => import('../views/ListingEvents.vue'),
+    },
   ],
 })
 

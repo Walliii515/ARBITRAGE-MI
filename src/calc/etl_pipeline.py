@@ -163,6 +163,18 @@ def _run_update_asset_market_profiles():
     update_asset_market_profiles()
 
 
+def _run_refresh_listing_events():
+    """
+    交易对上新事件刷新
+
+    数据源：mi_gate_future_contracts + mi_binance_spot_info + mi_base_asset
+    目标表：mi_listing_event
+    更新策略：按 base_asset UPSERT，已加入监控/已失效的标的不再弹窗。
+    """
+    from calc.listing_event_monitor import refresh_listing_events
+    refresh_listing_events()
+
+
 def _run_cleanup_vwap_snapshots():
     """
     VWAP 基差快照数据清理
@@ -267,6 +279,15 @@ ETL_TASKS: List[ETLTask] = [
         interval_minutes=_etl_config.get('tasks', {}).get('update_asset_market_profiles', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
         run_on_startup=_etl_config.get('tasks', {}).get('update_asset_market_profiles', {}).get('run_on_startup', True),
         enabled=_etl_config.get('tasks', {}).get('update_asset_market_profiles', {}).get('enabled', True),
+    ),
+    ETLTask(
+        name='refresh_listing_events',
+        description='交易对上新事件 → mi_listing_event（双边匹配候选弹窗提醒）',
+        runner=_run_refresh_listing_events,
+        schedule='interval',
+        interval_minutes=_etl_config.get('tasks', {}).get('refresh_listing_events', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
+        run_on_startup=_etl_config.get('tasks', {}).get('refresh_listing_events', {}).get('run_on_startup', True),
+        enabled=_etl_config.get('tasks', {}).get('refresh_listing_events', {}).get('enabled', True),
     ),
     ETLTask(
         name='cleanup_vwap_snapshots',
