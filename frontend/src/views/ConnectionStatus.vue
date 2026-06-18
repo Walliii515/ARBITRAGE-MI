@@ -34,7 +34,6 @@ const {
   gateWsLatencyMs,
   binanceWsLatencyMs,
   exchangeRiskMonitor,
-  delistRiskReport,
   fetchDelistRisks,
   fetchConnectionStatus,
 } = useConnectionMonitor()
@@ -81,7 +80,9 @@ function delistRiskText(data: ConnectionRow) {
 }
 
 function maybeShowDelistRiskAlert() {
-  const risks = delistRiskReport.value.items || []
+  const risks = rowData.value
+    .filter((row) => isConnectionAssetEnabled(row))
+    .flatMap((row) => row.delist_risks || [])
   if (!risks.length) return
   const fingerprint = risks
     .map((risk) => `${risk.risk_key}:${risk.delist_at || ''}:${risk.status || ''}`)
