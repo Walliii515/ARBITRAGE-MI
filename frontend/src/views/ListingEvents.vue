@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, shallowRef } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { AgGridVue } from 'ag-grid-vue3'
-import type { ColDef, GetRowIdParams, GridReadyEvent, ICellRendererParams, ValueFormatterParams } from 'ag-grid-community'
+import type { ColDef, GetRowIdParams, GridApi, GridReadyEvent, ICellRendererParams, ValueFormatterParams } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import { get, post } from '../utils/request'
 import { showError, showSuccess, showWarning } from '../utils/message'
 
 type CandidateStatus = 'matched' | 'gate_only' | 'binance_only'
+type CandidateFilter = CandidateStatus | 'added_to_monitor' | 'all'
 type ActionStatus = 'pending' | 'acknowledged' | 'ignored' | 'disabled' | 'added_to_monitor'
 
 interface ListingEventRow {
@@ -33,14 +34,24 @@ interface ListingEventRow {
   strategy_tier: string | null
 }
 
+const PAGE_KEY = 'listing_events'
+const gridApi = shallowRef<GridApi | null>(null)
 const loading = ref(false)
 const actionLoading = ref(false)
 const rowData = ref<ListingEventRow[]>([])
 const summary = ref<Record<string, any>>({})
 const actionFilter = ref<ActionStatus | 'all'>('pending')
-const candidateFilter = ref<CandidateStatus | 'all'>('all')
+const candidateFilter = ref<CandidateFilter>('matched')
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
+
+interface ColumnVisibility {
+  colId: string
+  headerName: string
+  visible: boolean
+}
+
+const columnVisibilities = ref<ColumnVisibility[]>([])
 
 const pendingActionable = computed(() => Number(summary.value.pending_actionable || 0))
 
@@ -56,8 +67,19 @@ function actionText(value: string) {
   if (value === 'acknowledged') return '已读'
   if (value === 'ignored') return '已忽略'
   if (value === 'disabled') return '已失效'
-  if (value === 'added_to_monitor') return '已加入'
+  if (value === 'added_to_monitor') return '已处理'
   return value || ''
+}
+
+function displayCandidateText(data?: ListingEventRow | null) {
+  if (data?.action_status === 'added_to_monitor') return '已加入'
+  return candidateText(data?.candidate_status || '')
+}
+
+function displayCandidateColor(data?: ListingEventRow | null) {
+  if (data?.action_status === 'added_to_monitor') return '#67c23a'
+  if (data?.candidate_status === 'matched') return '#409eff'
+  return '#e6a23c'
 }
 
 function formatNumber(value: unknown) {
@@ -82,8 +104,8 @@ const columnDefs: ColDef<ListingEventRow>[] = [
     field: 'candidate_status',
     width: 110,
     cellRenderer: (params: ICellRendererParams<ListingEventRow>) => {
-      const color = params.value === 'matched' ? '#67c23a' : '#e6a23c'
-      return `<span style="color:${color}">${candidateText(params.value)}</span>`
+      const color = displayCandidateColor(params.data)
+      return `<span style="color:${color}">${displayCandidateText(params.data)}</span>`
     },
   },
   {
@@ -129,7 +151,7 @@ const columnDefs: ColDef<ListingEventRow>[] = [
   { headerName: '原因', field: 'action_reason', width: 180 },
   {
     headerName: '操作',
-    field: 'base_asset',
+    colId: 'actions',
     width: 220,
     pinned: 'right',
     sortable: false,
@@ -167,6 +189,61 @@ const defaultColDef: ColDef = {
   resizable: true,
   filter: true,
   suppressMovable: true,
+  enableRowGroup: false,
+  enablePivot: false,
+  enableValue: false,
+}
+
+function refreshColumnVisibilities() {
+  if (!gridApi.value) return
+  const states = gridApi.value.getColumnState()
+  columnVisibilities.value = columnDefs
+    .filter((col) => col.field || col.colId)
+    .map((col) => {
+      const colId = (col.colId ?? col.field) as string
+      const state = states.find((s) => s.colId === colId)
+      return {
+        colId,
+        headerName: col.headerName ?? colId,
+        visible: state?.hide !== true,
+      }
+    })
+}
+
+function toggleColumnVisibility(colId: string, visible: boolean) {
+  if (!gridApi.value) return
+  gridApi.value.setColumnsVisible([colId], visible)
+  const col = columnVisibilities.value.find((c) => c.colId === colId)
+  if (col) col.visible = visible
+}
+
+async function saveColumnState() {
+  if (!gridApi.value) return
+  try {
+    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState: gridApi.value.getColumnState() })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || data?.success === false) {
+      showError(data?.message || data?.detail || '保存列配置失败')
+      return
+    }
+    showSuccess('列配置已保存')
+  } catch (e: any) {
+    showError(e?.message || '保存列配置失败')
+  }
+}
+
+async function loadColumnState() {
+  if (!gridApi.value) return
+  try {
+    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const data = await res.json().catch(() => ({}))
+    if (Array.isArray(data?.columnState)) {
+      gridApi.value.applyColumnState({ state: data.columnState, applyOrder: true })
+      refreshColumnVisibilities()
+    }
+  } catch (e) {
+    console.warn('Failed to load listing events column config:', e)
+  }
 }
 
 async function fetchRows() {
@@ -189,6 +266,13 @@ async function fetchRows() {
   } finally {
     loading.value = false
   }
+}
+
+function handleCandidateFilterChange() {
+  if (candidateFilter.value === 'added_to_monitor') {
+    actionFilter.value = 'all'
+  }
+  fetchRows()
 }
 
 async function refreshEvents() {
@@ -280,7 +364,10 @@ async function disableAsset(asset: string) {
 }
 
 function onGridReady(params: GridReadyEvent<ListingEventRow>) {
+  gridApi.value = params.api
   setupGridCopy(params.api)
+  loadColumnState()
+  refreshColumnVisibilities()
 }
 
 function getRowId(params: GetRowIdParams<ListingEventRow>) {
@@ -300,21 +387,37 @@ onMounted(fetchRows)
         <span>已失效: <b>{{ summary.disabled || 0 }}</b></span>
       </div>
       <div class="filters">
-        <el-radio-group v-model="actionFilter" size="small" @change="fetchRows">
-          <el-radio-button value="pending">待处理</el-radio-button>
-          <el-radio-button value="acknowledged">已读</el-radio-button>
-          <el-radio-button value="added_to_monitor">已加入</el-radio-button>
-          <el-radio-button value="disabled">已失效</el-radio-button>
-          <el-radio-button value="all">全部</el-radio-button>
-        </el-radio-group>
-        <el-radio-group v-model="candidateFilter" size="small" @change="fetchRows">
-          <el-radio-button value="all">全部候选</el-radio-button>
+        <el-radio-group v-model="candidateFilter" size="small" @change="handleCandidateFilterChange">
           <el-radio-button value="matched">双边候选</el-radio-button>
           <el-radio-button value="gate_only">仅Gate</el-radio-button>
           <el-radio-button value="binance_only">仅Binance</el-radio-button>
+          <el-radio-button value="added_to_monitor">已加入</el-radio-button>
+          <el-radio-button value="all">全部候选</el-radio-button>
+        </el-radio-group>
+        <el-radio-group v-model="actionFilter" size="small" @change="fetchRows">
+          <el-radio-button value="all">全部处理</el-radio-button>
+          <el-radio-button value="pending">待处理</el-radio-button>
+          <el-radio-button value="acknowledged">已读</el-radio-button>
+          <el-radio-button value="ignored">已忽略</el-radio-button>
+          <el-radio-button value="disabled">已失效</el-radio-button>
         </el-radio-group>
         <el-button size="small" :loading="loading" @click="fetchRows">刷新</el-button>
         <el-button size="small" type="primary" :loading="loading" @click="refreshEvents">扫描上新</el-button>
+        <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
+          <template #reference>
+            <el-button size="small">列选择</el-button>
+          </template>
+          <div class="column-picker">
+            <div v-for="col in columnVisibilities" :key="col.colId" class="column-picker-item">
+              <el-checkbox
+                :model-value="col.visible"
+                @change="(val: boolean | string | number) => toggleColumnVisibility(col.colId, !!val)"
+              />
+              <span class="column-picker-label">{{ col.headerName }}</span>
+            </div>
+          </div>
+        </el-popover>
+        <el-button size="small" @click="saveColumnState">保存列配置</el-button>
       </div>
     </div>
 
@@ -326,6 +429,9 @@ onMounted(fetchRows)
         :defaultColDef="defaultColDef"
         :rowData="rowData"
         :getRowId="getRowId"
+        :pagination="true"
+        :paginationPageSize="50"
+        :paginationPageSizeSelector="[20, 50, 100, 200]"
         :animateRows="false"
         :suppressCellFocus="true"
         @grid-ready="onGridReady"
@@ -381,6 +487,26 @@ onMounted(fetchRows)
 .grid-wrapper {
   flex: 1;
   min-height: 0;
+}
+
+.column-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.column-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 22px;
+}
+
+.column-picker-label {
+  color: var(--app-text, #e5e7eb);
+  font-size: 13px;
 }
 
 :deep(.listing-add-btn),

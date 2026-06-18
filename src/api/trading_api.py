@@ -1178,7 +1178,7 @@ async def get_delist_risks(
 @router.get('/listing-events')
 async def get_listing_events(
     action_status: Optional[str] = Query(None, description="处理状态过滤：pending/acknowledged/ignored/disabled/added_to_monitor/all"),
-    candidate_status: Optional[str] = Query(None, description="候选状态过滤：matched/gate_only/binance_only/all"),
+    candidate_status: Optional[str] = Query(None, description="候选状态过滤：matched/gate_only/binance_only/added_to_monitor/all"),
     actionable_only: bool = Query(False, description="仅展示可提醒候选"),
     limit: int = Query(200, ge=1, le=1000),
 ):

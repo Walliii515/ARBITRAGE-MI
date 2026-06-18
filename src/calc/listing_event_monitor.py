@@ -290,8 +290,13 @@ def list_listing_events(
         conditions.append('e.action_status = %s')
         params.append(action_status)
     if candidate_status and candidate_status != 'all':
-        conditions.append('e.candidate_status = %s')
-        params.append(candidate_status)
+        if candidate_status == 'added_to_monitor':
+            conditions.append("e.action_status = 'added_to_monitor'")
+        else:
+            conditions.append('e.candidate_status = %s')
+            params.append(candidate_status)
+            if candidate_status == 'matched':
+                conditions.append("e.action_status <> 'added_to_monitor'")
     if actionable_only:
         conditions.append('e.is_actionable = 1')
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ''
