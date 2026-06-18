@@ -14,6 +14,7 @@ import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import { showError, showSuccess, showWarning } from '../utils/message'
 import { get, post } from '../utils/request'
+import { addPopupNotification } from '../utils/notificationHistory'
 import {
   isConnectionAssetEnabled,
   useConnectionMonitor,
@@ -98,7 +99,14 @@ function maybeShowDelistRiskAlert() {
     const due = risk.delist_at ? `，时间 ${risk.delist_at}` : ''
     return `${risk.base_asset} ${risk.exchange} ${risk.message || risk.status || risk.risk_type}${due}`
   }).join('\n')
-  ElMessageBox.alert(preview, `监控标的下架风险 ${risks.length} 个`, {
+  const title = `监控标的下架风险 ${risks.length} 个`
+  addPopupNotification({
+    title,
+    message: preview,
+    type: 'warning',
+    source: 'delist_risk',
+  })
+  ElMessageBox.alert(preview, title, {
     type: 'warning',
     confirmButtonText: '知道了',
   }).catch(() => {})

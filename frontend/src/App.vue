@@ -6,10 +6,18 @@ import { useRouter } from 'vue-router'
 import { removeToken } from './utils/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { post, get } from './utils/request'
+import {
+  addPopupNotification,
+  clearPopupNotifications,
+  listPopupNotifications,
+  POPUP_NOTIFICATION_HISTORY_EVENT,
+  type PopupNotification,
+} from './utils/notificationHistory'
 
 const route = useRoute()
 const router = useRouter()
 const isCollapsed = ref(false)
+const notificationHistory = ref<PopupNotification[]>([])
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
 let listingAlertTimer: ReturnType<typeof setInterval> | null = null
 const LISTING_ALERT_STORAGE_KEY = 'listing_event_alert'
@@ -40,6 +48,29 @@ const tradingModeColor = computed(() => {
     default: return 'transparent'
   }
 })
+
+const notificationCount = computed(() => notificationHistory.value.length)
+
+function refreshNotificationHistory() {
+  notificationHistory.value = listPopupNotifications()
+}
+
+function clearNotificationHistory() {
+  clearPopupNotifications()
+  refreshNotificationHistory()
+}
+
+function formatNotificationTime(value: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
 
 // ───── 开仓暂停开关 ─────
 const forwardOpenPaused = ref(true)
@@ -151,7 +182,15 @@ async function maybeShowListingAlert() {
       const spotVol = Number(item.binance_quote_volume || 0)
       return `${item.base_asset} Gate:${item.gate_contract || '-'} Binance:${item.binance_symbol || '-'} 24h=${gateVol.toFixed(0)}/${spotVol.toFixed(0)}`
     }).join('\n')
-    ElMessageBox.confirm(preview, `交易对上新候选 ${items.length} 个`, {
+    const title = `交易对上新候选 ${items.length} 个`
+    addPopupNotification({
+      title,
+      message: preview,
+      type: 'warning',
+      source: 'listing_events',
+    })
+    refreshNotificationHistory()
+    ElMessageBox.confirm(preview, title, {
       type: 'warning',
       confirmButtonText: '去处理',
       cancelButtonText: '稍后',
@@ -178,6 +217,8 @@ function stopListingAlertTimer() {
 }
 
 onMounted(() => {
+  refreshNotificationHistory()
+  window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, refreshNotificationHistory)
   if (!isLoginPage.value) {
     startOpenPauseStatusTimer()
     startListingAlertTimer()
@@ -196,6 +237,8 @@ watch(isLoginPage, (loginPage) => {
 
 onUnmounted(() => {
   stopOpenPauseStatusTimer()
+  stopListingAlertTimer()
+  window.removeEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, refreshNotificationHistory)
 })
 
 async function handleLogout() {
@@ -228,6 +271,54 @@ function toggleMenu() {
           <span v-if="!isCollapsed">Arbitrage-Mi</span>
           <span v-else>Ai</span>
         </div>
+        <el-popover
+          placement="right-start"
+          :width="340"
+          trigger="click"
+          popper-class="notification-history-popper"
+          @show="refreshNotificationHistory"
+        >
+          <template #reference>
+            <button class="notification-bell" title="弹窗消息">
+              <el-badge
+                :value="notificationCount"
+                :hidden="notificationCount === 0"
+                :max="99"
+                type="danger"
+              >
+                <el-icon><Bell /></el-icon>
+              </el-badge>
+            </button>
+          </template>
+          <div class="notification-history">
+            <div class="notification-history-header">
+              <span>弹窗消息</span>
+              <button
+                class="notification-clear"
+                :disabled="notificationCount === 0"
+                @click="clearNotificationHistory"
+              >
+                清空
+              </button>
+            </div>
+            <div v-if="notificationHistory.length === 0" class="notification-empty">
+              暂无弹窗消息
+            </div>
+            <div v-else class="notification-list">
+              <div
+                v-for="item in notificationHistory"
+                :key="item.id"
+                class="notification-item"
+              >
+                <div class="notification-item-top">
+                  <span class="notification-title">{{ item.title }}</span>
+                  <span class="notification-time">{{ formatNotificationTime(item.created_at) }}</span>
+                </div>
+                <div class="notification-message">{{ item.message }}</div>
+              </div>
+            </div>
+          </div>
+        </el-popover>
         <div v-if="tradingMode !== 'unknown'" class="trading-mode-badge" :style="{ backgroundColor: tradingModeColor }">
           <span v-if="!isCollapsed">{{ tradingModeLabel }}</span>
           <span v-else>{{ tradingModeLabel[0] }}</span>
@@ -411,7 +502,7 @@ function toggleMenu() {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 6px;
   color: var(--app-text);
   font-size: 15px;
   font-weight: 600;
@@ -419,11 +510,113 @@ function toggleMenu() {
   border-bottom: 1px solid var(--app-border);
   overflow: hidden;
   white-space: nowrap;
-  padding: 0 12px;
+  padding: 0 8px;
 }
 
 .logo-title {
   flex-shrink: 0;
+}
+
+.notification-bell {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #9aa0a6;
+  cursor: pointer;
+}
+
+.notification-bell:hover {
+  background: rgba(33, 150, 243, 0.12);
+  color: #2196f3;
+}
+
+.notification-bell :deep(.el-badge__content) {
+  transform: translateY(-45%) translateX(60%);
+}
+
+.notification-history {
+  max-height: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.notification-history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--app-text, #e5e7eb);
+}
+
+.notification-clear {
+  border: 0;
+  background: transparent;
+  color: #409eff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.notification-clear:disabled {
+  color: #606266;
+  cursor: not-allowed;
+}
+
+.notification-empty {
+  color: #909399;
+  font-size: 13px;
+  padding: 16px 0;
+  text-align: center;
+}
+
+.notification-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.notification-item {
+  padding: 8px 10px;
+  border: 1px solid var(--app-border, #2d2d3d);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.notification-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.notification-title {
+  color: var(--app-text, #e5e7eb);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notification-time {
+  color: #909399;
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.notification-message {
+  color: #c0c4cc;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .trading-mode-badge {
