@@ -109,7 +109,7 @@ function formatPnl(value: unknown): string {
 }
 
 .fh-table-wrap {
-  max-height: min(58vh, 520px);
+  max-height: min(36vh, 340px);
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: #4b5560 #1e2527;
