@@ -197,12 +197,15 @@ class Reconciler:
         }
 
     def cleanup_old_snapshots(self):
-        """按配置清理历史快照。"""
+        """按配置清理历史快照；历史不一致记录保留用于风险追溯。"""
         if self.cfg.retention_days <= 0:
             return
         cutoff = datetime.now() - timedelta(days=self.cfg.retention_days)
         with db_manager.get_cursor() as cursor:
-            cursor.execute("DELETE FROM mi_recon_snapshot WHERE snapshot_at < %s", (cutoff,))
+            cursor.execute(
+                "DELETE FROM mi_recon_snapshot WHERE snapshot_at < %s AND is_match = 1",
+                (cutoff,),
+            )
 
     def _load_local_spot_positions(self) -> Dict[str, float]:
         sql = """

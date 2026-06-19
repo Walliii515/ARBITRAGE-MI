@@ -360,7 +360,7 @@ account_capital:
 reconciliation:
   enabled: true
   interval_sec: 60
-  retention_days: 30
+  retention_days: 3                         # 只清理3天前的一致快照；不一致快照永久保留用于追溯
   ignored_binance_spot_assets: [BNB]        # BNB 用作 Binance 手续费抵扣燃料，不参与套利持仓对账
   mark_exchange_risk: true                  # Gate 实仓少于本地持仓时标记 position 风险；多余实仓写风险事件
   adl_lookback_sec: 86400                   # 回查 Gate my_trades 识别 auto_deleveraging 的窗口（24小时）

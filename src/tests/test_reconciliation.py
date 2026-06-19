@@ -180,6 +180,39 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(cursor.params[0], 'BEL')
         self.assertEqual(cursor.params[1], 'missing_gate_position')
 
+    def test_cleanup_old_snapshots_keeps_mismatches(self):
+        class FakeCursor:
+            def __init__(self):
+                self.sql = ''
+                self.params = None
+
+            def execute(self, sql, params=None):
+                self.sql = sql
+                self.params = params
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(retention_days=3),
+        )
+        cursor = FakeCursor()
+
+        with patch('calc.reconciliation.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            reconciler.cleanup_old_snapshots()
+
+        self.assertIn('snapshot_at < %s', cursor.sql)
+        self.assertIn('is_match = 1', cursor.sql)
+        self.assertEqual(len(cursor.params), 1)
+
 
 class TestExchangeDesyncRemediator(unittest.TestCase):
     def test_gate_adl_reuses_prior_spot_fill_when_available_spot_is_zero(self):
