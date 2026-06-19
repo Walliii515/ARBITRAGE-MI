@@ -63,9 +63,12 @@ trade:
       enabled: true                         # 普通单标的额度用完后，极优机会允许进入增强额度
       enhanced_ratio: 0.20                  # 增强后单标的 spot/future 占用上限
       min_funding_24h_bps: 50               # 24h funding 足够厚才允许加仓
-      min_basis_improvement_bps: 20         # 当前入场基差需比同币已有持仓加权均价更好
+      min_basis_improvement_bps: 8          # 优质加仓最低基差改善要求
+      basis_improvement_ratio: 0.25         # 相对已有加权入场基差的改善比例
+      max_basis_improvement_bps: 20         # 优质加仓最高基差改善要求，避免高基差仓位阈值过硬
       min_gate_margin_rate_pct: 500         # Gate 保证金/维持保证金足够安全才允许加仓
       cooldown_sec: 300                     # 同标的增强加仓成功后的冷却
+    presignal_reject_log_cooldown_sec: 300  # 预信号风控拒绝落库限流；用于复盘“页面满足但未进信号”
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）

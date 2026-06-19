@@ -51,9 +51,12 @@ class TradingExecutorConfig:
     quality_scale_in_enabled: bool = False
     quality_scale_in_enhanced_ratio: float = 0.20
     quality_scale_in_min_funding_24h_bps: float = 50.0
-    quality_scale_in_min_basis_improvement_bps: float = 20.0
+    quality_scale_in_min_basis_improvement_bps: float = 8.0
+    quality_scale_in_basis_improvement_ratio: float = 0.25
+    quality_scale_in_max_basis_improvement_bps: float = 20.0
     quality_scale_in_min_gate_margin_rate_pct: float = 500.0
     quality_scale_in_cooldown_sec: int = 300
+    presignal_reject_log_cooldown_sec: int = 300
     reject_cooldown_sec: int = 60
     # 旁路风控新鲜度硬约束：本地接收最近一次 WS 盘口与当前下单时刻的允许最大延迟（毫秒）
     # 阐释：update_time(交易所时间戳) 不可靠，只以本地 last_update_time 判定“现在距上次收到行情多久”
@@ -286,11 +289,24 @@ class TradingExecutor:
         self.quality_scale_in_min_basis_improvement_bps = float(
             cfg.quality_scale_in_min_basis_improvement_bps or 0
         )
+        self.quality_scale_in_basis_improvement_ratio = max(
+            float(cfg.quality_scale_in_basis_improvement_ratio or 0),
+            0.0,
+        )
+        self.quality_scale_in_max_basis_improvement_bps = max(
+            float(cfg.quality_scale_in_max_basis_improvement_bps or 0),
+            self.quality_scale_in_min_basis_improvement_bps,
+        )
         self.quality_scale_in_min_gate_margin_rate_pct = float(
             cfg.quality_scale_in_min_gate_margin_rate_pct or 0
         )
         self.quality_scale_in_cooldown_sec = max(int(cfg.quality_scale_in_cooldown_sec or 0), 0)
         self._quality_scale_in_last_time: Dict[str, datetime] = {}
+        self.presignal_reject_log_cooldown_sec = max(
+            int(cfg.presignal_reject_log_cooldown_sec or 0),
+            0,
+        )
+        self._presignal_reject_last_time: Dict[tuple, datetime] = {}
 
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
         self.reject_cooldown_sec = cfg.reject_cooldown_sec
@@ -642,6 +658,7 @@ class TradingExecutor:
                         continue
                                 
                 # 1. 风控检查
+                had_active_signal = base_asset in self._peak_state
                 if not self._pass_risk_check(row):
                     # 风控不通过，清除该标的峰值监控状态（基差已跌回阈值下）
                     exit_reason = self._get_risk_fail_reason(row)
@@ -650,6 +667,12 @@ class TradingExecutor:
                         base_asset, 'conditions_lost', exit_reason,
                         exit_basis_bps=float(current_basis) if current_basis is not None else None
                     )
+                    if not had_active_signal:
+                        self._record_presignal_rejection(
+                            base_asset,
+                            exit_reason,
+                            current_basis,
+                        )
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     continue
@@ -2079,20 +2102,31 @@ class TradingExecutor:
         existing_basis = self._holding_weighted_basis_by_asset.get(base_asset)
         if existing_basis is None:
             return False, '缺少已有仓位均价'
+        required_improvement = self._quality_scale_in_required_improvement_bps(existing_basis)
         improvement = current_basis - float(existing_basis)
-        if improvement < self.quality_scale_in_min_basis_improvement_bps:
+        if improvement < required_improvement:
             return (
                 False,
                 f"基差改善{improvement:.1f}<"
-                f"{self.quality_scale_in_min_basis_improvement_bps:.1f}bps"
+                f"{required_improvement:.1f}bps"
+                f"(min={self.quality_scale_in_min_basis_improvement_bps:.1f},"
+                f"ratio={self.quality_scale_in_basis_improvement_ratio:.0%},"
+                f"max={self.quality_scale_in_max_basis_improvement_bps:.1f})"
             )
 
         return (
             True,
             f"优质加仓额度({self.max_asset_exposure_ratio:.0%}->{self.quality_scale_in_enhanced_ratio:.0%},"
             f"funding={funding_bps:.1f}bps,"
-            f"basis_improve={improvement:.1f}bps,"
+            f"basis_improve={improvement:.1f}/{required_improvement:.1f}bps,"
             f"MMR={margin_rate:.0f}%)"
+        )
+
+    def _quality_scale_in_required_improvement_bps(self, existing_basis_bps: float) -> float:
+        ratio_required = abs(float(existing_basis_bps)) * self.quality_scale_in_basis_improvement_ratio
+        return min(
+            max(ratio_required, self.quality_scale_in_min_basis_improvement_bps),
+            self.quality_scale_in_max_basis_improvement_bps,
         )
 
     def _apply_realtime_funding_info(self, base_asset: str, row: Optional[Dict]) -> None:
@@ -2456,28 +2490,40 @@ class TradingExecutor:
     # 信号日志记录
     # ──────────────────────────────────────────────────────────────────
 
+    def _insert_signal_record(self, fields: Dict[str, object]) -> Optional[int]:
+        """统一创建 mi_trade_signal 记录，避免预信号与监控信号字段口径漂移。"""
+        sql = """
+            INSERT INTO mi_trade_signal (
+                base_asset, signal_time, resolved_time, status,
+                entry_basis_bps, signal_basis_bps, peak_basis_bps,
+                exit_basis_bps, exit_reason, duration_sec, trigger_type
+            ) VALUES (
+                %(base_asset)s, %(signal_time)s, %(resolved_time)s, %(status)s,
+                %(entry_basis_bps)s, %(signal_basis_bps)s, %(peak_basis_bps)s,
+                %(exit_basis_bps)s, %(exit_reason)s, %(duration_sec)s, %(trigger_type)s
+            )
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, fields)
+            return cursor.lastrowid
+
     def _create_signal(self, base_asset: str, entry_basis_bps: float) -> Optional[int]:
         """创建信号记录（进入峰值监控时）"""
         try:
-            sql = """
-                INSERT INTO mi_trade_signal (
-                    base_asset, signal_time, status,
-                    entry_basis_bps, signal_basis_bps, peak_basis_bps
-                ) VALUES (
-                    %(base_asset)s, %(signal_time)s, 'monitoring',
-                    %(entry_basis_bps)s, %(signal_basis_bps)s, %(peak_basis_bps)s
-                )
-            """
             basis = round(entry_basis_bps, 2)
-            with db_manager.get_cursor() as cursor:
-                cursor.execute(sql, {
-                    'base_asset': base_asset,
-                    'signal_time': datetime.now(),
-                    'entry_basis_bps': basis,
-                    'signal_basis_bps': basis,
-                    'peak_basis_bps': basis,
-                })
-                return cursor.lastrowid
+            return self._insert_signal_record({
+                'base_asset': base_asset,
+                'signal_time': datetime.now(),
+                'resolved_time': None,
+                'status': 'monitoring',
+                'entry_basis_bps': basis,
+                'signal_basis_bps': basis,
+                'peak_basis_bps': basis,
+                'exit_basis_bps': None,
+                'exit_reason': None,
+                'duration_sec': None,
+                'trigger_type': None,
+            })
         except Exception as e:
             logger.error(f"信号记录创建失败 {base_asset}: {e}")
             return None
@@ -2542,6 +2588,64 @@ class TradingExecutor:
         except Exception as e:
             logger.error(f"信号记录更新失败 {base_asset}: {e}")
         self._record_signal_noise_event(base_asset, status)
+
+    def _record_presignal_rejection(
+        self,
+        base_asset: str,
+        exit_reason: Optional[str],
+        basis_bps: Optional[float],
+    ) -> None:
+        """限流记录尚未进入峰值状态机的风控拒绝，便于解释“页面满足但无信号”。"""
+        if not base_asset or not exit_reason:
+            return
+        if not self._should_record_presignal_rejection(exit_reason):
+            return
+        category = self._presignal_reject_category(exit_reason)
+        key = (str(base_asset).upper(), category)
+        now = datetime.now()
+        last_time = self._presignal_reject_last_time.get(key)
+        if (
+            last_time
+            and self.presignal_reject_log_cooldown_sec > 0
+            and (now - last_time).total_seconds() < self.presignal_reject_log_cooldown_sec
+        ):
+            return
+        try:
+            basis = self._float_or_none(basis_bps)
+            rounded_basis = round(basis, 2) if basis is not None else None
+            self._insert_signal_record({
+                'base_asset': base_asset,
+                'signal_time': now,
+                'resolved_time': now,
+                'status': 'conditions_lost',
+                'entry_basis_bps': rounded_basis,
+                'signal_basis_bps': rounded_basis,
+                'peak_basis_bps': rounded_basis,
+                'exit_basis_bps': rounded_basis,
+                'exit_reason': f"预信号风控拒绝|{exit_reason}",
+                'duration_sec': 0,
+                'trigger_type': 'pre_risk',
+            })
+            self._presignal_reject_last_time[key] = now
+            self._record_signal_noise_event(base_asset, 'conditions_lost')
+        except Exception as e:
+            logger.error(f"预信号风控拒绝记录失败 {base_asset}: {e}")
+
+    @staticmethod
+    def _should_record_presignal_rejection(reason: str) -> bool:
+        reason_text = str(reason or '')
+        return any(marker in reason_text for marker in (
+            '资金风控',
+            '单标的资金',
+            '保证金风控',
+            '交易所仓位风险',
+            '开仓金额低于最小名义值',
+        ))
+
+    @staticmethod
+    def _presignal_reject_category(reason: str) -> str:
+        head = str(reason or '').split('|', 1)[0].split('(', 1)[0].strip()
+        return head or 'unknown'
 
     @staticmethod
     def _normalize_signal_trigger_type(trigger_type: Optional[str]) -> Optional[str]:

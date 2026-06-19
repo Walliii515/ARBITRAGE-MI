@@ -1672,13 +1672,22 @@ def _run_open_position_check_once():
                     'trade.open.quality_scale_in.min_funding_24h_bps', 50.0
                 ),
                 quality_scale_in_min_basis_improvement_bps=config.get_float(
-                    'trade.open.quality_scale_in.min_basis_improvement_bps', 20.0
+                    'trade.open.quality_scale_in.min_basis_improvement_bps', 8.0
+                ),
+                quality_scale_in_basis_improvement_ratio=config.get_float(
+                    'trade.open.quality_scale_in.basis_improvement_ratio', 0.25
+                ),
+                quality_scale_in_max_basis_improvement_bps=config.get_float(
+                    'trade.open.quality_scale_in.max_basis_improvement_bps', 20.0
                 ),
                 quality_scale_in_min_gate_margin_rate_pct=config.get_float(
                     'trade.open.quality_scale_in.min_gate_margin_rate_pct', 500.0
                 ),
                 quality_scale_in_cooldown_sec=config.get_int(
                     'trade.open.quality_scale_in.cooldown_sec', 300
+                ),
+                presignal_reject_log_cooldown_sec=config.get_int(
+                    'trade.open.presignal_reject_log_cooldown_sec', 300
                 ),
                 reject_cooldown_sec=config.get_int('trade.open.reject_cooldown_sec', 60),
                 max_orderbook_lag_ms=config.get_float('trade.open.max_orderbook_lag_ms', 1000.0),

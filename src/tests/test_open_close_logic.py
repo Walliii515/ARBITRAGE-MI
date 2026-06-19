@@ -90,9 +90,12 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           quality_scale_in_enabled=False,
                           quality_scale_in_enhanced_ratio=0.20,
                           quality_scale_in_min_funding_24h_bps=50.0,
-                          quality_scale_in_min_basis_improvement_bps=20.0,
+                          quality_scale_in_min_basis_improvement_bps=8.0,
+                          quality_scale_in_basis_improvement_ratio=0.25,
+                          quality_scale_in_max_basis_improvement_bps=20.0,
                           quality_scale_in_min_gate_margin_rate_pct=500.0,
                           quality_scale_in_cooldown_sec=300,
+                          presignal_reject_log_cooldown_sec=300,
                           contract_meta=None,
                           spot_meta=None,
                           asset_profile_meta=None):
@@ -124,8 +127,11 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         quality_scale_in_enhanced_ratio=quality_scale_in_enhanced_ratio,
         quality_scale_in_min_funding_24h_bps=quality_scale_in_min_funding_24h_bps,
         quality_scale_in_min_basis_improvement_bps=quality_scale_in_min_basis_improvement_bps,
+        quality_scale_in_basis_improvement_ratio=quality_scale_in_basis_improvement_ratio,
+        quality_scale_in_max_basis_improvement_bps=quality_scale_in_max_basis_improvement_bps,
         quality_scale_in_min_gate_margin_rate_pct=quality_scale_in_min_gate_margin_rate_pct,
         quality_scale_in_cooldown_sec=quality_scale_in_cooldown_sec,
+        presignal_reject_log_cooldown_sec=presignal_reject_log_cooldown_sec,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
@@ -1469,7 +1475,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
         te._holding_future_margin_by_asset['ALLO'] = 4.5
-        te._holding_weighted_basis_by_asset['ALLO'] = 40.0
+        te._holding_weighted_basis_by_asset['ALLO'] = 43.0
         te._holding_margin_rate['ALLO'] = 800.0
 
         row = self._row('ALLO', 50.0, 0.008646)
@@ -1478,7 +1484,33 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_risk_check(row))
         reason = te._get_risk_fail_reason(row)
         self.assertIn('优质加仓拒绝', reason)
-        self.assertIn('基差改善10.0<20.0bps', reason)
+        self.assertIn('基差改善7.0<10.8bps', reason)
+
+    def test_quality_scale_in_caps_relative_improvement_requirement(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_weighted_basis_by_asset['ALLO'] = 100.0
+        te._holding_margin_rate['ALLO'] = 800.0
+
+        row = self._row('ALLO', 120.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertIn('basis_improve=20.0/20.0bps', row.get('_quality_scale_in_reason', ''))
 
     def test_quality_scale_in_rejects_without_existing_weighted_basis(self):
         te = make_trading_executor(
@@ -1506,6 +1538,34 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         reason = te._get_risk_fail_reason(row)
         self.assertIn('优质加仓拒绝', reason)
         self.assertIn('缺少已有仓位均价', reason)
+
+    def test_presignal_rejection_is_rate_limited_by_asset_and_reason_category(self):
+        te = make_trading_executor(presignal_reject_log_cooldown_sec=300)
+        cursor = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__.return_value = cursor
+
+        with patch('calc.trading_executor.db_manager.get_cursor', return_value=ctx):
+            te._record_presignal_rejection('BEL', '单标的资金占用(Binance spot 345.07>总资金10%=330.92USDT)', 36.1)
+            te._record_presignal_rejection('BEL', '单标的资金占用(Binance spot 345.08>总资金10%=330.92USDT)', 36.2)
+
+        self.assertEqual(cursor.execute.call_count, 1)
+        params = cursor.execute.call_args.args[1]
+        self.assertEqual(params['base_asset'], 'BEL')
+        self.assertEqual(params['trigger_type'], 'pre_risk')
+        self.assertIn('预信号风控拒绝|单标的资金占用', params['exit_reason'])
+        self.assertEqual(params['exit_basis_bps'], 36.1)
+
+    def test_presignal_rejection_skips_plain_market_condition_failures(self):
+        te = make_trading_executor(presignal_reject_log_cooldown_sec=300)
+        cursor = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__.return_value = cursor
+
+        with patch('calc.trading_executor.db_manager.get_cursor', return_value=ctx):
+            te._record_presignal_rejection('BEL', '基差跌回入场门槛下(3.0<entry_floor=8.0bps)', 3.0)
+
+        cursor.execute.assert_not_called()
 
     def test_low_funding_negative_p20_requires_positive_carry_floor(self):
         te = make_trading_executor(
