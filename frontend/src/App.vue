@@ -499,10 +499,13 @@ function toggleMenu() {
   position: relative;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .logo {
   height: 60px;
+  flex: 0 0 60px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -635,6 +638,7 @@ function toggleMenu() {
 
 .collapse-btn {
   height: 48px;
+  flex: 0 0 48px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -660,6 +664,24 @@ function toggleMenu() {
 .app-menu {
   border-right: none;
   flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(154, 160, 166, 0.35) transparent;
+}
+
+.app-menu::-webkit-scrollbar {
+  width: 6px;
+}
+
+.app-menu::-webkit-scrollbar-thumb {
+  background: rgba(154, 160, 166, 0.35);
+  border-radius: 999px;
+}
+
+.app-menu::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .app-menu :deep(.el-menu-item) {
@@ -688,6 +710,7 @@ function toggleMenu() {
 }
 
 .open-pause-controls {
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -754,6 +777,7 @@ function toggleMenu() {
 }
 
 .logout-section {
+  flex-shrink: 0;
   padding: 16px;
   border-top: 1px solid var(--app-border);
 }
