@@ -22,6 +22,8 @@ const notificationHistory = ref<PopupNotification[]>([])
 const notificationUnreadCount = ref(0)
 const notificationFilter = ref<'unread' | 'read' | 'all'>('unread')
 const notificationLoading = ref(false)
+const notificationLoadingMore = ref(false)
+const notificationPagination = ref({ page: 1, page_size: 50, total: 0, total_pages: 0 })
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
 let listingAlertTimer: ReturnType<typeof setInterval> | null = null
 let riskAlertTimer: ReturnType<typeof setInterval> | null = null
@@ -32,6 +34,7 @@ const RISK_ALERT_SEEN_STORAGE_KEY = 'exchange_risk_notification_seen'
 const RISK_ALERT_INTERVAL_MS = 60 * 1000
 const RISK_ALERT_LOOKBACK_HOURS = 24
 const RISK_ALERT_MAX_SEEN = 500
+const NOTIFICATION_PAGE_SIZE = 50
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
@@ -59,6 +62,7 @@ const tradingModeColor = computed(() => {
 })
 
 const notificationCount = computed(() => notificationUnreadCount.value)
+const notificationHasMore = computed(() => notificationPagination.value.page < notificationPagination.value.total_pages)
 
 async function refreshNotificationHistory(syncRecent = true) {
   if (isLoginPage.value) return
@@ -66,10 +70,13 @@ async function refreshNotificationHistory(syncRecent = true) {
   try {
     const data = await listPopupNotifications({
       readStatus: notificationFilter.value,
+      page: 1,
+      pageSize: NOTIFICATION_PAGE_SIZE,
       syncRecent,
     })
     notificationHistory.value = data.items
     notificationUnreadCount.value = data.unread_count
+    notificationPagination.value = data.pagination
   } catch {
     // request.ts 会提示错误；这里避免影响主界面。
   } finally {
@@ -77,10 +84,41 @@ async function refreshNotificationHistory(syncRecent = true) {
   }
 }
 
+async function loadMoreNotifications() {
+  if (isLoginPage.value || notificationLoading.value || notificationLoadingMore.value || !notificationHasMore.value) return
+  notificationLoadingMore.value = true
+  try {
+    const data = await listPopupNotifications({
+      readStatus: notificationFilter.value,
+      page: notificationPagination.value.page + 1,
+      pageSize: NOTIFICATION_PAGE_SIZE,
+      syncRecent: false,
+    })
+    const existing = new Set(notificationHistory.value.map((item) => item.id))
+    notificationHistory.value = [
+      ...notificationHistory.value,
+      ...data.items.filter((item) => !existing.has(item.id)),
+    ]
+    notificationUnreadCount.value = data.unread_count
+    notificationPagination.value = data.pagination
+  } catch {
+    // request.ts 会提示错误
+  } finally {
+    notificationLoadingMore.value = false
+  }
+}
+
 async function markAllNotificationsRead() {
   try {
-    await markAllPopupNotificationsRead()
-    await refreshNotificationHistory(false)
+    const data = await markAllPopupNotificationsRead()
+    notificationUnreadCount.value = Number(data?.unread_count ?? 0)
+    if (notificationFilter.value === 'unread') {
+      notificationHistory.value = []
+      notificationPagination.value = { ...notificationPagination.value, total: 0, total_pages: 0 }
+      return
+    }
+    const now = new Date().toISOString()
+    notificationHistory.value = notificationHistory.value.map((item) => ({ ...item, read_at: item.read_at || now }))
   } catch {
     // request.ts 会提示错误
   }
@@ -88,8 +126,20 @@ async function markAllNotificationsRead() {
 
 async function markNotificationRead(id: number) {
   try {
-    await markPopupNotificationRead(id)
-    await refreshNotificationHistory(false)
+    const data = await markPopupNotificationRead(id)
+    notificationUnreadCount.value = Number(data?.unread_count ?? Math.max(notificationUnreadCount.value - 1, 0))
+    if (notificationFilter.value === 'unread') {
+      notificationHistory.value = notificationHistory.value.filter((item) => item.id !== id)
+      notificationPagination.value = {
+        ...notificationPagination.value,
+        total: Math.max(notificationPagination.value.total - 1, 0),
+      }
+      return
+    }
+    const now = new Date().toISOString()
+    notificationHistory.value = notificationHistory.value.map((item) => (
+      item.id === id ? { ...item, read_at: item.read_at || now } : item
+    ))
   } catch {
     // request.ts 会提示错误
   }
@@ -459,6 +509,17 @@ function toggleMenu() {
                 </div>
               </div>
             </div>
+            <div v-if="notificationHistory.length > 0" class="notification-pagination">
+              <span>{{ notificationHistory.length }} / {{ notificationPagination.total }}</span>
+              <button
+                v-if="notificationHasMore"
+                class="notification-load-more"
+                :disabled="notificationLoadingMore"
+                @click="loadMoreNotifications"
+              >
+                {{ notificationLoadingMore ? '加载中...' : '加载更多' }}
+              </button>
+            </div>
           </div>
         </el-popover>
         <div v-if="tradingMode !== 'unknown'" class="trading-mode-badge" :style="{ backgroundColor: tradingModeColor }">
@@ -821,6 +882,32 @@ function toggleMenu() {
 
 .notification-read-btn:hover {
   background: rgba(64, 158, 255, 0.24);
+}
+
+.notification-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #909399;
+  font-size: 12px;
+  padding-top: 2px;
+}
+
+.notification-load-more {
+  border: 1px solid rgba(64, 158, 255, 0.36);
+  border-radius: 4px;
+  background: rgba(64, 158, 255, 0.1);
+  color: #409eff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.notification-load-more:disabled {
+  border-color: rgba(144, 147, 153, 0.24);
+  background: rgba(144, 147, 153, 0.08);
+  color: #909399;
+  cursor: wait;
 }
 
 .trading-mode-badge {
