@@ -192,7 +192,7 @@ FUNDING_SUPPORT_WINDOW_HOURS = config.get_float('trade.open.funding_support_wind
 FUNDING_SUPPORT_MIN_SAMPLES = config.get_int('trade.open.funding_support_min_samples', 2)
 REALTIME_MIN_FUNDING_RATE_BPS = config.get_float(
     'trade.open.realtime_min_funding_rate_bps',
-    MIN_FUNDING_RATE_BPS,
+    5.0,
 )
 # 盘口覆盖阈值
 ORDERBOOK_COVERAGE_THRESHOLD = config.get_float('trade.open.orderbook_coverage_threshold', 0.8)

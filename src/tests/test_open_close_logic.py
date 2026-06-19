@@ -1350,9 +1350,9 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_risk_check(self._row('ALLO', 10.0, 0.008646)))
         self.assertTrue(te._pass_risk_check(self._row('ALLO', 20.0, 0.008646)))
 
-    def test_funding_support_avg_allows_lower_realtime_open_floor(self):
+    def test_funding_support_stable_channel_requires_avg_and_current(self):
         te = make_trading_executor(
-            min_funding_rate_bps=15.0,
+            min_funding_rate_bps=25.0,
             min_funding_support_bps=10.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
@@ -1368,16 +1368,34 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertTrue(te._pass_risk_check(row))
 
-    def test_funding_support_avg_rejects_weak_settled_history(self):
+    def test_funding_support_high_realtime_channel_bypasses_weak_history(self):
         te = make_trading_executor(
-            min_funding_rate_bps=15.0,
+            min_funding_rate_bps=25.0,
             min_funding_support_bps=10.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
-        row = self._row('ALLO', 50.0, 0.0040)
+        row = self._row('ALLO', 50.0, 0.0025)
+        row.update({
+            'funding_rate_24h_avg_bps': 9.5,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+
+    def test_funding_support_rejects_weak_history_without_high_realtime(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=10.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 50.0, 0.0012)
         row.update({
             'funding_rate_24h_avg_bps': 9.5,
             'funding_rate_24h_avg_samples': 3,
@@ -1385,11 +1403,11 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         })
 
         self.assertFalse(te._pass_risk_check(row))
-        self.assertIn('资金费率均值不达标', te._get_risk_fail_reason(row))
+        self.assertIn('资金费率通道不达标', te._get_risk_fail_reason(row))
 
-    def test_funding_support_avg_keeps_realtime_floor(self):
+    def test_funding_support_stable_channel_keeps_realtime_floor(self):
         te = make_trading_executor(
-            min_funding_rate_bps=15.0,
+            min_funding_rate_bps=25.0,
             min_funding_support_bps=10.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
@@ -1404,18 +1422,18 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         })
 
         self.assertFalse(te._pass_risk_check(row))
-        self.assertIn('实时资金费率低于兜底', te._get_risk_fail_reason(row))
+        self.assertIn('稳定资金费通道实时不达标', te._get_risk_fail_reason(row))
 
-    def test_funding_support_samples_fallback_to_realtime_floor(self):
+    def test_funding_support_samples_need_high_realtime_channel(self):
         te = make_trading_executor(
-            min_funding_rate_bps=15.0,
+            min_funding_rate_bps=25.0,
             min_funding_support_bps=10.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
-        row = self._row('ALLO', 50.0, 0.0012)
+        row = self._row('ALLO', 50.0, 0.0018)
         row.update({
             'funding_rate_24h_avg_bps': 12.0,
             'funding_rate_24h_avg_samples': 1,
@@ -1425,9 +1443,9 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_risk_check(row))
         self.assertIn('资金费率样本不足', te._get_risk_fail_reason(row))
 
-    def test_realtime_funding_floor_uses_support_when_samples_enough(self):
+    def test_realtime_funding_floor_uses_stable_channel_when_history_strong(self):
         te = make_trading_executor(
-            min_funding_rate_bps=15.0,
+            min_funding_rate_bps=25.0,
             min_funding_support_bps=10.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
@@ -1440,13 +1458,13 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         }
 
         with patch('calc.trading_executor.get_single_contract_funding_info', return_value={
-            'funding_rate_24h': 0.0006,
+            'funding_rate_24h': 0.0005,
         }):
             self.assertTrue(te._verify_realtime_funding_rate('ALLO', 'ALLO_USDT'))
 
-    def test_realtime_funding_floor_falls_back_when_samples_not_enough(self):
+    def test_realtime_funding_floor_uses_high_channel_when_history_not_available(self):
         te = make_trading_executor(
-            min_funding_rate_bps=15.0,
+            min_funding_rate_bps=25.0,
             min_funding_support_bps=10.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
@@ -1459,7 +1477,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         }
 
         with patch('calc.trading_executor.get_single_contract_funding_info', return_value={
-            'funding_rate_24h': 0.0006,
+            'funding_rate_24h': 0.0018,
         }):
             self.assertFalse(te._verify_realtime_funding_rate('ALLO', 'ALLO_USDT'))
 

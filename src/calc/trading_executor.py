@@ -976,30 +976,47 @@ class TradingExecutor:
         samples = int(ctx['samples'])
         current_bps = float(ctx['current_bps'])
 
+        if ctx['has_current'] and current_bps >= self.min_funding_rate_bps:
+            return (
+                True,
+                f"新高资金费通道(实时={current_bps:.2f}bps>="
+                f"{self.min_funding_rate_bps:.1f}bps)",
+            )
+
+        current_fail = (
+            f"实时资金费率不达标({current_bps:.2f}bps<"
+            f"{self.realtime_min_funding_rate_bps:.1f}bps)"
+            if ctx['has_current']
+            else "缺少实时资金费率"
+        )
+
         if support_bps is not None and samples >= self.funding_support_min_samples:
             support_bps = float(support_bps)
             if support_bps < self.min_funding_support_bps:
                 return (
                     False,
-                    f"资金费率均值不达标(avg24={support_bps:.2f}bps<"
-                    f"{self.min_funding_support_bps:.1f}bps,n={samples})",
+                    f"资金费率通道不达标(avg24={support_bps:.2f}bps<"
+                    f"{self.min_funding_support_bps:.1f}bps,n={samples};"
+                    f"新高实时{current_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)",
                 )
-            if ctx['has_current'] and current_bps < self.realtime_min_funding_rate_bps:
+            if not ctx['has_current'] or current_bps < self.realtime_min_funding_rate_bps:
                 return (
                     False,
-                    f"实时资金费率低于兜底({current_bps:.2f}bps<"
-                    f"{self.realtime_min_funding_rate_bps:.1f}bps,"
-                    f"avg24={support_bps:.2f}bps,n={samples})",
+                    f"稳定资金费通道实时不达标({current_fail},"
+                    f"avg24={support_bps:.2f}bps,n={samples};"
+                    f"新高门槛={self.min_funding_rate_bps:.1f}bps)",
                 )
-            return True, ''
-
-        if ctx['has_current'] and current_bps < self.min_funding_rate_bps:
             return (
-                False,
-                f"资金费率样本不足({samples}<{self.funding_support_min_samples})且实时不达标"
-                f"({current_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)",
+                True,
+                f"稳定资金费通道(avg24={support_bps:.2f}bps,n={samples},"
+                f"实时={current_bps:.2f}bps)",
             )
-        return True, ''
+
+        return (
+            False,
+            f"资金费率样本不足({samples}<{self.funding_support_min_samples})且未达新高通道"
+            f"({current_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)",
+        )
 
     def _realtime_funding_floor_bps(self, base_asset: str) -> tuple[float, str]:
         support = self.funding_support_meta.get(str(base_asset or '').strip().upper()) or {}
@@ -1008,9 +1025,13 @@ class TradingExecutor:
             samples = int(support.get('funding_rate_24h_avg_samples') or 0)
         except (TypeError, ValueError):
             samples = 0
-        if support_bps is not None and samples >= self.funding_support_min_samples:
-            return float(self.realtime_min_funding_rate_bps), '兜底'
-        return float(self.min_funding_rate_bps), '样本不足下限'
+        if (
+            support_bps is not None
+            and samples >= self.funding_support_min_samples
+            and float(support_bps) >= self.min_funding_support_bps
+        ):
+            return float(self.realtime_min_funding_rate_bps), '稳定通道下限'
+        return float(self.min_funding_rate_bps), '新高通道下限'
 
     @staticmethod
     def _float_or_none(value) -> Optional[float]:
@@ -1802,7 +1823,7 @@ class TradingExecutor:
         """
         风控规则检查:
         0. 保证金风控: 该标的现有持仓 保证金/维持保证金 < warning_pct 时禁止开仓
-        1. 最近已结算 funding 均值达标；样本不足时回退实时 funding 下限
+        1. 稳定 funding 通道或新高 funding 通道达标
         2. 开仓盘口覆盖 <= 阈值
         3. 开仓基差 >= funding-adjusted entry_floor
         4. 旧模式下保留盈利性守卫；新模式下 entry_floor 已合并 funding、手续费和滑点缓冲
@@ -2179,7 +2200,7 @@ class TradingExecutor:
                 logger.debug(f"实时费率校验跳过(获取失败) | {base_asset}")
                 return True
             
-            # 均值门槛已在普通风控层判断；实盘最终旁路只做实时 funding 兜底。
+            # 普通风控已判定 funding 通道；最终校验只确认实时费率仍满足对应通道下限。
             rate_bps = float(info['funding_rate_24h']) * 10000
             realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
             if rate_bps < realtime_floor:
