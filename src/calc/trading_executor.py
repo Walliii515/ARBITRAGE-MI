@@ -500,7 +500,7 @@ class TradingExecutor:
         for pos in positions:
             if pos.get('status') != 'holding':
                 continue
-            ba = pos.get('base_asset', '')
+            ba = str(pos.get('base_asset') or '').upper()
             if not ba:
                 continue
             margin_rate = pos.get('gate_maintenance_margin_rate')

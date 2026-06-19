@@ -12,7 +12,7 @@ import json
 import threading
 import time
 from decimal import Decimal
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Any, List, Dict
 from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
@@ -111,6 +111,11 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
 def _serialize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """批量序列化数据库行"""
     return [_serialize_row(row) for row in rows]
+
+
+def _risk_notification_key(prefix: str, *parts: Any) -> str:
+    values = [str(part if part is not None else '').strip() for part in parts]
+    return f"{prefix}:{':'.join(values)}"[:220]
 
 
 def _format_meta_dt(value) -> str | None:
@@ -777,6 +782,109 @@ async def get_reconciliation_history(
             'total': total,
             'total_pages': (total + page_size - 1) // page_size if total else 0,
         },
+    }
+
+
+@router.get('/risk-notifications/recent')
+async def get_recent_risk_notifications(
+    hours: int = Query(24, ge=1, le=168, description="回看最近N小时风险事件"),
+    limit: int = Query(50, ge=1, le=200, description="最多返回事件数"),
+):
+    """返回需要进入前端铃铛的近期风险事件。"""
+    cutoff = datetime.now() - timedelta(hours=hours)
+    items: List[Dict[str, Any]] = []
+
+    exchange_sql = """
+        SELECT
+            id, event_key, exchange, market_type, risk_type, base_asset, contract,
+            event_at, side, size, fill_price, mark_price, liq_price, pnl,
+            status, remediation_action, created_at, updated_at
+        FROM mi_exchange_risk_event
+        WHERE event_key NOT LIKE 'recon:%%'
+          AND (created_at >= %s OR updated_at >= %s OR event_at >= %s)
+        ORDER BY GREATEST(created_at, updated_at) DESC, event_at DESC
+        LIMIT %s
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(exchange_sql, [cutoff, cutoff, cutoff, limit])
+        exchange_rows = cursor.fetchall()
+
+    for row in exchange_rows:
+        row = _serialize_row(row)
+        items.append({
+            'dedup_key': _risk_notification_key('exchange_risk', row.get('event_key')),
+            'source': 'exchange_risk',
+            'severity': 'error',
+            'title': f"交易所风险: {row.get('base_asset') or '-'}",
+            'message': (
+                f"{row.get('exchange') or '-'} {row.get('risk_type') or 'unknown'} "
+                f"status={row.get('status') or '-'} "
+                f"size={row.get('size') if row.get('size') is not None else '-'} "
+                f"price={row.get('fill_price') if row.get('fill_price') is not None else '-'}"
+            ),
+            'event_at': row.get('event_at'),
+            'base_asset': row.get('base_asset'),
+            'risk_type': row.get('risk_type'),
+            'status': row.get('status'),
+            'detail': row,
+        })
+
+    ignore_sql, ignore_params = _reconciliation_ignore_clause()
+    recon_sql = f"""
+        SELECT
+            id, snapshot_at, exchange, base_asset, dimension,
+            local_value, exchange_value, diff_value, diff_ratio, detail
+        FROM mi_recon_snapshot
+        WHERE snapshot_at >= %s
+          AND is_match = 0
+          {ignore_sql}
+        ORDER BY snapshot_at DESC, exchange ASC, base_asset ASC
+        LIMIT %s
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(recon_sql, [cutoff, *ignore_params, limit])
+        recon_rows = cursor.fetchall()
+
+    for row in recon_rows:
+        row = _serialize_row(row)
+        base_asset = row.get('base_asset') or '-'
+        exchange = row.get('exchange') or '-'
+        dimension = row.get('dimension') or '-'
+        items.append({
+            'dedup_key': _risk_notification_key(
+                'reconciliation',
+                exchange,
+                base_asset,
+                dimension,
+                row.get('local_value'),
+                row.get('exchange_value'),
+            ),
+            'source': 'reconciliation',
+            'severity': 'warning',
+            'title': f"持仓对账不一致: {base_asset}",
+            'message': (
+                f"{exchange} {dimension} "
+                f"local={row.get('local_value') if row.get('local_value') is not None else '-'} "
+                f"exchange={row.get('exchange_value') if row.get('exchange_value') is not None else '-'} "
+                f"diff={row.get('diff_value') if row.get('diff_value') is not None else '-'}"
+            ),
+            'event_at': row.get('snapshot_at'),
+            'base_asset': base_asset,
+            'risk_type': dimension,
+            'status': 'mismatch',
+            'detail': row,
+        })
+
+    items.sort(key=lambda item: str(item.get('event_at') or ''), reverse=True)
+    items = items[:limit]
+    return {
+        'items': items,
+        'summary': {
+            'total': len(items),
+            'exchange_risk': sum(1 for item in items if item.get('source') == 'exchange_risk'),
+            'reconciliation': sum(1 for item in items if item.get('source') == 'reconciliation'),
+        },
+        'lookback_hours': hours,
     }
 
 

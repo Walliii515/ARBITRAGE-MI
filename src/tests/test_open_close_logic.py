@@ -3008,6 +3008,27 @@ class TestGatePositionRiskEnrichment(unittest.TestCase):
         self.assertAlmostEqual(positions[0]['gate_position_margin_equity'], 7.69702499)
         self.assertAlmostEqual(positions[0]['gate_maintenance_margin_rate'], 664.19)
 
+    def test_position_without_future_contract_uses_base_asset_contract(self):
+        from calc.gate_position_risk import attach_gate_position_risk
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'BEL',
+            'future_open_contracts': 20,
+        }]
+        gate_positions = [{
+            'contract': 'BEL_USDT',
+            'size': '-20',
+            'margin': '10',
+            'unrealised_pnl': '1',
+            'maintenance_margin': '0.5',
+        }]
+
+        attach_gate_position_risk(positions, gate_positions)
+
+        self.assertAlmostEqual(positions[0]['gate_position_margin'], 10.0)
+        self.assertAlmostEqual(positions[0]['gate_maintenance_margin_rate'], 2200.0)
+
     def test_contract_amounts_are_allocated_across_local_positions(self):
         from calc.gate_position_risk import attach_gate_position_risk
 

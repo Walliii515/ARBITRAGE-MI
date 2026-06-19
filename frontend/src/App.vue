@@ -20,9 +20,14 @@ const isCollapsed = ref(false)
 const notificationHistory = ref<PopupNotification[]>([])
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
 let listingAlertTimer: ReturnType<typeof setInterval> | null = null
+let riskAlertTimer: ReturnType<typeof setInterval> | null = null
 const LISTING_ALERT_STORAGE_KEY = 'listing_event_alert'
 const LISTING_ALERT_SNOOZE_MS = 6 * 60 * 60 * 1000
 const LISTING_ALERT_INTERVAL_MS = 15 * 60 * 1000
+const RISK_ALERT_SEEN_STORAGE_KEY = 'exchange_risk_notification_seen'
+const RISK_ALERT_INTERVAL_MS = 60 * 1000
+const RISK_ALERT_LOOKBACK_HOURS = 24
+const RISK_ALERT_MAX_SEEN = 500
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
@@ -216,12 +221,86 @@ function stopListingAlertTimer() {
   }
 }
 
+function loadSeenRiskNotificationKeys() {
+  try {
+    const rows = JSON.parse(localStorage.getItem(RISK_ALERT_SEEN_STORAGE_KEY) || '[]')
+    return new Set(Array.isArray(rows) ? rows.map((item) => String(item)) : [])
+  } catch {
+    return new Set<string>()
+  }
+}
+
+function saveSeenRiskNotificationKeys(keys: Set<string>) {
+  localStorage.setItem(
+    RISK_ALERT_SEEN_STORAGE_KEY,
+    JSON.stringify(Array.from(keys).slice(-RISK_ALERT_MAX_SEEN)),
+  )
+}
+
+function buildRiskNotificationMessage(item: any) {
+  const lines = [String(item.message || '')]
+  if (item.event_at) lines.push(`时间: ${item.event_at}`)
+  if (item.detail?.contract) lines.push(`合约: ${item.detail.contract}`)
+  return lines.filter(Boolean).join('\n')
+}
+
+async function maybeShowRiskAlerts() {
+  if (isLoginPage.value) return
+  try {
+    const res = await get(`/api/trading/risk-notifications/recent?hours=${RISK_ALERT_LOOKBACK_HOURS}&limit=50`)
+    if (!res.ok) return
+    const data = await res.json()
+    const items = Array.isArray(data.items) ? data.items : []
+    if (!items.length) return
+
+    const seen = loadSeenRiskNotificationKeys()
+    const unseen = items
+      .slice()
+      .reverse()
+      .filter((item: any) => item?.dedup_key && !seen.has(String(item.dedup_key)))
+
+    if (!unseen.length) return
+
+    for (const item of unseen) {
+      const key = String(item.dedup_key)
+      addPopupNotification({
+        title: String(item.title || '交易风险通知'),
+        message: buildRiskNotificationMessage(item),
+        type: item.severity === 'error' ? 'error' : 'warning',
+        source: String(item.source || 'risk'),
+        dedup_key: key,
+      })
+      seen.add(key)
+    }
+    saveSeenRiskNotificationKeys(seen)
+    refreshNotificationHistory()
+    ElMessage.warning(`新增 ${unseen.length} 条交易风险通知`)
+  } catch {
+    // 风险提醒失败不影响主界面
+  }
+}
+
+function startRiskAlertTimer() {
+  setTimeout(maybeShowRiskAlerts, 5000)
+  if (!riskAlertTimer) {
+    riskAlertTimer = setInterval(maybeShowRiskAlerts, RISK_ALERT_INTERVAL_MS)
+  }
+}
+
+function stopRiskAlertTimer() {
+  if (riskAlertTimer) {
+    clearInterval(riskAlertTimer)
+    riskAlertTimer = null
+  }
+}
+
 onMounted(() => {
   refreshNotificationHistory()
   window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, refreshNotificationHistory)
   if (!isLoginPage.value) {
     startOpenPauseStatusTimer()
     startListingAlertTimer()
+    startRiskAlertTimer()
   }
 })
 
@@ -229,15 +308,18 @@ watch(isLoginPage, (loginPage) => {
   if (loginPage) {
     stopOpenPauseStatusTimer()
     stopListingAlertTimer()
+    stopRiskAlertTimer()
   } else {
     startOpenPauseStatusTimer()
     startListingAlertTimer()
+    startRiskAlertTimer()
   }
 })
 
 onUnmounted(() => {
   stopOpenPauseStatusTimer()
   stopListingAlertTimer()
+  stopRiskAlertTimer()
   window.removeEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, refreshNotificationHistory)
 })
 

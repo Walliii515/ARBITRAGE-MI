@@ -1527,6 +1527,7 @@ onUnmounted(() => {
         :row-height="32"
         :localeText="localeText"
         :tooltipShowDelay="300"
+        :tooltipInteraction="true"
         :isExternalFilterPresent="isExternalFilterPresent"
         :doesExternalFilterPass="doesExternalFilterPass"
         @grid-ready="onGridReady"

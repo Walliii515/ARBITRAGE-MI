@@ -35,7 +35,7 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
             _clear_gate_risk_fields(pos)
             continue
 
-        contract = str(pos.get('future_contract') or '').upper()
+        contract = _position_contract(pos)
         gate_pos = gate_by_contract.get(contract)
         if not gate_pos:
             _clear_gate_risk_fields(pos)
@@ -90,11 +90,19 @@ def _group_holding_positions_by_contract(
     for pos in positions:
         if pos.get('status') != 'holding':
             continue
-        contract = str(pos.get('future_contract') or '').upper()
+        contract = _position_contract(pos)
         if not contract or contract not in gate_by_contract:
             continue
         result.setdefault(contract, []).append(pos)
     return result
+
+
+def _position_contract(pos: Dict) -> str:
+    contract = str(pos.get('future_contract') or '').strip().upper()
+    if contract:
+        return contract
+    base_asset = str(pos.get('base_asset') or '').strip().upper()
+    return f"{base_asset}_USDT" if base_asset else ''
 
 
 def _position_share(pos: Dict, contract_positions: List[Dict], total_weight: float) -> float:

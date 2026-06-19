@@ -4,6 +4,7 @@ export interface PopupNotification {
   message: string
   type?: 'warning' | 'error' | 'success' | 'info'
   source?: string
+  dedup_key?: string
   created_at: string
 }
 
@@ -26,12 +27,17 @@ export function listPopupNotifications(): PopupNotification[] {
 }
 
 export function addPopupNotification(input: Omit<PopupNotification, 'id' | 'created_at'>) {
+  const current = parseHistory()
+  if (input.dedup_key) {
+    const existing = current.find((item) => item.dedup_key === input.dedup_key)
+    if (existing) return existing
+  }
   const item: PopupNotification = {
     ...input,
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     created_at: new Date().toISOString(),
   }
-  const next = [item, ...parseHistory()].slice(0, MAX_HISTORY)
+  const next = [item, ...current].slice(0, MAX_HISTORY)
   localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
   window.dispatchEvent(new CustomEvent(POPUP_NOTIFICATION_HISTORY_EVENT))
   return item
