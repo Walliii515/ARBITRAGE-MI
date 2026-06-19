@@ -1539,6 +1539,60 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertIn('优质加仓拒绝', reason)
         self.assertIn('缺少已有仓位均价', reason)
 
+    def test_quality_scale_in_allows_when_gate_mmr_cache_missing(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_weighted_basis_by_asset['ALLO'] = 20.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertTrue(row.get('_quality_scale_in_used'))
+        self.assertIn('MMR=NA', row.get('_quality_scale_in_reason', ''))
+
+    def test_quality_scale_in_rejects_when_gate_mmr_known_low(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 2.0
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': {'available': 80.0, 'net_value': 100.0},
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_future_margin_by_asset['ALLO'] = 4.5
+        te._holding_weighted_basis_by_asset['ALLO'] = 20.0
+        te._holding_margin_rate['ALLO'] = 309.4
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 2.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('优质加仓拒绝', reason)
+        self.assertIn('MMR 309.4%<500.0%', reason)
+
     def test_presignal_rejection_is_rate_limited_by_asset_and_reason_category(self):
         te = make_trading_executor(presignal_reject_log_cooldown_sec=300)
         cursor = MagicMock()

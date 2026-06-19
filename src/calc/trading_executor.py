@@ -2076,18 +2076,6 @@ class TradingExecutor:
             if remain > 0:
                 return False, f"冷却{remain:.0f}s"
 
-        if self._holding_exchange_risk_by_asset.get(base_asset):
-            return False, '存在交易所仓位风险'
-
-        margin_rate = self._holding_margin_rate.get(base_asset)
-        if margin_rate is None:
-            return False, '缺少Gate MMR'
-        if margin_rate < self.quality_scale_in_min_gate_margin_rate_pct:
-            return (
-                False,
-                f"MMR {margin_rate:.1f}%<{self.quality_scale_in_min_gate_margin_rate_pct:.1f}%"
-            )
-
         funding_bps = self._funding_24h_bps(base_asset, row)
         if funding_bps < self.quality_scale_in_min_funding_24h_bps:
             return (
@@ -2114,12 +2102,23 @@ class TradingExecutor:
                 f"max={self.quality_scale_in_max_basis_improvement_bps:.1f})"
             )
 
+        if self._holding_exchange_risk_by_asset.get(base_asset):
+            return False, '存在交易所仓位风险'
+
+        margin_rate = self._holding_margin_rate.get(base_asset)
+        if margin_rate is not None and margin_rate < self.quality_scale_in_min_gate_margin_rate_pct:
+            return (
+                False,
+                f"MMR {margin_rate:.1f}%<{self.quality_scale_in_min_gate_margin_rate_pct:.1f}%"
+            )
+        margin_label = f"{margin_rate:.0f}%" if margin_rate is not None else "NA"
+
         return (
             True,
             f"优质加仓额度({self.max_asset_exposure_ratio:.0%}->{self.quality_scale_in_enhanced_ratio:.0%},"
             f"funding={funding_bps:.1f}bps,"
             f"basis_improve={improvement:.1f}/{required_improvement:.1f}bps,"
-            f"MMR={margin_rate:.0f}%)"
+            f"MMR={margin_label})"
         )
 
     def _quality_scale_in_required_improvement_bps(self, existing_basis_bps: float) -> float:
