@@ -311,7 +311,7 @@ async function markRead(asset: string) {
 async function addToMonitor(asset: string) {
   if (actionLoading.value) return
   try {
-    await ElMessageBox.confirm(`${asset} 将加入监控候选；新标的默认 C 层（已有标的不改分层），后续开仓仍受 24h 成交量等策略过滤控制。`, '加入监控', {
+    await ElMessageBox.confirm(`${asset} 将加入监控候选，并按当前 Gate/Binance 24h 成交额计算 A/B/C 分层；后续开仓仍受策略过滤控制。`, '加入监控', {
       type: 'warning',
       confirmButtonText: '确认加入',
       cancelButtonText: '取消',

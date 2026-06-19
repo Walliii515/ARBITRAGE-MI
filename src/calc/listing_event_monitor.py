@@ -57,6 +57,23 @@ def _json_default(value):
     return str(value)
 
 
+def calculate_strategy_tier_from_volumes(spot_volume: Any, future_volume: Any) -> str:
+    spot = _to_float(spot_volume) or 0.0
+    future = _to_float(future_volume) or 0.0
+    if spot >= 10_000_000 and future >= 5_000_000:
+        return 'A'
+    if spot >= 1_000_000 and future >= 500_000:
+        return 'B'
+    return 'C'
+
+
+def _format_volume(value: Any) -> str:
+    n = _to_float(value)
+    if n is None:
+        return '0'
+    return f'{n:.0f}'
+
+
 def ensure_listing_event_table() -> None:
     with db_manager.get_cursor() as cursor:
         cursor.execute(_CREATE_TABLE_SQL)
@@ -364,7 +381,40 @@ def mark_listing_events(base_assets: Iterable[str], action_status: str, reason: 
             return cursor.rowcount
 
 
-def _set_base_asset_state(cursor, asset: str, is_valid: str, reason: str) -> int:
+def _calculate_asset_strategy_tier(cursor, asset: str) -> tuple[str, str]:
+    cursor.execute(
+        """
+        SELECT
+            s.quote_volume AS spot_volume,
+            g.volume_24h_settle AS future_volume
+        FROM (SELECT %s AS base_asset) a
+        LEFT JOIN mi_binance_spot_info s
+          ON UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci = a.base_asset
+         AND s.symbol = CONCAT(a.base_asset, 'USDT')
+        LEFT JOIN mi_gate_future_contracts g
+          ON UPPER(TRIM(g.base_asset)) COLLATE utf8mb4_unicode_ci = a.base_asset
+         AND g.name = CONCAT(a.base_asset, '_USDT')
+        """,
+        [asset],
+    )
+    row = cursor.fetchone() or {}
+    spot_volume = row.get('spot_volume')
+    future_volume = row.get('future_volume')
+    tier = calculate_strategy_tier_from_volumes(spot_volume, future_volume)
+    reason = (
+        f'listing_event_add_to_monitor: tier={tier},'
+        f'spot24h={_format_volume(spot_volume)},future24h={_format_volume(future_volume)}'
+    )
+    return tier, reason
+
+
+def _set_base_asset_state(
+    cursor,
+    asset: str,
+    is_valid: str,
+    reason: str,
+    strategy_tier: Optional[str] = None,
+) -> int:
     cursor.execute(
         """
         SELECT COUNT(*) AS cnt
@@ -375,28 +425,42 @@ def _set_base_asset_state(cursor, asset: str, is_valid: str, reason: str) -> int
     )
     exists = int((cursor.fetchone() or {}).get('cnt') or 0) > 0
     if exists:
-        cursor.execute(
-            """
-            UPDATE mi_base_asset
-            SET is_valid = %s,
-                tier_reason = %s,
-                tier_updated_at = NOW()
-            WHERE UPPER(TRIM(base_asset)) = %s
-            """,
-            [is_valid, reason[:255], asset],
-        )
+        if strategy_tier:
+            cursor.execute(
+                """
+                UPDATE mi_base_asset
+                SET is_valid = %s,
+                    strategy_tier = %s,
+                    tier_reason = %s,
+                    tier_updated_at = NOW()
+                WHERE UPPER(TRIM(base_asset)) = %s
+                """,
+                [is_valid, strategy_tier, reason[:255], asset],
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE mi_base_asset
+                SET is_valid = %s,
+                    tier_reason = %s,
+                    tier_updated_at = NOW()
+                WHERE UPPER(TRIM(base_asset)) = %s
+                """,
+                [is_valid, reason[:255], asset],
+            )
         return cursor.rowcount
 
+    tier = strategy_tier or 'C'
     cursor.execute(
         """
         INSERT INTO mi_base_asset (
             base_asset, spot_symbol, future_name, is_valid, strategy_tier,
             tier_reason, tier_updated_at
         ) VALUES (
-            %s, %s, %s, %s, 'C', %s, NOW()
+            %s, %s, %s, %s, %s, %s, NOW()
         )
         """,
-        [asset, f'{asset}USDT', f'{asset}_USDT', is_valid, reason[:255]],
+        [asset, f'{asset}USDT', f'{asset}_USDT', is_valid, tier, reason[:255]],
     )
     return cursor.rowcount
 
@@ -408,7 +472,14 @@ def add_listing_asset_to_monitor(base_asset: str) -> Dict[str, Any]:
         raise ValueError('无效标的资产')
     with db_manager.get_connection() as conn:
         with conn.cursor() as cursor:
-            affected_asset = _set_base_asset_state(cursor, asset, 'Y', 'listing_event_add_to_monitor')
+            tier, tier_reason = _calculate_asset_strategy_tier(cursor, asset)
+            affected_asset = _set_base_asset_state(
+                cursor,
+                asset,
+                'Y',
+                tier_reason,
+                strategy_tier=tier,
+            )
             cursor.execute(
                 """
                 UPDATE mi_listing_event
@@ -425,7 +496,8 @@ def add_listing_asset_to_monitor(base_asset: str) -> Dict[str, Any]:
         'success': True,
         'base_asset': asset,
         'affected': affected_asset,
-        'message': f'{asset} 已加入监控；新标的默认 C 层，已有标的不改分层',
+        'strategy_tier': tier,
+        'message': f'{asset} 已加入监控，按当前成交额分层为 {tier}',
     }
 
 
