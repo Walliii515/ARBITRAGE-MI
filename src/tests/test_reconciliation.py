@@ -164,6 +164,10 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'future_open_contracts': 493,
             'spot_symbol': 'BELUSDT',
             'future_contract': 'BEL_USDT',
+            'close_reason': (
+                '交易所仓位风险:liquidation|Gate强平|contract=BEL_USDT|'
+                'size=6568|price=0.12092|order_id=27866022859296966'
+            ),
         }])
         remediator._load_binance_available_qty = MagicMock(return_value=0.0)
         remediator._load_prior_spot_fill = MagicMock(return_value={
@@ -182,9 +186,8 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'BEL',
             493.0,
             {
-                'type': 'liquidation',
-                'detail': 'Gate强平|contract=BEL_USDT',
-                'future_close_price': 0.12092,
+                'type': 'missing_gate_position',
+                'detail': 'Gate实仓不匹配|contract=BEL_USDT|local=493|exchange=0|missing=493',
             },
             require_desynced=False,
         )
@@ -194,6 +197,9 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertTrue(result['results'][0]['reused_prior_spot_fill'])
         remediator._mark_prior_spot_order_executed.assert_called_once()
         remediator._insert_synthetic_future_adl_order.assert_called_once()
+        synthetic_risk = remediator._insert_synthetic_future_adl_order.call_args.args[2]
+        self.assertEqual(synthetic_risk['future_close_price'], 0.12092)
+        self.assertEqual(synthetic_risk['future_exchange_order_id'], '27866022859296966')
         remediator._close_position.assert_called_once()
 
     def test_gate_adl_does_not_reuse_partial_prior_spot_fill(self):

@@ -302,6 +302,7 @@ class ExchangeDesyncRemediator:
                 'expected_qty': expected_qty,
             }
 
+        risk = self._risk_with_prior_liquidation(pos, risk)
         now = datetime.now()
         reason = f"{self._build_close_reason(risk)}|复用风险平仓已成交现货"
         spot_result = {
@@ -327,6 +328,28 @@ class ExchangeDesyncRemediator:
             'spot_exec_price': prior['exec_price'],
             'reused_prior_spot_fill': True,
         }
+
+    def _risk_with_prior_liquidation(self, pos: Dict, risk: Dict) -> Dict:
+        if _float(risk.get('future_close_price')) > 0:
+            return risk
+
+        text = "|".join(
+            str(pos.get(key) or '')
+            for key in ('close_reason', 'exchange_risk_detail')
+        )
+        price_match = re.search(r"(?:price|fill_price)=([0-9.]+)", text)
+        if not price_match:
+            return risk
+
+        updated = dict(risk)
+        updated['future_close_price'] = _float(price_match.group(1))
+        if '强平' in text or 'liquidation' in text:
+            updated.setdefault('type', 'liquidation')
+        order_match = re.search(r"order_id=([^|,\s]+)", text)
+        if order_match:
+            updated.setdefault('future_exchange_order_id', order_match.group(1))
+        updated.setdefault('future_liquidity_role', 'taker')
+        return updated
 
     def _load_prior_spot_fill(self, position_id: int) -> Optional[Dict]:
         sql = """
