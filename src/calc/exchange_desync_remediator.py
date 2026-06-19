@@ -4,6 +4,7 @@
 Gate futures 被 ADL 自动减仓后，本地 holding 仍对应 Binance spot 多头。
 本模块由实时 Gate 风险事件触发，自动卖出对应 spot，关闭本地持仓。
 """
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -83,12 +84,16 @@ class ExchangeDesyncRemediator:
         for pos in selected_positions:
             target_qty = min(_float(pos.get('spot_open_qty')), remaining_available)
             if target_qty <= max(float(self.cfg.min_spot_qty or 0), 0):
-                results.append({
-                    'attempted': True,
-                    'position_id': pos.get('id'),
-                    'success': False,
-                    'reason': 'spot_available_qty_insufficient',
-                })
+                prior_result = self._close_position_from_prior_spot_fill(pos, risk)
+                if prior_result.get('success'):
+                    results.append(prior_result)
+                else:
+                    results.append({
+                        'attempted': True,
+                        'position_id': pos.get('id'),
+                        'success': False,
+                        'reason': prior_result.get('reason') or 'spot_available_qty_insufficient',
+                    })
                 continue
 
             result = self._sell_spot_and_close_position(pos, target_qty, risk)
@@ -279,6 +284,138 @@ class ExchangeDesyncRemediator:
             'spot_exec_qty': spot_result.get('exec_qty'),
             'spot_exec_price': spot_result.get('exec_price'),
         }
+
+    def _close_position_from_prior_spot_fill(self, pos: Dict, risk: Dict) -> Dict:
+        """风险平仓已卖出现货、随后 Gate ADL 时，复用已成交现货补齐本地闭合。"""
+        position_id = int(pos['id'])
+        prior = self._load_prior_spot_fill(position_id)
+        if not prior:
+            return {'attempted': True, 'success': False, 'reason': 'spot_available_qty_insufficient'}
+
+        expected_qty = _float(pos.get('spot_open_qty'))
+        if expected_qty > 0 and prior['exec_qty'] + 1e-9 < expected_qty:
+            return {
+                'attempted': True,
+                'success': False,
+                'reason': 'prior_spot_fill_partial',
+                'spot_exec_qty': prior['exec_qty'],
+                'expected_qty': expected_qty,
+            }
+
+        now = datetime.now()
+        reason = f"{self._build_close_reason(risk)}|复用风险平仓已成交现货"
+        spot_result = {
+            'exec_price': prior['exec_price'],
+            'exec_qty': prior['exec_qty'],
+            'exec_amount': prior['exec_amount'],
+            'coverage_ratio': 0,
+        }
+        self._mark_prior_spot_order_executed(prior, pos, spot_result, reason, now)
+        self._insert_synthetic_future_adl_order(pos, prior['order_uuid'], risk, reason, now)
+        self._close_position(pos, spot_result, risk, reason, now)
+        logger.warning(
+            "ADL 自动处置补记完成 | %s | position_id=%s | prior_spot_qty=%s | "
+            "prior_spot_px=%s | future_adl_px=%s",
+            pos.get('base_asset'), position_id, prior['exec_qty'], prior['exec_price'],
+            risk.get('future_close_price'),
+        )
+        return {
+            'attempted': True,
+            'success': True,
+            'position_id': position_id,
+            'spot_exec_qty': prior['exec_qty'],
+            'spot_exec_price': prior['exec_price'],
+            'reused_prior_spot_fill': True,
+        }
+
+    def _load_prior_spot_fill(self, position_id: int) -> Optional[Dict]:
+        sql = """
+            SELECT id, order_uuid, base_asset, spot_symbol, future_contract,
+                   target_qty, target_amount, reject_reason, created_at
+            FROM mi_trade_order
+            WHERE position_id = %s
+              AND order_side = 'close'
+              AND market_type = 'spot'
+              AND status = 'rejected'
+              AND reject_reason LIKE '%%现货已成交%%'
+              AND reject_reason LIKE '%%spot_exec:%%'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (position_id,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+
+        match = re.search(
+            r"spot_exec:\s*price=([0-9.]+),\s*qty=([0-9.]+)",
+            str(row.get('reject_reason') or ''),
+        )
+        if not match:
+            return None
+        exec_price = _float(match.group(1))
+        exec_qty = _float(match.group(2))
+        if exec_price <= 0 or exec_qty <= 0:
+            return None
+        return {
+            **row,
+            'exec_price': exec_price,
+            'exec_qty': exec_qty,
+            'exec_amount': exec_price * exec_qty,
+        }
+
+    def _mark_prior_spot_order_executed(
+        self,
+        prior: Dict,
+        pos: Dict,
+        spot_result: Dict,
+        reason: str,
+        now: datetime,
+    ):
+        order = {
+            'order_side': 'close',
+            'market_type': 'spot',
+            'trade_direction': 'sell',
+        }
+        fields = self._execution_fields('spot_order', order, spot_result, True)
+        fee_rate = fields.get('fee_rate')
+        fee_amount_usdt = fields.get('fee_amount_usdt')
+        if fee_amount_usdt is None and fee_rate is not None:
+            fee_amount_usdt = _float(spot_result.get('exec_amount')) * _float(fee_rate)
+        sql = """
+            UPDATE mi_trade_order
+            SET status = 'executed',
+                reject_reason = %(reject_reason)s,
+                exec_price = %(exec_price)s,
+                exec_qty = %(exec_qty)s,
+                exec_amount = %(exec_amount)s,
+                coverage_ratio = %(coverage_ratio)s,
+                liquidity_role = %(liquidity_role)s,
+                fee_rate = %(fee_rate)s,
+                fee_amount = %(fee_amount)s,
+                fee_amount_usdt = %(fee_amount_usdt)s,
+                fee_asset = %(fee_asset)s,
+                exchange_order_id = %(exchange_order_id)s,
+                executed_at = %(executed_at)s
+            WHERE id = %(order_id)s
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'reject_reason': reason,
+                'exec_price': spot_result.get('exec_price'),
+                'exec_qty': spot_result.get('exec_qty'),
+                'exec_amount': spot_result.get('exec_amount'),
+                'coverage_ratio': spot_result.get('coverage_ratio'),
+                'liquidity_role': fields.get('liquidity_role'),
+                'fee_rate': fee_rate,
+                'fee_amount': fields.get('fee_amount'),
+                'fee_amount_usdt': fee_amount_usdt,
+                'fee_asset': fields.get('fee_asset'),
+                'exchange_order_id': fields.get('exchange_order_id'),
+                'executed_at': prior.get('created_at') or now,
+                'order_id': prior.get('id'),
+            })
 
     def _build_close_reason(self, risk: Dict) -> str:
         return (

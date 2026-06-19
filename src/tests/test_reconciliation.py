@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 from datetime import datetime
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -146,6 +147,104 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
 
 class TestExchangeDesyncRemediator(unittest.TestCase):
+    def test_gate_adl_reuses_prior_spot_fill_when_available_spot_is_zero(self):
+        class FakeExecutor:
+            contract_meta = {'BEL': {'quanto_multiplier': 1}}
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_positions_to_remediate = MagicMock(return_value=[{
+            'id': 222,
+            'base_asset': 'BEL',
+            'spot_open_qty': 493.0,
+            'future_open_qty': 493.0,
+            'future_open_price': 0.10217,
+            'future_open_contracts': 493,
+            'spot_symbol': 'BELUSDT',
+            'future_contract': 'BEL_USDT',
+        }])
+        remediator._load_binance_available_qty = MagicMock(return_value=0.0)
+        remediator._load_prior_spot_fill = MagicMock(return_value={
+            'id': 1571,
+            'order_uuid': 'close-risk-order',
+            'exec_price': 0.1196,
+            'exec_qty': 493.0,
+            'exec_amount': 58.9628,
+            'created_at': datetime(2026, 6, 19, 15, 48, 34),
+        })
+        remediator._mark_prior_spot_order_executed = MagicMock()
+        remediator._insert_synthetic_future_adl_order = MagicMock()
+        remediator._close_position = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'BEL',
+            493.0,
+            {
+                'type': 'liquidation',
+                'detail': 'Gate强平|contract=BEL_USDT',
+                'future_close_price': 0.12092,
+            },
+            require_desynced=False,
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['success_count'], 1)
+        self.assertTrue(result['results'][0]['reused_prior_spot_fill'])
+        remediator._mark_prior_spot_order_executed.assert_called_once()
+        remediator._insert_synthetic_future_adl_order.assert_called_once()
+        remediator._close_position.assert_called_once()
+
+    def test_gate_adl_does_not_reuse_partial_prior_spot_fill(self):
+        class FakeExecutor:
+            contract_meta = {'BEL': {'quanto_multiplier': 1}}
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_positions_to_remediate = MagicMock(return_value=[{
+            'id': 222,
+            'base_asset': 'BEL',
+            'spot_open_qty': 493.0,
+            'future_open_qty': 493.0,
+            'future_open_price': 0.10217,
+            'future_open_contracts': 493,
+            'spot_symbol': 'BELUSDT',
+            'future_contract': 'BEL_USDT',
+        }])
+        remediator._load_binance_available_qty = MagicMock(return_value=0.0)
+        remediator._load_prior_spot_fill = MagicMock(return_value={
+            'id': 1571,
+            'order_uuid': 'close-risk-order',
+            'exec_price': 0.1196,
+            'exec_qty': 100.0,
+            'exec_amount': 11.96,
+            'created_at': datetime(2026, 6, 19, 15, 48, 34),
+        })
+        remediator._mark_prior_spot_order_executed = MagicMock()
+        remediator._insert_synthetic_future_adl_order = MagicMock()
+        remediator._close_position = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'BEL',
+            493.0,
+            {
+                'type': 'liquidation',
+                'detail': 'Gate强平|contract=BEL_USDT',
+                'future_close_price': 0.12092,
+            },
+            require_desynced=False,
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['failure_count'], 1)
+        self.assertEqual(result['results'][0]['reason'], 'prior_spot_fill_partial')
+        remediator._mark_prior_spot_order_executed.assert_not_called()
+        remediator._insert_synthetic_future_adl_order.assert_not_called()
+        remediator._close_position.assert_not_called()
+
     def test_extra_gate_short_uses_reduce_only_close_buy(self):
         class FakeExecutor:
             contract_meta = {'EPIC': {'quanto_multiplier': 1}}
