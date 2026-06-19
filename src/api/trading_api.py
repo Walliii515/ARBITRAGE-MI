@@ -743,6 +743,19 @@ def _should_emit_reconciliation_notification(row: Dict[str, Any], latest_snapsho
     return not _db_bool(previous_is_match)
 
 
+def _append_unique_notification(
+    items: List[Dict[str, Any]],
+    seen_keys: set[str],
+    item: Dict[str, Any],
+) -> None:
+    dedup_key = str(item.get('dedup_key') or '')
+    if dedup_key:
+        if dedup_key in seen_keys:
+            return
+        seen_keys.add(dedup_key)
+    items.append(item)
+
+
 @router.get('/reconciliation/latest')
 async def get_reconciliation_latest():
     """返回最近一轮对账快照。"""
@@ -813,6 +826,7 @@ async def get_recent_risk_notifications(
     """返回需要进入前端铃铛的近期风险事件。"""
     cutoff = datetime.now() - timedelta(hours=hours)
     items: List[Dict[str, Any]] = []
+    seen_notification_keys: set[str] = set()
 
     exchange_sql = """
         SELECT
@@ -831,7 +845,7 @@ async def get_recent_risk_notifications(
 
     for row in exchange_rows:
         row = _serialize_row(row)
-        items.append({
+        _append_unique_notification(items, seen_notification_keys, {
             'dedup_key': _risk_notification_key('exchange_risk', row.get('event_key')),
             'source': 'exchange_risk',
             'severity': 'error',
@@ -889,15 +903,16 @@ async def get_recent_risk_notifications(
         base_asset = row.get('base_asset') or '-'
         exchange = row.get('exchange') or '-'
         dimension = row.get('dimension') or '-'
-        items.append({
-            'dedup_key': _risk_notification_key(
-                'reconciliation',
-                exchange,
-                base_asset,
-                dimension,
-                row.get('local_value'),
-                row.get('exchange_value'),
-            ),
+        dedup_key = _risk_notification_key(
+            'reconciliation',
+            exchange,
+            base_asset,
+            dimension,
+            row.get('local_value'),
+            row.get('exchange_value'),
+        )
+        _append_unique_notification(items, seen_notification_keys, {
+            'dedup_key': dedup_key,
             'source': 'reconciliation',
             'severity': 'warning',
             'title': f"持仓对账不一致: {base_asset}",

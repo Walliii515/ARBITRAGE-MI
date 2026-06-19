@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime
 
 from api.trading_api import (
+    _append_unique_notification,
     _build_forward_signal_filters,
     _should_emit_reconciliation_notification,
 )
@@ -62,6 +63,15 @@ class ReconciliationNotificationTests(unittest.TestCase):
         latest_snapshot_at = datetime(2026, 6, 19, 11, 53, 9)
 
         self.assertTrue(_should_emit_reconciliation_notification(row, latest_snapshot_at))
+
+    def test_append_unique_notification_keeps_first_dedup_key(self):
+        items = []
+        seen = set()
+
+        _append_unique_notification(items, seen, {'dedup_key': 'reconciliation:ASR', 'event_at': '11:52'})
+        _append_unique_notification(items, seen, {'dedup_key': 'reconciliation:ASR', 'event_at': '11:51'})
+
+        self.assertEqual(items, [{'dedup_key': 'reconciliation:ASR', 'event_at': '11:52'}])
 
 
 if __name__ == '__main__':
