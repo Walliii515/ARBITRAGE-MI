@@ -93,7 +93,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           quality_scale_in_min_basis_improvement_bps=8.0,
                           quality_scale_in_basis_improvement_ratio=0.25,
                           quality_scale_in_max_basis_improvement_bps=20.0,
-                          quality_scale_in_min_gate_margin_rate_pct=500.0,
+                          quality_scale_in_min_gate_margin_rate_pct=250.0,
                           quality_scale_in_cooldown_sec=300,
                           presignal_reject_log_cooldown_sec=300,
                           contract_meta=None,
@@ -1583,7 +1583,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
         te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 20.0
-        te._holding_margin_rate['ALLO'] = 309.4
+        te._holding_margin_rate['ALLO'] = 249.4
 
         row = self._row('ALLO', 50.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -1591,7 +1591,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_risk_check(row))
         reason = te._get_risk_fail_reason(row)
         self.assertIn('优质加仓拒绝', reason)
-        self.assertIn('MMR 309.4%<500.0%', reason)
+        self.assertIn('MMR 249.4%<250.0%', reason)
 
     def test_presignal_rejection_is_rate_limited_by_asset_and_reason_category(self):
         te = make_trading_executor(presignal_reject_log_cooldown_sec=300)

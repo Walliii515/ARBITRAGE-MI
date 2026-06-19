@@ -1681,7 +1681,8 @@ def _run_open_position_check_once():
                     'trade.open.quality_scale_in.max_basis_improvement_bps', 20.0
                 ),
                 quality_scale_in_min_gate_margin_rate_pct=config.get_float(
-                    'trade.open.quality_scale_in.min_gate_margin_rate_pct', 500.0
+                    'trade.open.quality_scale_in.min_gate_margin_rate_pct',
+                    config.get_float('margin.topup_pct', 250.0)
                 ),
                 quality_scale_in_cooldown_sec=config.get_int(
                     'trade.open.quality_scale_in.cooldown_sec', 300

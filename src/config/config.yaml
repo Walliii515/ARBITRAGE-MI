@@ -66,7 +66,7 @@ trade:
       min_basis_improvement_bps: 8          # 优质加仓最低基差改善要求
       basis_improvement_ratio: 0.25         # 相对已有加权入场基差的改善比例
       max_basis_improvement_bps: 20         # 优质加仓最高基差改善要求，避免高基差仓位阈值过硬
-      min_gate_margin_rate_pct: 500         # Gate MMR 已知且低于该值时，禁止使用增强额度
+      min_gate_margin_rate_pct: 250         # Gate MMR 已知且低于追保触发线时，禁止使用增强额度
       cooldown_sec: 300                     # 同标的增强加仓成功后的冷却
     presignal_reject_log_cooldown_sec: 300  # 预信号风控拒绝落库限流；用于复盘“页面满足但未进信号”
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）

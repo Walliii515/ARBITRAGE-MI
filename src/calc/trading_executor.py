@@ -54,7 +54,7 @@ class TradingExecutorConfig:
     quality_scale_in_min_basis_improvement_bps: float = 8.0
     quality_scale_in_basis_improvement_ratio: float = 0.25
     quality_scale_in_max_basis_improvement_bps: float = 20.0
-    quality_scale_in_min_gate_margin_rate_pct: float = 500.0
+    quality_scale_in_min_gate_margin_rate_pct: float = 250.0
     quality_scale_in_cooldown_sec: int = 300
     presignal_reject_log_cooldown_sec: int = 300
     reject_cooldown_sec: int = 60
