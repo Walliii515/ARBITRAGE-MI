@@ -421,7 +421,12 @@ def add_listing_asset_to_monitor(base_asset: str) -> Dict[str, Any]:
                 """,
                 [asset],
             )
-    return {'success': True, 'base_asset': asset, 'affected': affected_asset, 'message': f'{asset} 已加入监控，默认 C 层'}
+    return {
+        'success': True,
+        'base_asset': asset,
+        'affected': affected_asset,
+        'message': f'{asset} 已加入监控；新标的默认 C 层，已有标的不改分层',
+    }
 
 
 def disable_listing_asset(base_asset: str, reason: str = 'listing_event_disabled') -> Dict[str, Any]:
