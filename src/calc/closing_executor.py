@@ -455,8 +455,8 @@ class ClosingExecutor:
             if not orderbook_row:
                 logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                 continue
-            if self.protective_ioc_enabled and (
-                not self.future_maker_close_enabled or close_reason in {'margin_close', 'manual'}
+            if self.protective_ioc_enabled and close_reason != 'margin_close' and (
+                not self.future_maker_close_enabled or close_reason == 'manual'
             ):
                 slippage_bps = (
                     self.protective_ioc_take_profit_slippage_bps
@@ -1864,7 +1864,7 @@ class ClosingExecutor:
         if close_reason not in {'margin_close', 'manual'}:
             self._apply_future_maker_close(pos, orderbook_row or {}, future_order, close_reason)
 
-        return {
+        order_group = {
             'order_uuid': order_uuid,
             'base_asset': ba,
             'spot_symbol': spot_symbol,
@@ -1872,6 +1872,11 @@ class ClosingExecutor:
             'spot_order': spot_order,
             'future_order': future_order,
         }
+        if close_reason == 'margin_close':
+            future_order.pop('protective_price', None)
+            order_group['execution_sequence'] = 'future_then_spot'
+            order_group['execution_reason'] = 'margin_close'
+        return order_group
 
     def _apply_future_maker_close(
         self,
@@ -2008,10 +2013,19 @@ class ClosingExecutor:
             order['open_marginal_basis_bps'] = None
             order['funding_rate_24h'] = pos.get('funding_rate_24h')
 
-            if exec_result.get('success'):
+            exec_data = exec_result.get(market_key) or {}
+            leg_executed = bool(
+                exec_data
+                and exec_data.get('exec_price') is not None
+                and exec_data.get('exec_qty') is not None
+            )
+            if exec_result.get('success') or leg_executed:
                 # 成功时写入平仓触发原因，供前端复盘查看
-                order['reject_reason'] = close_reason_detail
-                exec_data = exec_result[market_key] or {}
+                if exec_result.get('success'):
+                    order['reject_reason'] = close_reason_detail
+                else:
+                    reject_msg = exec_result.get('message', '')
+                    order['reject_reason'] = f"{close_reason_detail} | 部分成交: {reject_msg}"
                 order['status'] = 'executed'
                 order['exec_price'] = exec_data.get('exec_price')
                 order['exec_qty'] = exec_data.get('exec_qty')

@@ -321,18 +321,18 @@ margin:
   # 默认维持保证金率（当合约表无数据时的回退值）
   default_maintenance_rate: 0.005
   # 保证金/维持保证金预警阈值(%): 低于此值时禁止该标的新开仓
-  warning_pct: 250
+  warning_pct: 300
   # 保证金/维持保证金自动追加阈值(%): 低于此值时先尝试追保
-  topup_pct: 250
-  # 保证金/维持保证金紧急平仓阈值(%): 低于此值且追保失败/不可追保才触发两端同时平仓
-  close_threshold_pct: 150
+  topup_pct: 300
+  # 保证金/维持保证金紧急平仓阈值(%): 低于此值时由系统主动市价平仓，避免等交易所强平
+  close_threshold_pct: 200
   # 自动追加保证金策略：补到目标 保证金/维持保证金 比例
   topup:
     enabled: true
-    target_maintenance_margin_rate_pct: 350
+    target_maintenance_margin_rate_pct: 500
     max_topup_open_notional_multiplier: 2   # 累计追保金额最多为开仓名义金额的倍数；同合约多笔会按合约聚合
     min_gate_available: 50
-    cooldown_sec: 60
+    cooldown_sec: 1
     min_amount_usdt: 0.1
     snapshot_max_age_sec: 180
     hedge_balance_tolerance_pct: 5

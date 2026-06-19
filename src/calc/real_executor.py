@@ -104,6 +104,9 @@ class RealExecutor:
             spot_order = order_group.get('spot_order', {})
             future_order = order_group.get('future_order', {})
 
+            if order_group.get('execution_sequence') == 'future_then_spot':
+                return self._execute_future_then_spot(order_group, orderbook_row)
+
             if self._is_future_maker_order(future_order):
                 return self._execute_future_maker_then_spot(order_group, orderbook_row)
 
@@ -170,6 +173,51 @@ class RealExecutor:
             result['message'] = f"系统异常: {str(e)}"
             logger.error(f"RealExecutor 异常: {e}", exc_info=True)
 
+        return result
+
+    def _execute_future_then_spot(self, order_group: Dict, orderbook_row: Dict) -> Dict:
+        """紧急平仓：先用 Gate reduce-only 市价平期货腿，再卖 Binance 现货。"""
+        result = {'success': False, 'spot_order': None, 'future_order': None, 'message': ''}
+        spot_order = order_group.get('spot_order', {})
+        future_order = dict(order_group.get('future_order', {}) or {})
+        future_order.pop('protective_price', None)
+        future_order.pop('execution_style', None)
+
+        future_result = self._place_gate_futures_order(future_order)
+        if not future_result.get('success'):
+            result['message'] = (
+                f"期货拒单(未执行现货): {future_result.get('reason')}"
+            )
+            logger.critical(
+                "⚠️ 紧急平仓期货腿失败，已跳过现货腿 | %s | reason=%s",
+                future_order.get('base_asset'), future_result.get('reason'),
+            )
+            return result
+
+        result['future_order'] = future_result
+        spot_result = self._place_binance_spot_order(spot_order)
+        if spot_result.get('success'):
+            result['spot_order'] = spot_result
+            result['success'] = True
+            result['message'] = '成交成功'
+            logger.warning(
+                "紧急平仓成功(Gate优先) | %s | future: price=%s, qty=%s | "
+                "spot: price=%s, qty=%s",
+                future_order.get('base_asset'),
+                future_result.get('exec_price'), future_result.get('exec_qty'),
+                spot_result.get('exec_price'), spot_result.get('exec_qty'),
+            )
+            return result
+
+        result['message'] = (
+            f"现货拒单(期货已成交,需人工处理): {spot_result.get('reason')} | "
+            f"future_exec: price={future_result.get('exec_price')}, "
+            f"qty={future_result.get('exec_qty')}"
+        )
+        logger.critical(
+            "⚠️ 紧急平仓现货腿失败 | %s | Gate风险已解除但Binance现货仍需处理: %s",
+            future_order.get('base_asset'), spot_result.get('reason'),
+        )
         return result
 
     def execute_reverse_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:

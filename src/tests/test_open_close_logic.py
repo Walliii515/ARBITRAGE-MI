@@ -404,6 +404,88 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         executor._place_binance_spot_order.assert_not_called()
         executor._place_gate_futures_order.assert_not_called()
 
+    def test_margin_close_future_then_spot_uses_gate_first(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        calls = []
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+
+        def gate_order(order):
+            calls.append('future')
+            self.assertNotIn('protective_price', order)
+            return {
+                'success': True,
+                'exec_price': 0.12092,
+                'exec_qty': 493.0,
+                'exec_amount': 59.61356,
+                'coverage_ratio': 0,
+            }
+
+        def spot_order(order):
+            calls.append('spot')
+            return {
+                'success': True,
+                'exec_price': 0.1196,
+                'exec_qty': 493.0,
+                'exec_amount': 58.9628,
+                'coverage_ratio': 0,
+            }
+
+        executor._place_gate_futures_order = MagicMock(side_effect=gate_order)
+        executor._place_binance_spot_order = MagicMock(side_effect=spot_order)
+
+        result = executor.execute({
+            'execution_sequence': 'future_then_spot',
+            'spot_order': {
+                'base_asset': 'BEL',
+                'order_side': 'close',
+                'trade_direction': 'sell',
+                'target_qty': 493.0,
+            },
+            'future_order': {
+                'base_asset': 'BEL',
+                'future_contract': 'BEL_USDT',
+                'order_side': 'close',
+                'trade_direction': 'buy',
+                'target_qty': 493.0,
+                'protective_price': 0.119,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(calls, ['future', 'spot'])
+
+    def test_margin_close_skips_spot_when_gate_market_close_fails(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'Gate 请求超时',
+        })
+        executor._place_binance_spot_order = MagicMock()
+
+        result = executor.execute({
+            'execution_sequence': 'future_then_spot',
+            'spot_order': {
+                'base_asset': 'BEL',
+                'order_side': 'close',
+                'trade_direction': 'sell',
+                'target_qty': 493.0,
+            },
+            'future_order': {
+                'base_asset': 'BEL',
+                'future_contract': 'BEL_USDT',
+                'order_side': 'close',
+                'trade_direction': 'buy',
+                'target_qty': 493.0,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIn('未执行现货', result['message'])
+        executor._place_binance_spot_order.assert_not_called()
+
     def test_binance_spot_protective_ioc_uses_limit_ioc_params(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
@@ -2992,26 +3074,46 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(future_order.get('maker_taker_reference_price'), 101.0)
         self.assertEqual(future_order.get('maker_spot_reference_price'), 100.0)
 
-    def test_force_close_reasons_keep_protective_ioc(self):
+    def test_margin_close_uses_gate_market_first_without_protective_ioc(self):
         self.ce.executor_client.channel = 'Live'
         self.ce.future_maker_close_enabled = True
         self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
 
-        for reason in ('margin_close', 'manual'):
-            group = self.ce._build_close_order_group({
-                'base_asset': 'BTC',
-                'spot_open_qty': 1.0,
-                'future_open_qty': 1.0,
-                'future_contract': 'BTC_USDT',
-            }, future_protective_price=101.23, orderbook_row={
-                'future_price_bid_1': 100.5,
-                'future_close_vwap': 101.0,
-                'spot_close_vwap': 100.0,
-            }, close_reason=reason)
+        group = self.ce._build_close_order_group({
+            'base_asset': 'BTC',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'future_contract': 'BTC_USDT',
+        }, future_protective_price=101.23, orderbook_row={
+            'future_price_bid_1': 100.5,
+            'future_close_vwap': 101.0,
+            'spot_close_vwap': 100.0,
+        }, close_reason='margin_close')
 
-            future_order = group['future_order']
-            self.assertNotIn('execution_style', future_order)
-            self.assertEqual(future_order['protective_price'], 101.23)
+        future_order = group['future_order']
+        self.assertNotIn('execution_style', future_order)
+        self.assertNotIn('protective_price', future_order)
+        self.assertEqual(group['execution_sequence'], 'future_then_spot')
+
+    def test_manual_close_keeps_protective_ioc(self):
+        self.ce.executor_client.channel = 'Live'
+        self.ce.future_maker_close_enabled = True
+        self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
+
+        group = self.ce._build_close_order_group({
+            'base_asset': 'BTC',
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'future_contract': 'BTC_USDT',
+        }, future_protective_price=101.23, orderbook_row={
+            'future_price_bid_1': 100.5,
+            'future_close_vwap': 101.0,
+            'spot_close_vwap': 100.0,
+        }, close_reason='manual')
+
+        future_order = group['future_order']
+        self.assertNotIn('execution_style', future_order)
+        self.assertEqual(future_order['protective_price'], 101.23)
 
     def test_manual_close_uses_protective_ioc_when_maker_close_enabled(self):
         self.ce.executor_client.channel = 'Live'
