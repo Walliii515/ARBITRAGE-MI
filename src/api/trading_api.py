@@ -35,6 +35,7 @@ from calc.listing_event_monitor import (
     mark_listing_events,
     refresh_listing_events,
 )
+from calc.orderbook_data_client import OrderBookDataClient
 from calc.position_order_fees import attach_position_order_fee_summary
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
@@ -72,6 +73,19 @@ class DisableBaseAssetRequest(BaseModel):
 
 class ListingEventActionRequest(BaseModel):
     reason: Optional[str] = None
+
+
+def _subscribe_listing_asset_orderbook(base_asset: str) -> Dict[str, Any]:
+    asset = (base_asset or '').strip().upper()
+    if not asset:
+        return {'ok': False, 'message': 'base_asset 为空'}
+    try:
+        client = OrderBookDataClient(timeout=8.0)
+        ok, message = client.retry_contract(asset)
+        return {'ok': bool(ok), 'message': message or ''}
+    except Exception as exc:
+        logger.warning('动态订阅上新标的失败: asset=%s error=%s', asset, exc, exc_info=True)
+        return {'ok': False, 'message': str(exc)[:200]}
 
 
 def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1236,9 +1250,21 @@ async def ignore_listing_event(base_asset: str, payload: ListingEventActionReque
 async def add_listing_event_to_monitor(base_asset: str):
     """将上新候选加入 mi_base_asset，后续按普通标的进入监控候选。"""
     try:
-        return add_listing_asset_to_monitor(base_asset)
+        result = add_listing_asset_to_monitor(base_asset)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    subscription = await asyncio.to_thread(_subscribe_listing_asset_orderbook, result.get('base_asset') or base_asset)
+    result['dynamic_subscription'] = subscription
+    result['requires_service_reload'] = not bool(subscription.get('ok'))
+    if subscription.get('ok'):
+        result['message'] = f"{result.get('message') or result.get('base_asset')}，已动态加入实时订阅"
+    else:
+        result['message'] = (
+            f"{result.get('message') or result.get('base_asset')}，但动态订阅失败："
+            f"{subscription.get('message') or '未知错误'}"
+        )
+    return result
 
 
 @router.post('/listing-events/{base_asset}/disable', dependencies=[Depends(verify_token_dependency)])
