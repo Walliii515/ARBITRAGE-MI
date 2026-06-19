@@ -506,6 +506,7 @@ def add_listing_asset_to_monitor(base_asset: str) -> Dict[str, Any]:
         'base_asset': asset,
         'affected': affected_asset,
         'strategy_tier': tier,
+        'requires_service_reload': True,
         'message': f'{asset} 已加入监控，按当前成交额分层为 {tier}',
     }
 

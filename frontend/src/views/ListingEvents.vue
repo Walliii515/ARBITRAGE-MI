@@ -337,7 +337,8 @@ async function addToMonitor(asset: string) {
       showError(data?.detail || data?.message || '加入监控失败')
       return
     }
-    showSuccess(data.message || `${asset} 已加入监控`)
+    const reloadHint = data?.requires_service_reload ? '；需重启行情数据/订单簿服务后进入实时订阅' : ''
+    showSuccess(`${data.message || `${asset} 已加入监控`}${reloadHint}`)
     await fetchRows()
   } finally {
     actionLoading.value = false
