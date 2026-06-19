@@ -37,6 +37,13 @@ from calc.listing_event_monitor import (
 )
 from calc.orderbook_data_client import OrderBookDataClient
 from calc.position_order_fees import attach_position_order_fee_summary
+from calc.popup_notification_store import (
+    count_unread_popup_notifications,
+    list_popup_notifications,
+    mark_popup_notifications_read,
+    upsert_popup_notification,
+    upsert_popup_notifications,
+)
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
 from calc.reverse_trade_store import (
@@ -75,6 +82,20 @@ class ListingEventActionRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class PopupNotificationCreateRequest(BaseModel):
+    title: str
+    message: str
+    type: Optional[str] = 'info'
+    source: Optional[str] = None
+    dedup_key: Optional[str] = None
+    event_at: Optional[Any] = None
+    payload: Optional[Dict[str, Any]] = None
+
+
+class PopupNotificationMarkReadRequest(BaseModel):
+    ids: Optional[List[int]] = None
+
+
 def _subscribe_listing_asset_orderbook(base_asset: str) -> Dict[str, Any]:
     asset = (base_asset or '').strip().upper()
     if not asset:
@@ -98,7 +119,7 @@ def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = value.strftime('%Y-%m-%d %H:%M:%S')
         elif isinstance(value, date):
             result[key] = value.strftime('%Y-%m-%d')
-        elif key in ('detail', 'binance_cross_margin', 'source_payload') and isinstance(value, str):
+        elif key in ('detail', 'binance_cross_margin', 'source_payload', 'payload') and isinstance(value, str):
             try:
                 result[key] = json.loads(value)
             except Exception:
@@ -818,12 +839,7 @@ async def get_reconciliation_history(
     }
 
 
-@router.get('/risk-notifications/recent')
-async def get_recent_risk_notifications(
-    hours: int = Query(24, ge=1, le=168, description="回看最近N小时风险事件"),
-    limit: int = Query(50, ge=1, le=200, description="最多返回事件数"),
-):
-    """返回需要进入前端铃铛的近期风险事件。"""
+def _build_recent_risk_notification_items(hours: int = 24, limit: int = 50) -> List[Dict[str, Any]]:
     cutoff = datetime.now() - timedelta(hours=hours)
     items: List[Dict[str, Any]] = []
     seen_notification_keys: set[str] = set()
@@ -930,7 +946,70 @@ async def get_recent_risk_notifications(
         })
 
     items.sort(key=lambda item: str(item.get('event_at') or ''), reverse=True)
-    items = items[:limit]
+    return items[:limit]
+
+
+def _sync_recent_popup_notifications() -> Dict[str, int]:
+    """Materialize current backend risk/listing signals into persistent bell history."""
+    listing_synced = 0
+    risk_synced = 0
+
+    listing_rows = list_listing_events(
+        action_status='pending',
+        candidate_status='matched',
+        actionable_only=True,
+        limit=20,
+    )
+    if listing_rows:
+        rows = _serialize_rows(listing_rows)
+        fingerprint = '|'.join(sorted(
+            f"{row.get('base_asset')}:{row.get('gate_contract') or ''}:"
+            f"{row.get('binance_symbol') or ''}:{row.get('last_seen_at') or ''}"
+            for row in rows
+        ))
+        preview = '\n'.join(
+            f"{row.get('base_asset')} Gate:{row.get('gate_contract') or '-'} "
+            f"Binance:{row.get('binance_symbol') or '-'} "
+            f"24h={float(row.get('gate_volume_24h_settle') or 0):.0f}/"
+            f"{float(row.get('binance_quote_volume') or 0):.0f}"
+            for row in rows[:8]
+        )
+        upsert_popup_notification(
+            title=f"交易对上新候选 {len(rows)} 个",
+            message=preview,
+            type='warning',
+            source='listing_events',
+            dedup_key=_risk_notification_key('listing_events', fingerprint),
+            event_at=max((row.get('last_seen_at') for row in rows if row.get('last_seen_at')), default=None),
+            payload={'items': rows},
+        )
+        listing_synced = 1
+
+    risk_items = _build_recent_risk_notification_items(hours=24, limit=50)
+    risk_synced = upsert_popup_notifications(
+        [
+            {
+                'title': item.get('title') or '交易风险通知',
+                'message': item.get('message') or '',
+                'type': 'error' if item.get('severity') == 'error' else 'warning',
+                'source': item.get('source') or 'risk',
+                'dedup_key': item.get('dedup_key'),
+                'event_at': item.get('event_at'),
+                'payload': item,
+            }
+            for item in risk_items
+        ],
+    )
+    return {'listing_events': listing_synced, 'risk': risk_synced}
+
+
+@router.get('/risk-notifications/recent')
+async def get_recent_risk_notifications(
+    hours: int = Query(24, ge=1, le=168, description="回看最近N小时风险事件"),
+    limit: int = Query(50, ge=1, le=200, description="最多返回事件数"),
+):
+    """返回需要进入前端铃铛的近期风险事件。"""
+    items = _build_recent_risk_notification_items(hours=hours, limit=limit)
     return {
         'items': items,
         'summary': {
@@ -940,6 +1019,65 @@ async def get_recent_risk_notifications(
         },
         'lookback_hours': hours,
     }
+
+
+@router.get('/notifications')
+async def get_popup_notifications(
+    read_status: str = Query('unread', description="读取状态：unread/read/all"),
+    source: Optional[str] = Query(None, description="消息来源过滤"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    sync_recent: bool = Query(True, description="先同步近期后端风险/上新事件"),
+):
+    """查询持久化铃铛消息。"""
+    synced = _sync_recent_popup_notifications() if sync_recent else {}
+    result = list_popup_notifications(
+        read_status=read_status,
+        source=source,
+        page=page,
+        page_size=page_size,
+    )
+    return {
+        'items': _serialize_rows(result['items']),
+        'pagination': result['pagination'],
+        'unread_count': result['unread_count'],
+        'synced': synced,
+    }
+
+
+@router.get('/notifications/unread-count')
+async def get_popup_notification_unread_count():
+    """返回铃铛未读数量。"""
+    return {'unread_count': count_unread_popup_notifications()}
+
+
+@router.post('/notifications', dependencies=[Depends(verify_token_dependency)])
+async def create_popup_notification(payload: PopupNotificationCreateRequest):
+    """写入一条持久化铃铛消息。"""
+    row = upsert_popup_notification(
+        title=payload.title,
+        message=payload.message,
+        type=payload.type or 'info',
+        source=payload.source,
+        dedup_key=payload.dedup_key,
+        event_at=payload.event_at,
+        payload=payload.payload,
+    )
+    return {'success': True, 'item': _serialize_row(row)}
+
+
+@router.post('/notifications/mark-read', dependencies=[Depends(verify_token_dependency)])
+async def mark_popup_notification_read(payload: PopupNotificationMarkReadRequest):
+    """将指定消息或全部未读消息标记为已读。"""
+    affected = mark_popup_notifications_read(ids=payload.ids)
+    return {'success': True, 'affected': affected, 'unread_count': count_unread_popup_notifications()}
+
+
+@router.post('/notifications/{notification_id}/read', dependencies=[Depends(verify_token_dependency)])
+async def mark_one_popup_notification_read(notification_id: int):
+    """将单条铃铛消息标记为已读。"""
+    affected = mark_popup_notifications_read(ids=[notification_id])
+    return {'success': True, 'affected': affected, 'unread_count': count_unread_popup_notifications()}
 
 
 @router.post('/reconciliation/run')

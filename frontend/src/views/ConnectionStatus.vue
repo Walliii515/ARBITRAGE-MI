@@ -105,6 +105,8 @@ function maybeShowDelistRiskAlert() {
     message: preview,
     type: 'warning',
     source: 'delist_risk',
+    dedup_key: `delist_risk:${fingerprint}`,
+    payload: { risks },
   })
   ElMessageBox.alert(preview, title, {
     type: 'warning',

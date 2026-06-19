@@ -8,8 +8,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { post, get } from './utils/request'
 import {
   addPopupNotification,
-  clearPopupNotifications,
   listPopupNotifications,
+  markAllPopupNotificationsRead,
+  markPopupNotificationRead,
   POPUP_NOTIFICATION_HISTORY_EVENT,
   type PopupNotification,
 } from './utils/notificationHistory'
@@ -18,6 +19,9 @@ const route = useRoute()
 const router = useRouter()
 const isCollapsed = ref(false)
 const notificationHistory = ref<PopupNotification[]>([])
+const notificationUnreadCount = ref(0)
+const notificationFilter = ref<'unread' | 'read' | 'all'>('unread')
+const notificationLoading = ref(false)
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
 let listingAlertTimer: ReturnType<typeof setInterval> | null = null
 let riskAlertTimer: ReturnType<typeof setInterval> | null = null
@@ -54,15 +58,45 @@ const tradingModeColor = computed(() => {
   }
 })
 
-const notificationCount = computed(() => notificationHistory.value.length)
+const notificationCount = computed(() => notificationUnreadCount.value)
 
-function refreshNotificationHistory() {
-  notificationHistory.value = listPopupNotifications()
+async function refreshNotificationHistory(syncRecent = true) {
+  if (isLoginPage.value) return
+  notificationLoading.value = true
+  try {
+    const data = await listPopupNotifications({
+      readStatus: notificationFilter.value,
+      syncRecent,
+    })
+    notificationHistory.value = data.items
+    notificationUnreadCount.value = data.unread_count
+  } catch {
+    // request.ts 会提示错误；这里避免影响主界面。
+  } finally {
+    notificationLoading.value = false
+  }
 }
 
-function clearNotificationHistory() {
-  clearPopupNotifications()
-  refreshNotificationHistory()
+async function markAllNotificationsRead() {
+  try {
+    await markAllPopupNotificationsRead()
+    await refreshNotificationHistory(false)
+  } catch {
+    // request.ts 会提示错误
+  }
+}
+
+async function markNotificationRead(id: number) {
+  try {
+    await markPopupNotificationRead(id)
+    await refreshNotificationHistory(false)
+  } catch {
+    // request.ts 会提示错误
+  }
+}
+
+function handleNotificationFilterChange() {
+  void refreshNotificationHistory(false)
 }
 
 function formatNotificationTime(value: string) {
@@ -188,13 +222,15 @@ async function maybeShowListingAlert() {
       return `${item.base_asset} Gate:${item.gate_contract || '-'} Binance:${item.binance_symbol || '-'} 24h=${gateVol.toFixed(0)}/${spotVol.toFixed(0)}`
     }).join('\n')
     const title = `交易对上新候选 ${items.length} 个`
-    addPopupNotification({
+    await addPopupNotification({
       title,
       message: preview,
       type: 'warning',
       source: 'listing_events',
+      dedup_key: `listing_events:${fingerprint}`,
+      payload: { items },
     })
-    refreshNotificationHistory()
+    await refreshNotificationHistory(false)
     ElMessageBox.confirm(preview, title, {
       type: 'warning',
       confirmButtonText: '去处理',
@@ -263,17 +299,19 @@ async function maybeShowRiskAlerts() {
 
     for (const item of unseen) {
       const key = String(item.dedup_key)
-      addPopupNotification({
+      await addPopupNotification({
         title: String(item.title || '交易风险通知'),
         message: buildRiskNotificationMessage(item),
         type: item.severity === 'error' ? 'error' : 'warning',
         source: String(item.source || 'risk'),
         dedup_key: key,
+        event_at: item.event_at,
+        payload: item,
       })
       seen.add(key)
     }
     saveSeenRiskNotificationKeys(seen)
-    refreshNotificationHistory()
+    await refreshNotificationHistory(false)
     ElMessage.warning(`新增 ${unseen.length} 条交易风险通知`)
   } catch {
     // 风险提醒失败不影响主界面
@@ -294,9 +332,11 @@ function stopRiskAlertTimer() {
   }
 }
 
+const notificationHistoryChangeHandler = () => void refreshNotificationHistory(false)
+
 onMounted(() => {
-  refreshNotificationHistory()
-  window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, refreshNotificationHistory)
+  void refreshNotificationHistory()
+  window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, notificationHistoryChangeHandler)
   if (!isLoginPage.value) {
     startOpenPauseStatusTimer()
     startListingAlertTimer()
@@ -320,7 +360,7 @@ onUnmounted(() => {
   stopOpenPauseStatusTimer()
   stopListingAlertTimer()
   stopRiskAlertTimer()
-  window.removeEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, refreshNotificationHistory)
+  window.removeEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, notificationHistoryChangeHandler)
 })
 
 async function handleLogout() {
@@ -355,10 +395,10 @@ function toggleMenu() {
         </div>
         <el-popover
           placement="right-start"
-          :width="340"
+          :width="380"
           trigger="click"
           popper-class="notification-history-popper"
-          @show="refreshNotificationHistory"
+          @show="() => refreshNotificationHistory()"
         >
           <template #reference>
             <button class="notification-bell" title="弹窗消息">
@@ -374,16 +414,29 @@ function toggleMenu() {
           </template>
           <div class="notification-history">
             <div class="notification-history-header">
-              <span>弹窗消息</span>
+              <span>弹窗消息 <b v-if="notificationUnreadCount > 0">{{ notificationUnreadCount }}</b></span>
               <button
                 class="notification-clear"
-                :disabled="notificationCount === 0"
-                @click="clearNotificationHistory"
+                :disabled="notificationUnreadCount === 0"
+                @click="markAllNotificationsRead"
               >
-                清空
+                全部已读
               </button>
             </div>
-            <div v-if="notificationHistory.length === 0" class="notification-empty">
+            <el-radio-group
+              v-model="notificationFilter"
+              size="small"
+              class="notification-filter"
+              @change="handleNotificationFilterChange"
+            >
+              <el-radio-button value="unread">未读</el-radio-button>
+              <el-radio-button value="read">已读</el-radio-button>
+              <el-radio-button value="all">全部</el-radio-button>
+            </el-radio-group>
+            <div v-if="notificationLoading" class="notification-empty">
+              加载中...
+            </div>
+            <div v-else-if="notificationHistory.length === 0" class="notification-empty">
               暂无弹窗消息
             </div>
             <div v-else class="notification-list">
@@ -391,12 +444,19 @@ function toggleMenu() {
                 v-for="item in notificationHistory"
                 :key="item.id"
                 class="notification-item"
+                :class="{ unread: !item.read_at }"
               >
                 <div class="notification-item-top">
-                  <span class="notification-title">{{ item.title }}</span>
+                  <span class="notification-title">
+                    <i v-if="!item.read_at" class="notification-unread-dot"></i>
+                    {{ item.title }}
+                  </span>
                   <span class="notification-time">{{ formatNotificationTime(item.created_at) }}</span>
                 </div>
                 <div class="notification-message">{{ item.message }}</div>
+                <div v-if="!item.read_at" class="notification-item-actions">
+                  <button class="notification-read-btn" @click="markNotificationRead(item.id)">标记已读</button>
+                </div>
               </div>
             </div>
           </div>
@@ -645,6 +705,12 @@ function toggleMenu() {
   color: var(--app-text, #e5e7eb);
 }
 
+.notification-history-header b {
+  margin-left: 4px;
+  color: #f56c6c;
+  font-size: 12px;
+}
+
 .notification-clear {
   border: 0;
   background: transparent;
@@ -656,6 +722,18 @@ function toggleMenu() {
 .notification-clear:disabled {
   color: #606266;
   cursor: not-allowed;
+}
+
+.notification-filter {
+  width: 100%;
+}
+
+.notification-filter :deep(.el-radio-button) {
+  flex: 1;
+}
+
+.notification-filter :deep(.el-radio-button__inner) {
+  width: 100%;
 }
 
 .notification-empty {
@@ -680,6 +758,11 @@ function toggleMenu() {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.notification-item.unread {
+  border-color: rgba(245, 108, 108, 0.45);
+  background: rgba(245, 108, 108, 0.08);
+}
+
 .notification-item-top {
   display: flex;
   align-items: center;
@@ -689,9 +772,13 @@ function toggleMenu() {
 }
 
 .notification-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--app-text, #e5e7eb);
   font-size: 13px;
   font-weight: 600;
+  min-width: 0;
 }
 
 .notification-time {
@@ -700,12 +787,40 @@ function toggleMenu() {
   font-size: 12px;
 }
 
+.notification-unread-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: #f56c6c;
+}
+
 .notification-message {
   color: #c0c4cc;
   font-size: 12px;
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.notification-item-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.notification-read-btn {
+  border: 0;
+  border-radius: 4px;
+  background: rgba(64, 158, 255, 0.14);
+  color: #409eff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.notification-read-btn:hover {
+  background: rgba(64, 158, 255, 0.24);
 }
 
 .trading-mode-badge {
