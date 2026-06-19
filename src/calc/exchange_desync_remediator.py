@@ -239,6 +239,7 @@ class ExchangeDesyncRemediator:
         order_uuid = str(uuid.uuid4())
         base_asset = str(pos.get('base_asset') or '').upper()
         now = datetime.now()
+        risk = self._risk_with_prior_future_fill(pos, risk)
         close_reason = self._build_close_reason(risk)
 
         spot_order = {
@@ -271,10 +272,11 @@ class ExchangeDesyncRemediator:
             }
 
         self._insert_spot_order(spot_order, spot_result, close_reason, True, now)
-        self._insert_synthetic_future_adl_order(pos, order_uuid, risk, close_reason, now)
+        if not risk.get('reused_prior_future_fill'):
+            self._insert_synthetic_future_adl_order(pos, order_uuid, risk, close_reason, now)
         self._close_position(pos, spot_result, risk, close_reason, now)
         logger.warning(
-            "ADL 自动处置完成 | %s | position_id=%s | spot_qty=%s | spot_px=%s | future_adl_px=%s",
+            "Gate 缺腿自动处置完成 | %s | position_id=%s | spot_qty=%s | spot_px=%s | future_close_px=%s",
             base_asset, position_id, spot_result.get('exec_qty'), spot_result.get('exec_price'), risk.get('future_close_price'),
         )
         return {
@@ -283,6 +285,59 @@ class ExchangeDesyncRemediator:
             'position_id': position_id,
             'spot_exec_qty': spot_result.get('exec_qty'),
             'spot_exec_price': spot_result.get('exec_price'),
+        }
+
+    def _risk_with_prior_future_fill(self, pos: Dict, risk: Dict) -> Dict:
+        """系统风险平仓期货腿已成交时，复用真实成交价关闭后续 spot 兜底。"""
+        prior = self._load_prior_future_fill(int(pos.get('id') or 0))
+        if not prior:
+            return risk
+
+        updated = dict(risk)
+        updated['future_close_price'] = prior['exec_price']
+        updated['future_exchange_order_id'] = prior.get('exchange_order_id')
+        updated['future_liquidity_role'] = prior.get('liquidity_role') or 'taker'
+        updated['future_close_size'] = abs(_float(pos.get('future_open_contracts')))
+        updated['reused_prior_future_fill'] = True
+        detail = str(updated.get('detail') or '')
+        updated['detail'] = (
+            f"{detail}|复用风险平仓已成交Gate期货|future_exec: "
+            f"price={prior['exec_price']}, qty={prior['exec_qty']}, "
+            f"order_id={prior.get('exchange_order_id') or ''}"
+        )
+        return updated
+
+    def _load_prior_future_fill(self, position_id: int) -> Optional[Dict]:
+        if position_id <= 0:
+            return None
+        sql = """
+            SELECT id, order_uuid, exec_price, exec_qty, exec_amount,
+                   liquidity_role, exchange_order_id, executed_at, reject_reason
+            FROM mi_trade_order
+            WHERE position_id = %s
+              AND order_side = 'close'
+              AND market_type = 'future'
+              AND status = 'executed'
+              AND exec_price IS NOT NULL
+              AND exec_qty IS NOT NULL
+              AND reject_reason LIKE '%%期货已成交%%'
+            ORDER BY executed_at DESC, id DESC
+            LIMIT 1
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (position_id,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        exec_price = _float(row.get('exec_price'))
+        exec_qty = _float(row.get('exec_qty'))
+        if exec_price <= 0 or exec_qty <= 0:
+            return None
+        return {
+            **row,
+            'exec_price': exec_price,
+            'exec_qty': exec_qty,
+            'exec_amount': _float(row.get('exec_amount')),
         }
 
     def _close_position_from_prior_spot_fill(self, pos: Dict, risk: Dict) -> Dict:

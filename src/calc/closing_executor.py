@@ -13,7 +13,7 @@
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Set
+from typing import Callable, List, Dict, Optional, Set
 
 from common.database import db_manager
 from common.config import config
@@ -34,6 +34,9 @@ from calc.dynamic_take_profit import (
 )
 
 logger = get_logger(__name__)
+
+
+FAST_RISK_CLOSE_REASONS = {'margin_close', 'delist_risk_exit', 'negative_funding_exit'}
 
 
 def _float_or_none(value) -> Optional[float]:
@@ -206,6 +209,7 @@ class ClosingExecutor:
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
+        self._reconciliation_trigger: Optional[Callable[[str, str], None]] = None
 
         self._close_resiliency_max_basis_rebound_bps = config.get_float(
             'trade.close_resiliency.max_basis_rebound_bps', 8.0
@@ -296,6 +300,10 @@ class ClosingExecutor:
         self._spot_manager = spot_manager
         if changed:
             logger.info('OrderBookManager 已注入 ClosingExecutor（平仓最终风控旁路就绪）')
+
+    def set_reconciliation_trigger(self, callback: Callable[[str, str], None]):
+        """注入后台对账触发器，用于断腿风险出现后尽快走现有兜底链路。"""
+        self._reconciliation_trigger = callback
 
     def set_delist_risk_report(self, report: Optional[Dict]):
         """注入异步刷新得到的下架风险报告；平仓关键路径只读内存。"""
@@ -455,7 +463,7 @@ class ClosingExecutor:
             if not orderbook_row:
                 logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                 continue
-            if self.protective_ioc_enabled and close_reason != 'margin_close' and (
+            if close_reason not in FAST_RISK_CLOSE_REASONS and self.protective_ioc_enabled and (
                 not self.future_maker_close_enabled or close_reason == 'manual'
             ):
                 slippage_bps = (
@@ -1861,7 +1869,7 @@ class ClosingExecutor:
         }
         if future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
-        if close_reason not in {'margin_close', 'manual'}:
+        if close_reason not in FAST_RISK_CLOSE_REASONS and close_reason != 'manual':
             self._apply_future_maker_close(pos, orderbook_row or {}, future_order, close_reason)
 
         order_group = {
@@ -1872,10 +1880,10 @@ class ClosingExecutor:
             'spot_order': spot_order,
             'future_order': future_order,
         }
-        if close_reason == 'margin_close':
+        if close_reason in FAST_RISK_CLOSE_REASONS:
             future_order.pop('protective_price', None)
             order_group['execution_sequence'] = 'future_then_spot'
-            order_group['execution_reason'] = 'margin_close'
+            order_group['execution_reason'] = close_reason
         return order_group
 
     def _apply_future_maker_close(
@@ -2064,6 +2072,9 @@ class ClosingExecutor:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(insert_sql, order)
 
+        if self._mark_partial_risk_close_desync(pos, exec_result, close_reason, close_reason_detail):
+            self._trigger_reconciliation('risk_close_partial_desync', str(pos.get('base_asset') or ''))
+
         # ── 更新持仓状态为 closed（仅成交成功时）──
         if exec_result.get('success'):
             update_sql = """
@@ -2094,6 +2105,83 @@ class ClosingExecutor:
                 f"close_spread_bps={close_spread_bps}"
             )
         return close_spread_bps
+
+    def _mark_partial_risk_close_desync(
+        self,
+        pos: Dict,
+        exec_result: Dict,
+        close_reason: str,
+        close_reason_detail: str,
+    ) -> bool:
+        """风险平仓 Gate 腿已成交但 spot 未成交时，标记断腿并交给对账兜底。"""
+        if close_reason not in FAST_RISK_CLOSE_REASONS or exec_result.get('success'):
+            return False
+        future_exec = exec_result.get('future_order') or {}
+        spot_exec = exec_result.get('spot_order') or {}
+        if not future_exec or spot_exec:
+            return False
+        future_price = _float_or_none(future_exec.get('exec_price'))
+        future_qty = _float_or_none(future_exec.get('exec_qty'))
+        if future_price is None or future_qty is None or future_qty <= 0:
+            return False
+
+        base_asset = str(pos.get('base_asset') or '').upper()
+        position_id = pos.get('id')
+        open_qty = abs(float(pos.get('future_open_qty') or 0))
+        risk_type = 'missing_gate_position'
+        if open_qty > 0 and abs(future_qty) + 1e-9 < open_qty:
+            risk_type = 'qty_mismatch'
+        message = str(exec_result.get('message') or '')
+        exchange_order_id = future_exec.get('exchange_order_id')
+        detail = (
+            f"系统风险平仓Gate期货已成交但Binance现货失败|asset={base_asset}|"
+            f"future_price={future_price}|future_qty={future_qty}|"
+            f"future_order_id={exchange_order_id or ''}|spot_reason={message[:180]}"
+        )
+        reason = f"交易所仓位风险:{risk_type}|{detail}"
+        sql = """
+            UPDATE mi_trade_position
+            SET exchange_risk_status = 'desynced',
+                exchange_risk_type = %(risk_type)s,
+                exchange_risk_at = %(risk_at)s,
+                exchange_risk_detail = %(detail)s,
+                close_reason = CASE
+                    WHEN close_reason IS NULL OR close_reason = '' THEN %(reason)s
+                    WHEN close_reason NOT LIKE %(reason_like)s THEN CONCAT(close_reason, '|', %(reason)s)
+                    ELSE close_reason
+                END
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'risk_type': risk_type,
+                'risk_at': datetime.now(),
+                'detail': detail,
+                'reason': reason,
+                'reason_like': '%系统风险平仓Gate期货已成交但Binance现货失败%',
+                'position_id': position_id,
+            })
+            updated = int(getattr(cursor, 'rowcount', 0) or 0)
+
+        logger.critical(
+            "风险平仓出现待处置断腿 | %s | position_id=%s | risk_type=%s | "
+            "future_price=%s | future_qty=%s | spot_reason=%s",
+            base_asset, position_id, risk_type, future_price, future_qty, message,
+        )
+        return updated > 0
+
+    def _trigger_reconciliation(self, reason: str, base_asset: str):
+        callback = self._reconciliation_trigger
+        if not callback:
+            return
+        try:
+            callback(reason, base_asset)
+        except Exception as e:
+            logger.warning(
+                "风险平仓后触发即时对账失败 | %s | reason=%s | %s",
+                base_asset, reason, e, exc_info=True,
+            )
 
     @staticmethod
     def _position_close_reason(close_reason_detail: str) -> str:

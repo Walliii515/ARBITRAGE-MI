@@ -715,12 +715,32 @@ _CAPITAL_HISTORY_INTERVALS = {
 }
 
 
-def _reconciliation_ignore_clause() -> tuple[str, List[Any]]:
+def _reconciliation_ignore_clause(table_alias: str = '') -> tuple[str, List[Any]]:
     ignored = sorted(get_ignored_binance_spot_assets())
     if not ignored:
         return '', []
     placeholders = ','.join(['%s'] * len(ignored))
-    return f" AND NOT (exchange = 'binance' AND base_asset IN ({placeholders}))", ignored
+    prefix = f"{table_alias}." if table_alias else ''
+    return f" AND NOT ({prefix}exchange = 'binance' AND {prefix}base_asset IN ({placeholders}))", ignored
+
+
+def _db_bool(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _should_emit_reconciliation_notification(row: Dict[str, Any], latest_snapshot_at: Any) -> bool:
+    """Suppress one-off historical reconciliation mismatches caused by in-flight trades."""
+    if latest_snapshot_at is not None and row.get('snapshot_at') == latest_snapshot_at:
+        return True
+    previous_is_match = row.get('previous_is_match')
+    if previous_is_match is None:
+        return False
+    return not _db_bool(previous_is_match)
 
 
 @router.get('/reconciliation/latest')
@@ -829,23 +849,42 @@ async def get_recent_risk_notifications(
             'detail': row,
         })
 
-    ignore_sql, ignore_params = _reconciliation_ignore_clause()
+    with db_manager.get_cursor() as cursor:
+        cursor.execute("SELECT MAX(snapshot_at) AS latest_snapshot_at FROM mi_recon_snapshot")
+        latest_recon_row = cursor.fetchone()
+    latest_snapshot_at = latest_recon_row.get('latest_snapshot_at') if latest_recon_row else None
+
+    ignore_sql, ignore_params = _reconciliation_ignore_clause('r')
+    candidate_limit = min(max(limit * 5, 100), 1000)
     recon_sql = f"""
         SELECT
-            id, snapshot_at, exchange, base_asset, dimension,
-            local_value, exchange_value, diff_value, diff_ratio, detail
-        FROM mi_recon_snapshot
-        WHERE snapshot_at >= %s
-          AND is_match = 0
+            r.id, r.snapshot_at, r.exchange, r.base_asset, r.dimension,
+            r.local_value, r.exchange_value, r.diff_value, r.diff_ratio, r.detail,
+            (
+                SELECT prev.is_match
+                FROM mi_recon_snapshot prev
+                WHERE prev.exchange = r.exchange
+                  AND prev.base_asset = r.base_asset
+                  AND prev.dimension = r.dimension
+                  AND prev.snapshot_at < r.snapshot_at
+                ORDER BY prev.snapshot_at DESC
+                LIMIT 1
+            ) AS previous_is_match
+        FROM mi_recon_snapshot r
+        WHERE r.snapshot_at >= %s
+          AND r.is_match = 0
           {ignore_sql}
-        ORDER BY snapshot_at DESC, exchange ASC, base_asset ASC
+        ORDER BY r.snapshot_at DESC, r.exchange ASC, r.base_asset ASC
         LIMIT %s
     """
     with db_manager.get_cursor() as cursor:
-        cursor.execute(recon_sql, [cutoff, *ignore_params, limit])
+        cursor.execute(recon_sql, [cutoff, *ignore_params, candidate_limit])
         recon_rows = cursor.fetchall()
 
     for row in recon_rows:
+        if not _should_emit_reconciliation_notification(row, latest_snapshot_at):
+            continue
+        row.pop('previous_is_match', None)
         row = _serialize_row(row)
         base_asset = row.get('base_asset') or '-'
         exchange = row.get('exchange') or '-'

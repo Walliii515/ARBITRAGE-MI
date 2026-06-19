@@ -486,6 +486,45 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertIn('未执行现货', result['message'])
         executor._place_binance_spot_order.assert_not_called()
 
+    def test_margin_close_returns_future_fill_when_spot_fails(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.12092,
+            'exec_qty': 493.0,
+            'exec_amount': 59.61,
+            'coverage_ratio': 0,
+            'exchange_order_id': 'gate-1',
+        })
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'Binance 请求超时',
+        })
+
+        result = executor.execute({
+            'execution_sequence': 'future_then_spot',
+            'spot_order': {
+                'base_asset': 'BEL',
+                'order_side': 'close',
+                'trade_direction': 'sell',
+                'target_qty': 493.0,
+            },
+            'future_order': {
+                'base_asset': 'BEL',
+                'future_contract': 'BEL_USDT',
+                'order_side': 'close',
+                'trade_direction': 'buy',
+                'target_qty': 493.0,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIsNotNone(result['future_order'])
+        self.assertEqual(result['future_order']['exchange_order_id'], 'gate-1')
+        self.assertIn('期货已成交', result['message'])
+
     def test_binance_spot_protective_ioc_uses_limit_ioc_params(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
@@ -2776,6 +2815,57 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             'funding_next_apply': (datetime.now() + timedelta(minutes=120)).strftime('%Y-%m-%d %H:%M:%S'),
         }
 
+    def test_partial_risk_close_marks_desync_and_triggers_reconciliation(self):
+        class FakeCursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.params = None
+
+            def execute(self, sql, params=None):
+                self.params = params
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        cursor = FakeCursor()
+        triggered = []
+        self.ce.set_reconciliation_trigger(lambda reason, asset: triggered.append((reason, asset)))
+
+        with patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            marked = self.ce._mark_partial_risk_close_desync(
+                {
+                    'id': 222,
+                    'base_asset': 'BEL',
+                    'future_open_qty': 493.0,
+                },
+                {
+                    'success': False,
+                    'message': '现货拒单(期货已成交,需人工处理): Binance 请求超时',
+                    'future_order': {
+                        'exec_price': 0.12092,
+                        'exec_qty': 493.0,
+                        'exchange_order_id': 'gate-1',
+                    },
+                    'spot_order': None,
+                },
+                'margin_close',
+                '保证金风险平仓',
+            )
+
+        self.assertTrue(marked)
+        self.assertEqual(cursor.params['risk_type'], 'missing_gate_position')
+        self.assertIn('Gate期货已成交但Binance现货失败', cursor.params['detail'])
+        self.ce._trigger_reconciliation('risk_close_partial_desync', 'BEL')
+        self.assertEqual(triggered, [('risk_close_partial_desync', 'BEL')])
+
     def test_fixed_net_take_profit_uses_fee_adjusted_profit(self):
         self.assertTrue(self.ce._check_take_profit(self.pos, 40.0))
         self.assertFalse(self.ce._check_take_profit(self.pos, 75.0))
@@ -3094,6 +3184,30 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertNotIn('execution_style', future_order)
         self.assertNotIn('protective_price', future_order)
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
+
+    def test_risk_close_reasons_use_gate_market_first_without_maker_or_protective_ioc(self):
+        self.ce.executor_client.channel = 'Live'
+        self.ce.future_maker_close_enabled = True
+        self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
+
+        for reason in ('delist_risk_exit', 'negative_funding_exit'):
+            with self.subTest(reason=reason):
+                group = self.ce._build_close_order_group({
+                    'base_asset': 'BTC',
+                    'spot_open_qty': 1.0,
+                    'future_open_qty': 1.0,
+                    'future_contract': 'BTC_USDT',
+                }, future_protective_price=101.23, orderbook_row={
+                    'future_price_bid_1': 100.5,
+                    'future_close_vwap': 101.0,
+                    'spot_close_vwap': 100.0,
+                }, close_reason=reason)
+
+                future_order = group['future_order']
+                self.assertNotIn('execution_style', future_order)
+                self.assertNotIn('protective_price', future_order)
+                self.assertEqual(group['execution_sequence'], 'future_then_spot')
+                self.assertEqual(group['execution_reason'], reason)
 
     def test_manual_close_keeps_protective_ioc(self):
         self.ce.executor_client.channel = 'Live'

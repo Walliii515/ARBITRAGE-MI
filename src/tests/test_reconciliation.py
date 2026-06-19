@@ -3,7 +3,7 @@ import os
 import sys
 import unittest
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -145,6 +145,41 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(reconciler.mark_calls[0][0], 'HEI')
         self.assertTrue(reconciler.mark_calls[0][1]['confirmed'])
 
+    def test_self_reported_gate_desync_confirms_without_prior_snapshot(self):
+        class FakeCursor:
+            def execute(self, sql, params=None):
+                self.params = params
+
+            def fetchone(self):
+                return {'id': 222}
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_confirm_runs=2),
+        )
+        cursor = FakeCursor()
+
+        with patch('calc.reconciliation.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            confirmed = reconciler._is_gate_risk_confirmed(
+                'BEL',
+                'missing_gate_position',
+                datetime(2026, 6, 19, 18, 0, 0),
+            )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(cursor.params[0], 'BEL')
+        self.assertEqual(cursor.params[1], 'missing_gate_position')
+
 
 class TestExchangeDesyncRemediator(unittest.TestCase):
     def test_gate_adl_reuses_prior_spot_fill_when_available_spot_is_zero(self):
@@ -201,6 +236,64 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(synthetic_risk['future_close_price'], 0.12092)
         self.assertEqual(synthetic_risk['future_exchange_order_id'], '27866022859296966')
         remediator._close_position.assert_called_once()
+
+    def test_gate_desync_reuses_prior_future_fill_after_spot_retry(self):
+        class FakeExecutor:
+            contract_meta = {'BEL': {'quanto_multiplier': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_price': 0.1196,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': 58.9628,
+                    'coverage_ratio': 0,
+                }
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        pos = {
+            'id': 222,
+            'base_asset': 'BEL',
+            'spot_open_qty': 493.0,
+            'spot_open_price': 0.119,
+            'future_open_qty': 493.0,
+            'future_open_price': 0.10217,
+            'future_open_contracts': 493,
+            'spot_symbol': 'BELUSDT',
+            'future_contract': 'BEL_USDT',
+        }
+        remediator._load_positions_to_remediate = MagicMock(return_value=[pos])
+        remediator._load_binance_available_qty = MagicMock(return_value=493.0)
+        remediator._load_prior_future_fill = MagicMock(return_value={
+            'exec_price': 0.12092,
+            'exec_qty': 493.0,
+            'exec_amount': 59.61356,
+            'exchange_order_id': 'gate-1',
+            'liquidity_role': 'taker',
+        })
+        remediator._insert_spot_order = MagicMock()
+        remediator._insert_synthetic_future_adl_order = MagicMock()
+        remediator._close_position = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'BEL',
+            493.0,
+            {
+                'type': 'missing_gate_position',
+                'detail': 'Gate实仓不匹配|contract=BEL_USDT|local=493|exchange=0|missing=493',
+            },
+            require_desynced=False,
+        )
+
+        self.assertTrue(result['success'])
+        remediator._insert_synthetic_future_adl_order.assert_not_called()
+        close_risk = remediator._close_position.call_args.args[2]
+        self.assertEqual(close_risk['future_close_price'], 0.12092)
+        self.assertEqual(close_risk['future_exchange_order_id'], 'gate-1')
+        self.assertTrue(close_risk['reused_prior_future_fill'])
 
     def test_gate_adl_does_not_reuse_partial_prior_spot_fill(self):
         class FakeExecutor:

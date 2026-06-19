@@ -437,6 +437,8 @@ class Reconciler:
         confirm_runs = max(int(self.cfg.auto_remediate_confirm_runs or 1), 1)
         if confirm_runs <= 1:
             return True
+        if self._has_self_reported_gate_desync(base_asset, risk_type, snapshot_at):
+            return True
 
         cutoff = snapshot_at - timedelta(seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 60), 60))
         with db_manager.get_cursor() as cursor:
@@ -466,6 +468,28 @@ class Reconciler:
             if previous_type != risk_type:
                 return False
         return True
+
+    def _has_self_reported_gate_desync(self, base_asset: str, risk_type: str, snapshot_at: datetime) -> bool:
+        """系统平仓已确认 Gate 腿成交时，允许即时对账直接进入兜底处置。"""
+        if risk_type not in {'missing_gate_position', 'qty_mismatch'}:
+            return False
+        cutoff = snapshot_at - timedelta(seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 60), 60))
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM mi_trade_position
+                WHERE status = 'holding'
+                  AND UPPER(base_asset) = %s
+                  AND exchange_risk_status = 'desynced'
+                  AND exchange_risk_type = %s
+                  AND exchange_risk_at >= %s
+                  AND exchange_risk_detail LIKE '%%系统风险平仓Gate期货已成交但Binance现货失败%%'
+                LIMIT 1
+                """,
+                (base_asset.upper(), risk_type, cutoff),
+            )
+            return cursor.fetchone() is not None
 
     @staticmethod
     def _gate_risk_type_from_values(local_value: float, exchange_value: float) -> Optional[str]:

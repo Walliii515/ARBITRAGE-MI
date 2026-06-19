@@ -315,6 +315,8 @@ _reverse_executor_client: Optional[ExecutorClient] = None
 _gate_risk_event_monitor = None
 _critical_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-open')
 _critical_close_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='critical-close')
+_reconciliation_trigger_lock = threading.Lock()
+_reconciliation_trigger_running: bool = False
 
 # ───── 开仓暂停开关 ─────
 _open_paused: bool = True                    # 正向开仓启动默认暂停，需人工恢复；平仓不受影响
@@ -1409,7 +1411,50 @@ def _configure_closing_executor(executor):
         executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
     if hasattr(executor, 'set_delist_risk_report'):
         executor.set_delist_risk_report(_delist_risk_report)
+    if hasattr(executor, 'set_reconciliation_trigger'):
+        executor.set_reconciliation_trigger(_trigger_reconciliation_once)
     return executor
+
+
+def _trigger_reconciliation_once(reason: str, base_asset: str = ''):
+    """后台触发一轮对账，缩短风险平仓部分成交后的兜底延迟。"""
+    global _reconciliation_trigger_running
+    if config.get_trade_mode() == 'virtual':
+        return
+    if not config.get_bool('reconciliation.enabled', True):
+        return
+    with _reconciliation_trigger_lock:
+        if _reconciliation_trigger_running:
+            logger.warning(
+                "即时对账已在运行，跳过重复触发 | asset=%s | reason=%s",
+                base_asset, reason,
+            )
+            return
+        _reconciliation_trigger_running = True
+
+    def _worker():
+        global _reconciliation_trigger_running
+        try:
+            result = build_default_reconciler().run_once()
+            logger.warning(
+                "风险平仓后即时对账完成 | asset=%s | reason=%s | result=%s",
+                base_asset, reason, result,
+            )
+        except Exception as e:
+            logger.error(
+                "风险平仓后即时对账失败 | asset=%s | reason=%s | %s",
+                base_asset, reason, e, exc_info=True,
+            )
+        finally:
+            with _reconciliation_trigger_lock:
+                _reconciliation_trigger_running = False
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"reconciliation-trigger-{str(base_asset or 'risk').lower()}",
+        daemon=True,
+    )
+    thread.start()
 
 
 @app.post('/api/trading/positions/{position_id}/manual-close', dependencies=[Depends(verify_token_dependency)])
@@ -2428,8 +2473,22 @@ async def _reconciliation_loop():
 
     while True:
         try:
-            result = await asyncio.to_thread(lambda: build_default_reconciler().run_once())
-            logger.info(f"交易所对账循环完成: {result}")
+            global _reconciliation_trigger_running
+            skip_running = False
+            with _reconciliation_trigger_lock:
+                if _reconciliation_trigger_running:
+                    skip_running = True
+                else:
+                    _reconciliation_trigger_running = True
+            if skip_running:
+                logger.info('交易所对账循环跳过：已有对账任务正在执行')
+            else:
+                try:
+                    result = await asyncio.to_thread(lambda: build_default_reconciler().run_once())
+                    logger.info(f"交易所对账循环完成: {result}")
+                finally:
+                    with _reconciliation_trigger_lock:
+                        _reconciliation_trigger_running = False
         except Exception as e:
             logger.error(f"交易所对账循环失败: {e}", exc_info=True)
         await asyncio.sleep(interval)
