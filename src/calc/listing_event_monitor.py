@@ -321,7 +321,7 @@ def list_listing_events(
         SELECT
             e.*,
             b.is_valid AS base_asset_is_valid,
-            COALESCE(b.strategy_tier, 'C') AS strategy_tier
+            b.strategy_tier AS strategy_tier
         FROM mi_listing_event e
         LEFT JOIN mi_base_asset b
           ON UPPER(TRIM(b.base_asset)) COLLATE utf8mb4_unicode_ci = e.base_asset
@@ -335,7 +335,16 @@ def list_listing_events(
     params.append(max(1, min(int(limit or 200), 1000)))
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, params)
-        return cursor.fetchall() or []
+        rows = cursor.fetchall() or []
+        for row in rows:
+            calculated_tier = calculate_strategy_tier_from_volumes(
+                row.get('binance_quote_volume'),
+                row.get('gate_volume_24h_settle'),
+            )
+            row['calculated_strategy_tier'] = calculated_tier
+            if not row.get('strategy_tier'):
+                row['strategy_tier'] = calculated_tier
+        return rows
 
 
 def listing_event_summary() -> Dict[str, Any]:

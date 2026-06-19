@@ -32,6 +32,7 @@ interface ListingEventRow {
   action_reason: string | null
   base_asset_is_valid: string | null
   strategy_tier: string | null
+  calculated_strategy_tier: string | null
 }
 
 const PAGE_KEY = 'listing_events'
@@ -95,6 +96,11 @@ function formatFundingBps(params: ValueFormatterParams) {
   const n = Number(params.value)
   if (!Number.isFinite(n)) return ''
   return `${(n * 10000).toFixed(2)}`
+}
+
+function findListingRow(asset: string) {
+  const normalized = String(asset || '').trim().toUpperCase()
+  return rowData.value.find((row) => String(row.base_asset || '').trim().toUpperCase() === normalized)
 }
 
 const columnDefs: ColDef<ListingEventRow>[] = [
@@ -310,8 +316,12 @@ async function markRead(asset: string) {
 
 async function addToMonitor(asset: string) {
   if (actionLoading.value) return
+  const row = findListingRow(asset)
+  const tier = row?.calculated_strategy_tier || row?.strategy_tier || '-'
+  const gateVolume = formatNumber(row?.gate_volume_24h_settle)
+  const binanceVolume = formatNumber(row?.binance_quote_volume)
   try {
-    await ElMessageBox.confirm(`${asset} 将加入监控候选，并按当前 Gate/Binance 24h 成交额计算 A/B/C 分层；后续开仓仍受策略过滤控制。`, '加入监控', {
+    await ElMessageBox.confirm(`${asset} 将加入监控候选，计算分层为 ${tier}（Gate 24h成交额 ${gateVolume || '-'}，Binance 24h成交额 ${binanceVolume || '-'}）；后续开仓仍受策略过滤控制。`, '加入监控', {
       type: 'warning',
       confirmButtonText: '确认加入',
       cancelButtonText: '取消',
