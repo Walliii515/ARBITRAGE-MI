@@ -636,8 +636,8 @@ class TradingExecutor:
                 
                 # 0. 数据完整性检查：缺少有效盘口数据时跳过
                 if row.get('spot_qty') is None or row.get('open_vwap_basis_bps') is None:
-                    # 数据不完整时清除峰值状态，避免数据恢复后误触发超时开仓
-                    self._resolve_signal(base_asset, 'conditions_lost', '数据不完整(盘口中断)')
+                    # 盘口过期或缺少有效深度时清除峰值状态，避免数据恢复后误触发超时开仓。
+                    self._resolve_signal(base_asset, 'conditions_lost', '盘口过期/低频更新，暂无法计算开仓VWAP')
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     continue

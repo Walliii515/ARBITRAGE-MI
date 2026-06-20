@@ -158,7 +158,7 @@ const exitReasonOptions = [
   { label: '资金费率不达标', value: '资金费率不达标' },
   { label: '最小名义值', value: '最小名义值' },
   { label: '成交量不足', value: '成交量不足' },
-  { label: '盘口中断', value: '盘口中断' },
+  { label: '盘口过期/低频', value: '盘口' },
 ]
 
 const columnDefs = ref<ColDef[]>([

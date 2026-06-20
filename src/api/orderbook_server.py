@@ -1697,7 +1697,7 @@ def _run_open_position_check_once():
                 basis_threshold_bps=config.get_float('trade.open.vwap_basis_threshold_bps', -60),
                 cooldown_sec=config.get_int('trade.open.cooldown_sec', 3600),
                 min_funding_rate_bps=config.get_float('trade.open.min_funding_rate_bps', -6.0),
-                min_funding_support_bps=config.get_float('trade.open.min_funding_support_bps', 10.0),
+                min_funding_support_bps=config.get_float('trade.open.min_funding_support_bps', 8.0),
                 funding_support_min_samples=config.get_int('trade.open.funding_support_min_samples', 2),
                 realtime_min_funding_rate_bps=config.get_float(
                     'trade.open.realtime_min_funding_rate_bps', 5.0

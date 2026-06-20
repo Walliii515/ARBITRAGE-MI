@@ -73,7 +73,7 @@ trade:
     orderbook_coverage_threshold: 0.6       # 盘口覆盖阈值（<= 此值显示绿色）
     risk_relief_bps: -5                     # 风险缓释（bps）
     min_funding_rate_bps: 25               # 新出现高资金费机会的实时24h资金费率下限(bps)
-    min_funding_support_bps: 10            # 稳定资金费通道的最近已结算资金费率均值下限(bps)
+    min_funding_support_bps: 8             # 稳定资金费通道的最近已结算资金费率均值下限(bps)
     funding_support_window_hours: 24       # 已结算资金费率均值统计窗口（小时）
     funding_support_min_samples: 2         # 均值判断至少需要的已结算样本数
     realtime_min_funding_rate_bps: 5       # 稳定资金费通道的当前实时24h资金费率下限(bps)

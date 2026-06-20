@@ -1353,7 +1353,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_funding_support_stable_channel_requires_avg_and_current(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
@@ -1361,7 +1361,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         row = self._row('ALLO', 50.0, 0.0008)
         row.update({
-            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_bps': 8.5,
             'funding_rate_24h_avg_samples': 3,
             'funding_rate_24h_avg_window_hours': 24,
         })
@@ -1371,7 +1371,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_funding_support_high_realtime_channel_bypasses_weak_history(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
@@ -1379,7 +1379,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         row = self._row('ALLO', 50.0, 0.0025)
         row.update({
-            'funding_rate_24h_avg_bps': 9.5,
+            'funding_rate_24h_avg_bps': 7.5,
             'funding_rate_24h_avg_samples': 3,
             'funding_rate_24h_avg_window_hours': 24,
         })
@@ -1389,7 +1389,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_funding_support_rejects_weak_history_without_high_realtime(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
@@ -1397,7 +1397,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         row = self._row('ALLO', 50.0, 0.0012)
         row.update({
-            'funding_rate_24h_avg_bps': 9.5,
+            'funding_rate_24h_avg_bps': 7.5,
             'funding_rate_24h_avg_samples': 3,
             'funding_rate_24h_avg_window_hours': 24,
         })
@@ -1408,7 +1408,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_funding_support_stable_channel_keeps_realtime_floor(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
@@ -1416,7 +1416,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         row = self._row('ALLO', 50.0, 0.0003)
         row.update({
-            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_bps': 8.5,
             'funding_rate_24h_avg_samples': 3,
             'funding_rate_24h_avg_window_hours': 24,
         })
@@ -1427,7 +1427,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_funding_support_samples_need_high_realtime_channel(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
@@ -1435,7 +1435,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         )
         row = self._row('ALLO', 50.0, 0.0018)
         row.update({
-            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_bps': 8.5,
             'funding_rate_24h_avg_samples': 1,
             'funding_rate_24h_avg_window_hours': 24,
         })
@@ -1446,13 +1446,13 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_realtime_funding_floor_uses_stable_channel_when_history_strong(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
         )
         te.funding_support_meta = {
             'ALLO': {
-                'funding_rate_24h_avg_bps': 12.0,
+                'funding_rate_24h_avg_bps': 8.5,
                 'funding_rate_24h_avg_samples': 3,
             }
         }
@@ -1465,13 +1465,13 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
     def test_realtime_funding_floor_uses_high_channel_when_history_not_available(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
-            min_funding_support_bps=10.0,
+            min_funding_support_bps=8.0,
             realtime_min_funding_rate_bps=5.0,
             funding_support_min_samples=2,
         )
         te.funding_support_meta = {
             'ALLO': {
-                'funding_rate_24h_avg_bps': 12.0,
+                'funding_rate_24h_avg_bps': 8.5,
                 'funding_rate_24h_avg_samples': 1,
             }
         }
