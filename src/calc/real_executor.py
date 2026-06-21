@@ -197,6 +197,22 @@ class RealExecutor:
         result['future_order'] = future_result
         spot_result = self._place_binance_spot_order(spot_order)
         if spot_result.get('success'):
+            target_qty = float(spot_order.get('target_qty') or 0)
+            exec_qty = float(spot_result.get('exec_qty') or 0)
+            if target_qty > 0 and exec_qty + 1e-12 < target_qty:
+                result['spot_order'] = spot_result
+                result['message'] = (
+                    f"现货部分成交(期货已成交,需人工处理): "
+                    f"filled={exec_qty}, target={target_qty} | "
+                    f"future_exec: price={future_result.get('exec_price')}, "
+                    f"qty={future_result.get('exec_qty')}"
+                )
+                logger.critical(
+                    "⚠️ 紧急平仓现货腿部分成交 | %s | Gate风险已解除但Binance现货剩余需处理: "
+                    "filled=%s target=%s",
+                    future_order.get('base_asset'), exec_qty, target_qty,
+                )
+                return result
             result['spot_order'] = spot_result
             result['success'] = True
             result['message'] = '成交成功'
