@@ -2169,6 +2169,10 @@ def _run_close_position_check_once():
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )
 
+        if _has_successful_margin_topup(results):
+            _invalidate_gate_position_risk_cache('margin_topup_success')
+            _get_gate_position_risk_snapshot(force_refresh=True)
+
         if any(r.get('success') for r in results):
             if event_loop and broadcast_queue:
                 payload = {
@@ -2200,7 +2204,24 @@ async def _close_position_loop():
         await loop.run_in_executor(_critical_close_executor, _run_close_position_check_once)
 
 
-def _get_gate_position_risk_snapshot() -> List[Dict]:
+def _has_successful_margin_topup(results: List[Dict]) -> bool:
+    return any(
+        result.get('success') and result.get('action') == 'margin_topup'
+        for result in results or []
+    )
+
+
+def _invalidate_gate_position_risk_cache(reason: str = ''):
+    global _gate_position_risk_cache, _gate_position_risk_cache_ts
+    had_cache = bool(_gate_position_risk_cache)
+    _gate_position_risk_cache = []
+    _gate_position_risk_cache_ts = 0.0
+    if had_cache:
+        suffix = f" | reason={reason}" if reason else ''
+        logger.info(f"Gate持仓风险快照缓存已失效{suffix}")
+
+
+def _get_gate_position_risk_snapshot(force_refresh: bool = False) -> List[Dict]:
     """读取 Gate 实时仓位风险，短缓存用于持仓监控展示。"""
     global _gate_position_risk_cache, _gate_position_risk_cache_ts
     if config.get_trade_mode() == 'virtual':
@@ -2208,7 +2229,7 @@ def _get_gate_position_risk_snapshot() -> List[Dict]:
 
     now = time.time()
     ttl_sec = max(10, config.get_int('trade.position.gate_risk_cache_sec', 30))
-    if _gate_position_risk_cache and now - _gate_position_risk_cache_ts < ttl_sec:
+    if not force_refresh and _gate_position_risk_cache and now - _gate_position_risk_cache_ts < ttl_sec:
         return _gate_position_risk_cache
 
     try:
