@@ -67,10 +67,17 @@ from calc.executor_client import ExecutorClient
 from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNING, SERVICE_STOPPING
 from calc.orderbook_data_client import OrderBookDataClient
 from calc.server_metrics import get_latest_server_metrics, list_server_metrics, record_server_metrics
+from calc.popup_notification_store import upsert_popup_notification
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
 
 setup_logging()
 logger = get_logger(__name__)
+
+AUTO_RISK_CLOSE_REASON_LABELS = {
+    'margin_close': '保证金风控强平',
+    'negative_funding_exit': '负资金费率强平',
+    'delist_risk_exit': '下架风险强平',
+}
 
 
 def _json_dumps(data) -> str:
@@ -2173,6 +2180,9 @@ def _run_close_position_check_once():
             _invalidate_gate_position_risk_cache('margin_topup_success')
             _get_gate_position_risk_snapshot(force_refresh=True)
 
+        if results:
+            _record_auto_risk_close_notifications(results, event_at=datetime.now())
+
         if any(r.get('success') for r in results):
             if event_loop and broadcast_queue:
                 payload = {
@@ -2209,6 +2219,60 @@ def _has_successful_margin_topup(results: List[Dict]) -> bool:
         result.get('success') and result.get('action') == 'margin_topup'
         for result in results or []
     )
+
+
+def _build_auto_risk_close_notification(result: Dict, event_at: Optional[datetime] = None) -> Optional[Dict]:
+    close_reason = str(result.get('close_reason') or '').strip()
+    if close_reason not in AUTO_RISK_CLOSE_REASON_LABELS:
+        return None
+    base_asset = str(result.get('base_asset') or '-').upper()
+    success = bool(result.get('success'))
+    status_text = '成功' if success else '失败'
+    label = AUTO_RISK_CLOSE_REASON_LABELS[close_reason]
+    order_uuid = result.get('order_uuid')
+    message_parts = [
+        f"{label}{status_text}",
+        f"标的={base_asset}",
+    ]
+    if result.get('message'):
+        message_parts.append(f"结果={result.get('message')}")
+    if result.get('pre_gate_basis_bps') is not None:
+        message_parts.append(f"旁路基差={float(result.get('pre_gate_basis_bps')):.1f}bps")
+    if result.get('actual_close_basis_bps') is not None:
+        message_parts.append(f"成交基差={float(result.get('actual_close_basis_bps')):.1f}bps")
+    if result.get('close_basis_slip_bps') is not None:
+        message_parts.append(f"滑点={float(result.get('close_basis_slip_bps')):+.1f}bps")
+    if order_uuid:
+        message_parts.append(f"order={order_uuid}")
+    return {
+        'title': f"系统强平{status_text}: {base_asset}",
+        'message': ' | '.join(message_parts),
+        'type': 'warning' if success else 'error',
+        'source': 'auto_risk_close',
+        'dedup_key': f"auto_risk_close:{close_reason}:{order_uuid}" if order_uuid else None,
+        'event_at': event_at or datetime.now(),
+        'payload': result,
+    }
+
+
+def _record_auto_risk_close_notifications(results: List[Dict], event_at: Optional[datetime] = None) -> int:
+    recorded = 0
+    for result in results or []:
+        item = _build_auto_risk_close_notification(result, event_at=event_at)
+        if not item:
+            continue
+        try:
+            upsert_popup_notification(**item)
+            recorded += 1
+        except Exception as exc:
+            logger.warning(
+                "系统强平铃铛消息写入失败 | asset=%s reason=%s error=%s",
+                result.get('base_asset'),
+                result.get('close_reason'),
+                exc,
+                exc_info=True,
+            )
+    return recorded
 
 
 def _invalidate_gate_position_risk_cache(reason: str = ''):
