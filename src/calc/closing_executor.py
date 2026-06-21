@@ -162,6 +162,7 @@ class ClosingExecutor:
         self._close_cooldown: Dict[str, datetime] = {}  # base_asset -> 上次失败时间
         self._margin_topup_attempt_cooldown: Dict[int, datetime] = {}
         self._margin_topup_contract_cooldown: Dict[str, datetime] = {}
+        self._margin_topup_success_contract_grace: Dict[str, datetime] = {}
         self.close_quality_guard_enabled = config.get_bool(
             'trade.close.close_quality_guard.enabled',
             config.get_bool('trade.close.take_profit_batch_guard.enabled', True),
@@ -193,6 +194,7 @@ class ClosingExecutor:
         )
         self.margin_topup_min_gate_available = config.get_float('margin.topup.min_gate_available', 50.0)
         self.margin_topup_cooldown_sec = config.get_int('margin.topup.cooldown_sec', 300)
+        self.margin_topup_success_grace_sec = config.get_int('margin.topup.success_grace_sec', 20)
         self.margin_topup_min_amount = config.get_float('margin.topup.min_amount_usdt', 0.1)
         self.margin_topup_snapshot_max_age_sec = config.get_int('margin.topup.snapshot_max_age_sec', 180)
         self.margin_topup_balance_tolerance_pct = config.get_float(
@@ -366,7 +368,8 @@ class ClosingExecutor:
 
             topup_result = self._check_and_topup_margin(pos, topup_contracts_this_run)
             if topup_result:
-                results.append(topup_result)
+                if not topup_result.get('suppress_result'):
+                    results.append(topup_result)
                 if topup_result.get('success'):
                     continue
 
@@ -844,6 +847,14 @@ class ClosingExecutor:
         ba = pos.get('base_asset', '')
         position_id = int(pos.get('id') or 0)
         contract = pos.get('future_contract') or f"{ba}_USDT"
+        if self._in_margin_topup_success_grace(pos, contract):
+            return {
+                'base_asset': ba,
+                'success': True,
+                'action': 'margin_topup_grace',
+                'suppress_result': True,
+                'message': '追保成功后等待Gate风险快照刷新',
+            }
         if topup_contracts_this_run is not None and contract in topup_contracts_this_run:
             return None
         if self._in_margin_topup_cooldown(position_id) or self._in_margin_topup_contract_cooldown(contract):
@@ -947,6 +958,7 @@ class ClosingExecutor:
 
         self._mark_margin_topup_success(position_id, topup_amount)
         self._set_margin_topup_contract_cooldown(contract)
+        self._set_margin_topup_success_grace(contract)
         logger.info(
             f"自动追保成功 | {ba} | position_id={position_id} | amount={topup_amount:.6f} | "
             f"margin={calc['margin_before']:.6f}->{calc['margin_before'] + topup_amount:.6f} | "
@@ -984,6 +996,34 @@ class ClosingExecutor:
     def _set_margin_topup_contract_cooldown(self, contract: str):
         if contract:
             self._margin_topup_contract_cooldown[str(contract).upper()] = datetime.now()
+
+    def _in_margin_topup_success_grace(self, pos: Dict, contract: str) -> bool:
+        if self.margin_topup_success_grace_sec <= 0:
+            return False
+        now = datetime.now()
+        contract_key = str(contract or '').upper()
+        if contract_key:
+            last_success = self._margin_topup_success_contract_grace.get(contract_key)
+            if last_success and (now - last_success).total_seconds() < self.margin_topup_success_grace_sec:
+                return True
+
+        last_at = self._parse_margin_topup_time(pos.get('margin_topup_last_at'))
+        return bool(last_at and (now - last_at).total_seconds() < self.margin_topup_success_grace_sec)
+
+    def _set_margin_topup_success_grace(self, contract: str):
+        if contract and self.margin_topup_success_grace_sec > 0:
+            self._margin_topup_success_contract_grace[str(contract).upper()] = datetime.now()
+
+    @staticmethod
+    def _parse_margin_topup_time(value) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                return datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return None
+        return None
 
     def _calculate_margin_topup_limit(self, pos: Dict) -> Optional[float]:
         multiplier = float(self.margin_topup_max_notional_multiplier or 0)

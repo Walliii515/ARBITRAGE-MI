@@ -333,6 +333,7 @@ margin:
     max_topup_open_notional_multiplier: 2   # 累计追保金额最多为开仓名义金额的倍数；同合约多笔会按合约聚合
     min_gate_available: 50
     cooldown_sec: 1
+    success_grace_sec: 20                  # 追保成功后等待 Gate 风险快照刷新，期间不重复追保/不按旧 MMR 平仓
     min_amount_usdt: 0.1
     snapshot_max_age_sec: 180
     hedge_balance_tolerance_pct: 5
