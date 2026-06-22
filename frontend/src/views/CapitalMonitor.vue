@@ -317,8 +317,23 @@ function occupiedAmount(row: CapitalRow | undefined, exchange: string): number |
 }
 
 function formatTooltipTime(value: unknown): string {
-  const date = new Date(String(value))
+  const rawValue = Array.isArray(value) ? value[0] : value
+  const numericValue = typeof rawValue === 'number'
+    ? rawValue
+    : typeof rawValue === 'string' && rawValue.trim() !== ''
+      ? Number(rawValue)
+      : NaN
+  const date = Number.isFinite(numericValue)
+    ? new Date(numericValue)
+    : new Date(String(rawValue))
   if (!Number.isFinite(date.getTime())) return String(value ?? '-')
+  if (selectedChartMode.value === 'daily_return') {
+    return date.toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    })
+  }
   return date.toLocaleString('zh-CN', {
     month: '2-digit',
     day: '2-digit',
