@@ -35,17 +35,19 @@ type ChartMetric =
   | 'funding_pnl_usdt'
   | 'total_pnl_usdt'
   | 'gross_total_pnl_usdt'
-  | 'net_realized_return_pct'
+  | 'daily_realized_pnl_usdt'
+  | 'daily_return_pct'
 type ChartModeKey =
   | 'equity_usdt'
   | 'unrealized_pnl_usdt'
   | 'realized_breakdown'
   | 'gross_total_pnl_usdt'
-  | 'net_realized_return_pct'
+  | 'daily_return'
 type ChartSeriesGroup = 'asset' | 'pnl' | 'ratio'
 type ChartMetricOption = { key: ChartMetric; label: string; group: ChartSeriesGroup; color: string }
 type ChartModeOption = { key: ChartModeKey; label: string }
 type ChartLineType = 'solid' | 'dashed'
+type ChartSeriesType = 'line' | 'bar'
 type ChartSeries = {
   exchange: ExchangeKey
   metric: ChartMetric
@@ -54,6 +56,7 @@ type ChartSeries = {
   group: ChartSeriesGroup
   points: Array<{ time: string; value: number }>
   lineType: ChartLineType
+  seriesType: ChartSeriesType
 }
 
 const latestRows = ref<CapitalRow[]>([])
@@ -77,7 +80,8 @@ const metricOptions: ChartMetricOption[] = [
   { key: 'funding_pnl_usdt', label: '资金费收益', group: 'pnl', color: '#00a870' },
   { key: 'total_pnl_usdt', label: '净已实现收益', group: 'pnl', color: '#409eff' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
-  { key: 'net_realized_return_pct', label: '净实现收益率', group: 'ratio', color: '#14b8a6' },
+  { key: 'daily_realized_pnl_usdt', label: '每日净已实现收益', group: 'pnl', color: '#409eff' },
+  { key: 'daily_return_pct', label: '每日收益率', group: 'ratio', color: '#14b8a6' },
 ]
 
 const chartModeOptions: ChartModeOption[] = [
@@ -85,7 +89,7 @@ const chartModeOptions: ChartModeOption[] = [
   { key: 'unrealized_pnl_usdt', label: '未实现盈亏' },
   { key: 'realized_breakdown', label: '收益趋势' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏' },
-  { key: 'net_realized_return_pct', label: '净实现收益率' },
+  { key: 'daily_return', label: '每日收益' },
 ]
 
 const realizedBreakdownMetrics: ChartMetric[] = [
@@ -112,11 +116,15 @@ const latestByExchange = computed(() => {
 })
 
 const chartSeries = computed<ChartSeries[]>(() => {
-  const metrics: ChartMetric[] = selectedChartMode.value === 'realized_breakdown'
-    ? realizedBreakdownMetrics
-    : [selectedChartMode.value]
   const rows = historyRows.value
     .filter((row) => row.exchange === selectedExchange.value)
+  if (selectedChartMode.value === 'daily_return') {
+    return buildDailyReturnSeries(rows)
+  }
+
+  const metrics: ChartMetric[] = selectedChartMode.value === 'realized_breakdown'
+    ? realizedBreakdownMetrics
+    : [selectedChartMode.value as ChartMetric]
   const latestEquity = latestByExchange.value[selectedExchange.value]?.equity_usdt
     ?? rows[rows.length - 1]?.equity_usdt
   const series: ChartSeries[] = metrics.map((metric): ChartSeries => {
@@ -133,6 +141,7 @@ const chartSeries = computed<ChartSeries[]>(() => {
       group: option.group,
       points,
       lineType: 'solid' as const,
+      seriesType: 'line' as const,
     }
   })
   if (selectedChartMode.value === 'gross_total_pnl_usdt' && series[0]?.points.length > 1) {
@@ -144,10 +153,76 @@ const chartSeries = computed<ChartSeries[]>(() => {
       group: 'pnl',
       points: buildTrendPoints(series[0].points),
       lineType: 'dashed' as const,
+      seriesType: 'line' as const,
     })
   }
   return series
 })
+
+function buildDailyReturnSeries(rows: CapitalRow[]): ChartSeries[] {
+  const sortedRows = rows
+    .slice()
+    .sort((a, b) => new Date(a.snapshot_at).getTime() - new Date(b.snapshot_at).getTime())
+  const buckets = new Map<string, CapitalRow[]>()
+  for (const row of sortedRows) {
+    const dayKey = dayStartKey(row.snapshot_at)
+    if (!dayKey) continue
+    const items = buckets.get(dayKey) || []
+    items.push(row)
+    buckets.set(dayKey, items)
+  }
+
+  const profitPoints: Array<{ time: string; value: number }> = []
+  const returnPoints: Array<{ time: string; value: number }> = []
+  for (const [dayKey, items] of buckets) {
+    const first = items[0]
+    const last = items[items.length - 1]
+    const firstPnl = Number(first?.total_pnl_usdt ?? NaN)
+    const lastPnl = Number(last?.total_pnl_usdt ?? NaN)
+    const baseEquity = Number(first?.equity_usdt ?? NaN)
+    if (!Number.isFinite(firstPnl) || !Number.isFinite(lastPnl)) continue
+    const dailyPnl = lastPnl - firstPnl
+    profitPoints.push({ time: dayKey, value: dailyPnl })
+    returnPoints.push({
+      time: dayKey,
+      value: Number.isFinite(baseEquity) && Math.abs(baseEquity) > 1e-9
+        ? (dailyPnl / baseEquity) * 100
+        : 0,
+    })
+  }
+
+  return [
+    {
+      exchange: selectedExchange.value,
+      metric: 'daily_realized_pnl_usdt',
+      label: `${exchangeLabel(selectedExchange.value)} 每日净已实现收益`,
+      color: '#409eff',
+      group: 'pnl',
+      points: profitPoints,
+      lineType: 'solid',
+      seriesType: 'bar',
+    },
+    {
+      exchange: selectedExchange.value,
+      metric: 'daily_return_pct',
+      label: `${exchangeLabel(selectedExchange.value)} 每日收益率`,
+      color: '#14b8a6',
+      group: 'ratio',
+      points: returnPoints,
+      lineType: 'solid',
+      seriesType: 'line',
+    },
+  ]
+}
+
+function dayStartKey(value: string): string | null {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return null
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day} 00:00:00`
+}
 
 function buildTrendPoints(points: Array<{ time: string; value: number }>): Array<{ time: string; value: number }> {
   const samples = points
@@ -198,15 +273,14 @@ function hasAmount(value: number | null | undefined): boolean {
   return value != null && Number.isFinite(Number(value))
 }
 
-function netRealizedReturnPct(row: CapitalRow | undefined, equityOverride?: number | null): number | null {
-  const equity = Number(equityOverride ?? row?.equity_usdt ?? NaN)
-  const netRealized = Number(row?.total_pnl_usdt ?? NaN)
-  if (!Number.isFinite(equity) || Math.abs(equity) <= 1e-9 || !Number.isFinite(netRealized)) return null
-  return (netRealized / equity) * 100
-}
-
 function chartMetricValue(row: CapitalRow, metric: ChartMetric, latestEquity?: number | null): number {
-  if (metric === 'net_realized_return_pct') return netRealizedReturnPct(row, latestEquity) ?? 0
+  if (metric === 'daily_return_pct') {
+    const equity = Number(latestEquity ?? row.equity_usdt ?? NaN)
+    const netRealized = Number(row.total_pnl_usdt ?? NaN)
+    if (!Number.isFinite(equity) || Math.abs(equity) <= 1e-9 || !Number.isFinite(netRealized)) return 0
+    return (netRealized / equity) * 100
+  }
+  if (metric === 'daily_realized_pnl_usdt') return Number(row.total_pnl_usdt ?? 0)
   return Number(row[metric] ?? 0)
 }
 
@@ -339,14 +413,15 @@ function buildChartOption(): EChartsOption {
     ],
     series: chartSeries.value.map((series) => ({
       name: series.label,
-      type: 'line',
-      smooth: true,
-      showSymbol: false,
+      type: series.seriesType,
+      smooth: series.seriesType === 'line',
+      showSymbol: series.seriesType === 'line' && selectedChartMode.value === 'daily_return',
       symbolSize: 7,
       yAxisIndex: chartYAxisIndex(series.group),
       emphasis: { focus: 'series' },
       data: series.points.map((point) => [point.time, point.value]),
       lineStyle: { width: series.lineType === 'dashed' ? 2 : 2.2, type: series.lineType },
+      barMaxWidth: series.seriesType === 'bar' ? 34 : undefined,
     })),
   }
 }
@@ -386,10 +461,11 @@ async function fetchHistory() {
     const params = new URLSearchParams()
     const window = timeWindowOptions.find((item) => item.key === selectedWindow.value)
       || timeWindowOptions.find((item) => item.key === '7d')!
-    if (window.hours != null) params.set('hours', String(window.hours))
+    if (selectedChartMode.value === 'daily_return' && window.hours != null) params.set('days', '1')
+    else if (window.hours != null) params.set('hours', String(window.hours))
     else params.set('days', String(window.days || 7))
     params.set('exchange', selectedExchange.value)
-    params.set('interval', selectedInterval.value)
+    params.set('interval', dailyHistoryInterval())
     const historyRes = await get(`/api/trading/capital/history?${params.toString()}`)
     const history = await historyRes.json()
     historyRows.value = history.rows || []
@@ -398,6 +474,11 @@ async function fetchHistory() {
   } finally {
     loading.value = false
   }
+}
+
+function dailyHistoryInterval(): HistoryInterval {
+  if (selectedChartMode.value !== 'daily_return') return selectedInterval.value
+  return selectedWindow.value === '30d' || selectedWindow.value === '90d' ? '1h' : '10m'
 }
 
 async function runSnapshot() {
@@ -488,6 +569,10 @@ watch([historyRows, selectedChartMode, selectedExchange], () => {
 })
 
 watch([selectedExchange, selectedInterval], () => {
+  fetchHistory()
+})
+
+watch(selectedChartMode, () => {
   fetchHistory()
 })
 
@@ -606,12 +691,6 @@ onBeforeUnmount(() => {
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
-          <span>净实现收益率</span>
-          <strong :class="Number(netRealizedReturnPct(latestByExchange[exchange]) || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            <span>{{ formatPercent(netRealizedReturnPct(latestByExchange[exchange])) }}</span>
-          </strong>
-        </div>
-        <div v-if="showSummaryDetails" class="metric-row">
           <span>总盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.gross_total_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             <span>{{ formatAmount(latestByExchange[exchange]?.gross_total_pnl_usdt) }}</span>
@@ -636,6 +715,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="metric-selector-row">
         <el-radio-group
+          v-if="selectedChartMode !== 'daily_return'"
           v-model="selectedInterval"
           size="small"
           class="interval-selector"
