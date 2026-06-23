@@ -37,6 +37,7 @@ logger = get_logger(__name__)
 
 
 FAST_RISK_CLOSE_REASONS = {'margin_close', 'delist_risk_exit', 'negative_funding_exit'}
+CLOSE_QTY_TOLERANCE = 1e-8
 
 
 def _float_or_none(value) -> Optional[float]:
@@ -2115,6 +2116,16 @@ class ClosingExecutor:
         if self._mark_partial_risk_close_desync(pos, exec_result, close_reason, close_reason_detail):
             self._trigger_reconciliation('risk_close_partial_desync', str(pos.get('base_asset') or ''))
 
+        partial_state = self._close_partial_fill_state(pos, order_group, exec_result)
+        if partial_state.get('partial'):
+            if partial_state.get('balanced'):
+                self._keep_partial_close_remainder(pos, partial_state, position_close_reason)
+                self._trigger_reconciliation('close_partial_fill', str(pos.get('base_asset') or ''))
+            else:
+                self._mark_unbalanced_partial_close_desync(pos, partial_state, close_reason_detail)
+                self._trigger_reconciliation('close_partial_desync', str(pos.get('base_asset') or ''))
+            return close_spread_bps
+
         # ── 更新持仓状态为 closed（仅成交成功时）──
         if exec_result.get('success'):
             update_sql = """
@@ -2145,6 +2156,120 @@ class ClosingExecutor:
                 f"close_spread_bps={close_spread_bps}"
             )
         return close_spread_bps
+
+    def _close_partial_fill_state(self, pos: Dict, order_group: Dict, exec_result: Dict) -> Dict:
+        if not exec_result.get('success'):
+            return {'partial': False}
+
+        spot_target = _float_or_none((order_group.get('spot_order') or {}).get('target_qty')) or 0.0
+        future_target = _float_or_none((order_group.get('future_order') or {}).get('target_qty')) or 0.0
+        spot_exec = _float_or_none((exec_result.get('spot_order') or {}).get('exec_qty')) or 0.0
+        future_exec = _float_or_none((exec_result.get('future_order') or {}).get('exec_qty')) or 0.0
+        if spot_target <= CLOSE_QTY_TOLERANCE or future_target <= CLOSE_QTY_TOLERANCE:
+            return {'partial': False}
+
+        spot_shortfall = max(0.0, spot_target - spot_exec)
+        future_shortfall = max(0.0, future_target - future_exec)
+        partial = spot_shortfall > CLOSE_QTY_TOLERANCE or future_shortfall > CLOSE_QTY_TOLERANCE
+        if not partial:
+            return {'partial': False}
+
+        remaining_contracts = self._remaining_future_contracts(pos, future_target, future_shortfall)
+        balanced = (
+            spot_exec > CLOSE_QTY_TOLERANCE
+            and future_exec > CLOSE_QTY_TOLERANCE
+            and abs(spot_shortfall - future_shortfall) <= max(CLOSE_QTY_TOLERANCE, min(spot_target, future_target) * 1e-8)
+        )
+        return {
+            'partial': True,
+            'balanced': balanced,
+            'spot_target': spot_target,
+            'future_target': future_target,
+            'spot_exec': spot_exec,
+            'future_exec': future_exec,
+            'spot_remaining': spot_shortfall,
+            'future_remaining': future_shortfall,
+            'future_contracts_remaining': remaining_contracts,
+        }
+
+    def _remaining_future_contracts(self, pos: Dict, future_target: float, future_remaining: float) -> float:
+        open_contracts = abs(_float_or_none(pos.get('future_open_contracts')) or future_target)
+        if future_target <= CLOSE_QTY_TOLERANCE:
+            return max(0.0, future_remaining)
+        contracts = open_contracts * max(0.0, future_remaining) / future_target
+        rounded = round(contracts)
+        return float(rounded) if abs(contracts - rounded) <= 1e-8 else contracts
+
+    def _keep_partial_close_remainder(self, pos: Dict, state: Dict, close_reason: str) -> None:
+        spot_remaining = max(0.0, float(state.get('spot_remaining') or 0))
+        future_remaining = max(0.0, float(state.get('future_remaining') or 0))
+        future_contracts_remaining = max(0.0, float(state.get('future_contracts_remaining') or 0))
+        spot_open_price = _float_or_none(pos.get('spot_open_price')) or 0.0
+        future_open_price = _float_or_none(pos.get('future_open_price')) or 0.0
+        partial_note = (
+            f"部分平仓保留剩余|spot={state.get('spot_exec'):g}/{state.get('spot_target'):g}|"
+            f"future={state.get('future_exec'):g}/{state.get('future_target'):g}|"
+            f"remaining={spot_remaining:g}"
+        )
+        update_sql = """
+            UPDATE mi_trade_position SET
+                status = 'holding',
+                spot_open_qty = %(spot_open_qty)s,
+                spot_open_amount = %(spot_open_amount)s,
+                future_open_qty = %(future_open_qty)s,
+                future_open_contracts = %(future_open_contracts)s,
+                future_open_amount = %(future_open_amount)s,
+                close_reason = %(close_reason)s
+            WHERE id = %(position_id)s
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(update_sql, {
+                'spot_open_qty': spot_remaining,
+                'spot_open_amount': spot_remaining * spot_open_price,
+                'future_open_qty': future_remaining,
+                'future_open_contracts': future_contracts_remaining,
+                'future_open_amount': future_remaining * future_open_price,
+                'close_reason': f"{close_reason}|{partial_note}",
+                'position_id': pos.get('id'),
+            })
+        logger.warning(
+            "平仓部分成交，保留剩余持仓 | position_id=%s | %s",
+            pos.get('id'), partial_note,
+        )
+
+    def _mark_unbalanced_partial_close_desync(self, pos: Dict, state: Dict, close_reason_detail: str) -> bool:
+        detail = (
+            f"普通平仓部分成交且两腿不一致|asset={pos.get('base_asset')}|"
+            f"spot={state.get('spot_exec'):g}/{state.get('spot_target'):g}|"
+            f"future={state.get('future_exec'):g}/{state.get('future_target'):g}"
+        )
+        sql = """
+            UPDATE mi_trade_position
+            SET exchange_risk_status = 'desynced',
+                exchange_risk_type = 'qty_mismatch',
+                exchange_risk_at = %(risk_at)s,
+                exchange_risk_detail = %(detail)s,
+                close_reason = CASE
+                    WHEN close_reason IS NULL OR close_reason = '' THEN %(reason)s
+                    WHEN close_reason NOT LIKE %(reason_like)s THEN CONCAT(close_reason, '|', %(reason)s)
+                    ELSE close_reason
+                END
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+        """
+        reason = f"交易所仓位风险:qty_mismatch|{detail}|{close_reason_detail}"
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'risk_at': datetime.now(),
+                'detail': detail,
+                'reason': reason,
+                'reason_like': '%普通平仓部分成交且两腿不一致%',
+                'position_id': pos.get('id'),
+            })
+            updated = int(cursor.rowcount or 0)
+        if updated:
+            logger.warning("普通平仓部分成交断腿标记 | position_id=%s | %s", pos.get('id'), detail)
+        return bool(updated)
 
     def _mark_partial_risk_close_desync(
         self,

@@ -372,6 +372,7 @@ reconciliation:
     max_positions_per_run: 20               # Gate 缺腿时最多自动卖出多少个本地 holding spot
     min_spot_qty: 0.0
     close_extra_gate_position: true         # Gate 多出 forward 空头时，自动 reduce-only 买回多余合约
+    binance_spot_position: true             # Gate 多余合约兜底后，同步修复 Binance spot 多/少多头
 
 # 反向资金费率套利（short spot + long future）
 # 反向策略独立于正向策略；正向策略配置不复用这里的状态。

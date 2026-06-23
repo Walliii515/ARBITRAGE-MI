@@ -2970,6 +2970,99 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.ce._trigger_reconciliation('risk_close_partial_desync', 'BEL')
         self.assertEqual(triggered, [('risk_close_partial_desync', 'BEL')])
 
+    def test_take_profit_partial_fill_keeps_remaining_position(self):
+        class FakeCursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        cursor = FakeCursor()
+        triggered = []
+        self.ce.set_reconciliation_trigger(lambda reason, asset: triggered.append((reason, asset)))
+        pos = {
+            'id': 247,
+            'base_asset': 'BEL',
+            'spot_symbol': 'BELUSDT',
+            'future_contract': 'BEL_USDT',
+            'spot_open_qty': 421.0,
+            'spot_open_price': 0.12,
+            'spot_open_amount': 50.52,
+            'future_open_qty': 421.0,
+            'future_open_price': 0.121,
+            'future_open_amount': 50.941,
+            'future_open_contracts': 421,
+            'future_open_leverage': 10,
+            'current_spread_bps': -25.0,
+            'funding_rate_24h': 0.0,
+        }
+        order_group = {
+            'order_uuid': 'partial-close',
+            'spot_order': {
+                'order_uuid': 'partial-close',
+                'base_asset': 'BEL',
+                'spot_symbol': 'BELUSDT',
+                'future_contract': None,
+                'order_side': 'close',
+                'market_type': 'spot',
+                'trade_direction': 'sell',
+                'target_qty': 421.0,
+                'target_amount': 50.0,
+            },
+            'future_order': {
+                'order_uuid': 'partial-close',
+                'base_asset': 'BEL',
+                'spot_symbol': None,
+                'future_contract': 'BEL_USDT',
+                'order_side': 'close',
+                'market_type': 'future',
+                'trade_direction': 'buy',
+                'target_qty': 421.0,
+                'target_amount': 50.0,
+            },
+        }
+        exec_result = {
+            'success': True,
+            'spot_order': {
+                'exec_price': 0.1774,
+                'exec_qty': 369.0,
+                'exec_amount': 65.4606,
+                'coverage_ratio': 0,
+            },
+            'future_order': {
+                'exec_price': 0.17715,
+                'exec_qty': 369.0,
+                'exec_amount': 65.3700,
+                'coverage_ratio': 0,
+            },
+            'execution_stats': {},
+        }
+
+        with patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            self.ce._save_close(pos, order_group, exec_result, 'take_profit', '动态止盈')
+
+        update_calls = [params for sql, params in cursor.calls if 'spot_open_qty = %(spot_open_qty)s' in sql]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0]['spot_open_qty'], 52.0)
+        self.assertEqual(update_calls[0]['future_open_qty'], 52.0)
+        self.assertEqual(update_calls[0]['future_open_contracts'], 52.0)
+        self.assertIn('部分平仓保留剩余', update_calls[0]['close_reason'])
+        self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
+
     def test_fixed_net_take_profit_uses_fee_adjusted_profit(self):
         self.assertTrue(self.ce._check_take_profit(self.pos, 40.0))
         self.assertFalse(self.ce._check_take_profit(self.pos, 75.0))

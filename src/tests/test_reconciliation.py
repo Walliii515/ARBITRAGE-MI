@@ -107,6 +107,55 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(reconciler.mark_calls, [])
         self.assertFalse(row['detail']['exchange_risk']['confirmed'])
 
+    def test_gate_extra_success_pairs_binance_extra_spot_remediation(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'close_extra_gate_future',
+        })
+        reconciler.remediator.remediate_binance_spot_desync = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'sell_extra_binance_spot',
+        })
+        reconciler._record_reconciliation_risk_event = MagicMock()
+
+        result = reconciler._auto_remediate_gate_risks(
+            datetime(2026, 6, 23, 16, 38, 33),
+            [{
+                'base_asset': 'BEL',
+                'confirmed': True,
+                'risk': {
+                    'type': 'extra_gate_position',
+                    'contract': 'BEL_USDT',
+                    'exchange_size': -2770,
+                    'mark_price': 0.17781,
+                },
+                'local_contracts': 2718.0,
+                'exchange_contracts': 2770.0,
+                'extra_contracts': 52.0,
+            }],
+            [{
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'BEL',
+                'local_value': 2718.0,
+                'exchange_value': 2770.0,
+            }],
+        )
+
+        self.assertTrue(result[0]['success'])
+        self.assertEqual(result[0]['paired_binance_spot_result']['action'], 'sell_extra_binance_spot')
+        reconciler.remediator.remediate_binance_spot_desync.assert_called_once()
+        kwargs = reconciler.remediator.remediate_binance_spot_desync.call_args.kwargs
+        self.assertEqual(kwargs['base_asset'], 'BEL')
+        self.assertEqual(kwargs['local_qty'], 2718.0)
+        self.assertEqual(kwargs['exchange_qty'], 2770.0)
+
     def test_confirmed_gate_qty_mismatch_marks_position_risk(self):
         class TrackingReconciler(Reconciler):
             def __init__(self):
@@ -432,6 +481,48 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
 
         self.assertFalse(result['attempted'])
         self.assertEqual(result['reason'], 'extra_gate_position_not_confirmed_short')
+
+    def test_binance_extra_spot_remediation_sells_surplus(self):
+        class FakeExecutor:
+            contract_meta = {'BEL': {'quanto_multiplier': 1}}
+
+            def __init__(self):
+                self.order = None
+
+            def place_binance_spot_order(self, order):
+                self.order = order
+                return {
+                    'success': True,
+                    'exec_price': 0.1738,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': 9.0376,
+                    'coverage_ratio': 0,
+                    'exchange_order_id': 'spot-1',
+                }
+
+            def _get_binance_usdt_price(self, asset):
+                return 0.1738
+
+        fake = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            fake,
+            ExchangeDesyncRemediationConfig(enabled=True, remediate_binance_spot_position=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=2024.0)
+        remediator._insert_spot_order = MagicMock()
+
+        result = remediator.remediate_binance_spot_desync(
+            'BEL',
+            local_qty=1972.0,
+            exchange_qty=2024.0,
+            risk={'type': 'extra_gate_position', 'contract': 'BEL_USDT'},
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['action'], 'sell_extra_binance_spot')
+        self.assertEqual(fake.order['trade_direction'], 'sell')
+        self.assertEqual(fake.order['target_qty'], 52.0)
+        remediator._insert_spot_order.assert_called_once()
 
 
 if __name__ == '__main__':

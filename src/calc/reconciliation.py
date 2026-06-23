@@ -44,6 +44,7 @@ class ReconciliationConfig:
     auto_remediate_max_positions_per_run: int = 20
     auto_remediate_min_spot_qty: float = 0.0
     auto_remediate_close_extra_gate_position: bool = True
+    auto_remediate_binance_spot_position: bool = True
 
 
 def normalize_asset_set(values) -> Set[str]:
@@ -121,6 +122,9 @@ def build_default_reconciler() -> 'Reconciler':
         auto_remediate_close_extra_gate_position=config.get_bool(
             'reconciliation.auto_remediate.close_extra_gate_position', True
         ),
+        auto_remediate_binance_spot_position=config.get_bool(
+            'reconciliation.auto_remediate.binance_spot_position', True
+        ),
     )
     return Reconciler(executor, cfg)
 
@@ -138,6 +142,7 @@ class Reconciler:
                 max_positions_per_run=self.cfg.auto_remediate_max_positions_per_run,
                 min_spot_qty=self.cfg.auto_remediate_min_spot_qty,
                 close_extra_gate_position=self.cfg.auto_remediate_close_extra_gate_position,
+                remediate_binance_spot_position=self.cfg.auto_remediate_binance_spot_position,
                 spot_open_fee=config.get_float('trade.fee.spot_open', 0.00075),
                 spot_close_fee=config.get_float('trade.fee.spot_close', 0.00075),
                 future_open_fee=config.get_float('trade.fee.future_open', 0.0002),
@@ -158,9 +163,11 @@ class Reconciler:
 
         try:
             binance_balances = self.executor.fetch_binance_spot_balances()
-            rows.extend(self._compare_binance(snapshot_at, local_spot, binance_balances))
+            binance_rows = self._compare_binance(snapshot_at, local_spot, binance_balances)
+            rows.extend(binance_rows)
         except Exception as e:
             logger.warning(f'Binance 现货对账拉取失败: {e}', exc_info=True)
+            binance_rows = []
             rows.append(self._error_row(snapshot_at, 'binance', e))
 
         try:
@@ -170,7 +177,7 @@ class Reconciler:
             if self.cfg.mark_exchange_risk:
                 gate_risks = self._mark_gate_desync_risks(snapshot_at, gate_rows)
             if self.cfg.auto_remediate_enabled:
-                remediation_results.extend(self._auto_remediate_gate_risks(snapshot_at, gate_risks))
+                remediation_results.extend(self._auto_remediate_gate_risks(snapshot_at, gate_risks, binance_rows))
             rows.extend(gate_rows)
         except Exception as e:
             logger.warning(f'Gate 期货对账拉取失败: {e}', exc_info=True)
@@ -502,10 +509,20 @@ class Reconciler:
             return 'extra_gate_position'
         return None
 
-    def _auto_remediate_gate_risks(self, snapshot_at: datetime, risks: List[Dict]) -> List[Dict]:
+    def _auto_remediate_gate_risks(
+        self,
+        snapshot_at: datetime,
+        risks: List[Dict],
+        binance_rows: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
         results: List[Dict] = []
         if not risks:
             return results
+        binance_by_asset = {
+            str(row.get('base_asset') or '').upper(): row
+            for row in (binance_rows or [])
+            if row.get('exchange') == 'binance' and row.get('dimension') == 'position'
+        }
 
         for item in risks:
             risk = item.get('risk') or {}
@@ -529,12 +546,43 @@ class Reconciler:
                     extra_contracts=float(item.get('extra_contracts') or 0),
                     risk=risk,
                 )
+                spot_result = self._auto_remediate_binance_spot_for_gate_extra(item, risk, result, binance_by_asset)
+                if spot_result.get('attempted'):
+                    result = {
+                        **result,
+                        'paired_binance_spot_result': spot_result,
+                        'success': bool(result.get('success')) and bool(spot_result.get('success')),
+                    }
             else:
                 result = {'attempted': False, 'reason': f'unsupported_gate_risk:{risk_type}'}
 
             self._record_reconciliation_risk_event(snapshot_at, item, result)
             results.append(result)
         return results
+
+    def _auto_remediate_binance_spot_for_gate_extra(
+        self,
+        item: Dict,
+        risk: Dict,
+        gate_result: Dict,
+        binance_by_asset: Dict[str, Dict],
+    ) -> Dict:
+        if not gate_result.get('success'):
+            return {'attempted': False, 'reason': 'gate_extra_remediation_not_successful'}
+        base_asset = str(item.get('base_asset') or '').upper()
+        row = binance_by_asset.get(base_asset)
+        if not row:
+            return {'attempted': False, 'reason': 'no_binance_position_row'}
+        local_qty = float(row.get('local_value') or 0)
+        exchange_qty = float(row.get('exchange_value') or 0)
+        if abs(exchange_qty - local_qty) <= BINANCE_SPOT_TOLERANCE:
+            return {'attempted': False, 'reason': 'binance_spot_already_match'}
+        return self.remediator.remediate_binance_spot_desync(
+            base_asset=base_asset,
+            local_qty=local_qty,
+            exchange_qty=exchange_qty,
+            risk=risk,
+        )
 
     def _record_reconciliation_risk_event(self, snapshot_at: datetime, item: Dict, result: Dict):
         risk = item.get('risk') or {}

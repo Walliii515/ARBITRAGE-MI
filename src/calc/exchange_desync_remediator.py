@@ -26,6 +26,7 @@ class ExchangeDesyncRemediationConfig:
     max_positions_per_run: int = 20
     min_spot_qty: float = 0.0
     close_extra_gate_position: bool = True
+    remediate_binance_spot_position: bool = True
     spot_open_fee: float = 0.00075
     spot_close_fee: float = 0.00075
     future_open_fee: float = 0.0002
@@ -180,6 +181,104 @@ class ExchangeDesyncRemediator:
             'future_result': result,
             'reason': result.get('reason') if not success else None,
         }
+
+    def remediate_binance_spot_desync(
+        self,
+        base_asset: str,
+        local_qty: float,
+        exchange_qty: float,
+        risk: Dict,
+    ) -> Dict:
+        """Binance 现货与本地 holding 不一致时，按本地数量修复多余/缺少的多头。"""
+        base_asset = str(base_asset or '').upper()
+        if not self.cfg.enabled:
+            return {'attempted': False, 'reason': 'disabled'}
+        if not self.cfg.remediate_binance_spot_position:
+            return {'attempted': False, 'reason': 'remediate_binance_spot_position_disabled'}
+
+        diff = float(exchange_qty or 0) - float(local_qty or 0)
+        if abs(diff) <= max(float(self.cfg.min_spot_qty or 0), 1e-8):
+            return {'attempted': False, 'reason': 'binance_spot_diff<=tolerance', 'diff_qty': diff}
+
+        trade_direction = 'sell' if diff > 0 else 'buy'
+        target_qty = abs(diff)
+        if trade_direction == 'sell':
+            available_qty = self._load_binance_available_qty(base_asset)
+            if available_qty + 1e-9 < target_qty:
+                return {
+                    'attempted': True,
+                    'success': False,
+                    'action': 'sell_extra_binance_spot',
+                    'base_asset': base_asset,
+                    'target_qty': target_qty,
+                    'reason': 'spot_available_qty_insufficient',
+                    'available_qty': available_qty,
+                }
+
+        order_uuid = str(uuid.uuid4())
+        price_hint = self._estimate_binance_spot_price(base_asset, risk)
+        action = 'sell_extra_binance_spot' if trade_direction == 'sell' else 'buy_missing_binance_spot'
+        reason = (
+            f"对账兜底自动处置|Binance现货{'多余' if diff > 0 else '缺少'}|"
+            f"asset={base_asset}|local={local_qty:g}|exchange={exchange_qty:g}|diff={diff:g}|"
+            f"关联风险={risk.get('type', 'unknown')}"
+        )
+        order = {
+            'order_uuid': order_uuid,
+            'position_id': None,
+            'base_asset': base_asset,
+            'spot_symbol': f'{base_asset}USDT',
+            'future_contract': risk.get('contract') or f'{base_asset}_USDT',
+            'order_side': 'close',
+            'market_type': 'spot',
+            'trade_direction': trade_direction,
+            'leverage': 1.0,
+            'target_qty': target_qty,
+            'target_amount': target_qty * price_hint,
+        }
+        if trade_direction == 'buy':
+            order['quantity_mode'] = 'base'
+
+        result = self.executor.place_binance_spot_order(order)
+        success = bool(result.get('success'))
+        self._insert_spot_order(order, result, reason, success, datetime.now())
+        if success:
+            logger.warning(
+                "Binance 现货对账自动处置完成 | %s | action=%s | qty=%s | px=%s",
+                base_asset, action, result.get('exec_qty'), result.get('exec_price'),
+            )
+        else:
+            logger.error(
+                "Binance 现货对账自动处置失败 | %s | action=%s | qty=%s | reason=%s",
+                base_asset, action, target_qty, result.get('reason'),
+            )
+        return {
+            'attempted': True,
+            'success': success,
+            'action': action,
+            'base_asset': base_asset,
+            'order_uuid': order_uuid,
+            'target_qty': target_qty,
+            'local_qty': local_qty,
+            'exchange_qty': exchange_qty,
+            'spot_result': result,
+            'reason': result.get('reason') if not success else None,
+        }
+
+    def _estimate_binance_spot_price(self, base_asset: str, risk: Dict) -> float:
+        for key in ('spot_price', 'mark_price', 'future_close_price'):
+            price = _float(risk.get(key))
+            if price > 0:
+                return price
+        getter = getattr(self.executor, '_get_binance_usdt_price', None)
+        if callable(getter):
+            try:
+                price = _float(getter(base_asset))
+                if price > 0:
+                    return price
+            except Exception:
+                logger.debug("Binance spot price estimate failed | %s", base_asset, exc_info=True)
+        return 0.0
 
     def _load_positions_to_remediate(
         self,
