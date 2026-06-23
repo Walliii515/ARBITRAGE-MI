@@ -2218,7 +2218,6 @@ class ClosingExecutor:
                 spot_open_amount = %(spot_open_amount)s,
                 future_open_qty = %(future_open_qty)s,
                 future_open_contracts = %(future_open_contracts)s,
-                future_open_amount = %(future_open_amount)s,
                 close_reason = %(close_reason)s
             WHERE id = %(position_id)s
         """
@@ -2228,7 +2227,6 @@ class ClosingExecutor:
                 'spot_open_amount': spot_remaining * spot_open_price,
                 'future_open_qty': future_remaining,
                 'future_open_contracts': future_contracts_remaining,
-                'future_open_amount': future_remaining * future_open_price,
                 'close_reason': f"{close_reason}|{partial_note}",
                 'position_id': pos.get('id'),
             })

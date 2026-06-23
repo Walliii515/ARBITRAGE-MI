@@ -3056,6 +3056,8 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 
         update_calls = [params for sql, params in cursor.calls if 'spot_open_qty = %(spot_open_qty)s' in sql]
         self.assertEqual(len(update_calls), 1)
+        update_sql = next(sql for sql, _ in cursor.calls if 'spot_open_qty = %(spot_open_qty)s' in sql)
+        self.assertNotIn('future_open_amount', update_sql)
         self.assertEqual(update_calls[0]['spot_open_qty'], 52.0)
         self.assertEqual(update_calls[0]['future_open_qty'], 52.0)
         self.assertEqual(update_calls[0]['future_open_contracts'], 52.0)
