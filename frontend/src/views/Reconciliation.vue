@@ -22,9 +22,25 @@ interface ReconRow {
   detail: Record<string, unknown> | string | null
 }
 
+interface ExposureRow {
+  base_asset: string
+  snapshot_at: string
+  binance_exchange_value: number | null
+  gate_exchange_value: number | null
+  exchange_diff: number | null
+  exposure_side: 'balanced' | 'spot_long' | 'gate_short' | 'missing_leg'
+  binance_local_value: number | null
+  gate_local_value: number | null
+  local_diff: number | null
+  binance_match: boolean
+  gate_match: boolean
+}
+
 const rowData = shallowRef<ReconRow[]>([])
+const latestRows = shallowRef<ReconRow[]>([])
 const loading = ref(false)
 const running = ref(false)
+const activeTab = ref<'raw' | 'exposure'>('raw')
 const filterDays = ref(1)
 const mismatchesOnly = ref(false)
 const paginationPageSize = ref(50)
@@ -41,6 +57,16 @@ function formatNumber(value: number | null | undefined, maxDecimals = 10): strin
   const n = Number(value)
   if (Number.isInteger(n)) return String(n)
   return n.toFixed(maxDecimals).replace(/\.?0+$/, '')
+}
+
+function toNumber(value: number | null | undefined): number | null {
+  if (value == null) return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+function isRowMatch(value: ReconRow['is_match']): boolean {
+  return value === true || value === 1
 }
 
 function formatDetail(value: ReconRow['detail']): string {
@@ -62,13 +88,21 @@ function matchRenderer(params: ICellRendererParams<ReconRow>) {
     : '<span style="color:#f56c6c;font-weight:600">差异</span>'
 }
 
+function exposureRenderer(params: ICellRendererParams<ExposureRow>) {
+  const value = params.value as ExposureRow['exposure_side']
+  if (value === 'balanced') return '<span style="color:#67c23a;font-weight:600">平衡</span>'
+  if (value === 'spot_long') return '<span style="color:#e6a23c;font-weight:600">Binance现货多余</span>'
+  if (value === 'gate_short') return '<span style="color:#f56c6c;font-weight:600">Gate空头多余</span>'
+  return '<span style="color:#f56c6c;font-weight:600">缺腿</span>'
+}
+
 function diffStyle(params: any) {
   const value = Number(params.value || 0)
   if (!Number.isFinite(value) || Math.abs(value) === 0) return null
   return { color: '#f56c6c', fontWeight: '600' }
 }
 
-const columnDefs = computed<ColDef<ReconRow>[]>(() => [
+const rawColumnDefs = computed<ColDef<ReconRow>[]>(() => [
   { headerName: '对账时间', field: 'snapshot_at', width: 165, sort: 'desc' },
   { headerName: '交易所', field: 'exchange', width: 100, cellRenderer: exchangeRenderer },
   { headerName: '标的', field: 'base_asset', width: 105, pinned: 'left' },
@@ -118,7 +152,65 @@ const columnDefs = computed<ColDef<ReconRow>[]>(() => [
   },
 ])
 
-const defaultColDef: ColDef<ReconRow> = {
+const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
+  { headerName: '标的', field: 'base_asset', width: 110, pinned: 'left', sort: 'asc' },
+  { headerName: '对账时间', field: 'snapshot_at', width: 165 },
+  { headerName: '敞口状态', field: 'exposure_side', width: 130, cellRenderer: exposureRenderer },
+  {
+    headerName: 'Binance实仓',
+    field: 'binance_exchange_value',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: 'Gate实仓',
+    field: 'gate_exchange_value',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: '敞口(Binance-Gate)',
+    field: 'exchange_diff',
+    width: 170,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+    cellStyle: diffStyle,
+  },
+  {
+    headerName: 'Binance本地',
+    field: 'binance_local_value',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: 'Gate本地',
+    field: 'gate_local_value',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: '本地差(Binance-Gate)',
+    field: 'local_diff',
+    width: 170,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+    cellStyle: diffStyle,
+  },
+  { headerName: 'Binance对账', field: 'binance_match', width: 115, cellRenderer: matchRenderer },
+  { headerName: 'Gate对账', field: 'gate_match', width: 105, cellRenderer: matchRenderer },
+])
+
+const defaultColDef: ColDef = {
   sortable: true,
   resizable: true,
   filter: true,
@@ -127,6 +219,67 @@ const defaultColDef: ColDef<ReconRow> = {
 const totalPages = computed(() =>
   Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
 )
+
+const exposureRows = computed<ExposureRow[]>(() => {
+  const grouped = new Map<string, { binance?: ReconRow; gate?: ReconRow; snapshot_at: string }>()
+  for (const row of latestRows.value) {
+    if (row.dimension !== 'position') continue
+    const exchange = String(row.exchange || '').toLowerCase()
+    if (exchange !== 'binance' && exchange !== 'gate') continue
+    const asset = String(row.base_asset || '').toUpperCase()
+    if (!asset) continue
+    const item = grouped.get(asset) || { snapshot_at: row.snapshot_at }
+    item.snapshot_at = item.snapshot_at || row.snapshot_at
+    if (exchange === 'binance') item.binance = row
+    if (exchange === 'gate') item.gate = row
+    grouped.set(asset, item)
+  }
+
+  return Array.from(grouped.entries()).map(([baseAsset, item]) => {
+    const binanceExchange = toNumber(item.binance?.exchange_value)
+    const gateExchange = toNumber(item.gate?.exchange_value)
+    const binanceLocal = toNumber(item.binance?.local_value)
+    const gateLocal = toNumber(item.gate?.local_value)
+    const exchangeDiff = binanceExchange != null && gateExchange != null
+      ? binanceExchange - gateExchange
+      : null
+    const localDiff = binanceLocal != null && gateLocal != null
+      ? binanceLocal - gateLocal
+      : null
+    const tolerance = 1e-8
+    let exposureSide: ExposureRow['exposure_side'] = 'balanced'
+    if (binanceExchange == null || gateExchange == null) {
+      exposureSide = 'missing_leg'
+    } else if (exchangeDiff != null && exchangeDiff > tolerance) {
+      exposureSide = 'spot_long'
+    } else if (exchangeDiff != null && exchangeDiff < -tolerance) {
+      exposureSide = 'gate_short'
+    }
+    return {
+      base_asset: baseAsset,
+      snapshot_at: item.snapshot_at,
+      binance_exchange_value: binanceExchange,
+      gate_exchange_value: gateExchange,
+      exchange_diff: exchangeDiff,
+      exposure_side: exposureSide,
+      binance_local_value: binanceLocal,
+      gate_local_value: gateLocal,
+      local_diff: localDiff,
+      binance_match: item.binance ? isRowMatch(item.binance.is_match) : false,
+      gate_match: item.gate ? isRowMatch(item.gate.is_match) : false,
+    }
+  })
+})
+
+const exposureSummary = computed(() => {
+  const rows = exposureRows.value
+  const exposed = rows.filter((row) => row.exposure_side !== 'balanced').length
+  return {
+    total: rows.length,
+    exposed,
+    balanced: rows.length - exposed,
+  }
+})
 
 async function fetchRows() {
   loading.value = true
@@ -147,6 +300,27 @@ async function fetchRows() {
   }
 }
 
+async function fetchLatestRows() {
+  const res = await get('/api/trading/reconciliation/latest')
+  const data = await res.json()
+  latestRows.value = Array.isArray(data.rows) ? data.rows : []
+}
+
+async function refreshCurrentTab() {
+  if (activeTab.value === 'exposure') {
+    loading.value = true
+    try {
+      await fetchLatestRows()
+    } catch (e: any) {
+      showError(e?.message || '获取敞口对照数据失败')
+    } finally {
+      loading.value = false
+    }
+    return
+  }
+  await fetchRows()
+}
+
 async function runReconciliation() {
   running.value = true
   try {
@@ -156,6 +330,7 @@ async function runReconciliation() {
       showSuccess(data.message || '对账完成')
       paginationCurrentPage.value = 1
       await fetchRows()
+      await fetchLatestRows()
     } else {
       showError(data.message || '对账失败')
     }
@@ -185,12 +360,23 @@ function onGridReady(params: GridReadyEvent<ReconRow>) {
   setupGridCopy(params.api)
 }
 
+function onExposureGridReady(params: GridReadyEvent<ExposureRow>) {
+  setupGridCopy(params.api)
+}
+
 function onRowDoubleClicked(params: any) {
   detailRow.value = params.data || null
   detailDialogVisible.value = true
 }
 
-onMounted(fetchRows)
+onMounted(async () => {
+  await Promise.all([
+    fetchRows(),
+    fetchLatestRows().catch((e: any) => {
+      showError(e?.message || '获取敞口对照数据失败')
+    }),
+  ])
+})
 </script>
 
 <template>
@@ -205,7 +391,7 @@ onMounted(fetchRows)
         立即对账
       </el-button>
 
-      <div class="filter-group">
+      <div v-if="activeTab === 'raw'" class="filter-group">
         <span class="filter-label">时间：</span>
         <el-button-group size="small">
           <el-button :type="filterDays === 1 ? 'primary' : 'default'" @click="filterDays = 1; resetAndFetch()">24小时</el-button>
@@ -216,30 +402,54 @@ onMounted(fetchRows)
       </div>
 
       <el-switch
+        v-if="activeTab === 'raw'"
         v-model="mismatchesOnly"
         active-text="仅显示差异"
         inactive-text="显示全部"
         @change="resetAndFetch"
       />
 
-      <el-button size="small" :loading="loading" @click="fetchRows">刷新</el-button>
+      <el-button size="small" :loading="loading" @click="refreshCurrentTab">刷新</el-button>
     </div>
 
-    <div class="grid-container">
-      <AgGridVue
-        :theme="orderbookGridTheme"
-        :rowData="rowData"
-        :columnDefs="columnDefs"
-        :defaultColDef="defaultColDef"
-        :getRowId="(params: any) => String(params.data.id)"
-        :tooltipShowDelay="300"
-        style="width: 100%; height: 100%"
-        @grid-ready="onGridReady"
-        @row-double-clicked="onRowDoubleClicked"
-      />
-    </div>
+    <el-tabs v-model="activeTab" class="recon-tabs">
+      <el-tab-pane label="明细" name="raw">
+        <div class="grid-container">
+          <AgGridVue
+            :theme="orderbookGridTheme"
+            :rowData="rowData"
+            :columnDefs="rawColumnDefs"
+            :defaultColDef="defaultColDef"
+            :getRowId="(params: any) => String(params.data.id)"
+            :tooltipShowDelay="300"
+            style="width: 100%; height: 100%"
+            @grid-ready="onGridReady"
+            @row-double-clicked="onRowDoubleClicked"
+          />
+        </div>
+      </el-tab-pane>
 
-    <div class="pagination-bar">
+      <el-tab-pane label="币种敞口" name="exposure">
+        <div class="exposure-summary">
+          <span>标的 {{ exposureSummary.total }}</span>
+          <span class="summary-ok">平衡 {{ exposureSummary.balanced }}</span>
+          <span class="summary-bad">有敞口 {{ exposureSummary.exposed }}</span>
+        </div>
+        <div class="grid-container">
+          <AgGridVue
+            :theme="orderbookGridTheme"
+            :rowData="exposureRows"
+            :columnDefs="exposureColumnDefs"
+            :defaultColDef="defaultColDef"
+            :getRowId="(params: any) => String(params.data.base_asset)"
+            style="width: 100%; height: 100%"
+            @grid-ready="onExposureGridReady"
+          />
+        </div>
+      </el-tab-pane>
+    </el-tabs>
+
+    <div v-if="activeTab === 'raw'" class="pagination-bar">
       <div class="pagination-info">
         共 {{ paginationTotal }} 条记录，第 {{ paginationCurrentPage }} / {{ totalPages }} 页
       </div>
@@ -324,6 +534,46 @@ onMounted(fetchRows)
 .grid-container {
   flex: 1;
   min-height: 420px;
+}
+
+.recon-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.recon-tabs :deep(.el-tabs__content) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.recon-tabs :deep(.el-tab-pane) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.exposure-summary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 0 10px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.summary-ok {
+  color: #67c23a;
+  font-weight: 600;
+}
+
+.summary-bad {
+  color: #f56c6c;
+  font-weight: 600;
 }
 
 .pagination-bar {
