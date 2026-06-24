@@ -792,6 +792,73 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(result['execution_stats']['future_maker']['fallback_filled'], True)
         executor._place_binance_spot_order.assert_called_once()
 
+    def test_future_maker_close_fallback_uses_gate_market_semantics(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(side_effect=[
+            {
+                'success': False,
+                'reason': 'future maker未成交(fill=0%)',
+                'execution_stats': {
+                    'future_maker': {
+                        'attempted': True,
+                        'filled': False,
+                        'fill_ratio': 0,
+                        'wait_ms': 1000,
+                        'ttl_ms': 1000,
+                    }
+                },
+            },
+            {
+                'success': True,
+                'exec_price': 0.01983,
+                'exec_qty': 1429.0,
+                'exec_amount': 28.33,
+                'coverage_ratio': 0,
+            },
+        ])
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.0197,
+            'exec_qty': 1429.0,
+            'exec_amount': 28.14,
+            'coverage_ratio': 0,
+        })
+
+        result = executor.execute({
+            'spot_order': {
+                'order_uuid': 'ai-close',
+                'base_asset': 'AI',
+                'order_side': 'close',
+                'market_type': 'spot',
+                'trade_direction': 'sell',
+                'target_qty': 1429.0,
+                'target_amount': 28.14,
+            },
+            'future_order': {
+                'order_uuid': 'ai-close',
+                'base_asset': 'AI',
+                'future_contract': 'AI_USDT',
+                'order_side': 'close',
+                'market_type': 'future',
+                'trade_direction': 'buy',
+                'execution_style': 'maker',
+                'maker_fallback_ioc_enabled': True,
+                'maker_fallback_protective_price': 0.01983013,
+                'target_qty': 1429.0,
+                'target_amount': 28.33,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        fallback_order = executor._place_gate_futures_order.call_args_list[1].args[0]
+        self.assertNotIn('execution_style', fallback_order)
+        self.assertNotIn('protective_price', fallback_order)
+        self.assertNotIn('maker_fallback_protective_price', fallback_order)
+        self.assertTrue(result['execution_stats']['future_maker']['fallback_market'])
+        executor._place_binance_spot_order.assert_called_once()
+
     def test_future_maker_spot_ioc_failure_retries_market_hedge(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
@@ -2919,6 +2986,95 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             'funding_next_apply': (datetime.now() + timedelta(minutes=120)).strftime('%Y-%m-%d %H:%M:%S'),
         }
 
+    def _bel_close_position(self, qty=410.0):
+        return {
+            'id': 247,
+            'base_asset': 'BEL',
+            'spot_symbol': 'BELUSDT',
+            'future_contract': 'BEL_USDT',
+            'spot_open_qty': qty,
+            'spot_open_price': 0.12,
+            'spot_open_amount': qty * 0.12,
+            'future_open_qty': qty,
+            'future_open_price': 0.121,
+            'future_open_contracts': qty,
+            'future_open_leverage': 10,
+            'current_spread_bps': -25.0,
+            'funding_rate_24h': 0.0,
+        }
+
+    def _bel_close_order_group(self, qty=410.0):
+        return {
+            'order_uuid': 'bel-close',
+            'spot_order': {
+                'order_uuid': 'bel-close',
+                'base_asset': 'BEL',
+                'spot_symbol': 'BELUSDT',
+                'future_contract': None,
+                'order_side': 'close',
+                'market_type': 'spot',
+                'trade_direction': 'sell',
+                'target_qty': qty,
+                'target_amount': 50.0,
+            },
+            'future_order': {
+                'order_uuid': 'bel-close',
+                'base_asset': 'BEL',
+                'spot_symbol': None,
+                'future_contract': 'BEL_USDT',
+                'order_side': 'close',
+                'market_type': 'future',
+                'trade_direction': 'buy',
+                'target_qty': qty,
+                'target_amount': 50.0,
+            },
+        }
+
+    def _close_exec_result(self, spot_qty, future_qty):
+        return {
+            'success': True,
+            'spot_order': {
+                'exec_price': 0.1774,
+                'exec_qty': spot_qty,
+                'exec_amount': 0.1774 * spot_qty,
+                'coverage_ratio': 0,
+            },
+            'future_order': {
+                'exec_price': 0.17715,
+                'exec_qty': future_qty,
+                'exec_amount': 0.17715 * future_qty,
+                'coverage_ratio': 0,
+            },
+            'execution_stats': {},
+        }
+
+    def _record_save_close(self, pos, order_group, exec_result, close_reason='take_profit', detail='动态止盈'):
+        class FakeCursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        cursor = FakeCursor()
+        triggered = []
+        self.ce.set_reconciliation_trigger(lambda reason, asset: triggered.append((reason, asset)))
+        with patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            self.ce._save_close(pos, order_group, exec_result, close_reason, detail)
+        return cursor, triggered
+
     def test_partial_risk_close_marks_desync_and_triggers_reconciliation(self):
         class FakeCursor:
             rowcount = 1
@@ -3064,6 +3220,103 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertIn('部分平仓保留剩余', update_calls[0]['close_reason'])
         self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
         self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
+
+    def test_take_profit_full_fill_marks_position_closed(self):
+        cursor, triggered = self._record_save_close(
+            self._bel_close_position(qty=410.0),
+            self._bel_close_order_group(qty=410.0),
+            self._close_exec_result(410.0, 410.0),
+        )
+
+        self.assertTrue(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        self.assertFalse(any('spot_open_qty = %(spot_open_qty)s' in sql for sql, _ in cursor.calls))
+        self.assertFalse(any('exchange_risk_status = ' in sql for sql, _ in cursor.calls))
+        self.assertEqual(triggered, [])
+
+    def test_take_profit_unbalanced_partial_fill_marks_desync_without_closing(self):
+        cursor, triggered = self._record_save_close(
+            self._bel_close_position(qty=410.0),
+            self._bel_close_order_group(qty=410.0),
+            self._close_exec_result(235.0, 410.0),
+        )
+
+        risk_calls = [
+            (sql, params) for sql, params in cursor.calls
+            if "exchange_risk_status = 'desynced'" in sql
+        ]
+        self.assertEqual(len(risk_calls), 1)
+        self.assertIn('普通平仓部分成交且两腿不一致', risk_calls[0][1]['detail'])
+        self.assertIn('spot=235/410|future=410/410', risk_calls[0][1]['detail'])
+        self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        self.assertFalse(any('spot_open_qty = %(spot_open_qty)s' in sql for sql, _ in cursor.calls))
+        self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
+
+    def test_take_profit_low_notional_residual_skips_execution(self):
+        class FakeCursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        cursor = FakeCursor()
+        self.ce.spot_meta = {'AI': {'min_notional': 5.0}}
+        pos = {
+            'id': 293,
+            'status': 'holding',
+            'base_asset': 'AI',
+            'spot_symbol': 'AIUSDT',
+            'future_contract': 'AI_USDT',
+            'spot_open_qty': 11.0,
+            'spot_open_price': 0.021,
+            'spot_open_amount': 0.231,
+            'future_open_qty': 11.0,
+            'future_open_price': 0.0212,
+            'future_open_contracts': 11.0,
+            'current_spread_bps': 55.0,
+            'funding_rate_24h': 0.001,
+        }
+        row = {
+            'spot_close_vwap': 0.0197,
+            'future_close_vwap': 0.01983,
+            'close_vwap_basis_bps': 66.0,
+        }
+        execute_mock = MagicMock(return_value={'success': True})
+
+        with (
+            patch.object(self.ce, '_check_and_topup_margin', return_value=None),
+            patch.object(self.ce, '_check_margin_liquidation', return_value=False),
+            patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
+            patch.object(self.ce, '_check_funding_count', return_value=False),
+            patch.object(self.ce, '_check_take_profit', return_value=True),
+            patch.object(self.ce, '_pass_valley_check', return_value=True),
+            patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
+            patch.object(self.ce, '_pre_execution_gate', return_value=(True, row, 66.0, '')),
+            patch.object(self.ce, '_build_take_profit_detail', return_value='动态止盈'),
+            patch.object(self.ce, '_execute_close', execute_mock),
+            patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)),
+        ):
+            results = self.ce.check_and_close([pos], {}, {'AI': row})
+
+        execute_mock.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]['success'])
+        self.assertIn('低名义残仓跳过平仓', results[0]['message'])
+        update_calls = [params for sql, params in cursor.calls if 'UPDATE mi_trade_position' in sql]
+        self.assertEqual(len(update_calls), 1)
+        self.assertIn('notional=0.2167<min_notional=5USDT', update_calls[0]['reason'])
 
     def test_fixed_net_take_profit_uses_fee_adjusted_profit(self):
         self.assertTrue(self.ce._check_take_profit(self.pos, 40.0))
@@ -3362,6 +3615,27 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(future_order.get('maker_price'), 100.5)
         self.assertEqual(future_order.get('maker_taker_reference_price'), 101.0)
         self.assertEqual(future_order.get('maker_spot_reference_price'), 100.0)
+
+    def test_live_close_market_fallback_does_not_require_protective_price(self):
+        self.ce.executor_client.channel = 'Live'
+        self.ce.future_maker_close_enabled = True
+        self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
+        self.ce.future_maker_close_fallback_ioc_enabled = True
+        self.ce.future_maker_close_fallback_allowed_tiers = {'A', 'B'}
+
+        group = self.ce._build_close_order_group({
+            'base_asset': 'AI',
+            'spot_open_qty': 1429.0,
+            'future_open_qty': 1429.0,
+            'future_contract': 'AI_USDT',
+        }, orderbook_row={
+            'future_price_bid_1': 0.01978,
+        }, close_reason='take_profit')
+
+        future_order = group['future_order']
+        self.assertEqual(future_order.get('execution_style'), 'maker')
+        self.assertTrue(future_order.get('maker_fallback_ioc_enabled'))
+        self.assertIsNone(future_order.get('maker_fallback_protective_price'))
 
     def test_margin_close_uses_gate_market_first_without_protective_ioc(self):
         self.ce.executor_client.channel = 'Live'

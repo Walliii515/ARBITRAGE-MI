@@ -697,7 +697,11 @@ class RealExecutor:
         maker_result: Dict,
         stats: Dict,
     ) -> Dict:
-        """Future maker 未成交后，按预先写入的保护价尝试一次 IOC 兜底。"""
+        """Future maker 未成交后的兜底。
+
+        开仓仍使用保护价 IOC，避免反向滑点吃掉入场边际；平仓 fallback
+        使用 Gate 市价语义（price=0 + tif=ioc），优先完整退出目标数量。
+        """
         maker_stats = stats.setdefault('future_maker', {})
         maker_stats['fallback_ioc_enabled'] = bool(
             maker_order.get('maker_fallback_ioc_enabled')
@@ -714,8 +718,14 @@ class RealExecutor:
         maker_stats['fallback_attempted'] = False
         maker_stats['fallback_filled'] = False
 
+        use_market_fallback = maker_order.get('order_side') == 'close'
+        maker_stats['fallback_market'] = bool(use_market_fallback)
+
         protective_price = maker_order.get('maker_fallback_protective_price')
-        if not maker_order.get('maker_fallback_ioc_enabled') or protective_price is None:
+        if not maker_order.get('maker_fallback_ioc_enabled'):
+            maker_stats['fallback_reason'] = 'disabled_or_no_protective_price'
+            return {'success': False, 'reason': maker_result.get('reason', 'future maker未成交')}
+        if not use_market_fallback and protective_price is None:
             maker_stats['fallback_reason'] = 'disabled_or_no_protective_price'
             return {'success': False, 'reason': maker_result.get('reason', 'future maker未成交')}
 
@@ -724,7 +734,11 @@ class RealExecutor:
         fallback_order.pop('maker_ttl_ms', None)
         fallback_order.pop('maker_price', None)
         fallback_order.pop('maker_price_source', None)
-        fallback_order['protective_price'] = protective_price
+        if use_market_fallback:
+            fallback_order.pop('protective_price', None)
+            fallback_order.pop('maker_fallback_protective_price', None)
+        else:
+            fallback_order['protective_price'] = protective_price
         maker_stats['fallback_attempted'] = True
 
         fallback_result = self._place_gate_futures_order(fallback_order)

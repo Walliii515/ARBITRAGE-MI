@@ -377,6 +377,49 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(close_risk['future_exchange_order_id'], 'gate-1')
         self.assertTrue(close_risk['reused_prior_future_fill'])
 
+    def test_gate_desync_low_notional_residual_does_not_submit_spot_order(self):
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1}}
+            spot_meta = {'AI': {'min_notional': 5.0}}
+
+            def __init__(self):
+                self.place_binance_spot_order = MagicMock()
+
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_positions_to_remediate = MagicMock(return_value=[{
+            'id': 293,
+            'base_asset': 'AI',
+            'spot_open_qty': 11.0,
+            'spot_open_price': 0.021,
+            'future_open_qty': 11.0,
+            'future_open_price': 0.0212,
+            'future_open_contracts': 11,
+            'spot_symbol': 'AIUSDT',
+            'future_contract': 'AI_USDT',
+        }])
+        remediator._load_binance_available_qty = MagicMock(return_value=11.0)
+        remediator._append_risk_detail = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'AI',
+            11.0,
+            {
+                'type': 'qty_mismatch',
+                'detail': 'Gate实仓不匹配|contract=AI_USDT|local=41809|exchange=41798|missing=11',
+            },
+            require_desynced=False,
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['failure_count'], 1)
+        self.assertIn('spot_notional_below_min', result['results'][0]['reason'])
+        executor.place_binance_spot_order.assert_not_called()
+        remediator._append_risk_detail.assert_called_once()
+
     def test_gate_adl_does_not_reuse_partial_prior_spot_fill(self):
         class FakeExecutor:
             contract_meta = {'BEL': {'quanto_multiplier': 1}}

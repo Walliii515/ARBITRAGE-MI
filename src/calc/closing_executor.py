@@ -467,6 +467,23 @@ class ClosingExecutor:
             if not orderbook_row:
                 logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                 continue
+            if close_reason == 'take_profit':
+                notional_ok, notional_reason = self._check_spot_close_min_notional(pos, orderbook_row)
+                if not notional_ok:
+                    self._mark_low_notional_residual(pos, notional_reason)
+                    self._clear_position_close_state(ba, pos)
+                    self._close_cooldown[ba] = datetime.now()
+                    logger.warning(
+                        "低名义残仓跳过普通止盈平仓 | %s | position_id=%s | %s",
+                        ba, pos.get('id'), notional_reason,
+                    )
+                    results.append({
+                        'base_asset': ba,
+                        'success': False,
+                        'close_reason': close_reason,
+                        'message': notional_reason,
+                    })
+                    continue
             if close_reason not in FAST_RISK_CLOSE_REASONS and self.protective_ioc_enabled and (
                 not self.future_maker_close_enabled or close_reason == 'manual'
             ):
@@ -569,6 +586,66 @@ class ClosingExecutor:
             f"平仓质量保护通过 | {base_asset} | reason={close_reason} | "
             f"close_basis_slip={slip_bps:.1f}bps<={threshold:.1f}bps"
         )
+
+    def _check_spot_close_min_notional(self, pos: Dict, orderbook_row: Dict) -> tuple[bool, str]:
+        """普通止盈前确认 Binance spot 腿不低于最小名义金额。"""
+        base_asset = str(pos.get('base_asset') or '').upper()
+        meta = self.spot_meta.get(base_asset) or {}
+        min_notional = _float_or_none(meta.get('min_notional'))
+        if min_notional is None or min_notional <= 0:
+            return True, ''
+
+        qty = _float_or_none(pos.get('spot_open_qty')) or 0.0
+        if qty <= CLOSE_QTY_TOLERANCE:
+            return True, ''
+
+        price = self._spot_close_reference_price(pos, orderbook_row)
+        if price is None or price <= 0:
+            return True, ''
+
+        notional = qty * price
+        if notional + 1e-9 >= min_notional:
+            return True, ''
+        return False, (
+            f"低名义残仓跳过平仓|qty={qty:g}|price={price:g}|"
+            f"notional={notional:.4f}<min_notional={min_notional:g}USDT|避免单腿成交"
+        )
+
+    @staticmethod
+    def _spot_close_reference_price(pos: Dict, orderbook_row: Dict) -> Optional[float]:
+        for key in (
+            'spot_close_vwap',
+            'spot_price_bid_1',
+            'spot_bid_price_1',
+            'spot_bid_1',
+            'spot_close_price',
+        ):
+            price = _float_or_none(orderbook_row.get(key))
+            if price is not None and price > 0:
+                return price
+        price = _float_or_none(pos.get('spot_open_price'))
+        return price if price is not None and price > 0 else None
+
+    def _mark_low_notional_residual(self, pos: Dict, reason: str) -> None:
+        position_id = pos.get('id')
+        if not position_id:
+            return
+        sql = """
+            UPDATE mi_trade_position
+            SET close_reason = CASE
+                WHEN close_reason IS NULL OR close_reason = '' THEN %(reason)s
+                WHEN close_reason NOT LIKE %(reason_like)s THEN CONCAT(close_reason, '|', %(reason)s)
+                ELSE close_reason
+            END
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'reason': reason,
+                'reason_like': '%低名义残仓跳过平仓%',
+                'position_id': position_id,
+            })
 
     def _valley_key(self, base_asset: str, pos: Optional[Dict] = None):
         """止盈谷底状态按持仓隔离；无 position_id 时兼容旧测试/降级为 base_asset。"""
@@ -1958,11 +2035,12 @@ class ClosingExecutor:
         if self.future_maker_close_price_offset_bps:
             maker_price *= 1 - self.future_maker_close_price_offset_bps / 10000.0
 
-        fallback_price = None
-        if (
+        fallback_allowed = (
             self.future_maker_close_fallback_ioc_enabled
             and tier in self.future_maker_close_fallback_allowed_tiers
-        ):
+        )
+        fallback_price = None
+        if fallback_allowed:
             slippage_bps = (
                 self.protective_ioc_take_profit_slippage_bps
                 if close_reason == 'take_profit'
@@ -1979,7 +2057,7 @@ class ClosingExecutor:
             'maker_strategy_tier': tier,
             'maker_taker_reference_price': row.get('future_close_vwap'),
             'maker_spot_reference_price': row.get('spot_close_vwap'),
-            'maker_fallback_ioc_enabled': fallback_price is not None,
+            'maker_fallback_ioc_enabled': fallback_allowed,
             'maker_fallback_protective_price': fallback_price,
             'maker_fallback_slippage_bps': slippage_bps
             if fallback_price is not None else None,

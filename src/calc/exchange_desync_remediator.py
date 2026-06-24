@@ -96,6 +96,20 @@ class ExchangeDesyncRemediator:
                         'reason': prior_result.get('reason') or 'spot_available_qty_insufficient',
                     })
                 continue
+            min_notional_reason = self._below_spot_min_notional(pos, target_qty)
+            if min_notional_reason:
+                self._append_risk_detail(pos.get('id'), f"自动处置跳过|{min_notional_reason}")
+                logger.warning(
+                    "Gate 缺腿自动处置跳过低名义残余 | %s | position_id=%s | qty=%s | %s",
+                    base_asset, pos.get('id'), target_qty, min_notional_reason,
+                )
+                results.append({
+                    'attempted': True,
+                    'success': False,
+                    'position_id': pos.get('id'),
+                    'reason': min_notional_reason,
+                })
+                continue
 
             result = self._sell_spot_and_close_position(pos, target_qty, risk)
             results.append(result)
@@ -279,6 +293,23 @@ class ExchangeDesyncRemediator:
             except Exception:
                 logger.debug("Binance spot price estimate failed | %s", base_asset, exc_info=True)
         return 0.0
+
+    def _below_spot_min_notional(self, pos: Dict, target_qty: float) -> Optional[str]:
+        base_asset = str(pos.get('base_asset') or '').upper()
+        meta = getattr(self.executor, 'spot_meta', {}) or {}
+        min_notional = _float((meta.get(base_asset) or {}).get('min_notional'))
+        if min_notional <= 0 or target_qty <= 0:
+            return None
+        price = _float(pos.get('spot_open_price'))
+        if price <= 0:
+            return None
+        notional = target_qty * price
+        if notional + 1e-9 >= min_notional:
+            return None
+        return (
+            f"spot_notional_below_min|qty={target_qty:g}|price={price:g}|"
+            f"notional={notional:.4f}<min_notional={min_notional:g}USDT"
+        )
 
     def _load_positions_to_remediate(
         self,
