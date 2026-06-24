@@ -253,7 +253,26 @@ def record_server_metrics(disk_path: str = '/', retention_days: int = 14) -> Dic
             %(uptime_sec)s, %(detail_json)s
         )
     """
-    payload = dict(snapshot)
+    payload = {
+        key: snapshot.get(key)
+        for key in (
+            'snapshot_at',
+            'hostname',
+            'cpu_usage_percent',
+            'load1',
+            'load5',
+            'load15',
+            'cpu_count',
+            'memory_total_bytes',
+            'memory_used_bytes',
+            'memory_usage_percent',
+            'disk_path',
+            'disk_total_bytes',
+            'disk_used_bytes',
+            'disk_usage_percent',
+            'uptime_sec',
+        )
+    }
     payload['detail_json'] = json.dumps(snapshot.get('detail') or {}, ensure_ascii=False)
     with db_manager.get_connection() as conn:
         with conn.cursor() as cursor:
