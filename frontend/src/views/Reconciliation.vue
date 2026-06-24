@@ -20,16 +20,20 @@ interface ReconRow {
   diff_ratio: number | null
   is_match: boolean | number
   detail: Record<string, unknown> | string | null
+  quanto_multiplier?: number | null
 }
 
 interface ExposureRow {
   base_asset: string
   snapshot_at: string
   binance_exchange_value: number | null
+  gate_exchange_contracts: number | null
   gate_exchange_value: number | null
+  gate_quanto_multiplier: number | null
   exchange_diff: number | null
   exposure_side: 'balanced' | 'spot_long' | 'gate_short' | 'missing_leg'
   binance_local_value: number | null
+  gate_local_contracts: number | null
   gate_local_value: number | null
   local_diff: number | null
   binance_match: boolean
@@ -63,6 +67,11 @@ function toNumber(value: number | null | undefined): number | null {
   if (value == null) return null
   const n = Number(value)
   return Number.isFinite(n) ? n : null
+}
+
+function positiveNumberOrDefault(value: number | null | undefined, fallback = 1): number {
+  const n = toNumber(value)
+  return n != null && n > 0 ? n : fallback
 }
 
 function isRowMatch(value: ReconRow['is_match']): boolean {
@@ -165,9 +174,25 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
     valueFormatter: (p) => formatNumber(p.value),
   },
   {
-    headerName: 'Gate实仓',
+    headerName: 'Gate实仓(标的)',
     field: 'gate_exchange_value',
     width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: 'Gate张数',
+    field: 'gate_exchange_contracts',
+    width: 110,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: 'Gate乘数',
+    field: 'gate_quanto_multiplier',
+    width: 105,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
     valueFormatter: (p) => formatNumber(p.value),
@@ -190,8 +215,16 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
     valueFormatter: (p) => formatNumber(p.value),
   },
   {
-    headerName: 'Gate本地',
+    headerName: 'Gate本地(标的)',
     field: 'gate_local_value',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+  },
+  {
+    headerName: 'Gate本地张数',
+    field: 'gate_local_contracts',
     width: 125,
     type: 'numericColumn',
     cellClass: 'ag-right-aligned-cell',
@@ -237,9 +270,16 @@ const exposureRows = computed<ExposureRow[]>(() => {
 
   return Array.from(grouped.entries()).map(([baseAsset, item]) => {
     const binanceExchange = toNumber(item.binance?.exchange_value)
-    const gateExchange = toNumber(item.gate?.exchange_value)
+    const gateExchangeContracts = toNumber(item.gate?.exchange_value)
+    const gateMultiplier = positiveNumberOrDefault(item.gate?.quanto_multiplier)
+    const gateExchange = gateExchangeContracts != null
+      ? gateExchangeContracts * gateMultiplier
+      : null
     const binanceLocal = toNumber(item.binance?.local_value)
-    const gateLocal = toNumber(item.gate?.local_value)
+    const gateLocalContracts = toNumber(item.gate?.local_value)
+    const gateLocal = gateLocalContracts != null
+      ? gateLocalContracts * gateMultiplier
+      : null
     const exchangeDiff = binanceExchange != null && gateExchange != null
       ? binanceExchange - gateExchange
       : null
@@ -259,10 +299,13 @@ const exposureRows = computed<ExposureRow[]>(() => {
       base_asset: baseAsset,
       snapshot_at: item.snapshot_at,
       binance_exchange_value: binanceExchange,
+      gate_exchange_contracts: gateExchangeContracts,
       gate_exchange_value: gateExchange,
+      gate_quanto_multiplier: item.gate ? gateMultiplier : null,
       exchange_diff: exchangeDiff,
       exposure_side: exposureSide,
       binance_local_value: binanceLocal,
+      gate_local_contracts: gateLocalContracts,
       gate_local_value: gateLocal,
       local_diff: localDiff,
       binance_match: item.binance ? isRowMatch(item.binance.is_match) : false,

@@ -4,6 +4,7 @@ from datetime import datetime
 from api.trading_api import (
     _append_unique_notification,
     _build_forward_signal_filters,
+    _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
 )
 
@@ -72,6 +73,16 @@ class ReconciliationNotificationTests(unittest.TestCase):
         _append_unique_notification(items, seen, {'dedup_key': 'reconciliation:ASR', 'event_at': '11:51'})
 
         self.assertEqual(items, [{'dedup_key': 'reconciliation:ASR', 'event_at': '11:52'}])
+
+
+class ReconciliationLatestQueryTests(unittest.TestCase):
+    def test_latest_query_attaches_gate_quanto_multiplier(self):
+        sql = _reconciliation_latest_sql(" AND NOT (s.exchange = 'binance' AND s.base_asset IN (%s))")
+
+        self.assertIn('c.quanto_multiplier', sql)
+        self.assertIn('mi_gate_future_contracts c', sql)
+        self.assertIn('UPPER(TRIM(c.base_asset)) = UPPER(TRIM(s.base_asset))', sql)
+        self.assertIn('s.snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)', sql)
 
 
 if __name__ == '__main__':

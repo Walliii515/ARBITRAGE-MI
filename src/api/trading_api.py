@@ -745,6 +745,20 @@ def _reconciliation_ignore_clause(table_alias: str = '') -> tuple[str, List[Any]
     return f" AND NOT ({prefix}exchange = 'binance' AND {prefix}base_asset IN ({placeholders}))", ignored
 
 
+def _reconciliation_latest_sql(ignore_sql: str) -> str:
+    return """
+        SELECT
+            s.*,
+            c.quanto_multiplier
+        FROM mi_recon_snapshot s
+        LEFT JOIN mi_gate_future_contracts c
+          ON UPPER(TRIM(c.base_asset)) = UPPER(TRIM(s.base_asset))
+        WHERE s.snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)
+        {ignore_sql}
+        ORDER BY s.exchange ASC, s.base_asset ASC
+    """.format(ignore_sql=ignore_sql)
+
+
 def _db_bool(value: Any) -> bool:
     if value is None:
         return False
@@ -780,14 +794,8 @@ def _append_unique_notification(
 @router.get('/reconciliation/latest')
 async def get_reconciliation_latest():
     """返回最近一轮对账快照。"""
-    ignore_sql, ignore_params = _reconciliation_ignore_clause()
-    sql = """
-        SELECT *
-        FROM mi_recon_snapshot
-        WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)
-        {ignore_sql}
-        ORDER BY exchange ASC, base_asset ASC
-    """.format(ignore_sql=ignore_sql)
+    ignore_sql, ignore_params = _reconciliation_ignore_clause('s')
+    sql = _reconciliation_latest_sql(ignore_sql)
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, ignore_params)
         rows = cursor.fetchall()
