@@ -63,6 +63,18 @@ const diskScopeLabel = computed(() => {
   if (latest.value?.disk_path === 'all') return '全局本地磁盘'
   return latest.value?.disk_path || '/'
 })
+const systemDisk = computed(() => diskFilesystems.value.find((item) => item.mount_point === '/') || null)
+const dataDisk = computed(() =>
+  diskFilesystems.value.find((item) =>
+    item.mount_point === '/data' || item.mount_points?.includes('/var/lib/mysql')
+  ) || null
+)
+
+function diskFromRow(row: ServerMetricRow, mountPoint: string): DiskFilesystem | null {
+  const filesystems = row.detail?.disk_filesystems
+  if (!Array.isArray(filesystems)) return null
+  return (filesystems as DiskFilesystem[]).find((item) => item.mount_point === mountPoint) || null
+}
 
 const statusItems = computed(() => {
   const item = latest.value
@@ -82,7 +94,21 @@ const statusItems = computed(() => {
       sub: `${formatBytes(item?.memory_used_bytes)} / ${formatBytes(item?.memory_total_bytes)}`,
     },
     {
-      label: '硬盘使用率',
+      label: '系统盘',
+      value: formatPercent(systemDisk.value?.usage_percent),
+      raw: systemDisk.value?.usage_percent,
+      tone: usageTone(systemDisk.value?.usage_percent),
+      sub: `/ · ${formatBytes(systemDisk.value?.used_bytes)} / ${formatBytes(systemDisk.value?.total_bytes)}`,
+    },
+    {
+      label: '数据盘',
+      value: formatPercent(dataDisk.value?.usage_percent),
+      raw: dataDisk.value?.usage_percent,
+      tone: usageTone(dataDisk.value?.usage_percent),
+      sub: `/data · ${formatBytes(dataDisk.value?.used_bytes)} / ${formatBytes(dataDisk.value?.total_bytes)}`,
+    },
+    {
+      label: '全局磁盘',
       value: formatPercent(item?.disk_usage_percent),
       raw: item?.disk_usage_percent,
       tone: usageTone(item?.disk_usage_percent),
@@ -159,10 +185,12 @@ function chartColors() {
 function buildUsageChartOption(): EChartsOption {
   const colors = chartColors()
   const series = [
-    { name: 'CPU', key: 'cpu_usage_percent', color: '#4dabf7' },
-    { name: '内存', key: 'memory_usage_percent', color: '#63e6be' },
-    { name: '硬盘', key: 'disk_usage_percent', color: '#ffd43b' },
-  ] as const
+    { name: 'CPU', color: '#4dabf7', value: (row: ServerMetricRow) => row.cpu_usage_percent },
+    { name: '内存', color: '#63e6be', value: (row: ServerMetricRow) => row.memory_usage_percent },
+    { name: '系统盘', color: '#ffd43b', value: (row: ServerMetricRow) => diskFromRow(row, '/')?.usage_percent ?? null },
+    { name: '数据盘', color: '#ffa94d', value: (row: ServerMetricRow) => diskFromRow(row, '/data')?.usage_percent ?? null },
+    { name: '全局磁盘', color: '#adb5bd', value: (row: ServerMetricRow) => row.disk_usage_percent },
+  ]
 
   return {
     color: series.map((item) => item.color),
@@ -205,7 +233,7 @@ function buildUsageChartOption(): EChartsOption {
       smooth: true,
       showSymbol: false,
       emphasis: { focus: 'series' },
-      data: rows.value.map((row) => [row.snapshot_at, row[item.key] ?? null]),
+      data: rows.value.map((row) => [row.snapshot_at, item.value(row)]),
       lineStyle: { width: 2.2 },
     })),
   }
@@ -440,7 +468,7 @@ onBeforeUnmount(() => {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
