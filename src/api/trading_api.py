@@ -752,7 +752,8 @@ def _reconciliation_latest_sql(ignore_sql: str) -> str:
             c.quanto_multiplier
         FROM mi_recon_snapshot s
         LEFT JOIN mi_gate_future_contracts c
-          ON UPPER(TRIM(c.base_asset)) = UPPER(TRIM(s.base_asset))
+          ON UPPER(TRIM(c.base_asset)) COLLATE utf8mb4_unicode_ci
+           = UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci
         WHERE s.snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)
         {ignore_sql}
         ORDER BY s.exchange ASC, s.base_asset ASC

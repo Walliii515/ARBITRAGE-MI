@@ -81,7 +81,8 @@ class ReconciliationLatestQueryTests(unittest.TestCase):
 
         self.assertIn('c.quanto_multiplier', sql)
         self.assertIn('mi_gate_future_contracts c', sql)
-        self.assertIn('UPPER(TRIM(c.base_asset)) = UPPER(TRIM(s.base_asset))', sql)
+        self.assertIn('UPPER(TRIM(c.base_asset)) COLLATE utf8mb4_unicode_ci', sql)
+        self.assertIn('UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci', sql)
         self.assertIn('s.snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)', sql)
 
 
