@@ -115,8 +115,93 @@ def _uptime_sec() -> Optional[int]:
         return None
 
 
-def collect_server_metrics(disk_path: str = '/') -> Dict[str, Any]:
+def _decode_mount_path(value: str) -> str:
+    return value.replace('\\040', ' ')
+
+
+def _collect_local_disk_filesystems() -> List[Dict[str, Any]]:
+    """Collect mounted local block filesystems and de-duplicate bind mounts."""
+    filesystems: Dict[str, Dict[str, Any]] = {}
+    try:
+        with open('/proc/self/mountinfo', 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        parts = line.strip().split()
+        if '-' not in parts or len(parts) < 10:
+            continue
+        sep = parts.index('-')
+        mount_point = _decode_mount_path(parts[4])
+        fs_type = parts[sep + 1]
+        source = parts[sep + 2]
+        if not source.startswith('/dev/'):
+            continue
+        if fs_type in {'squashfs', 'tmpfs', 'devtmpfs'}:
+            continue
+        try:
+            usage = shutil.disk_usage(mount_point)
+        except OSError:
+            continue
+
+        key = os.path.realpath(source)
+        existing = filesystems.get(key)
+        if existing:
+            existing['mount_points'].append(mount_point)
+            if len(mount_point) < len(existing['mount_point']):
+                existing['mount_point'] = mount_point
+            continue
+
+        filesystems[key] = {
+            'source': source,
+            'mount_point': mount_point,
+            'mount_points': [mount_point],
+            'fstype': fs_type,
+            'total_bytes': usage.total,
+            'used_bytes': usage.used,
+            'free_bytes': usage.free,
+            'usage_percent': round(usage.used / usage.total * 100.0, 4) if usage.total else None,
+        }
+
+    return sorted(filesystems.values(), key=lambda item: item['mount_point'])
+
+
+def _disk_info(disk_path: str) -> Dict[str, Any]:
+    filesystems = _collect_local_disk_filesystems()
+    if filesystems:
+        total = sum(int(item.get('total_bytes') or 0) for item in filesystems)
+        used = sum(int(item.get('used_bytes') or 0) for item in filesystems)
+        return {
+            'disk_path': 'all',
+            'disk_total_bytes': total,
+            'disk_used_bytes': used,
+            'disk_usage_percent': round(used / total * 100.0, 4) if total else None,
+            'disk_filesystems': filesystems,
+            'disk_sample_mode': 'all_local_filesystems',
+        }
+
     disk = shutil.disk_usage(disk_path)
+    return {
+        'disk_path': disk_path,
+        'disk_total_bytes': disk.total,
+        'disk_used_bytes': disk.used,
+        'disk_usage_percent': round(disk.used / disk.total * 100.0, 4) if disk.total else None,
+        'disk_filesystems': [{
+            'source': disk_path,
+            'mount_point': disk_path,
+            'mount_points': [disk_path],
+            'fstype': '',
+            'total_bytes': disk.total,
+            'used_bytes': disk.used,
+            'free_bytes': disk.free,
+            'usage_percent': round(disk.used / disk.total * 100.0, 4) if disk.total else None,
+        }],
+        'disk_sample_mode': 'single_path',
+    }
+
+
+def collect_server_metrics(disk_path: str = '/') -> Dict[str, Any]:
     load1 = load5 = load15 = None
     if hasattr(os, 'getloadavg'):
         try:
@@ -125,7 +210,7 @@ def collect_server_metrics(disk_path: str = '/') -> Dict[str, Any]:
             pass
 
     memory = _memory_info()
-    disk_usage_percent = round(disk.used / disk.total * 100.0, 4) if disk.total else None
+    disk = _disk_info(disk_path)
     now = datetime.now().replace(microsecond=0)
 
     return {
@@ -137,14 +222,16 @@ def collect_server_metrics(disk_path: str = '/') -> Dict[str, Any]:
         'load15': round(load15, 4) if load15 is not None else None,
         'cpu_count': os.cpu_count(),
         **memory,
-        'disk_path': disk_path,
-        'disk_total_bytes': disk.total,
-        'disk_used_bytes': disk.used,
-        'disk_usage_percent': disk_usage_percent,
+        'disk_path': disk['disk_path'],
+        'disk_total_bytes': disk['disk_total_bytes'],
+        'disk_used_bytes': disk['disk_used_bytes'],
+        'disk_usage_percent': disk['disk_usage_percent'],
         'uptime_sec': _uptime_sec(),
         'detail': {
             'platform': platform.platform(),
             'python': platform.python_version(),
+            'disk_sample_mode': disk['disk_sample_mode'],
+            'disk_filesystems': disk['disk_filesystems'],
         },
     }
 

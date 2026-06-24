@@ -26,6 +26,17 @@ interface ServerMetricRow {
   detail?: Record<string, unknown>
 }
 
+interface DiskFilesystem {
+  source: string
+  mount_point: string
+  mount_points?: string[]
+  fstype?: string
+  total_bytes: number | null
+  used_bytes: number | null
+  free_bytes: number | null
+  usage_percent: number | null
+}
+
 const rows = ref<ServerMetricRow[]>([])
 const latest = ref<ServerMetricRow | null>(null)
 const loading = ref(false)
@@ -41,6 +52,17 @@ const hasRows = computed(() => rows.value.length > 0)
 const lastUpdatedAt = computed(() => latest.value?.snapshot_at || '-')
 const hostLabel = computed(() => latest.value?.hostname || '-')
 const sampleCount = computed(() => rows.value.length)
+const diskFilesystems = computed<DiskFilesystem[]>(() => {
+  const filesystems = latest.value?.detail?.disk_filesystems
+  if (!Array.isArray(filesystems)) return []
+  return filesystems
+    .map((item) => item as DiskFilesystem)
+    .filter((item) => item?.mount_point && item?.total_bytes != null)
+})
+const diskScopeLabel = computed(() => {
+  if (latest.value?.disk_path === 'all') return '全局本地磁盘'
+  return latest.value?.disk_path || '/'
+})
 
 const statusItems = computed(() => {
   const item = latest.value
@@ -64,7 +86,7 @@ const statusItems = computed(() => {
       value: formatPercent(item?.disk_usage_percent),
       raw: item?.disk_usage_percent,
       tone: usageTone(item?.disk_usage_percent),
-      sub: `${item?.disk_path || '/'} · ${formatBytes(item?.disk_used_bytes)} / ${formatBytes(item?.disk_total_bytes)}`,
+      sub: `${diskScopeLabel.value} · ${formatBytes(item?.disk_used_bytes)} / ${formatBytes(item?.disk_total_bytes)}`,
     },
     {
       label: '运行时长',
@@ -347,6 +369,31 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
+
+    <section class="disk-panel">
+      <div class="chart-header">
+        <h3>磁盘明细</h3>
+        <span>按本地块设备去重汇总，bind mount 不重复计入总量</span>
+      </div>
+      <div class="disk-list">
+        <div v-for="fs in diskFilesystems" :key="`${fs.source}-${fs.mount_point}`" class="disk-row">
+          <div class="disk-row-main">
+            <strong>{{ fs.mount_point }}</strong>
+            <span>{{ fs.source }} {{ fs.fstype || '' }}</span>
+          </div>
+          <div class="disk-row-meter">
+            <div class="disk-bar">
+              <i :style="{ width: `${Math.min(100, Math.max(0, Number(fs.usage_percent || 0)))}%` }"></i>
+            </div>
+            <span>{{ formatPercent(fs.usage_percent) }}</span>
+          </div>
+          <div class="disk-row-size">
+            {{ formatBytes(fs.used_bytes) }} / {{ formatBytes(fs.total_bytes) }}
+          </div>
+        </div>
+        <div v-if="!diskFilesystems.length" class="disk-empty">暂无磁盘明细</div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -468,6 +515,14 @@ onBeforeUnmount(() => {
   padding: 14px;
 }
 
+.disk-panel {
+  margin-top: 16px;
+  padding: 14px;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+}
+
 .chart-header {
   display: flex;
   align-items: center;
@@ -502,10 +557,86 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.disk-list {
+  display: grid;
+  gap: 10px;
+}
+
+.disk-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(180px, 280px) minmax(140px, auto);
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+  background: var(--app-surface-elevated);
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+}
+
+.disk-row-main {
+  min-width: 0;
+}
+
+.disk-row-main strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.disk-row-main span,
+.disk-empty {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.disk-row-meter {
+  display: grid;
+  grid-template-columns: 1fr 52px;
+  align-items: center;
+  gap: 10px;
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.disk-bar {
+  height: 8px;
+  overflow: hidden;
+  background: #2b3134;
+  border-radius: 999px;
+}
+
+.disk-bar i {
+  display: block;
+  height: 100%;
+  background: #ffd43b;
+  border-radius: inherit;
+}
+
+.disk-row-size {
+  color: var(--app-text);
+  font-size: 13px;
+  text-align: right;
+  white-space: nowrap;
+}
+
 @media (max-width: 1180px) {
   .summary-grid,
   .chart-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .disk-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .disk-row-size {
+    text-align: left;
   }
 }
 
