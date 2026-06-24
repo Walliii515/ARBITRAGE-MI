@@ -59,10 +59,6 @@ const diskFilesystems = computed<DiskFilesystem[]>(() => {
     .map((item) => item as DiskFilesystem)
     .filter((item) => item?.mount_point && item?.total_bytes != null)
 })
-const diskScopeLabel = computed(() => {
-  if (latest.value?.disk_path === 'all') return '全局本地磁盘'
-  return latest.value?.disk_path || '/'
-})
 const systemDisk = computed(() => diskFilesystems.value.find((item) => item.mount_point === '/') || null)
 const dataDisk = computed(() =>
   diskFilesystems.value.find((item) =>
@@ -106,13 +102,6 @@ const statusItems = computed(() => {
       raw: dataDisk.value?.usage_percent,
       tone: usageTone(dataDisk.value?.usage_percent),
       sub: `/data · ${formatBytes(dataDisk.value?.used_bytes)} / ${formatBytes(dataDisk.value?.total_bytes)}`,
-    },
-    {
-      label: '全局磁盘',
-      value: formatPercent(item?.disk_usage_percent),
-      raw: item?.disk_usage_percent,
-      tone: usageTone(item?.disk_usage_percent),
-      sub: `${diskScopeLabel.value} · ${formatBytes(item?.disk_used_bytes)} / ${formatBytes(item?.disk_total_bytes)}`,
     },
     {
       label: '运行时长',
@@ -189,7 +178,6 @@ function buildUsageChartOption(): EChartsOption {
     { name: '内存', color: '#63e6be', value: (row: ServerMetricRow) => row.memory_usage_percent },
     { name: '系统盘', color: '#ffd43b', value: (row: ServerMetricRow) => diskFromRow(row, '/')?.usage_percent ?? null },
     { name: '数据盘', color: '#ffa94d', value: (row: ServerMetricRow) => diskFromRow(row, '/data')?.usage_percent ?? null },
-    { name: '全局磁盘', color: '#adb5bd', value: (row: ServerMetricRow) => row.disk_usage_percent },
   ]
 
   return {
