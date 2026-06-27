@@ -113,3 +113,16 @@ tasks:
     schedule: daily
     daily_hour: 0  # 凌晨0点执行阈值计算
     daily_minute: 5  # 延迟5分钟，避免与其他凌晨0点任务撞车
+
+  # 反向策略高负 Funding 概率预测 - 每日批量统计
+  # 数据源：mi_gate_future_his_funding_rates + mi_gate_future_contracts
+  # 目标表：mi_reverse_funding_prediction
+  # 用途：预测未来 1/2/3 期出现 24h funding <= threshold_rate 的概率，
+  #      供提前借币观察页面和后续研究复盘使用。
+  daily_reverse_funding_prediction:
+    enabled: true
+    schedule: daily
+    daily_hour: 0
+    daily_minute: 20
+    threshold_rate: -0.01
+    lookback_days: 30

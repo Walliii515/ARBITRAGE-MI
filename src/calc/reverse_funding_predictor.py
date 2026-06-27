@@ -11,13 +11,18 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from common.config import config
 from common.database import db_manager
+from common.logger import get_logger
 
 
 DEFAULT_THRESHOLD_RATE = -0.01
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_PAGE_SIZE = 100
 MIN_CONDITIONAL_SAMPLES = 20
+MODEL_VERSION = 'funding_bucket_v1_pool'
+
+logger = get_logger(__name__)
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -89,6 +94,84 @@ def _round_or_none(value: Optional[float], digits: int = 6) -> Optional[float]:
     if value is None:
         return None
     return round(float(value), digits)
+
+
+def _normalize_threshold_rate(threshold_rate: float) -> float:
+    threshold = float(threshold_rate or DEFAULT_THRESHOLD_RATE)
+    # This page is for high-negative funding. If the UI sends +1%, normalize to -1%.
+    if threshold > 0:
+        threshold = -threshold
+    return max(-1.0, min(0.0, threshold))
+
+
+def _normalize_lookback_days(lookback_days: int) -> int:
+    return min(max(int(lookback_days or DEFAULT_LOOKBACK_DAYS), 3), 90)
+
+
+def _like_keyword(keyword: str) -> str:
+    return f"%{str(keyword or '').strip().upper()}%"
+
+
+def _allowed_strategy_tiers() -> List[str]:
+    raw = config.get('orderbook.strategy_tiers', ['A', 'B'])
+    if isinstance(raw, str):
+        tiers = [part.strip().upper() for part in raw.split(',')]
+    elif isinstance(raw, (list, tuple, set)):
+        tiers = [str(part).strip().upper() for part in raw]
+    else:
+        tiers = ['A', 'B']
+    tiers = [tier for tier in tiers if tier in ('A', 'B', 'C')]
+    return tiers or ['A', 'B']
+
+
+def _load_prediction_universe() -> Dict[str, str]:
+    """Load the same asset universe used by orderbook subscriptions."""
+    allowed_tiers = _allowed_strategy_tiers()
+    tier_placeholders = ', '.join(['%s'] * len(allowed_tiers))
+    max_contracts = config.get_int('orderbook.max_contracts', 999)
+    settle = str(config.get('orderbook.settle', 'usdt') or 'usdt').upper()
+    min_spot_volume = config.get_float('trade.filter.min_spot_volume_24h_usdt', 0)
+    min_future_volume = config.get_float('trade.filter.min_future_volume_24h_usdt', 0)
+    sql = """
+        SELECT
+            UPPER(TRIM(b.base_asset)) AS base_asset,
+            COALESCE(b.strategy_tier, 'C') AS strategy_tier
+        FROM mi_base_asset b
+        INNER JOIN mi_gate_future_contracts g
+            ON g.base_asset = UPPER(TRIM(b.base_asset))
+           AND g.name = CONCAT(UPPER(TRIM(b.base_asset)), %s)
+        INNER JOIN mi_binance_spot_info s
+            ON s.base_asset = UPPER(TRIM(b.base_asset))
+           AND s.symbol = CONCAT(UPPER(TRIM(b.base_asset)), %s)
+        WHERE b.is_valid = 'Y'
+          AND COALESCE(b.strategy_tier, 'C') IN ({tier_placeholders})
+          AND g.status = 'trading'
+          AND s.status = 'TRADING'
+          AND s.is_spot_trading_allowed = 1
+          AND UPPER(TRIM(b.base_asset)) REGEXP '^[A-Z0-9]+$'
+          AND COALESCE(g.volume_24h_settle, 0) >= %s
+          AND COALESCE(s.quote_volume, 0) >= %s
+        ORDER BY g.funding_rate_24h DESC, g.volume_24h_settle DESC, s.quote_volume DESC
+        LIMIT %s
+    """.format(tier_placeholders=tier_placeholders)
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(
+            sql,
+            (
+                f'_{settle}',
+                settle,
+                *allowed_tiers,
+                min_future_volume,
+                min_spot_volume,
+                max_contracts,
+            ),
+        )
+        rows = cursor.fetchall() or []
+    return {
+        str(row.get('base_asset') or '').strip().upper(): str(row.get('strategy_tier') or 'C').strip().upper()
+        for row in rows
+        if row.get('base_asset')
+    }
 
 
 def _load_current_contracts() -> Dict[str, Dict[str, Any]]:
@@ -208,6 +291,7 @@ def _compute_prediction_row(
         'current_bucket': current_bucket,
         'current_bucket_label': _bucket_label(current_bucket),
         'threshold_rate': threshold_rate,
+        'model_version': MODEL_VERSION,
         'sample_count': len(rates),
         'conditional_sample_count': conditional_samples,
         'high_negative_count': high_count,
@@ -226,32 +310,98 @@ def _compute_prediction_row(
     }
 
 
-def get_reverse_funding_prediction_page(
+def ensure_reverse_funding_prediction_table() -> None:
+    sql = """
+        CREATE TABLE IF NOT EXISTS mi_reverse_funding_prediction (
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            generated_at DATETIME NOT NULL,
+            model_version VARCHAR(64) NOT NULL,
+            threshold_rate DECIMAL(18,10) NOT NULL,
+            lookback_days INT NOT NULL,
+            base_asset VARCHAR(32) NOT NULL,
+            contract VARCHAR(64) NOT NULL,
+            strategy_tier VARCHAR(8) DEFAULT NULL,
+            current_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
+            previous_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
+            funding_rate_change DECIMAL(18,10) DEFAULT NULL,
+            current_bucket VARCHAR(32) DEFAULT NULL,
+            current_bucket_label VARCHAR(32) DEFAULT NULL,
+            sample_count INT DEFAULT NULL,
+            conditional_sample_count INT DEFAULT NULL,
+            high_negative_count INT DEFAULT NULL,
+            high_negative_frequency DECIMAL(12,6) DEFAULT NULL,
+            negative_count INT DEFAULT NULL,
+            negative_frequency DECIMAL(12,6) DEFAULT NULL,
+            min_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
+            max_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
+            avg_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
+            p_next_1 DECIMAL(12,6) DEFAULT NULL,
+            p_next_2 DECIMAL(12,6) DEFAULT NULL,
+            p_next_3 DECIMAL(12,6) DEFAULT NULL,
+            base_p_next_1 DECIMAL(12,6) DEFAULT NULL,
+            base_p_next_2 DECIMAL(12,6) DEFAULT NULL,
+            base_p_next_3 DECIMAL(12,6) DEFAULT NULL,
+            conditional_p_next_1 DECIMAL(12,6) DEFAULT NULL,
+            conditional_p_next_2 DECIMAL(12,6) DEFAULT NULL,
+            conditional_p_next_3 DECIMAL(12,6) DEFAULT NULL,
+            confidence DECIMAL(12,6) DEFAULT NULL,
+            last_history_time DATETIME DEFAULT NULL,
+            last_high_negative_time DATETIME DEFAULT NULL,
+            funding_next_apply DATETIME DEFAULT NULL,
+            current_updated_at DATETIME DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            KEY idx_generated (generated_at),
+            KEY idx_model_latest (threshold_rate, lookback_days, generated_at),
+            KEY idx_asset_generated (base_asset, generated_at),
+            KEY idx_contract_generated (contract, generated_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql)
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'mi_reverse_funding_prediction'
+              AND COLUMN_NAME = 'strategy_tier'
+            """
+        )
+        row = cursor.fetchone() or {}
+        if int(row.get('cnt') or 0) == 0:
+            cursor.execute(
+                """
+                ALTER TABLE mi_reverse_funding_prediction
+                ADD COLUMN strategy_tier VARCHAR(8) DEFAULT NULL AFTER contract
+                """
+            )
+
+
+def _compute_prediction_rows(
     *,
     threshold_rate: float = DEFAULT_THRESHOLD_RATE,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     keyword: str = '',
-    page: int = 1,
-    page_size: int = DEFAULT_PAGE_SIZE,
-) -> Dict[str, Any]:
-    threshold_rate = float(threshold_rate or DEFAULT_THRESHOLD_RATE)
-    # This page is for high-negative funding. If the UI sends +1%, normalize to -1%.
-    if threshold_rate > 0:
-        threshold_rate = -threshold_rate
-    lookback_days = min(max(int(lookback_days or DEFAULT_LOOKBACK_DAYS), 3), 90)
-    page = max(int(page or 1), 1)
-    page_size = min(max(int(page_size or DEFAULT_PAGE_SIZE), 10), 5000)
+) -> List[Dict[str, Any]]:
+    threshold_rate = _normalize_threshold_rate(threshold_rate)
+    lookback_days = _normalize_lookback_days(lookback_days)
     keyword = str(keyword or '').strip().upper()
 
     current_by_contract = _load_current_contracts()
+    eligible_assets = _load_prediction_universe()
     history_by_contract = _group_history(_load_funding_history(lookback_days))
 
     rows: List[Dict[str, Any]] = []
     for contract, history in history_by_contract.items():
         current = current_by_contract.get(contract)
+        base_asset = _contract_base_asset(contract, current)
+        strategy_tier = eligible_assets.get(base_asset)
+        if not strategy_tier:
+            continue
         row = _compute_prediction_row(contract, history, current, threshold_rate)
         if not row:
             continue
+        row['strategy_tier'] = strategy_tier
         if keyword and keyword not in row['base_asset'] and keyword not in row['contract']:
             continue
         rows.append(row)
@@ -265,20 +415,29 @@ def get_reverse_funding_prediction_page(
         ),
         reverse=True,
     )
+    return rows
 
+
+def _build_summary(
+    rows: List[Dict[str, Any]],
+    *,
+    threshold_rate: float,
+    lookback_days: int,
+    source: str,
+    generated_at: Optional[Any] = None,
+) -> Dict[str, Any]:
     total = len(rows)
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_rows = rows[start:end]
-
     latest_history_time = max((row.get('last_history_time') for row in rows if row.get('last_history_time')), default=None)
     current_high_count = sum(1 for row in rows if (row.get('current_funding_rate_24h') or 0) <= threshold_rate)
-    summary = {
+    return {
         'asset_count': total,
         'current_high_negative_count': current_high_count,
         'threshold_rate': threshold_rate,
         'lookback_days': lookback_days,
         'latest_history_time': latest_history_time,
+        'generated_at': _serialize_dt(generated_at),
+        'model_version': MODEL_VERSION,
+        'source': source,
         'avg_p_next_1': _round_or_none(
             sum((row.get('p_next_1') or 0.0) for row in rows) / total if total else None,
             6,
@@ -292,8 +451,272 @@ def get_reverse_funding_prediction_page(
             6,
         ),
     }
+
+
+def predict_high_negative_funding(
+    *,
+    base_asset: Optional[str] = None,
+    threshold_rate: float = DEFAULT_THRESHOLD_RATE,
+    horizons: Tuple[int, ...] = (1, 2, 3),
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    as_of: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Reusable prediction entrypoint for reverse pre-borrow research.
+
+    ``horizons`` and ``as_of`` are accepted to keep the call shape stable for
+    future model upgrades. The current bucket model supports 1/2/3 period
+    horizons and always reads the latest stored market state.
+    """
+    del as_of
+    supported = {1, 2, 3}
+    unsupported = set(horizons) - supported
+    if unsupported:
+        raise ValueError(f'unsupported horizons: {sorted(unsupported)}')
+    keyword = str(base_asset or '').strip().upper()
+    rows = _compute_prediction_rows(
+        threshold_rate=threshold_rate,
+        lookback_days=lookback_days,
+        keyword=keyword,
+    )
+    if base_asset:
+        wanted = str(base_asset).strip().upper()
+        rows = [row for row in rows if row.get('base_asset') == wanted]
+    return rows
+
+
+def refresh_reverse_funding_predictions(
+    *,
+    threshold_rate: float = DEFAULT_THRESHOLD_RATE,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> Dict[str, Any]:
+    threshold_rate = _normalize_threshold_rate(threshold_rate)
+    lookback_days = _normalize_lookback_days(lookback_days)
+    ensure_reverse_funding_prediction_table()
+    rows = _compute_prediction_rows(
+        threshold_rate=threshold_rate,
+        lookback_days=lookback_days,
+    )
+    generated_at = datetime.now()
+    if not rows:
+        return {
+            'success': True,
+            'inserted': 0,
+            'summary': _build_summary(
+                [],
+                threshold_rate=threshold_rate,
+                lookback_days=lookback_days,
+                source='stored',
+                generated_at=generated_at,
+            ),
+        }
+
+    columns = [
+        'generated_at', 'model_version', 'threshold_rate', 'lookback_days',
+        'base_asset', 'contract', 'strategy_tier', 'current_funding_rate_24h',
+        'previous_funding_rate_24h', 'funding_rate_change', 'current_bucket',
+        'current_bucket_label', 'sample_count', 'conditional_sample_count',
+        'high_negative_count', 'high_negative_frequency', 'negative_count',
+        'negative_frequency', 'min_funding_rate_24h', 'max_funding_rate_24h',
+        'avg_funding_rate_24h', 'p_next_1', 'p_next_2', 'p_next_3',
+        'base_p_next_1', 'base_p_next_2', 'base_p_next_3',
+        'conditional_p_next_1', 'conditional_p_next_2', 'conditional_p_next_3',
+        'confidence', 'last_history_time', 'last_high_negative_time',
+        'funding_next_apply', 'current_updated_at',
+    ]
+    sql = f"""
+        INSERT INTO mi_reverse_funding_prediction ({', '.join(columns)})
+        VALUES ({', '.join(['%s'] * len(columns))})
+    """
+    params = []
+    for row in rows:
+        params.append(tuple(
+            generated_at if col == 'generated_at'
+            else MODEL_VERSION if col == 'model_version'
+            else threshold_rate if col == 'threshold_rate'
+            else lookback_days if col == 'lookback_days'
+            else row.get(col)
+            for col in columns
+        ))
+
+    with db_manager.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany(sql, params)
+        conn.commit()
+
+    logger.info(
+        '反向Funding预测已刷新: generated_at=%s threshold=%s lookback=%s rows=%s',
+        generated_at.strftime('%Y-%m-%d %H:%M:%S'),
+        threshold_rate,
+        lookback_days,
+        len(rows),
+    )
+    return {
+        'success': True,
+        'inserted': len(rows),
+        'summary': _build_summary(
+            rows,
+            threshold_rate=threshold_rate,
+            lookback_days=lookback_days,
+            source='stored',
+            generated_at=generated_at,
+        ),
+    }
+
+
+def _latest_generated_at(threshold_rate: float, lookback_days: int) -> Optional[Any]:
+    ensure_reverse_funding_prediction_table()
+    sql = """
+        SELECT MAX(generated_at) AS generated_at
+        FROM mi_reverse_funding_prediction
+        WHERE threshold_rate = %s
+          AND lookback_days = %s
+          AND model_version = %s
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, (threshold_rate, lookback_days, MODEL_VERSION))
+        row = cursor.fetchone() or {}
+    return row.get('generated_at')
+
+
+def _load_stored_prediction_page(
+    *,
+    threshold_rate: float,
+    lookback_days: int,
+    keyword: str = '',
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> Dict[str, Any]:
+    generated_at = _latest_generated_at(threshold_rate, lookback_days)
+    if generated_at is None:
+        return {'rows': [], 'pagination': {'page': page, 'page_size': page_size, 'total': 0, 'total_pages': 1}}
+
+    where = """
+        generated_at = %s
+        AND threshold_rate = %s
+        AND lookback_days = %s
+        AND model_version = %s
+    """
+    params: List[Any] = [generated_at, threshold_rate, lookback_days, MODEL_VERSION]
+    if keyword:
+        where += " AND (base_asset LIKE %s OR contract LIKE %s)"
+        like = _like_keyword(keyword)
+        params.extend([like, like])
+
+    count_sql = f"SELECT COUNT(*) AS total FROM mi_reverse_funding_prediction WHERE {where}"
+    summary_sql = f"""
+        SELECT
+            COUNT(*) AS asset_count,
+            SUM(current_funding_rate_24h <= threshold_rate) AS current_high_negative_count,
+            MAX(last_history_time) AS latest_history_time,
+            AVG(p_next_1) AS avg_p_next_1,
+            AVG(p_next_2) AS avg_p_next_2,
+            AVG(p_next_3) AS avg_p_next_3
+        FROM mi_reverse_funding_prediction
+        WHERE {where}
+    """
+    data_sql = f"""
+        SELECT *
+        FROM mi_reverse_funding_prediction
+        WHERE {where}
+        ORDER BY p_next_3 DESC, p_next_2 DESC, p_next_1 DESC, high_negative_frequency DESC, base_asset ASC
+        LIMIT %s OFFSET %s
+    """
+    offset = (page - 1) * page_size
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(count_sql, params)
+        total = int((cursor.fetchone() or {}).get('total') or 0)
+        cursor.execute(summary_sql, params)
+        summary_row = cursor.fetchone() or {}
+        cursor.execute(data_sql, params + [page_size, offset])
+        page_rows = list(cursor.fetchall() or [])
+
+    summary = {
+        'asset_count': int(summary_row.get('asset_count') or 0),
+        'current_high_negative_count': int(summary_row.get('current_high_negative_count') or 0),
+        'threshold_rate': threshold_rate,
+        'lookback_days': lookback_days,
+        'latest_history_time': _serialize_dt(summary_row.get('latest_history_time')),
+        'generated_at': _serialize_dt(generated_at),
+        'model_version': MODEL_VERSION,
+        'source': 'stored',
+        'avg_p_next_1': _round_or_none(_as_float(summary_row.get('avg_p_next_1')), 6),
+        'avg_p_next_2': _round_or_none(_as_float(summary_row.get('avg_p_next_2')), 6),
+        'avg_p_next_3': _round_or_none(_as_float(summary_row.get('avg_p_next_3')), 6),
+    }
     return {
         'summary': summary,
+        'rows': [_serialize_prediction_row(row) for row in page_rows],
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total': total,
+            'total_pages': (total + page_size - 1) // page_size if page_size else 1,
+        },
+    }
+
+
+def _serialize_prediction_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in row.items():
+        if key in {'id'}:
+            continue
+        if isinstance(value, datetime):
+            out[key] = _serialize_dt(value)
+        elif hasattr(value, '__float__') and not isinstance(value, (str, bytes)):
+            try:
+                out[key] = float(value)
+            except Exception:
+                out[key] = value
+        else:
+            out[key] = value
+    return out
+
+
+def get_reverse_funding_prediction_page(
+    *,
+    threshold_rate: float = DEFAULT_THRESHOLD_RATE,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    keyword: str = '',
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    prefer_stored: bool = True,
+) -> Dict[str, Any]:
+    threshold_rate = _normalize_threshold_rate(threshold_rate)
+    lookback_days = _normalize_lookback_days(lookback_days)
+    page = max(int(page or 1), 1)
+    page_size = min(max(int(page_size or DEFAULT_PAGE_SIZE), 10), 5000)
+    keyword = str(keyword or '').strip().upper()
+
+    if prefer_stored:
+        try:
+            stored = _load_stored_prediction_page(
+                threshold_rate=threshold_rate,
+                lookback_days=lookback_days,
+                keyword=keyword,
+                page=page,
+                page_size=page_size,
+            )
+            if stored.get('pagination', {}).get('total', 0) > 0:
+                return stored
+        except Exception as e:
+            logger.warning(f'读取反向Funding预测落库结果失败，改用即时计算: {e}', exc_info=True)
+
+    rows = _compute_prediction_rows(
+        threshold_rate=threshold_rate,
+        lookback_days=lookback_days,
+        keyword=keyword,
+    )
+    total = len(rows)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_rows = rows[start:end]
+    return {
+        'summary': _build_summary(
+            rows,
+            threshold_rate=threshold_rate,
+            lookback_days=lookback_days,
+            source='live',
+        ),
         'rows': page_rows,
         'pagination': {
             'page': page,

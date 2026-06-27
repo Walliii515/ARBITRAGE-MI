@@ -229,6 +229,33 @@ def _run_daily_vwap_analysis():
         logger.error(f'每日VWAP基差分位阈值计算失败: {e}', exc_info=True)
 
 
+def _run_daily_reverse_funding_prediction():
+    """
+    反向策略高负 Funding 概率预测 - 每日批量统计
+
+    数据源：mi_gate_future_his_funding_rates + mi_gate_future_contracts
+    目标表：mi_reverse_funding_prediction
+    更新策略：追加一版 generated_at 快照，页面默认读取最新一版
+    用途：为提前借币观察提供未来 1/2/3 期高负资金费概率排序
+    """
+    from calc.reverse_funding_predictor import refresh_reverse_funding_predictions
+
+    task_cfg = _etl_config.get('tasks', {}).get('daily_reverse_funding_prediction', {})
+    threshold_rate = float(task_cfg.get('threshold_rate', -0.01))
+    lookback_days = int(task_cfg.get('lookback_days', 30))
+    logger.info(
+        f'开始每日反向Funding预测计算 (threshold={threshold_rate}, lookback={lookback_days})'
+    )
+    try:
+        result = refresh_reverse_funding_predictions(
+            threshold_rate=threshold_rate,
+            lookback_days=lookback_days,
+        )
+        logger.info(f"每日反向Funding预测完成，写入 {result.get('inserted', 0)} 条")
+    except Exception as e:
+        logger.error(f'每日反向Funding预测失败: {e}', exc_info=True)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 任务注册表
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -311,6 +338,15 @@ ETL_TASKS: List[ETLTask] = [
             _etl_config.get('tasks', {}).get('daily_vwap_threshold', {}).get('enabled', True)
             and _is_vwap_threshold_update_enabled()
         ),
+    ),
+    ETLTask(
+        name='daily_reverse_funding_prediction',
+        description='反向高负Funding概率预测每日统计 → mi_reverse_funding_prediction（追加快照）',
+        runner=_run_daily_reverse_funding_prediction,
+        schedule='daily',
+        daily_hour=_etl_config.get('tasks', {}).get('daily_reverse_funding_prediction', {}).get('daily_hour', 0),
+        daily_minute=_etl_config.get('tasks', {}).get('daily_reverse_funding_prediction', {}).get('daily_minute', 20),
+        enabled=_etl_config.get('tasks', {}).get('daily_reverse_funding_prediction', {}).get('enabled', True),
     ),
 ]
 

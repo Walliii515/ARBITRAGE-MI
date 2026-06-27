@@ -14,6 +14,9 @@ interface PredictionSummary {
   threshold_rate?: number
   lookback_days?: number
   latest_history_time?: string | null
+  generated_at?: string | null
+  model_version?: string | null
+  source?: string | null
   avg_p_next_1?: number | null
   avg_p_next_2?: number | null
   avg_p_next_3?: number | null
@@ -22,6 +25,7 @@ interface PredictionSummary {
 interface PredictionRow {
   base_asset: string
   contract: string
+  strategy_tier?: string | null
   current_funding_rate_24h?: number | null
   previous_funding_rate_24h?: number | null
   funding_rate_change?: number | null
@@ -75,6 +79,7 @@ void gridContainerRef
 const rowData = shallowRef<PredictionRow[]>([])
 const summary = ref<PredictionSummary>({})
 const loading = ref(false)
+const recomputing = ref(false)
 const keyword = ref('')
 const thresholdPct = ref(-1)
 const lookbackDays = ref(30)
@@ -99,6 +104,12 @@ const summaryItems = computed(() => [
   { label: '平均P2', value: formatProbability(summary.value.avg_p_next_2), tone: 'info' },
   { label: '平均P3', value: formatProbability(summary.value.avg_p_next_3), tone: 'info' },
 ])
+
+const sourceLabel = computed(() => {
+  if (summary.value.source === 'stored') return '落库模型'
+  if (summary.value.source === 'live') return '即时计算'
+  return '--'
+})
 
 const defaultColDef: ColDef<PredictionRow> = {
   sortable: true,
@@ -148,6 +159,7 @@ function probabilityCellClass(params: ValueFormatterParams<PredictionRow>) {
 const columnDefs = ref<ColDef<PredictionRow>[]>([
   { field: 'base_asset', headerName: '标的资产', width: 100, pinned: 'left' },
   { field: 'contract', headerName: '合约', width: 120 },
+  { field: 'strategy_tier', headerName: '分层', width: 80 },
   {
     field: 'current_funding_rate_24h',
     headerName: '当前24h资金费',
@@ -305,6 +317,7 @@ async function fetchPredictions(resetPage = false) {
     params.set('lookback_days', String(lookbackDays.value))
     params.set('page', String(paginationCurrentPage.value))
     params.set('page_size', String(paginationPageSize.value))
+    params.set('prefer_stored', 'true')
     if (keyword.value.trim()) params.set('keyword', keyword.value.trim())
     const res = await get(`/api/reverse-funding/predictions?${params.toString()}`)
     const data: PredictionPayload = await res.json()
@@ -320,6 +333,28 @@ async function fetchPredictions(resetPage = false) {
     showError('获取Funding预测失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function recomputePredictions() {
+  if (recomputing.value) return
+  recomputing.value = true
+  try {
+    const params = new URLSearchParams()
+    params.set('threshold', String(thresholdPct.value / 100))
+    params.set('lookback_days', String(lookbackDays.value))
+    const res = await post(`/api/reverse-funding/predictions/refresh?${params.toString()}`)
+    const data = await res.json()
+    if (!res.ok || data?.success === false) {
+      showError(data?.message || '重算模型失败')
+      return
+    }
+    showSuccess(`模型已重算，写入 ${data?.inserted ?? 0} 条`)
+    await fetchPredictions(true)
+  } catch {
+    showError('重算模型失败')
+  } finally {
+    recomputing.value = false
   }
 }
 
@@ -382,6 +417,14 @@ onUnmounted(() => {
           <span class="summary-value">{{ summary.latest_history_time || '--' }}</span>
         </span>
         <span class="summary-item">
+          <span class="summary-label">模型更新</span>
+          <span class="summary-value">{{ summary.generated_at || '--' }}</span>
+        </span>
+        <span class="summary-item">
+          <span class="summary-label">模型来源</span>
+          <span class="summary-value">{{ sourceLabel }}</span>
+        </span>
+        <span class="summary-item">
           <span class="summary-label">页面刷新</span>
           <span class="summary-value">{{ lastLoadedAt }}</span>
         </span>
@@ -437,6 +480,9 @@ onUnmounted(() => {
         </el-select>
         <el-button size="small" type="primary" :loading="loading" :icon="Refresh" @click="fetchPredictions(true)">
           刷新
+        </el-button>
+        <el-button size="small" :loading="recomputing" @click="recomputePredictions">
+          重算模型
         </el-button>
       </div>
     </el-card>
