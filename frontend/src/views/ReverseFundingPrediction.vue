@@ -20,12 +20,29 @@ interface PredictionSummary {
   avg_p_next_1?: number | null
   avg_p_next_2?: number | null
   avg_p_next_3?: number | null
+  filter_steps?: FilterStep[]
+  filter_options?: Record<string, unknown>
 }
 
 interface PredictionRow {
   base_asset: string
   contract: string
   strategy_tier?: string | null
+  expected_funding_bps?: number | null
+  borrowable?: number | boolean | null
+  borrow_capacity_usdt?: number | null
+  borrow_hourly_rate?: number | null
+  borrow_24h_bps?: number | null
+  max_borrowable_amount?: number | null
+  borrow_snapshot_time?: string | null
+  probability_filter_pass?: boolean | null
+  confidence_filter_pass?: boolean | null
+  negative_funding_filter_pass?: boolean | null
+  borrowable_filter_pass?: boolean | null
+  capacity_filter_pass?: boolean | null
+  borrow_cost_filter_pass?: boolean | null
+  preborrow_filter_pass?: boolean | null
+  preborrow_filter_reason?: string | null
   current_funding_rate_24h?: number | null
   previous_funding_rate_24h?: number | null
   funding_rate_change?: number | null
@@ -66,6 +83,13 @@ interface PredictionPayload {
   }
 }
 
+interface FilterStep {
+  key: string
+  label: string
+  enabled: boolean
+  count: number
+}
+
 interface ColumnVisibility {
   colId: string
   headerName: string
@@ -83,6 +107,17 @@ const recomputing = ref(false)
 const keyword = ref('')
 const thresholdPct = ref(-0.6)
 const lookbackDays = ref(30)
+const probabilityFilter = ref(false)
+const minPNext2Pct = ref(20)
+const minPNext3Pct = ref(25)
+const confidenceFilter = ref(false)
+const minConfidencePct = ref(50)
+const negativeFundingFilter = ref(false)
+const borrowableFilter = ref(false)
+const capacityFilter = ref(false)
+const minBorrowCapacityUsdt = ref(100)
+const borrowCostFilter = ref(false)
+const maxBorrowCostRatio = ref(1)
 const autoRefresh = ref(true)
 const refreshIntervalSec = ref(300)
 const lastLoadedAt = ref('--')
@@ -104,6 +139,8 @@ const summaryItems = computed(() => [
   { label: '平均P2', value: formatProbability(summary.value.avg_p_next_2), tone: 'info' },
   { label: '平均P3', value: formatProbability(summary.value.avg_p_next_3), tone: 'info' },
 ])
+
+const filterSteps = computed(() => summary.value.filter_steps ?? [])
 
 const sourceLabel = computed(() => {
   if (summary.value.source === 'stored') return '落库模型'
@@ -135,9 +172,28 @@ function formatDecimal(value: unknown, digits = 2): string {
   return Number.isFinite(n) ? n.toFixed(digits) : ''
 }
 
+function formatBps(value: unknown): string {
+  const n = Number(value)
+  return Number.isFinite(n) ? `${n.toFixed(2)} bps` : ''
+}
+
+function formatUsdt(value: unknown): string {
+  const n = Number(value)
+  return Number.isFinite(n) ? `${n.toFixed(2)} U` : ''
+}
+
+function formatBool(value: unknown): string {
+  if (value === true || value === 1) return '是'
+  if (value === false || value === 0) return '否'
+  return ''
+}
+
 const probabilityFormatter = (params: ValueFormatterParams<PredictionRow>) => formatProbability(params.value)
 const fundingFormatter = (params: ValueFormatterParams<PredictionRow>) => formatFunding(params.value)
 const numberFormatter = (params: ValueFormatterParams<PredictionRow>) => formatDecimal(params.value, 0)
+const bpsFormatter = (params: ValueFormatterParams<PredictionRow>) => formatBps(params.value)
+const usdtFormatter = (params: ValueFormatterParams<PredictionRow>) => formatUsdt(params.value)
+const boolFormatter = (params: ValueFormatterParams<PredictionRow>) => formatBool(params.value)
 
 function fundingCellClass(params: ValueFormatterParams<PredictionRow>) {
   const n = Number(params.value)
@@ -156,10 +212,29 @@ function probabilityCellClass(params: ValueFormatterParams<PredictionRow>) {
   return ''
 }
 
+function passCellClass(params: ValueFormatterParams<PredictionRow>) {
+  if (params.value === true || params.value === 1) return 'value-positive'
+  if (params.value === false || params.value === 0) return 'value-negative'
+  return ''
+}
+
 const columnDefs = ref<ColDef<PredictionRow>[]>([
   { field: 'base_asset', headerName: '标的资产', width: 100, pinned: 'left' },
   { field: 'contract', headerName: '合约', width: 120 },
   { field: 'strategy_tier', headerName: '分层', width: 80 },
+  {
+    field: 'preborrow_filter_pass',
+    headerName: '候选通过',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
+    field: 'preborrow_filter_reason',
+    headerName: '过滤逻辑',
+    width: 360,
+    tooltipField: 'preborrow_filter_reason',
+  },
   {
     field: 'current_funding_rate_24h',
     headerName: '当前24h资金费',
@@ -245,6 +320,70 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     valueFormatter: probabilityFormatter,
   },
   {
+    field: 'expected_funding_bps',
+    headerName: '预期Funding',
+    width: 115,
+    type: 'numericColumn',
+    valueFormatter: bpsFormatter,
+    cellClass: probabilityCellClass,
+  },
+  {
+    field: 'borrow_24h_bps',
+    headerName: '借币24h成本',
+    width: 120,
+    type: 'numericColumn',
+    valueFormatter: bpsFormatter,
+  },
+  {
+    field: 'borrow_capacity_usdt',
+    headerName: '可借额度',
+    width: 105,
+    type: 'numericColumn',
+    valueFormatter: usdtFormatter,
+  },
+  {
+    field: 'borrowable',
+    headerName: '当前可借',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
+    field: 'probability_filter_pass',
+    headerName: '概率通过',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
+    field: 'confidence_filter_pass',
+    headerName: '置信通过',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
+    field: 'negative_funding_filter_pass',
+    headerName: '负费率通过',
+    width: 105,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
+    field: 'capacity_filter_pass',
+    headerName: '额度通过',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
+    field: 'borrow_cost_filter_pass',
+    headerName: '成本通过',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
+  },
+  {
     field: 'sample_count',
     headerName: '样本数',
     width: 90,
@@ -260,6 +399,7 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
   },
   { field: 'last_high_negative_time', headerName: '最近高负时间', width: 160 },
   { field: 'funding_next_apply', headerName: '下次支付时间', width: 160 },
+  { field: 'borrow_snapshot_time', headerName: '借币更新时间', width: 160 },
   { field: 'last_history_time', headerName: '历史更新时间', width: 160 },
 ])
 
@@ -318,6 +458,17 @@ async function fetchPredictions(resetPage = false) {
     params.set('page', String(paginationCurrentPage.value))
     params.set('page_size', String(paginationPageSize.value))
     params.set('prefer_stored', 'true')
+    params.set('probability_filter', String(probabilityFilter.value))
+    params.set('min_p_next_2', String(minPNext2Pct.value / 100))
+    params.set('min_p_next_3', String(minPNext3Pct.value / 100))
+    params.set('confidence_filter', String(confidenceFilter.value))
+    params.set('min_confidence', String(minConfidencePct.value / 100))
+    params.set('negative_funding_filter', String(negativeFundingFilter.value))
+    params.set('borrowable_filter', String(borrowableFilter.value))
+    params.set('capacity_filter', String(capacityFilter.value))
+    params.set('min_borrow_capacity_usdt', String(minBorrowCapacityUsdt.value))
+    params.set('borrow_cost_filter', String(borrowCostFilter.value))
+    params.set('max_borrow_cost_ratio', String(maxBorrowCostRatio.value))
     if (keyword.value.trim()) params.set('keyword', keyword.value.trim())
     const res = await get(`/api/reverse-funding/predictions?${params.toString()}`)
     const data: PredictionPayload = await res.json()
@@ -485,6 +636,114 @@ onUnmounted(() => {
           重算模型
         </el-button>
       </div>
+      <div class="filter-row rule-row">
+        <el-switch
+          v-model="probabilityFilter"
+          inline-prompt
+          active-text="概率"
+          inactive-text="概率"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">P2≥</span>
+        <el-input-number
+          v-model="minPNext2Pct"
+          size="small"
+          :min="0"
+          :max="100"
+          :step="1"
+          :precision="0"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">P3≥</span>
+        <el-input-number
+          v-model="minPNext3Pct"
+          size="small"
+          :min="0"
+          :max="100"
+          :step="1"
+          :precision="0"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+        <el-switch
+          v-model="confidenceFilter"
+          inline-prompt
+          active-text="置信"
+          inactive-text="置信"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">≥</span>
+        <el-input-number
+          v-model="minConfidencePct"
+          size="small"
+          :min="0"
+          :max="100"
+          :step="5"
+          :precision="0"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+        <el-switch
+          v-model="negativeFundingFilter"
+          inline-prompt
+          active-text="负费率"
+          inactive-text="负费率"
+          @change="applyFilterChange"
+        />
+        <el-switch
+          v-model="borrowableFilter"
+          inline-prompt
+          active-text="可借"
+          inactive-text="可借"
+          @change="applyFilterChange"
+        />
+        <el-switch
+          v-model="capacityFilter"
+          inline-prompt
+          active-text="额度"
+          inactive-text="额度"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">≥</span>
+        <el-input-number
+          v-model="minBorrowCapacityUsdt"
+          size="small"
+          :min="0"
+          :step="10"
+          :precision="0"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+        <el-switch
+          v-model="borrowCostFilter"
+          inline-prompt
+          active-text="成本"
+          inactive-text="成本"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">≤预期×</span>
+        <el-input-number
+          v-model="maxBorrowCostRatio"
+          size="small"
+          :min="0"
+          :max="10"
+          :step="0.1"
+          :precision="1"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+      </div>
+      <div v-if="filterSteps.length" class="filter-steps">
+        <span
+          v-for="step in filterSteps"
+          :key="step.key"
+          class="filter-step"
+          :class="{ disabled: !step.enabled && step.key !== 'all' }"
+        >
+          {{ step.label }} {{ step.count }}
+        </span>
+      </div>
     </el-card>
 
     <el-card shadow="never" class="grid-card">
@@ -581,6 +840,36 @@ onUnmounted(() => {
 .filter-row {
   flex-wrap: wrap;
   gap: 12px;
+}
+
+.rule-row {
+  margin-top: 10px;
+  gap: 8px;
+}
+
+.rule-row :deep(.el-input-number) {
+  width: 92px;
+}
+
+.filter-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.filter-step {
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  color: var(--app-text);
+  font-size: 12px;
+  line-height: 24px;
+  padding: 0 8px;
+}
+
+.filter-step.disabled {
+  color: var(--app-text-muted);
+  opacity: 0.65;
 }
 
 .summary-item {

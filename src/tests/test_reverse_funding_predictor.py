@@ -67,8 +67,54 @@ def test_compute_prediction_rows_uses_orderbook_universe(monkeypatch):
     monkeypatch.setattr(predictor, '_load_current_contracts', lambda: {})
     monkeypatch.setattr(predictor, '_load_funding_history', lambda lookback_days: history_rows)
     monkeypatch.setattr(predictor, '_load_prediction_universe', lambda: {'ABC': 'B'})
+    monkeypatch.setattr(predictor, '_load_latest_borrow_meta', lambda: {})
 
     rows = predictor._compute_prediction_rows(threshold_rate=-0.01, lookback_days=30)
 
     assert [row['base_asset'] for row in rows] == ['ABC']
     assert rows[0]['strategy_tier'] == 'B'
+
+
+def test_apply_prediction_filters_tracks_step_counts():
+    rows = [
+        {
+            'base_asset': 'AAA',
+            'p_next_2': 0.30,
+            'p_next_3': 0.40,
+            'confidence': 0.70,
+            'current_funding_rate_24h': -0.002,
+            'borrowable': 1,
+            'borrow_capacity_usdt': 120,
+            'borrow_24h_bps': 5,
+            'expected_funding_bps': 10,
+        },
+        {
+            'base_asset': 'BBB',
+            'p_next_2': 0.10,
+            'p_next_3': 0.12,
+            'confidence': 0.80,
+            'current_funding_rate_24h': -0.003,
+            'borrowable': 1,
+            'borrow_capacity_usdt': 120,
+            'borrow_24h_bps': 5,
+            'expected_funding_bps': 10,
+        },
+    ]
+
+    filtered, steps, opts = predictor._apply_prediction_filters(
+        rows,
+        {
+            'probability_enabled': True,
+            'confidence_enabled': True,
+            'negative_funding_enabled': True,
+            'borrowable_enabled': True,
+            'capacity_enabled': True,
+            'borrow_cost_enabled': True,
+            'min_borrow_capacity_usdt': 100,
+        },
+    )
+
+    assert [row['base_asset'] for row in filtered] == ['AAA']
+    assert [step['count'] for step in steps] == [2, 1, 1, 1, 1, 1, 1]
+    assert opts['min_p_next_2'] == predictor.DEFAULT_MIN_P_NEXT_2
+    assert filtered[0]['preborrow_filter_pass'] is True

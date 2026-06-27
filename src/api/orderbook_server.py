@@ -1271,6 +1271,17 @@ async def reverse_funding_predictions(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=10, le=5000),
     prefer_stored: bool = Query(True),
+    probability_filter: bool = Query(False),
+    min_p_next_2: float = Query(0.20, ge=0.0, le=1.0),
+    min_p_next_3: float = Query(0.25, ge=0.0, le=1.0),
+    confidence_filter: bool = Query(False),
+    min_confidence: float = Query(0.50, ge=0.0, le=1.0),
+    negative_funding_filter: bool = Query(False),
+    borrowable_filter: bool = Query(False),
+    capacity_filter: bool = Query(False),
+    min_borrow_capacity_usdt: float = Query(100.0, ge=0.0),
+    borrow_cost_filter: bool = Query(False),
+    max_borrow_cost_ratio: float = Query(1.0, ge=0.0, le=10.0),
 ):
     return await asyncio.to_thread(
         lambda: get_reverse_funding_prediction_page(
@@ -1280,6 +1291,19 @@ async def reverse_funding_predictions(
             page=page,
             page_size=page_size,
             prefer_stored=prefer_stored,
+            filter_options={
+                'probability_enabled': probability_filter,
+                'min_p_next_2': min_p_next_2,
+                'min_p_next_3': min_p_next_3,
+                'confidence_enabled': confidence_filter,
+                'min_confidence': min_confidence,
+                'negative_funding_enabled': negative_funding_filter,
+                'borrowable_enabled': borrowable_filter,
+                'capacity_enabled': capacity_filter,
+                'min_borrow_capacity_usdt': min_borrow_capacity_usdt,
+                'borrow_cost_enabled': borrow_cost_filter,
+                'max_borrow_cost_ratio': max_borrow_cost_ratio,
+            },
         )
     )
 
