@@ -16,7 +16,7 @@ from common.database import db_manager
 from common.logger import get_logger
 
 
-DEFAULT_THRESHOLD_RATE = -0.01
+DEFAULT_THRESHOLD_RATE = -0.006
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_PAGE_SIZE = 100
 MIN_CONDITIONAL_SAMPLES = 20

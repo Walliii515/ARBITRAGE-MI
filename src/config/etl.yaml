@@ -124,5 +124,5 @@ tasks:
     schedule: daily
     daily_hour: 0
     daily_minute: 20
-    threshold_rate: -0.01
+    threshold_rate: -0.006
     lookback_days: 30

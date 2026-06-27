@@ -1265,7 +1265,7 @@ async def reverse_research_collect():
 
 @app.get('/api/reverse-funding/predictions', dependencies=[Depends(verify_token_dependency)])
 async def reverse_funding_predictions(
-    threshold: float = Query(-0.01, ge=-1.0, le=0.0),
+    threshold: float = Query(-0.006, ge=-1.0, le=0.0),
     lookback_days: int = Query(30, ge=3, le=90),
     keyword: str = Query('', max_length=64),
     page: int = Query(1, ge=1),
@@ -1286,7 +1286,7 @@ async def reverse_funding_predictions(
 
 @app.post('/api/reverse-funding/predictions/refresh', dependencies=[Depends(verify_token_dependency)])
 async def reverse_funding_predictions_refresh(
-    threshold: float = Query(-0.01, ge=-1.0, le=0.0),
+    threshold: float = Query(-0.006, ge=-1.0, le=0.0),
     lookback_days: int = Query(30, ge=3, le=90),
 ):
     return await asyncio.to_thread(
