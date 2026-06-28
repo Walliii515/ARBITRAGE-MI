@@ -1595,6 +1595,51 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertEqual(row.get('_entry_high_basis_amount_usdt'), te.open_amount_usdt * 0.5)
         self.assertIn('高基差通道', row.get('_open_channel_reason', ''))
 
+    def test_open_reason_starts_with_funding_channel_label(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=10.0,
+            min_funding_support_bps=8.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+        )
+        row = self._row('ALLO', 70.0, 0.0010)
+        row.update({
+            'funding_rate_24h_avg_bps': 8.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+        reason = te._build_open_reason(row, 'ALLO', 70.0)
+
+        self.assertTrue(reason.startswith('开仓通道(funding)|'))
+
+    def test_open_reason_starts_with_high_basis_channel_label(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            funding_support_min_samples=2,
+            high_basis_enabled=True,
+            high_basis_min_funding_24h_bps=3.0,
+            high_basis_min_entry_buffer_bps=25.0,
+            high_basis_min_net_edge_bps=20.0,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        row = self._row('ALLO', 70.0, 0.0003)
+        row.update({
+            'funding_rate_24h_avg_bps': 2.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+        reason = te._build_open_reason(row, 'ALLO', 70.0)
+
+        self.assertTrue(reason.startswith('开仓通道(高基差)|'))
+
     def test_high_basis_channel_rejects_when_net_convergence_edge_is_small(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,

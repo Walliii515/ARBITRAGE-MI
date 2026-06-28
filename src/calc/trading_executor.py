@@ -2968,12 +2968,22 @@ class TradingExecutor:
 
         return '风控条件变化'
 
+    def _open_channel_reason_label(self, row: Dict, base_asset: str) -> str:
+        state = self._peak_state.get(base_asset) or {}
+        if state.get('entry_channel') == 'high_basis' or row.get('_high_basis_channel'):
+            return '开仓通道(高基差)'
+        if state.get('trigger') == 'funding_carry' or row.get('_funding_carry_candidate'):
+            return '开仓通道(FundingCarry)'
+        if state.get('entry_channel') == 'funding' or row.get('_open_channel') == 'funding':
+            return '开仓通道(funding)'
+        return '开仓通道(其他)'
+
     def _build_open_reason(self, row: Dict, base_asset: str, open_vwap_basis: float) -> str:
         """
         构建开仓原因字符串，记录关键决策参数，便于复盘。
         格式: "基差{bps}(entry_floor={floor},p20={p20})|carry(...)|费率|峰值|门槛|量"
         """
-        parts = []
+        parts = [self._open_channel_reason_label(row, base_asset)]
 
         # 1. VWAP基差 vs funding-adjusted entry floor
         entry_snapshot = dict(self._state_entry_snapshot(base_asset, row, open_vwap_basis))
