@@ -17,9 +17,6 @@ interface PredictionSummary {
   generated_at?: string | null
   model_version?: string | null
   source?: string | null
-  avg_p_next_1?: number | null
-  avg_p_next_2?: number | null
-  avg_p_next_3?: number | null
   avg_follow_score?: number | null
   avg_borrow_pressure_score?: number | null
   follow_candidate_count?: number
@@ -57,7 +54,6 @@ interface PredictionRow {
   borrow_capacity_change_12h_usdt?: number | null
   borrow_capacity_24h_high_usdt?: number | null
   borrow_capacity_drawdown_24h_pct?: number | null
-  borrow_capacity_to_24h_high_pct?: number | null
   borrow_availability_1h_pct?: number | null
   borrow_availability_4h_pct?: number | null
   borrow_availability_12h_pct?: number | null
@@ -84,22 +80,9 @@ interface PredictionRow {
   conditional_sample_count?: number | null
   high_negative_count?: number | null
   high_negative_frequency?: number | null
-  negative_count?: number | null
-  negative_frequency?: number | null
-  min_funding_rate_24h?: number | null
   avg_funding_rate_24h?: number | null
-  p_next_1?: number | null
-  p_next_2?: number | null
-  p_next_3?: number | null
-  base_p_next_1?: number | null
-  base_p_next_2?: number | null
-  base_p_next_3?: number | null
-  conditional_p_next_1?: number | null
-  conditional_p_next_2?: number | null
-  conditional_p_next_3?: number | null
   confidence?: number | null
   last_history_time?: string | null
-  last_high_negative_time?: string | null
   funding_next_apply?: string | null
   current_updated_at?: string | null
 }
@@ -193,11 +176,6 @@ const defaultColDef: ColDef<PredictionRow> = {
   enableValue: false,
 }
 
-function formatProbability(value: unknown): string {
-  const n = Number(value)
-  return Number.isFinite(n) ? `${(n * 100).toFixed(1)}%` : ''
-}
-
 function formatFunding(value: unknown): string {
   const n = Number(value)
   return Number.isFinite(n) ? `${(n * 100).toFixed(4)}%` : ''
@@ -229,7 +207,6 @@ function formatBool(value: unknown): string {
   return ''
 }
 
-const probabilityFormatter = (params: ValueFormatterParams<PredictionRow>) => formatProbability(params.value)
 const fundingFormatter = (params: ValueFormatterParams<PredictionRow>) => formatFunding(params.value)
 const numberFormatter = (params: ValueFormatterParams<PredictionRow>) => formatDecimal(params.value, 0)
 const bpsFormatter = (params: ValueFormatterParams<PredictionRow>) => formatBps(params.value)
@@ -243,15 +220,6 @@ function fundingCellClass(params: ValueFormatterParams<PredictionRow>) {
   if (n <= thresholdPct.value / 100) return 'value-danger'
   if (n < 0) return 'value-negative'
   return 'value-positive'
-}
-
-function probabilityCellClass(params: ValueFormatterParams<PredictionRow>) {
-  const n = Number(params.value)
-  if (!Number.isFinite(n)) return ''
-  if (n >= 0.5) return 'value-danger'
-  if (n >= 0.2) return 'value-warning'
-  if (n > 0) return 'value-info'
-  return ''
 }
 
 function scoreCellClass(params: ValueFormatterParams<PredictionRow>) {
@@ -381,13 +349,6 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     cellClass: dropCellClass,
   },
   {
-    field: 'borrow_capacity_to_24h_high_pct',
-    headerName: '当前/高点',
-    width: 105,
-    type: 'numericColumn',
-    valueFormatter: percentValueFormatter,
-  },
-  {
     field: 'borrow_availability_4h_pct',
     headerName: '4h可借占比',
     width: 115,
@@ -409,19 +370,12 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     valueFormatter: numberFormatter,
   },
   {
-    field: 'min_funding_rate_24h',
-    headerName: '历史最低24h',
-    width: 120,
-    valueFormatter: fundingFormatter,
-    cellClass: fundingCellClass,
-  },
-  {
     field: 'expected_funding_bps',
     headerName: '当前预期Funding',
     width: 135,
     type: 'numericColumn',
     valueFormatter: bpsFormatter,
-    cellClass: probabilityCellClass,
+    cellClass: scoreCellClass,
   },
   {
     field: 'borrow_24h_bps',
@@ -431,27 +385,11 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     valueFormatter: bpsFormatter,
   },
   {
-    field: 'p_next_3',
-    headerName: 'P3高负参考',
-    width: 115,
-    type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
-    cellClass: probabilityCellClass,
-  },
-  {
-    field: 'negative_frequency',
-    headerName: '负费率频率',
-    width: 115,
-    type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
-  },
-  {
     field: 'preborrow_filter_reason',
     headerName: '过滤逻辑',
     width: 360,
     tooltipField: 'preborrow_filter_reason',
   },
-  { field: 'last_high_negative_time', headerName: '最近高负时间', width: 160 },
   { field: 'funding_next_apply', headerName: '下次支付时间', width: 160 },
   { field: 'borrow_snapshot_time', headerName: '借币更新时间', width: 160 },
 ])
