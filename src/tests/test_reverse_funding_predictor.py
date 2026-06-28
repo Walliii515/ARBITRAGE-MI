@@ -58,8 +58,12 @@ def test_attach_follow_metrics_scores_objective_follow_signal():
 
     assert row['funding_change_4h_bps'] == pytest.approx(-60)
     assert row['borrow_capacity_drop_4h_pct'] == pytest.approx(70)
+    assert row['borrow_capacity_drop_4h_usdt'] == pytest.approx(700)
+    assert row['borrow_capacity_drawdown_24h_pct'] == pytest.approx(70)
+    assert row['borrow_pressure_score'] > 50
     assert row['follow_score'] > 50
     assert '资金费下行' in row['follow_reason']
+    assert '额度压力' in row['follow_reason']
 
 
 def test_predict_high_negative_funding_filters_asset(monkeypatch):
@@ -113,6 +117,10 @@ def test_apply_prediction_filters_tracks_step_counts():
             'funding_change_4h_bps': -12,
             'funding_change_12h_bps': -20,
             'borrow_capacity_drop_max_pct': 35,
+            'borrow_pressure_score': 25,
+            'borrow_capacity_drawdown_24h_pct': 3,
+            'borrow_capacity_drop_4h_usdt': 8,
+            'borrow_capacity_change_1h_usdt': -2,
             'high_negative_count': 2,
             'current_funding_rate_24h': -0.002,
             'borrowable': 1,
@@ -127,6 +135,10 @@ def test_apply_prediction_filters_tracks_step_counts():
             'funding_change_4h_bps': -2,
             'funding_change_12h_bps': -3,
             'borrow_capacity_drop_max_pct': 5,
+            'borrow_pressure_score': 3,
+            'borrow_capacity_drawdown_24h_pct': 0.5,
+            'borrow_capacity_drop_4h_usdt': 1,
+            'borrow_capacity_change_1h_usdt': 1,
             'high_negative_count': 0,
             'current_funding_rate_24h': -0.003,
             'borrowable': 1,
@@ -146,6 +158,9 @@ def test_apply_prediction_filters_tracks_step_counts():
             'borrowable_enabled': True,
             'borrow_cost_enabled': True,
             'min_borrow_capacity_usdt': 100,
+            'min_borrow_pressure_score': 12,
+            'min_capacity_drawdown_pct': 2,
+            'min_capacity_drop_usdt': 5,
         },
     )
 

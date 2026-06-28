@@ -21,6 +21,7 @@ interface PredictionSummary {
   avg_p_next_2?: number | null
   avg_p_next_3?: number | null
   avg_follow_score?: number | null
+  avg_borrow_pressure_score?: number | null
   follow_candidate_count?: number
   borrow_drop_count?: number
   funding_down_count?: number
@@ -48,6 +49,20 @@ interface PredictionRow {
   borrow_capacity_drop_4h_pct?: number | null
   borrow_capacity_drop_12h_pct?: number | null
   borrow_capacity_drop_max_pct?: number | null
+  borrow_capacity_drop_1h_usdt?: number | null
+  borrow_capacity_drop_4h_usdt?: number | null
+  borrow_capacity_drop_12h_usdt?: number | null
+  borrow_capacity_change_1h_usdt?: number | null
+  borrow_capacity_change_4h_usdt?: number | null
+  borrow_capacity_change_12h_usdt?: number | null
+  borrow_capacity_24h_high_usdt?: number | null
+  borrow_capacity_drawdown_24h_pct?: number | null
+  borrow_capacity_to_24h_high_pct?: number | null
+  borrow_availability_1h_pct?: number | null
+  borrow_availability_4h_pct?: number | null
+  borrow_availability_12h_pct?: number | null
+  borrow_pressure_score?: number | null
+  borrow_pressure_filter_pass?: boolean | null
   follow_score_filter_pass?: boolean | null
   funding_down_filter_pass?: boolean | null
   borrow_drop_filter_pass?: boolean | null
@@ -129,7 +144,9 @@ const minFollowScore = ref(50)
 const fundingDownFilter = ref(false)
 const minFundingDropBps = ref(5)
 const borrowDropFilter = ref(false)
-const minBorrowDropPct = ref(20)
+const minBorrowPressureScore = ref(12)
+const minCapacityDrawdownPct = ref(2)
+const minCapacityDropUsdt = ref(5)
 const historyHighNegativeFilter = ref(false)
 const borrowableFilter = ref(false)
 const minBorrowCapacityUsdt = ref(100)
@@ -153,9 +170,10 @@ const summaryItems = computed(() => [
   { label: '观察标的', value: summary.value.asset_count ?? 0, tone: '' },
   { label: '跟随候选', value: summary.value.follow_candidate_count ?? 0, tone: 'danger' },
   { label: '资金费下行', value: summary.value.funding_down_count ?? 0, tone: 'info' },
-  { label: '额度下降', value: summary.value.borrow_drop_count ?? 0, tone: 'warning' },
+  { label: '额度压力', value: summary.value.borrow_drop_count ?? 0, tone: 'warning' },
   { label: '当前高负', value: summary.value.current_high_negative_count ?? 0, tone: 'danger' },
   { label: '平均跟随分', value: formatDecimal(summary.value.avg_follow_score, 1), tone: 'info' },
+  { label: '平均压力分', value: formatDecimal(summary.value.avg_borrow_pressure_score, 1), tone: 'info' },
 ])
 
 const filterSteps = computed(() => summary.value.filter_steps ?? [])
@@ -248,8 +266,16 @@ function scoreCellClass(params: ValueFormatterParams<PredictionRow>) {
 function dropCellClass(params: ValueFormatterParams<PredictionRow>) {
   const n = Number(params.value)
   if (!Number.isFinite(n) || n <= 0) return ''
-  if (n >= 50) return 'value-danger'
-  if (n >= 20) return 'value-warning'
+  if (n >= 5) return 'value-danger'
+  if (n >= 2) return 'value-warning'
+  return 'value-info'
+}
+
+function usdtDropCellClass(params: ValueFormatterParams<PredictionRow>) {
+  const n = Number(params.value)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  if (n >= 20) return 'value-danger'
+  if (n >= 5) return 'value-warning'
   return 'value-info'
 }
 
@@ -324,28 +350,49 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     valueFormatter: usdtFormatter,
   },
   {
-    field: 'borrow_capacity_drop_1h_pct',
-    headerName: '额度1h下降',
+    field: 'borrow_pressure_score',
+    headerName: '额度压力分',
     width: 115,
+    type: 'numericColumn',
+    valueFormatter: (params) => formatDecimal(params.value, 1),
+    cellClass: scoreCellClass,
+  },
+  {
+    field: 'borrow_capacity_drop_4h_usdt',
+    headerName: '4h下降U',
+    width: 105,
+    type: 'numericColumn',
+    valueFormatter: usdtFormatter,
+    cellClass: usdtDropCellClass,
+  },
+  {
+    field: 'borrow_capacity_24h_high_usdt',
+    headerName: '24h高点额度',
+    width: 125,
+    type: 'numericColumn',
+    valueFormatter: usdtFormatter,
+  },
+  {
+    field: 'borrow_capacity_drawdown_24h_pct',
+    headerName: '高点回撤',
+    width: 105,
     type: 'numericColumn',
     valueFormatter: percentValueFormatter,
     cellClass: dropCellClass,
   },
   {
-    field: 'borrow_capacity_drop_4h_pct',
-    headerName: '额度4h下降',
+    field: 'borrow_capacity_to_24h_high_pct',
+    headerName: '当前/高点',
+    width: 105,
+    type: 'numericColumn',
+    valueFormatter: percentValueFormatter,
+  },
+  {
+    field: 'borrow_availability_4h_pct',
+    headerName: '4h可借占比',
     width: 115,
     type: 'numericColumn',
     valueFormatter: percentValueFormatter,
-    cellClass: dropCellClass,
-  },
-  {
-    field: 'borrow_capacity_drop_12h_pct',
-    headerName: '额度12h下降',
-    width: 120,
-    type: 'numericColumn',
-    valueFormatter: percentValueFormatter,
-    cellClass: dropCellClass,
   },
   {
     field: 'borrowable',
@@ -469,7 +516,9 @@ async function fetchPredictions(resetPage = false) {
     params.set('funding_down_filter', String(fundingDownFilter.value))
     params.set('min_funding_drop_bps', String(minFundingDropBps.value))
     params.set('borrow_drop_filter', String(borrowDropFilter.value))
-    params.set('min_borrow_drop_pct', String(minBorrowDropPct.value))
+    params.set('min_borrow_pressure_score', String(minBorrowPressureScore.value))
+    params.set('min_capacity_drawdown_pct', String(minCapacityDrawdownPct.value))
+    params.set('min_capacity_drop_usdt', String(minCapacityDropUsdt.value))
     params.set('history_high_negative_filter', String(historyHighNegativeFilter.value))
     params.set('borrowable_filter', String(borrowableFilter.value))
     params.set('min_borrow_capacity_usdt', String(minBorrowCapacityUsdt.value))
@@ -683,22 +732,45 @@ onUnmounted(() => {
         <el-switch
           v-model="borrowDropFilter"
           inline-prompt
-          active-text="额度下降"
-          inactive-text="额度下降"
+          active-text="额度压力"
+          inactive-text="额度压力"
           @change="applyFilterChange"
         />
-        <span class="filter-label">≥</span>
+        <span class="filter-label">分≥</span>
         <el-input-number
-          v-model="minBorrowDropPct"
+          v-model="minBorrowPressureScore"
           size="small"
           :min="0"
           :max="100"
-          :step="5"
+          :step="1"
           :precision="0"
           controls-position="right"
           @change="applyFilterChange"
         />
+        <span class="filter-label">回撤≥</span>
+        <el-input-number
+          v-model="minCapacityDrawdownPct"
+          size="small"
+          :min="0"
+          :max="100"
+          :step="0.5"
+          :precision="1"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
         <span class="filter-label">%</span>
+        <span class="filter-label">下降≥</span>
+        <el-input-number
+          v-model="minCapacityDropUsdt"
+          size="small"
+          :min="0"
+          :max="10000"
+          :step="1"
+          :precision="1"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">U</span>
         <el-switch
           v-model="historyHighNegativeFilter"
           inline-prompt
