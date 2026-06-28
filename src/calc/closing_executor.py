@@ -74,6 +74,12 @@ class ClosingExecutor:
             'trade.vwap.close_threshold_percentile', 'close_basis_p20'
         ).strip()
         self.dynamic_take_profit_cfg = self._load_dynamic_take_profit_config()
+        self.high_basis_close_take_profit_bps = config.get_float(
+            'trade.high_basis_open.close_take_profit_bps', 30.0
+        )
+        self.high_basis_close_positive_funding_hold_enabled = config.get_bool(
+            'trade.high_basis_open.close_positive_funding_hold_enabled', False
+        )
         self.max_funding_payments = config.get_int('trade.close.max_funding_payments', 30)
         self.positive_funding_hold_enabled = config.get_bool(
             'trade.close.positive_funding_hold_enabled', True
@@ -760,8 +766,19 @@ class ClosingExecutor:
             return 'nextFunding(NA)'
         return f'nextFunding({next_bps:+.1f}bps,{next_min:.0f}min)'
 
+    @staticmethod
+    def _is_high_basis_position(pos: Dict) -> bool:
+        return '高基差通道' in str(pos.get('open_reason') or '')
+
+    def _effective_take_profit_bps(self, pos: Dict) -> float:
+        if self._is_high_basis_position(pos):
+            return max(float(self.high_basis_close_take_profit_bps or 0.0), 0.0)
+        return float(self.fixed_take_profit_bps)
+
     def _should_hold_for_positive_funding(self, pos: Dict, close_basis_bps: float) -> bool:
         if not self.positive_funding_hold_enabled:
+            return False
+        if self._is_high_basis_position(pos) and not self.high_basis_close_positive_funding_hold_enabled:
             return False
         next_bps = self._next_funding_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
@@ -1377,7 +1394,7 @@ class ClosingExecutor:
             close_basis_bps=float(current_spread_bps),
             close_threshold_meta=threshold_meta,
             close_threshold_col=self.close_threshold_col,
-            fixed_take_profit_bps=self.fixed_take_profit_bps,
+            fixed_take_profit_bps=self._effective_take_profit_bps(pos),
             fee_full_bps=self.fee_full_bps,
             cfg=self.dynamic_take_profit_cfg,
         )
@@ -1688,6 +1705,8 @@ class ClosingExecutor:
                     f">={self.fixed_take_profit_bps:.1f}bps"
                     f"|{self._funding_context_text(pos)}"
                 )
+            if self._is_high_basis_position(pos):
+                detail = f"高基差仓|{detail}"
         else:
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
             spread_profit_bps = open_spread_bps - current_spread_bps

@@ -165,6 +165,19 @@ trade:
     basis_relax_bps: 15                     # current_basis >= max(开仓p20, 平仓p20) - 15bps
     max_next_funding_min: 30                # 距离下次资金费结算 <= 30分钟
 
+  # ─── 高基差开仓通道 ───
+  # funding 不够厚但入场基差显著优于平仓阈值时，允许作为短周期收敛机会进入正常开仓链路。
+  # 仍然复用盘口恢复、最终旁路、执行保护、成交漂移冷却和单币额度风控。
+  high_basis_open:
+    enabled: true
+    allowed_tiers: [A, B]
+    amount_multiplier: 0.5                  # 高基差通道先用普通单笔金额的50%试点
+    min_funding_24h_bps: 3                  # funding 不要求很厚，但实时24h不能太差
+    min_entry_buffer_bps: 25                # 当前基差至少高于 entry_floor 的额外安全垫
+    min_net_edge_bps: 20                    # 当前基差 - 平仓p20 - 全部手续费 - 滑点缓冲后的最低净空间
+    close_take_profit_bps: 30               # 高基差仓单独净止盈阈值，避免按普通carry仓长期占用资金
+    close_positive_funding_hold_enabled: false # 高基差仓默认不因下一期小额正资金费暂缓止盈
+
   # ─── 行情画像参数覆盖 ───
   # market_profile 不替代 A/B/C 分层：A/B/C 决定是否进交易池，
   # market_profile 决定行情稀疏/薄盘标的使用哪组监控和执行参数。

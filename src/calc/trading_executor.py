@@ -143,6 +143,12 @@ class TradingExecutorConfig:
     funding_carry_min_24h_bps: float = 30.0
     funding_carry_basis_relax_bps: float = 15.0
     funding_carry_max_next_funding_min: float = 30.0
+    high_basis_enabled: bool = True
+    high_basis_allowed_tiers: List[str] = field(default_factory=lambda: ['A', 'B'])
+    high_basis_amount_multiplier: float = 0.5
+    high_basis_min_funding_24h_bps: float = 3.0
+    high_basis_min_entry_buffer_bps: float = 25.0
+    high_basis_min_net_edge_bps: float = 20.0
 
     # ─── 行情画像参数覆盖 ───
     thin_bursty_enabled: bool = True
@@ -411,6 +417,16 @@ class TradingExecutor:
         self.funding_carry_min_24h_bps = float(cfg.funding_carry_min_24h_bps)
         self.funding_carry_basis_relax_bps = float(cfg.funding_carry_basis_relax_bps)
         self.funding_carry_max_next_funding_min = float(cfg.funding_carry_max_next_funding_min)
+        self.high_basis_enabled = bool(cfg.high_basis_enabled)
+        self.high_basis_allowed_tiers: Set[str] = {
+            str(t).strip().upper()
+            for t in (cfg.high_basis_allowed_tiers or [])
+            if str(t).strip().upper() in ('A', 'B', 'C')
+        }
+        self.high_basis_amount_multiplier = max(float(cfg.high_basis_amount_multiplier), 0.0)
+        self.high_basis_min_funding_24h_bps = float(cfg.high_basis_min_funding_24h_bps)
+        self.high_basis_min_entry_buffer_bps = float(cfg.high_basis_min_entry_buffer_bps)
+        self.high_basis_min_net_edge_bps = float(cfg.high_basis_min_net_edge_bps)
 
         self.thin_bursty_enabled = bool(cfg.thin_bursty_enabled)
         self.thin_bursty_open_amount_multiplier = self.reduced_open_amount_multiplier
@@ -751,6 +767,27 @@ class TradingExecutor:
                 peak_state = self._peak_state.get(base_asset, {})
                 if peak_state.get('trigger') == 'funding_carry':
                     self._apply_entry_snapshot_to_row(row, peak_state.get('entry_snapshot') or {})
+                elif peak_state.get('entry_channel') == 'high_basis':
+                    high_ok, high_reason, high_snapshot = self._high_basis_snapshot(
+                        base_asset, open_vwap_basis, row
+                    )
+                    if not high_ok:
+                        self._resolve_signal(
+                            base_asset,
+                            'gate_rejected',
+                            f'高基差旁路复核失败({high_reason})',
+                            exit_basis_bps=open_vwap_basis,
+                            trigger_type=peak_state.get('trigger'),
+                            signal_basis_bps=peak_state.get('signal_basis_bps'),
+                            pre_gate_basis_bps=open_vwap_basis,
+                        )
+                        self._peak_state.pop(base_asset, None)
+                        self._open_resiliency.clear(base_asset)
+                        continue
+                    self._apply_entry_snapshot_to_row(row, high_snapshot)
+                    row['_high_basis_channel'] = True
+                    row['_high_basis_reason'] = peak_state.get('open_channel_reason') or high_reason
+                    peak_state['entry_snapshot'] = high_snapshot
                 else:
                     self._annotate_entry_snapshot(row, open_vwap_basis)
                 signal_basis = peak_state.get('signal_basis_bps')
@@ -1018,6 +1055,120 @@ class TradingExecutor:
             f"({current_bps:.2f}bps<{self.min_funding_rate_bps:.1f}bps)",
         )
 
+    def _clear_open_channel_marks(self, row: Optional[Dict]) -> None:
+        if row is None:
+            return
+        for key in (
+            '_open_channel',
+            '_open_channel_reason',
+            '_high_basis_channel',
+            '_high_basis_reason',
+            '_high_basis_entry_floor_bps',
+            '_high_basis_close_floor_bps',
+            '_high_basis_net_edge_bps',
+            '_high_basis_entry_buffer_bps',
+        ):
+            row.pop(key, None)
+
+    def _high_basis_snapshot(self, base_asset: str, basis_bps: float, row: Optional[Dict]) -> tuple[bool, str, Dict]:
+        if not self.high_basis_enabled:
+            return False, '未启用', {}
+
+        tier = self._asset_tier(base_asset)
+        if tier not in self.high_basis_allowed_tiers:
+            return False, f"分层{tier}不允许", {}
+
+        funding_bps = self._funding_24h_bps(base_asset, row)
+        if funding_bps + 1e-9 < self.high_basis_min_funding_24h_bps:
+            return (
+                False,
+                f"funding24h {funding_bps:.1f}<"
+                f"{self.high_basis_min_funding_24h_bps:.1f}bps",
+                {},
+            )
+
+        entry_snapshot = self._entry_snapshot(base_asset, basis_bps, row)
+        entry_floor = float(entry_snapshot.get('entry_floor_bps') or 0.0)
+        entry_buffer = float(basis_bps) - entry_floor
+        if entry_buffer < self.high_basis_min_entry_buffer_bps:
+            return (
+                False,
+                f"基差垫{entry_buffer:.1f}<"
+                f"{self.high_basis_min_entry_buffer_bps:.1f}bps",
+                {},
+            )
+
+        close_data = self.close_vwap_threshold_meta.get(base_asset) or {}
+        close_floor_raw = close_data.get(self.close_threshold_col)
+        if close_floor_raw is None:
+            close_floor_raw = close_data.get('close_basis_p20')
+        if close_floor_raw is None:
+            return False, f"缺少平仓阈值{self.close_threshold_col}", {}
+
+        close_floor = float(close_floor_raw)
+        net_edge = (
+            float(basis_bps)
+            - close_floor
+            - self.fee_cost_bps
+            - self.funding_entry_slippage_buffer_bps
+        )
+        if net_edge < self.high_basis_min_net_edge_bps:
+            return (
+                False,
+                f"收敛净空间{net_edge:.1f}<"
+                f"{self.high_basis_min_net_edge_bps:.1f}bps",
+                {},
+            )
+
+        snapshot = dict(entry_snapshot)
+        snapshot.update({
+            'high_basis': True,
+            'high_basis_entry_buffer_bps': round(entry_buffer, 4),
+            'high_basis_close_floor_bps': round(close_floor, 4),
+            'high_basis_net_edge_bps': round(net_edge, 4),
+            'high_basis_min_funding_24h_bps': round(self.high_basis_min_funding_24h_bps, 4),
+            'high_basis_min_entry_buffer_bps': round(self.high_basis_min_entry_buffer_bps, 4),
+            'high_basis_min_net_edge_bps': round(self.high_basis_min_net_edge_bps, 4),
+            'high_basis_amount_usdt': round(self._high_basis_amount(base_asset), 4),
+        })
+        reason = (
+            f"高基差通道(basis={float(basis_bps):.1f},"
+            f"entry_buffer={entry_buffer:.1f}/{self.high_basis_min_entry_buffer_bps:.1f}bps,"
+            f"net={net_edge:.1f}/{self.high_basis_min_net_edge_bps:.1f}bps,"
+            f"funding={funding_bps:.1f}bps)"
+        )
+        return True, reason, snapshot
+
+    def _check_open_channel_support(self, row: Dict) -> tuple[bool, str]:
+        self._clear_open_channel_marks(row)
+        funding_ok, funding_reason = self._check_funding_support(row)
+        if funding_ok:
+            row['_open_channel'] = 'funding'
+            row['_open_channel_reason'] = funding_reason
+            return True, funding_reason
+
+        base_asset = str(row.get('base_asset') or '').strip().upper()
+        basis = self._float_or_none(row.get('open_vwap_basis_bps'))
+        if basis is None:
+            return False, funding_reason
+
+        high_ok, high_reason, snapshot = self._high_basis_snapshot(base_asset, basis, row)
+        if high_ok:
+            row['_open_channel'] = 'high_basis'
+            row['_open_channel_reason'] = high_reason
+            row['_high_basis_channel'] = True
+            row['_high_basis_reason'] = high_reason
+            row['_high_basis_entry_floor_bps'] = snapshot.get('entry_floor_bps')
+            row['_high_basis_close_floor_bps'] = snapshot.get('high_basis_close_floor_bps')
+            row['_high_basis_net_edge_bps'] = snapshot.get('high_basis_net_edge_bps')
+            row['_high_basis_entry_buffer_bps'] = snapshot.get('high_basis_entry_buffer_bps')
+            row['open_amount_usdt'] = self._high_basis_amount(base_asset)
+            self._apply_entry_snapshot_to_row(row, snapshot)
+            return True, high_reason
+
+        suffix = f"|高基差通道不达标:{high_reason}" if self.high_basis_enabled else ""
+        return False, f"{funding_reason}{suffix}"
+
     def _realtime_funding_floor_bps(self, base_asset: str) -> tuple[float, str]:
         support = self.funding_support_meta.get(str(base_asset or '').strip().upper()) or {}
         support_bps = self._float_or_none(support.get('funding_rate_24h_avg_bps'))
@@ -1089,6 +1240,10 @@ class TradingExecutor:
 
     def _funding_carry_amount(self, base_asset: Optional[str] = None) -> float:
         return self._reduced_open_amount_usdt()
+
+    def _high_basis_amount(self, base_asset: Optional[str] = None) -> float:
+        amount = self._profile_open_amount(base_asset or '', self.open_amount_usdt)
+        return max(amount * self.high_basis_amount_multiplier, 0.0)
 
     def _active_open_amount_usdt(self, row: Optional[Dict] = None) -> float:
         if row and row.get('open_amount_usdt') is not None:
@@ -1247,6 +1402,14 @@ class TradingExecutor:
                 'funding_carry_next_min': row.get('_entry_funding_carry_next_min'),
                 'funding_carry_tier': row.get('_entry_funding_carry_tier'),
                 'funding_carry_amount_usdt': row.get('_entry_funding_carry_amount_usdt'),
+                'high_basis': row.get('_entry_high_basis'),
+                'high_basis_entry_buffer_bps': row.get('_entry_high_basis_entry_buffer_bps'),
+                'high_basis_close_floor_bps': row.get('_entry_high_basis_close_floor_bps'),
+                'high_basis_net_edge_bps': row.get('_entry_high_basis_net_edge_bps'),
+                'high_basis_min_funding_24h_bps': row.get('_entry_high_basis_min_funding_24h_bps'),
+                'high_basis_min_entry_buffer_bps': row.get('_entry_high_basis_min_entry_buffer_bps'),
+                'high_basis_min_net_edge_bps': row.get('_entry_high_basis_min_net_edge_bps'),
+                'high_basis_amount_usdt': row.get('_entry_high_basis_amount_usdt'),
             }
         if basis_bps is None:
             basis_bps = float((row or {}).get('open_vwap_basis_bps') or 0)
@@ -1835,6 +1998,10 @@ class TradingExecutor:
             if self._holding_margin_rate[base_asset] < self.margin_warning_pct:
                 return False
 
+        channel_ok, _channel_reason = self._check_open_channel_support(row)
+        if not channel_ok:
+            return False
+
         active_amount = self._active_open_amount_usdt(row)
         if not self._pass_account_capital_check(active_amount):
             return False
@@ -1846,10 +2013,6 @@ class TradingExecutor:
             min_notional = self.spot_meta[base_asset].get('min_notional')
             if min_notional is not None and active_amount < min_notional:
                 return False
-
-        funding_ok, _funding_reason = self._check_funding_support(row)
-        if not funding_ok:
-            return False
         
         # 盘口覆盖检查
         open_coverage = row.get('open_coverage')
@@ -2187,7 +2350,13 @@ class TradingExecutor:
             'funding_last_apply': info.get('funding_last_apply'),
         })
     
-    def _verify_realtime_funding_rate(self, base_asset: str, contract: str) -> bool:
+    def _verify_realtime_funding_rate(
+        self,
+        base_asset: str,
+        contract: str,
+        min_floor_bps: Optional[float] = None,
+        floor_label: Optional[str] = None,
+    ) -> bool:
         """
         开仓前实时校验资金费率：从 Gate API 获取最新费率，确认仍达到下限。
         若 API 调用失败（网络问题等），回退为放行（不阻塞开仓）。
@@ -2202,8 +2371,12 @@ class TradingExecutor:
             
             # 普通风控已判定 funding 通道；最终校验只确认实时费率仍满足对应通道下限。
             rate_bps = float(info['funding_rate_24h']) * 10000
-            realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
-            if rate_bps < realtime_floor:
+            if min_floor_bps is None:
+                realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
+            else:
+                realtime_floor = float(min_floor_bps)
+                floor_label = floor_label or '指定通道下限'
+            if rate_bps + 1e-9 < realtime_floor:
                 logger.info(
                     f"实时费率校验拦截 | {base_asset} | "
                     f"实时费率={rate_bps:.2f}bps < {floor_label}{realtime_floor:.1f}bps"
@@ -2300,11 +2473,12 @@ class TradingExecutor:
                 return False, None, None, '盘口合并失败'
 
             state = self._peak_state.get(base_asset)
-            target_amount_usdt = (
-                self._funding_carry_amount(base_asset)
-                if state and state.get('trigger') == 'funding_carry'
-                else self._profile_open_amount(base_asset, self.open_amount_usdt)
-            )
+            if state and state.get('trigger') == 'funding_carry':
+                target_amount_usdt = self._funding_carry_amount(base_asset)
+            elif state and state.get('entry_channel') == 'high_basis':
+                target_amount_usdt = self._high_basis_amount(base_asset)
+            else:
+                target_amount_usdt = self._profile_open_amount(base_asset, self.open_amount_usdt)
             merged = calculate_hedge_metrics(
                 merged, self.contract_meta, self.spot_meta, target_amount_usdt
             )
@@ -2329,7 +2503,13 @@ class TradingExecutor:
 
             # ── 4.5 实时资金费刷新：实盘最终旁路用下单前最新 funding 重算门槛 ──
             if self.executor_client.channel == 'Live':
-                if not self._verify_realtime_funding_rate(base_asset, contract):
+                high_basis_state = bool(state and state.get('entry_channel') == 'high_basis')
+                if not self._verify_realtime_funding_rate(
+                    base_asset,
+                    contract,
+                    self.high_basis_min_funding_24h_bps if high_basis_state else None,
+                    '高基差通道下限' if high_basis_state else None,
+                ):
                     return False, row, gate_basis_bps, '实时资金费率低于下限'
                 self._apply_realtime_funding_info(base_asset, row)
 
@@ -2343,6 +2523,20 @@ class TradingExecutor:
                     )
                     return False, row, gate_basis_bps, 'FundingCarry旁路复核失败(实时条件不满足)'
                 self._apply_entry_snapshot_to_row(row, entry_snapshot)
+            elif state and state.get('entry_channel') == 'high_basis':
+                high_ok, high_reason, entry_snapshot = self._high_basis_snapshot(
+                    base_asset, gate_basis_bps, row
+                )
+                if not high_ok:
+                    logger.info(
+                        f"开仓旁路-高基差复核失败 | {base_asset} | "
+                        f"gate_basis={gate_basis_bps:.2f}bps | reason={high_reason} | "
+                        f"lag(gate={gate_lag_ms:.0f}ms,spot={spot_lag_ms:.0f}ms)"
+                    )
+                    return False, row, gate_basis_bps, f'高基差旁路复核失败({high_reason})'
+                self._apply_entry_snapshot_to_row(row, entry_snapshot)
+                row['_high_basis_channel'] = True
+                row['_high_basis_reason'] = high_reason
             else:
                 entry_snapshot = self._entry_snapshot(base_asset, gate_basis_bps, row)
                 self._annotate_entry_snapshot(row, gate_basis_bps)
@@ -2439,16 +2633,33 @@ class TradingExecutor:
 
         if state is None:
             # 首次进入监控：实时费率校验 + 记录峰值 + 创建信号
-            if not self._verify_realtime_funding_rate(base_asset, contract):
+            high_basis_channel = bool(row.get('_high_basis_channel'))
+            if not self._verify_realtime_funding_rate(
+                base_asset,
+                contract,
+                self.high_basis_min_funding_24h_bps if high_basis_channel else None,
+                '高基差通道下限' if high_basis_channel else None,
+            ):
                 return False
             self._apply_realtime_funding_info(base_asset, row)
 
-            entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
+            if high_basis_channel:
+                high_ok, high_reason, entry_snapshot = self._high_basis_snapshot(
+                    base_asset, current_basis_bps, row
+                )
+                if not high_ok:
+                    logger.info(f"高基差通道实时复核失败 | {base_asset} | {high_reason}")
+                    return False
+                self._apply_entry_snapshot_to_row(row, entry_snapshot)
+            else:
+                entry_snapshot = self._state_entry_snapshot(base_asset, row, current_basis_bps)
             signal_id = self._create_signal(base_asset, current_basis_bps)
             self._peak_state[base_asset] = {
                 'peak_bps': current_basis_bps,
                 'start_time': now,
                 'trigger': None,
+                'entry_channel': 'high_basis' if high_basis_channel else 'funding',
+                'open_channel_reason': row.get('_open_channel_reason'),
                 'signal_id': signal_id,
                 'signal_basis_bps': current_basis_bps,
                 'entry_snapshot': entry_snapshot,
@@ -2691,6 +2902,10 @@ class TradingExecutor:
                     f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
                 )
 
+        channel_ok, channel_reason = self._check_open_channel_support(row)
+        if not channel_ok:
+            return channel_reason
+
         active_amount = self._active_open_amount_usdt(row)
         capital_ok, capital_reason = self._check_account_capital(active_amount)
         if not capital_ok:
@@ -2704,9 +2919,6 @@ class TradingExecutor:
             min_notional = self.spot_meta[base_asset].get('min_notional')
             if min_notional is not None and active_amount < min_notional:
                 return f"开仓金额低于最小名义值({active_amount}<{min_notional}USDT)"
-        funding_ok, funding_reason = self._check_funding_support(row)
-        if not funding_ok:
-            return funding_reason
 
         # 盘口覆盖检查
         open_coverage = row.get('open_coverage')
@@ -2815,18 +3027,30 @@ class TradingExecutor:
 
         # 3. 实时费率校验结果
         rt_rate = self._last_realtime_rate_bps.pop(base_asset, None)
+        peak_state = self._peak_state.get(base_asset)
         if rt_rate is not None:
-            realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
+            if peak_state and peak_state.get('entry_channel') == 'high_basis':
+                realtime_floor = self.high_basis_min_funding_24h_bps
+                floor_label = '高基差通道下限'
+            else:
+                realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
             parts.append(
                 f"实时24h{floor_label}✓({rt_rate:.2f}bps≥{realtime_floor:.1f})"
             )
 
         # 4. 峰值回落 / 超时信息
-        peak_state = self._peak_state.get(base_asset)
         if peak_state:
             peak_bps = peak_state.get('peak_bps', 0)
             trigger = peak_state.get('trigger', 'unknown')
             elapsed = (datetime.now() - peak_state['start_time']).total_seconds()
+            if peak_state.get('entry_channel') == 'high_basis':
+                parts.append(
+                    f"高基差通道("
+                    f"entry垫={float(entry_snapshot.get('high_basis_entry_buffer_bps', 0)):.1f}bps,"
+                    f"净空间={float(entry_snapshot.get('high_basis_net_edge_bps', 0)):.1f}bps,"
+                    f"close={float(entry_snapshot.get('high_basis_close_floor_bps', 0)):.1f},"
+                    f"金额{float(entry_snapshot.get('high_basis_amount_usdt', self._active_open_amount_usdt(row))):.1f}U)"
+                )
             if trigger == 'pullback':
                 parts.append(
                     f"峰值回落(峰{peak_bps:.1f},持续{elapsed:.1f}s≥{self.sustain_sec}s,"

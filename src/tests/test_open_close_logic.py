@@ -95,6 +95,11 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           quality_scale_in_max_basis_improvement_bps=20.0,
                           quality_scale_in_min_gate_margin_rate_pct=250.0,
                           quality_scale_in_cooldown_sec=300,
+                          high_basis_enabled=False,
+                          high_basis_amount_multiplier=0.5,
+                          high_basis_min_funding_24h_bps=3.0,
+                          high_basis_min_entry_buffer_bps=25.0,
+                          high_basis_min_net_edge_bps=20.0,
                           presignal_reject_log_cooldown_sec=300,
                           contract_meta=None,
                           spot_meta=None,
@@ -131,6 +136,11 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         quality_scale_in_max_basis_improvement_bps=quality_scale_in_max_basis_improvement_bps,
         quality_scale_in_min_gate_margin_rate_pct=quality_scale_in_min_gate_margin_rate_pct,
         quality_scale_in_cooldown_sec=quality_scale_in_cooldown_sec,
+        high_basis_enabled=high_basis_enabled,
+        high_basis_amount_multiplier=high_basis_amount_multiplier,
+        high_basis_min_funding_24h_bps=high_basis_min_funding_24h_bps,
+        high_basis_min_entry_buffer_bps=high_basis_min_entry_buffer_bps,
+        high_basis_min_net_edge_bps=high_basis_min_net_edge_bps,
         presignal_reject_log_cooldown_sec=presignal_reject_log_cooldown_sec,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
@@ -1557,6 +1567,75 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertFalse(te._pass_risk_check(row))
         self.assertIn('资金费率通道不达标', te._get_risk_fail_reason(row))
+
+    def test_high_basis_channel_allows_weak_funding_when_convergence_edge_is_large(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            high_basis_enabled=True,
+            high_basis_min_funding_24h_bps=3.0,
+            high_basis_min_entry_buffer_bps=25.0,
+            high_basis_min_net_edge_bps=20.0,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        row = self._row('ALLO', 70.0, 0.0003)
+        row.update({
+            'funding_rate_24h_avg_bps': 2.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertTrue(row.get('_high_basis_channel'))
+        self.assertEqual(row.get('open_amount_usdt'), te.open_amount_usdt * 0.5)
+        self.assertEqual(row.get('_entry_high_basis_amount_usdt'), te.open_amount_usdt * 0.5)
+        self.assertIn('高基差通道', row.get('_open_channel_reason', ''))
+
+    def test_high_basis_channel_rejects_when_net_convergence_edge_is_small(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            high_basis_enabled=True,
+            high_basis_min_funding_24h_bps=3.0,
+            high_basis_min_entry_buffer_bps=25.0,
+            high_basis_min_net_edge_bps=20.0,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        row = self._row('ALLO', 55.0, 0.0003)
+        row.update({
+            'funding_rate_24h_avg_bps': 2.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('资金费率通道不达标', reason)
+        self.assertIn('高基差通道不达标', reason)
+
+    def test_high_basis_realtime_funding_uses_its_own_floor(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            high_basis_enabled=True,
+            high_basis_min_funding_24h_bps=3.0,
+        )
+
+        with patch('calc.trading_executor.get_single_contract_funding_info', return_value={
+            'funding_rate_24h': 0.0003,
+        }):
+            self.assertTrue(te._verify_realtime_funding_rate(
+                'ALLO', 'ALLO_USDT', min_floor_bps=te.high_basis_min_funding_24h_bps
+            ))
 
     def test_funding_support_stable_channel_keeps_realtime_floor(self):
         te = make_trading_executor(
@@ -3321,6 +3400,37 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     def test_fixed_net_take_profit_uses_fee_adjusted_profit(self):
         self.assertTrue(self.ce._check_take_profit(self.pos, 40.0))
         self.assertFalse(self.ce._check_take_profit(self.pos, 75.0))
+
+    def test_high_basis_position_uses_dedicated_take_profit_threshold(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.ce.high_basis_close_take_profit_bps = 30.0
+        self.pos.update({
+            'open_reason': '基差105.0bps|高基差通道(entry垫=35.0bps,净空间=21.0bps)',
+            'open_spread_bps': 100.0,
+            'funding_pnl_bps': 0.0,
+            'funding_rate_24h': 0.0,
+        })
+
+        eval_ = self.ce._take_profit_eval(self.pos, 40.0, {'close_basis_p20': 30.0})
+
+        self.assertEqual(eval_.threshold_bps, 30.0)
+        self.assertTrue(self.ce._check_take_profit(self.pos, 40.0, {'close_basis_p20': 30.0}))
+
+    def test_high_basis_position_does_not_hold_for_positive_funding_by_default(self):
+        self.ce.fixed_take_profit_bps = 200.0
+        self.ce.high_basis_close_take_profit_bps = 30.0
+        self.ce.high_basis_close_positive_funding_hold_enabled = False
+        self.pos.update({
+            'open_reason': '高基差通道(entry垫=35.0bps,净空间=21.0bps)',
+            'open_spread_bps': 100.0,
+            'funding_pnl_bps': 0.0,
+            'funding_rate_24h': 0.003,
+            'funding_next_apply': (
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
+        })
+
+        self.assertTrue(self.ce._check_take_profit(self.pos, 40.0, {'close_basis_p20': 30.0}))
 
     def test_positive_funding_near_settlement_holds_take_profit(self):
         self.pos['funding_rate_24h'] = 0.003  # 约每8小时 +10bps

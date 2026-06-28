@@ -1874,6 +1874,20 @@ def _run_open_position_check_once():
                 funding_carry_max_next_funding_min=config.get_float(
                     'trade.funding_carry_open.max_next_funding_min', 30.0
                 ),
+                high_basis_enabled=config.get_bool('trade.high_basis_open.enabled', True),
+                high_basis_allowed_tiers=config.get('trade.high_basis_open.allowed_tiers', ['A', 'B']),
+                high_basis_amount_multiplier=config.get_float(
+                    'trade.high_basis_open.amount_multiplier', 0.5
+                ),
+                high_basis_min_funding_24h_bps=config.get_float(
+                    'trade.high_basis_open.min_funding_24h_bps', 3.0
+                ),
+                high_basis_min_entry_buffer_bps=config.get_float(
+                    'trade.high_basis_open.min_entry_buffer_bps', 25.0
+                ),
+                high_basis_min_net_edge_bps=config.get_float(
+                    'trade.high_basis_open.min_net_edge_bps', 20.0
+                ),
                 thin_bursty_enabled=config.get_bool('trade.market_profile.thin_bursty.enabled', True),
                 thin_bursty_max_orderbook_lag_ms=config.get_float(
                     'trade.market_profile.thin_bursty.max_orderbook_lag_ms', 1500.0
