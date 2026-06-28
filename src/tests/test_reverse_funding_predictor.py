@@ -34,6 +34,34 @@ def test_compute_prediction_row_returns_three_horizons():
     assert row['p_next_3'] is not None
 
 
+def test_attach_follow_metrics_scores_objective_follow_signal():
+    base = datetime(2026, 6, 1, 0, 0, 0)
+    funding_history = [
+        (base + timedelta(hours=i), rate)
+        for i, rate in enumerate([-0.001, -0.002, -0.003, -0.004, -0.007])
+    ]
+    borrow_history = [
+        {'snapshot_time': base, 'borrow_capacity_usdt': 1000},
+        {'snapshot_time': base + timedelta(hours=4), 'borrow_capacity_usdt': 300},
+    ]
+    row = {
+        'base_asset': 'ABC',
+        'current_funding_rate_24h': -0.007,
+        'borrowable': 1,
+        'borrow_capacity_usdt': 300,
+        'borrow_24h_bps': 6,
+        'high_negative_frequency': 0.2,
+        'high_negative_count': 3,
+    }
+
+    predictor._attach_follow_metrics(row, funding_history, borrow_history)
+
+    assert row['funding_change_4h_bps'] == pytest.approx(-60)
+    assert row['borrow_capacity_drop_4h_pct'] == pytest.approx(70)
+    assert row['follow_score'] > 50
+    assert '资金费下行' in row['follow_reason']
+
+
 def test_predict_high_negative_funding_filters_asset(monkeypatch):
     rows = [
         {'base_asset': 'ABC', 'contract': 'ABC_USDT', 'p_next_3': 0.3},
@@ -68,6 +96,7 @@ def test_compute_prediction_rows_uses_orderbook_universe(monkeypatch):
     monkeypatch.setattr(predictor, '_load_funding_history', lambda lookback_days: history_rows)
     monkeypatch.setattr(predictor, '_load_prediction_universe', lambda: {'ABC': 'B'})
     monkeypatch.setattr(predictor, '_load_latest_borrow_meta', lambda: {})
+    monkeypatch.setattr(predictor, '_load_borrow_history', lambda hours=24: {})
 
     rows = predictor._compute_prediction_rows(threshold_rate=-0.01, lookback_days=30)
 
@@ -79,9 +108,12 @@ def test_apply_prediction_filters_tracks_step_counts():
     rows = [
         {
             'base_asset': 'AAA',
-            'p_next_2': 0.30,
-            'p_next_3': 0.40,
-            'confidence': 0.70,
+            'follow_score': 80,
+            'funding_change_1h_bps': -8,
+            'funding_change_4h_bps': -12,
+            'funding_change_12h_bps': -20,
+            'borrow_capacity_drop_max_pct': 35,
+            'high_negative_count': 2,
             'current_funding_rate_24h': -0.002,
             'borrowable': 1,
             'borrow_capacity_usdt': 120,
@@ -90,9 +122,12 @@ def test_apply_prediction_filters_tracks_step_counts():
         },
         {
             'base_asset': 'BBB',
-            'p_next_2': 0.10,
-            'p_next_3': 0.12,
-            'confidence': 0.80,
+            'follow_score': 30,
+            'funding_change_1h_bps': -1,
+            'funding_change_4h_bps': -2,
+            'funding_change_12h_bps': -3,
+            'borrow_capacity_drop_max_pct': 5,
+            'high_negative_count': 0,
             'current_funding_rate_24h': -0.003,
             'borrowable': 1,
             'borrow_capacity_usdt': 120,
@@ -104,17 +139,17 @@ def test_apply_prediction_filters_tracks_step_counts():
     filtered, steps, opts = predictor._apply_prediction_filters(
         rows,
         {
-            'probability_enabled': True,
-            'confidence_enabled': True,
-            'negative_funding_enabled': True,
+            'follow_score_enabled': True,
+            'funding_down_enabled': True,
+            'borrow_drop_enabled': True,
+            'history_high_negative_enabled': True,
             'borrowable_enabled': True,
-            'capacity_enabled': True,
             'borrow_cost_enabled': True,
             'min_borrow_capacity_usdt': 100,
         },
     )
 
     assert [row['base_asset'] for row in filtered] == ['AAA']
-    assert [step['count'] for step in steps] == [2, 1, 1, 1, 1, 1, 1]
-    assert opts['min_p_next_2'] == predictor.DEFAULT_MIN_P_NEXT_2
+    assert [step['count'] for step in steps] == [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    assert opts['min_follow_score'] == predictor.DEFAULT_MIN_FOLLOW_SCORE
     assert filtered[0]['preborrow_filter_pass'] is True

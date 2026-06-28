@@ -20,6 +20,10 @@ interface PredictionSummary {
   avg_p_next_1?: number | null
   avg_p_next_2?: number | null
   avg_p_next_3?: number | null
+  avg_follow_score?: number | null
+  follow_candidate_count?: number
+  borrow_drop_count?: number
+  funding_down_count?: number
   filter_steps?: FilterStep[]
   filter_options?: Record<string, unknown>
 }
@@ -35,6 +39,19 @@ interface PredictionRow {
   borrow_24h_bps?: number | null
   max_borrowable_amount?: number | null
   borrow_snapshot_time?: string | null
+  follow_score?: number | null
+  follow_reason?: string | null
+  funding_change_1h_bps?: number | null
+  funding_change_4h_bps?: number | null
+  funding_change_12h_bps?: number | null
+  borrow_capacity_drop_1h_pct?: number | null
+  borrow_capacity_drop_4h_pct?: number | null
+  borrow_capacity_drop_12h_pct?: number | null
+  borrow_capacity_drop_max_pct?: number | null
+  follow_score_filter_pass?: boolean | null
+  funding_down_filter_pass?: boolean | null
+  borrow_drop_filter_pass?: boolean | null
+  history_high_negative_filter_pass?: boolean | null
   probability_filter_pass?: boolean | null
   confidence_filter_pass?: boolean | null
   negative_funding_filter_pass?: boolean | null
@@ -107,14 +124,14 @@ const recomputing = ref(false)
 const keyword = ref('')
 const thresholdPct = ref(-0.6)
 const lookbackDays = ref(30)
-const probabilityFilter = ref(false)
-const minPNext2Pct = ref(20)
-const minPNext3Pct = ref(25)
-const confidenceFilter = ref(false)
-const minConfidencePct = ref(50)
-const negativeFundingFilter = ref(false)
+const followScoreFilter = ref(false)
+const minFollowScore = ref(50)
+const fundingDownFilter = ref(false)
+const minFundingDropBps = ref(5)
+const borrowDropFilter = ref(false)
+const minBorrowDropPct = ref(20)
+const historyHighNegativeFilter = ref(false)
 const borrowableFilter = ref(false)
-const capacityFilter = ref(false)
 const minBorrowCapacityUsdt = ref(100)
 const borrowCostFilter = ref(false)
 const maxBorrowCostRatio = ref(1)
@@ -134,10 +151,11 @@ const totalPages = computed(() => Math.ceil(paginationTotal.value / paginationPa
 
 const summaryItems = computed(() => [
   { label: '观察标的', value: summary.value.asset_count ?? 0, tone: '' },
+  { label: '跟随候选', value: summary.value.follow_candidate_count ?? 0, tone: 'danger' },
+  { label: '资金费下行', value: summary.value.funding_down_count ?? 0, tone: 'info' },
+  { label: '额度下降', value: summary.value.borrow_drop_count ?? 0, tone: 'warning' },
   { label: '当前高负', value: summary.value.current_high_negative_count ?? 0, tone: 'danger' },
-  { label: '平均P1', value: formatProbability(summary.value.avg_p_next_1), tone: 'info' },
-  { label: '平均P2', value: formatProbability(summary.value.avg_p_next_2), tone: 'info' },
-  { label: '平均P3', value: formatProbability(summary.value.avg_p_next_3), tone: 'info' },
+  { label: '平均跟随分', value: formatDecimal(summary.value.avg_follow_score, 1), tone: 'info' },
 ])
 
 const filterSteps = computed(() => summary.value.filter_steps ?? [])
@@ -182,6 +200,11 @@ function formatUsdt(value: unknown): string {
   return Number.isFinite(n) ? `${n.toFixed(2)} U` : ''
 }
 
+function formatPercentValue(value: unknown): string {
+  const n = Number(value)
+  return Number.isFinite(n) ? `${n.toFixed(1)}%` : ''
+}
+
 function formatBool(value: unknown): string {
   if (value === true || value === 1) return '是'
   if (value === false || value === 0) return '否'
@@ -194,6 +217,7 @@ const numberFormatter = (params: ValueFormatterParams<PredictionRow>) => formatD
 const bpsFormatter = (params: ValueFormatterParams<PredictionRow>) => formatBps(params.value)
 const usdtFormatter = (params: ValueFormatterParams<PredictionRow>) => formatUsdt(params.value)
 const boolFormatter = (params: ValueFormatterParams<PredictionRow>) => formatBool(params.value)
+const percentValueFormatter = (params: ValueFormatterParams<PredictionRow>) => formatPercentValue(params.value)
 
 function fundingCellClass(params: ValueFormatterParams<PredictionRow>) {
   const n = Number(params.value)
@@ -212,6 +236,23 @@ function probabilityCellClass(params: ValueFormatterParams<PredictionRow>) {
   return ''
 }
 
+function scoreCellClass(params: ValueFormatterParams<PredictionRow>) {
+  const n = Number(params.value)
+  if (!Number.isFinite(n)) return ''
+  if (n >= 80) return 'value-danger'
+  if (n >= 50) return 'value-warning'
+  if (n > 0) return 'value-info'
+  return ''
+}
+
+function dropCellClass(params: ValueFormatterParams<PredictionRow>) {
+  const n = Number(params.value)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  if (n >= 50) return 'value-danger'
+  if (n >= 20) return 'value-warning'
+  return 'value-info'
+}
+
 function passCellClass(params: ValueFormatterParams<PredictionRow>) {
   if (params.value === true || params.value === 1) return 'value-positive'
   if (params.value === false || params.value === 0) return 'value-negative'
@@ -220,8 +261,17 @@ function passCellClass(params: ValueFormatterParams<PredictionRow>) {
 
 const columnDefs = ref<ColDef<PredictionRow>[]>([
   { field: 'base_asset', headerName: '标的资产', width: 100, pinned: 'left' },
-  { field: 'contract', headerName: '合约', width: 120 },
   { field: 'strategy_tier', headerName: '分层', width: 80 },
+  {
+    field: 'follow_score',
+    headerName: '跟随分',
+    width: 95,
+    type: 'numericColumn',
+    sort: 'desc',
+    sortIndex: 0,
+    valueFormatter: (params) => formatDecimal(params.value, 1),
+    cellClass: scoreCellClass,
+  },
   {
     field: 'preborrow_filter_pass',
     headerName: '候选通过',
@@ -230,10 +280,10 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     cellClass: passCellClass,
   },
   {
-    field: 'preborrow_filter_reason',
-    headerName: '过滤逻辑',
+    field: 'follow_reason',
+    headerName: '跟随解释',
     width: 360,
-    tooltipField: 'preborrow_filter_reason',
+    tooltipField: 'follow_reason',
   },
   {
     field: 'current_funding_rate_24h',
@@ -243,53 +293,73 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     cellClass: fundingCellClass,
   },
   {
-    field: 'p_next_1',
-    headerName: '未来1期高负概率',
-    width: 145,
-    type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
-    cellClass: probabilityCellClass,
-  },
-  {
-    field: 'p_next_2',
-    headerName: '未来2期高负概率',
-    width: 145,
-    type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
-    cellClass: probabilityCellClass,
-  },
-  {
-    field: 'p_next_3',
-    headerName: '未来3期高负概率',
-    width: 145,
-    type: 'numericColumn',
-    sort: 'desc',
-    sortIndex: 0,
-    valueFormatter: probabilityFormatter,
-    cellClass: probabilityCellClass,
-  },
-  { field: 'current_bucket_label', headerName: '当前状态', width: 105 },
-  {
-    field: 'high_negative_frequency',
-    headerName: '30天高负频率',
+    field: 'funding_change_1h_bps',
+    headerName: '资金费1h变化',
     width: 125,
     type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
-    cellClass: probabilityCellClass,
+    valueFormatter: bpsFormatter,
+    cellClass: fundingCellClass,
+  },
+  {
+    field: 'funding_change_4h_bps',
+    headerName: '资金费4h变化',
+    width: 125,
+    type: 'numericColumn',
+    valueFormatter: bpsFormatter,
+    cellClass: fundingCellClass,
+  },
+  {
+    field: 'funding_change_12h_bps',
+    headerName: '资金费12h变化',
+    width: 130,
+    type: 'numericColumn',
+    valueFormatter: bpsFormatter,
+    cellClass: fundingCellClass,
+  },
+  {
+    field: 'borrow_capacity_usdt',
+    headerName: '当前可借额度',
+    width: 125,
+    type: 'numericColumn',
+    valueFormatter: usdtFormatter,
+  },
+  {
+    field: 'borrow_capacity_drop_1h_pct',
+    headerName: '额度1h下降',
+    width: 115,
+    type: 'numericColumn',
+    valueFormatter: percentValueFormatter,
+    cellClass: dropCellClass,
+  },
+  {
+    field: 'borrow_capacity_drop_4h_pct',
+    headerName: '额度4h下降',
+    width: 115,
+    type: 'numericColumn',
+    valueFormatter: percentValueFormatter,
+    cellClass: dropCellClass,
+  },
+  {
+    field: 'borrow_capacity_drop_12h_pct',
+    headerName: '额度12h下降',
+    width: 120,
+    type: 'numericColumn',
+    valueFormatter: percentValueFormatter,
+    cellClass: dropCellClass,
+  },
+  {
+    field: 'borrowable',
+    headerName: '当前可借',
+    width: 95,
+    valueFormatter: boolFormatter,
+    cellClass: passCellClass,
   },
   {
     field: 'high_negative_count',
-    headerName: '高负次数',
-    width: 95,
+    headerName: '历史高负次数',
+    width: 120,
     type: 'numericColumn',
     valueFormatter: numberFormatter,
-  },
-  {
-    field: 'negative_frequency',
-    headerName: '负费率频率',
-    width: 115,
-    type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
   },
   {
     field: 'min_funding_rate_24h',
@@ -299,30 +369,9 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     cellClass: fundingCellClass,
   },
   {
-    field: 'avg_funding_rate_24h',
-    headerName: '历史均值24h',
-    width: 120,
-    valueFormatter: fundingFormatter,
-    cellClass: fundingCellClass,
-  },
-  {
-    field: 'funding_rate_change',
-    headerName: '当前变化',
-    width: 105,
-    valueFormatter: fundingFormatter,
-    cellClass: fundingCellClass,
-  },
-  {
-    field: 'confidence',
-    headerName: '置信度',
-    width: 95,
-    type: 'numericColumn',
-    valueFormatter: probabilityFormatter,
-  },
-  {
     field: 'expected_funding_bps',
-    headerName: '预期Funding',
-    width: 115,
+    headerName: '当前预期Funding',
+    width: 135,
     type: 'numericColumn',
     valueFormatter: bpsFormatter,
     cellClass: probabilityCellClass,
@@ -335,72 +384,29 @@ const columnDefs = ref<ColDef<PredictionRow>[]>([
     valueFormatter: bpsFormatter,
   },
   {
-    field: 'borrow_capacity_usdt',
-    headerName: '可借额度',
-    width: 105,
+    field: 'p_next_3',
+    headerName: 'P3高负参考',
+    width: 115,
     type: 'numericColumn',
-    valueFormatter: usdtFormatter,
+    valueFormatter: probabilityFormatter,
+    cellClass: probabilityCellClass,
   },
   {
-    field: 'borrowable',
-    headerName: '当前可借',
-    width: 95,
-    valueFormatter: boolFormatter,
-    cellClass: passCellClass,
-  },
-  {
-    field: 'probability_filter_pass',
-    headerName: '概率通过',
-    width: 95,
-    valueFormatter: boolFormatter,
-    cellClass: passCellClass,
-  },
-  {
-    field: 'confidence_filter_pass',
-    headerName: '置信通过',
-    width: 95,
-    valueFormatter: boolFormatter,
-    cellClass: passCellClass,
-  },
-  {
-    field: 'negative_funding_filter_pass',
-    headerName: '负费率通过',
-    width: 105,
-    valueFormatter: boolFormatter,
-    cellClass: passCellClass,
-  },
-  {
-    field: 'capacity_filter_pass',
-    headerName: '额度通过',
-    width: 95,
-    valueFormatter: boolFormatter,
-    cellClass: passCellClass,
-  },
-  {
-    field: 'borrow_cost_filter_pass',
-    headerName: '成本通过',
-    width: 95,
-    valueFormatter: boolFormatter,
-    cellClass: passCellClass,
-  },
-  {
-    field: 'sample_count',
-    headerName: '样本数',
-    width: 90,
+    field: 'negative_frequency',
+    headerName: '负费率频率',
+    width: 115,
     type: 'numericColumn',
-    valueFormatter: numberFormatter,
+    valueFormatter: probabilityFormatter,
   },
   {
-    field: 'conditional_sample_count',
-    headerName: '同状态样本',
-    width: 110,
-    type: 'numericColumn',
-    valueFormatter: numberFormatter,
+    field: 'preborrow_filter_reason',
+    headerName: '过滤逻辑',
+    width: 360,
+    tooltipField: 'preborrow_filter_reason',
   },
   { field: 'last_high_negative_time', headerName: '最近高负时间', width: 160 },
   { field: 'funding_next_apply', headerName: '下次支付时间', width: 160 },
   { field: 'borrow_snapshot_time', headerName: '借币更新时间', width: 160 },
-  { field: 'last_history_time', headerName: '历史更新时间', width: 160 },
 ])
 
 function refreshColumnVisibilities() {
@@ -458,14 +464,14 @@ async function fetchPredictions(resetPage = false) {
     params.set('page', String(paginationCurrentPage.value))
     params.set('page_size', String(paginationPageSize.value))
     params.set('prefer_stored', 'true')
-    params.set('probability_filter', String(probabilityFilter.value))
-    params.set('min_p_next_2', String(minPNext2Pct.value / 100))
-    params.set('min_p_next_3', String(minPNext3Pct.value / 100))
-    params.set('confidence_filter', String(confidenceFilter.value))
-    params.set('min_confidence', String(minConfidencePct.value / 100))
-    params.set('negative_funding_filter', String(negativeFundingFilter.value))
+    params.set('follow_score_filter', String(followScoreFilter.value))
+    params.set('min_follow_score', String(minFollowScore.value))
+    params.set('funding_down_filter', String(fundingDownFilter.value))
+    params.set('min_funding_drop_bps', String(minFundingDropBps.value))
+    params.set('borrow_drop_filter', String(borrowDropFilter.value))
+    params.set('min_borrow_drop_pct', String(minBorrowDropPct.value))
+    params.set('history_high_negative_filter', String(historyHighNegativeFilter.value))
     params.set('borrowable_filter', String(borrowableFilter.value))
-    params.set('capacity_filter', String(capacityFilter.value))
     params.set('min_borrow_capacity_usdt', String(minBorrowCapacityUsdt.value))
     params.set('borrow_cost_filter', String(borrowCostFilter.value))
     params.set('max_borrow_cost_ratio', String(maxBorrowCostRatio.value))
@@ -638,44 +644,52 @@ onUnmounted(() => {
       </div>
       <div class="filter-row rule-row">
         <el-switch
-          v-model="probabilityFilter"
+          v-model="followScoreFilter"
           inline-prompt
-          active-text="概率"
-          inactive-text="概率"
+          active-text="跟随分"
+          inactive-text="跟随分"
           @change="applyFilterChange"
         />
-        <span class="filter-label">P2≥</span>
+        <span class="filter-label">≥</span>
         <el-input-number
-          v-model="minPNext2Pct"
+          v-model="minFollowScore"
           size="small"
           :min="0"
-          :max="100"
-          :step="1"
-          :precision="0"
-          controls-position="right"
-          @change="applyFilterChange"
-        />
-        <span class="filter-label">P3≥</span>
-        <el-input-number
-          v-model="minPNext3Pct"
-          size="small"
-          :min="0"
-          :max="100"
-          :step="1"
+          :max="200"
+          :step="5"
           :precision="0"
           controls-position="right"
           @change="applyFilterChange"
         />
         <el-switch
-          v-model="confidenceFilter"
+          v-model="fundingDownFilter"
           inline-prompt
-          active-text="置信"
-          inactive-text="置信"
+          active-text="资金费下行"
+          inactive-text="资金费下行"
           @change="applyFilterChange"
         />
         <span class="filter-label">≥</span>
         <el-input-number
-          v-model="minConfidencePct"
+          v-model="minFundingDropBps"
+          size="small"
+          :min="0"
+          :max="500"
+          :step="1"
+          :precision="1"
+          controls-position="right"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">bps</span>
+        <el-switch
+          v-model="borrowDropFilter"
+          inline-prompt
+          active-text="额度下降"
+          inactive-text="额度下降"
+          @change="applyFilterChange"
+        />
+        <span class="filter-label">≥</span>
+        <el-input-number
+          v-model="minBorrowDropPct"
           size="small"
           :min="0"
           :max="100"
@@ -684,25 +698,19 @@ onUnmounted(() => {
           controls-position="right"
           @change="applyFilterChange"
         />
+        <span class="filter-label">%</span>
         <el-switch
-          v-model="negativeFundingFilter"
+          v-model="historyHighNegativeFilter"
           inline-prompt
-          active-text="负费率"
-          inactive-text="负费率"
+          active-text="历史高负"
+          inactive-text="历史高负"
           @change="applyFilterChange"
         />
         <el-switch
           v-model="borrowableFilter"
           inline-prompt
-          active-text="可借"
-          inactive-text="可借"
-          @change="applyFilterChange"
-        />
-        <el-switch
-          v-model="capacityFilter"
-          inline-prompt
-          active-text="额度"
-          inactive-text="额度"
+          active-text="当前可借"
+          inactive-text="当前可借"
           @change="applyFilterChange"
         />
         <span class="filter-label">≥</span>

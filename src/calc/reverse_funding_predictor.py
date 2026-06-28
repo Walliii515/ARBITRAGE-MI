@@ -20,11 +20,14 @@ DEFAULT_THRESHOLD_RATE = -0.006
 DEFAULT_LOOKBACK_DAYS = 30
 DEFAULT_PAGE_SIZE = 100
 MIN_CONDITIONAL_SAMPLES = 20
-MODEL_VERSION = 'funding_bucket_v1_pool_filters'
+MODEL_VERSION = 'funding_follow_v1'
 DEFAULT_MIN_P_NEXT_2 = 0.20
 DEFAULT_MIN_P_NEXT_3 = 0.25
 DEFAULT_MIN_CONFIDENCE = 0.50
 DEFAULT_BORROW_COST_RATIO = 1.0
+DEFAULT_MIN_FUNDING_DROP_BPS = 5.0
+DEFAULT_MIN_BORROW_DROP_PCT = 20.0
+DEFAULT_MIN_FOLLOW_SCORE = 50.0
 
 logger = get_logger(__name__)
 
@@ -218,6 +221,25 @@ def _load_latest_borrow_meta() -> Dict[str, Dict[str, Any]]:
     }
 
 
+def _load_borrow_history(hours: int = 24) -> Dict[str, List[Dict[str, Any]]]:
+    sql = """
+        SELECT base_asset, snapshot_time, borrowable, borrow_capacity_usdt,
+               borrow_hourly_rate, borrow_24h_bps, max_borrowable_amount
+        FROM mi_reverse_research_snapshot
+        WHERE snapshot_time >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+        ORDER BY base_asset ASC, snapshot_time ASC
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, (hours,))
+        rows = cursor.fetchall() or []
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        base_asset = str(row.get('base_asset') or '').strip().upper()
+        if base_asset:
+            grouped[base_asset].append(row)
+    return grouped
+
+
 def _load_funding_history(lookback_days: int) -> List[Dict[str, Any]]:
     sql = """
         SELECT contract, funding_rate_24h, record_time
@@ -257,6 +279,90 @@ def _expected_funding_bps(current_funding_rate_24h: Optional[float]) -> float:
     return abs(rate) * 10000.0 * capture_ratio
 
 
+def _value_at_or_before(
+    series: List[Tuple[datetime, Optional[float]]],
+    current_time: datetime,
+    hours: int,
+) -> Optional[float]:
+    if not series:
+        return None
+    target = current_time.timestamp() - hours * 3600
+    fallback = series[0][1]
+    chosen = None
+    for item_time, value in series:
+        if value is None:
+            continue
+        if item_time.timestamp() <= target:
+            chosen = value
+        else:
+            break
+    return chosen if chosen is not None else fallback
+
+
+def _rate_delta_bps(history: List[Tuple[datetime, float]], current_rate: Optional[float], hours: int) -> Optional[float]:
+    if not history or current_rate is None:
+        return None
+    current_time = history[-1][0]
+    ref_rate = _value_at_or_before([(item_time, rate) for item_time, rate in history], current_time, hours)
+    if ref_rate is None:
+        return None
+    return (current_rate - ref_rate) * 10000.0
+
+
+def _capacity_drop_pct(history: List[Dict[str, Any]], hours: int) -> Optional[float]:
+    points = [
+        (row.get('snapshot_time'), _as_float(row.get('borrow_capacity_usdt')))
+        for row in history
+        if row.get('snapshot_time') is not None
+    ]
+    points = [(item_time, value) for item_time, value in points if isinstance(item_time, datetime)]
+    if not points:
+        return None
+    current_time, current_value = points[-1]
+    current_value = current_value or 0.0
+    ref_value = _value_at_or_before(points, current_time, hours)
+    if ref_value is None or ref_value <= 0:
+        return None
+    return max(0.0, (ref_value - current_value) / ref_value * 100.0)
+
+
+def _score_follow_signal(row: Dict[str, Any]) -> Tuple[float, str]:
+    current_rate = _as_float(row.get('current_funding_rate_24h'), 0.0) or 0.0
+    funding_drop_1h = max(0.0, -(_as_float(row.get('funding_change_1h_bps'), 0.0) or 0.0))
+    funding_drop_4h = max(0.0, -(_as_float(row.get('funding_change_4h_bps'), 0.0) or 0.0))
+    funding_drop_12h = max(0.0, -(_as_float(row.get('funding_change_12h_bps'), 0.0) or 0.0))
+    borrow_drop_1h = _as_float(row.get('borrow_capacity_drop_1h_pct'), 0.0) or 0.0
+    borrow_drop_4h = _as_float(row.get('borrow_capacity_drop_4h_pct'), 0.0) or 0.0
+    borrow_drop_12h = _as_float(row.get('borrow_capacity_drop_12h_pct'), 0.0) or 0.0
+    max_borrow_drop = max(borrow_drop_1h, borrow_drop_4h, borrow_drop_12h)
+    history_freq = _as_float(row.get('high_negative_frequency'), 0.0) or 0.0
+    history_count = _as_float(row.get('high_negative_count'), 0.0) or 0.0
+    borrowable = int(row.get('borrowable') or 0) == 1
+    capacity = _as_float(row.get('borrow_capacity_usdt'), 0.0) or 0.0
+    borrow_cost = _as_float(row.get('borrow_24h_bps'), 0.0) or 0.0
+
+    funding_trend_score = min(35.0, funding_drop_1h * 1.2 + funding_drop_4h * 0.9 + funding_drop_12h * 0.45)
+    borrow_drop_score = min(30.0, max_borrow_drop * 0.30)
+    current_negative_score = min(15.0, max(0.0, -current_rate * 10000.0) * 0.4)
+    history_score = min(15.0, history_freq * 80.0 + min(history_count, 10.0) * 0.7)
+    borrow_state_score = (8.0 if borrowable else 0.0) + min(5.0, capacity / 100.0)
+    cost_penalty = min(18.0, borrow_cost * 0.25)
+    score = max(0.0, funding_trend_score + borrow_drop_score + current_negative_score + history_score + borrow_state_score - cost_penalty)
+
+    parts = []
+    if funding_drop_4h > 0 or funding_drop_12h > 0:
+        parts.append(f"资金费下行(4h={funding_drop_4h:.1f}bps,12h={funding_drop_12h:.1f}bps)")
+    if max_borrow_drop > 0:
+        parts.append(f"额度下降(max={max_borrow_drop:.1f}%)")
+    if borrowable:
+        parts.append(f"当前可借({capacity:.0f}U)")
+    if history_count > 0:
+        parts.append(f"历史高负{int(history_count)}次")
+    if borrow_cost > 0:
+        parts.append(f"借币成本{borrow_cost:.1f}bps")
+    return round(score, 2), '|'.join(parts) or '暂无明显跟随信号'
+
+
 def _attach_borrow_metrics(row: Dict[str, Any], borrow: Optional[Dict[str, Any]]) -> None:
     borrow = borrow or {}
     expected_bps = _expected_funding_bps(_as_float(row.get('current_funding_rate_24h')))
@@ -267,6 +373,24 @@ def _attach_borrow_metrics(row: Dict[str, Any], borrow: Optional[Dict[str, Any]]
     row['borrow_24h_bps'] = _round_or_none(_as_float(borrow.get('borrow_24h_bps')), 4)
     row['max_borrowable_amount'] = _round_or_none(_as_float(borrow.get('max_borrowable_amount')), 8)
     row['borrow_snapshot_time'] = _serialize_dt(borrow.get('snapshot_time'))
+
+
+def _attach_follow_metrics(row: Dict[str, Any], history: List[Tuple[datetime, float]], borrow_history: List[Dict[str, Any]]) -> None:
+    current_rate = _as_float(row.get('current_funding_rate_24h'))
+    row['funding_change_1h_bps'] = _round_or_none(_rate_delta_bps(history, current_rate, 1), 4)
+    row['funding_change_4h_bps'] = _round_or_none(_rate_delta_bps(history, current_rate, 4), 4)
+    row['funding_change_12h_bps'] = _round_or_none(_rate_delta_bps(history, current_rate, 12), 4)
+    row['borrow_capacity_drop_1h_pct'] = _round_or_none(_capacity_drop_pct(borrow_history, 1), 4)
+    row['borrow_capacity_drop_4h_pct'] = _round_or_none(_capacity_drop_pct(borrow_history, 4), 4)
+    row['borrow_capacity_drop_12h_pct'] = _round_or_none(_capacity_drop_pct(borrow_history, 12), 4)
+    row['borrow_capacity_drop_max_pct'] = _round_or_none(max(
+        _as_float(row.get('borrow_capacity_drop_1h_pct'), 0.0) or 0.0,
+        _as_float(row.get('borrow_capacity_drop_4h_pct'), 0.0) or 0.0,
+        _as_float(row.get('borrow_capacity_drop_12h_pct'), 0.0) or 0.0,
+    ), 4)
+    score, reason = _score_follow_signal(row)
+    row['follow_score'] = score
+    row['follow_reason'] = reason
 
 
 def _compute_prediction_row(
@@ -375,6 +499,15 @@ def ensure_reverse_funding_prediction_table() -> None:
             borrow_24h_bps DECIMAL(12,4) DEFAULT NULL,
             max_borrowable_amount DECIMAL(28,8) DEFAULT NULL,
             borrow_snapshot_time DATETIME DEFAULT NULL,
+            follow_score DECIMAL(12,4) DEFAULT NULL,
+            follow_reason VARCHAR(512) DEFAULT NULL,
+            funding_change_1h_bps DECIMAL(12,4) DEFAULT NULL,
+            funding_change_4h_bps DECIMAL(12,4) DEFAULT NULL,
+            funding_change_12h_bps DECIMAL(12,4) DEFAULT NULL,
+            borrow_capacity_drop_1h_pct DECIMAL(12,4) DEFAULT NULL,
+            borrow_capacity_drop_4h_pct DECIMAL(12,4) DEFAULT NULL,
+            borrow_capacity_drop_12h_pct DECIMAL(12,4) DEFAULT NULL,
+            borrow_capacity_drop_max_pct DECIMAL(12,4) DEFAULT NULL,
             current_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
             previous_funding_rate_24h DECIMAL(18,10) DEFAULT NULL,
             funding_rate_change DECIMAL(18,10) DEFAULT NULL,
@@ -434,6 +567,15 @@ def _ensure_prediction_columns(cursor) -> None:
         'borrow_24h_bps': "ADD COLUMN borrow_24h_bps DECIMAL(12,4) DEFAULT NULL AFTER borrow_hourly_rate",
         'max_borrowable_amount': "ADD COLUMN max_borrowable_amount DECIMAL(28,8) DEFAULT NULL AFTER borrow_24h_bps",
         'borrow_snapshot_time': "ADD COLUMN borrow_snapshot_time DATETIME DEFAULT NULL AFTER max_borrowable_amount",
+        'follow_score': "ADD COLUMN follow_score DECIMAL(12,4) DEFAULT NULL AFTER borrow_snapshot_time",
+        'follow_reason': "ADD COLUMN follow_reason VARCHAR(512) DEFAULT NULL AFTER follow_score",
+        'funding_change_1h_bps': "ADD COLUMN funding_change_1h_bps DECIMAL(12,4) DEFAULT NULL AFTER follow_reason",
+        'funding_change_4h_bps': "ADD COLUMN funding_change_4h_bps DECIMAL(12,4) DEFAULT NULL AFTER funding_change_1h_bps",
+        'funding_change_12h_bps': "ADD COLUMN funding_change_12h_bps DECIMAL(12,4) DEFAULT NULL AFTER funding_change_4h_bps",
+        'borrow_capacity_drop_1h_pct': "ADD COLUMN borrow_capacity_drop_1h_pct DECIMAL(12,4) DEFAULT NULL AFTER funding_change_12h_bps",
+        'borrow_capacity_drop_4h_pct': "ADD COLUMN borrow_capacity_drop_4h_pct DECIMAL(12,4) DEFAULT NULL AFTER borrow_capacity_drop_1h_pct",
+        'borrow_capacity_drop_12h_pct': "ADD COLUMN borrow_capacity_drop_12h_pct DECIMAL(12,4) DEFAULT NULL AFTER borrow_capacity_drop_4h_pct",
+        'borrow_capacity_drop_max_pct': "ADD COLUMN borrow_capacity_drop_max_pct DECIMAL(12,4) DEFAULT NULL AFTER borrow_capacity_drop_12h_pct",
     }
     for column, ddl in alters.items():
         if column not in existing:
@@ -453,6 +595,7 @@ def _compute_prediction_rows(
     current_by_contract = _load_current_contracts()
     eligible_assets = _load_prediction_universe()
     borrow_by_asset = _load_latest_borrow_meta()
+    borrow_history_by_asset = _load_borrow_history(24)
     history_by_contract = _group_history(_load_funding_history(lookback_days))
 
     rows: List[Dict[str, Any]] = []
@@ -467,12 +610,16 @@ def _compute_prediction_rows(
             continue
         row['strategy_tier'] = strategy_tier
         _attach_borrow_metrics(row, borrow_by_asset.get(base_asset))
+        _attach_follow_metrics(row, history, borrow_history_by_asset.get(base_asset, []))
         if keyword and keyword not in row['base_asset'] and keyword not in row['contract']:
             continue
         rows.append(row)
 
     rows.sort(
         key=lambda item: (
+            item.get('follow_score') or 0.0,
+            item.get('borrow_capacity_drop_max_pct') or 0.0,
+            max(0.0, -(item.get('funding_change_4h_bps') or 0.0)),
             item.get('p_next_3') or 0.0,
             item.get('p_next_2') or 0.0,
             item.get('p_next_1') or 0.0,
@@ -494,9 +641,19 @@ def _build_summary(
     total = len(rows)
     latest_history_time = max((row.get('last_history_time') for row in rows if row.get('last_history_time')), default=None)
     current_high_count = sum(1 for row in rows if (row.get('current_funding_rate_24h') or 0) <= threshold_rate)
+    follow_candidates = sum(1 for row in rows if (_as_float(row.get('follow_score'), 0.0) or 0.0) >= DEFAULT_MIN_FOLLOW_SCORE)
+    borrow_drop_count = sum(1 for row in rows if (_as_float(row.get('borrow_capacity_drop_max_pct'), 0.0) or 0.0) >= DEFAULT_MIN_BORROW_DROP_PCT)
+    funding_down_count = sum(1 for row in rows if min(
+        _as_float(row.get('funding_change_1h_bps'), 0.0) or 0.0,
+        _as_float(row.get('funding_change_4h_bps'), 0.0) or 0.0,
+        _as_float(row.get('funding_change_12h_bps'), 0.0) or 0.0,
+    ) <= -DEFAULT_MIN_FUNDING_DROP_BPS)
     return {
         'asset_count': total,
         'current_high_negative_count': current_high_count,
+        'follow_candidate_count': follow_candidates,
+        'borrow_drop_count': borrow_drop_count,
+        'funding_down_count': funding_down_count,
         'threshold_rate': threshold_rate,
         'lookback_days': lookback_days,
         'latest_history_time': latest_history_time,
@@ -515,6 +672,10 @@ def _build_summary(
             sum((row.get('p_next_3') or 0.0) for row in rows) / total if total else None,
             6,
         ),
+        'avg_follow_score': _round_or_none(
+            sum((_as_float(row.get('follow_score'), 0.0) or 0.0) for row in rows) / total if total else None,
+            4,
+        ),
     }
 
 
@@ -529,6 +690,10 @@ def _filter_bool(value: Any, default: bool = False) -> bool:
 def _normalize_filter_options(options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     raw = options or {}
     return {
+        'follow_score_enabled': _filter_bool(raw.get('follow_score_enabled')),
+        'funding_down_enabled': _filter_bool(raw.get('funding_down_enabled')),
+        'borrow_drop_enabled': _filter_bool(raw.get('borrow_drop_enabled')),
+        'history_high_negative_enabled': _filter_bool(raw.get('history_high_negative_enabled')),
         'probability_enabled': _filter_bool(raw.get('probability_enabled')),
         'confidence_enabled': _filter_bool(raw.get('confidence_enabled')),
         'negative_funding_enabled': _filter_bool(raw.get('negative_funding_enabled')),
@@ -538,6 +703,9 @@ def _normalize_filter_options(options: Optional[Dict[str, Any]]) -> Dict[str, An
         'min_p_next_2': max(0.0, min(1.0, float(raw.get('min_p_next_2') or DEFAULT_MIN_P_NEXT_2))),
         'min_p_next_3': max(0.0, min(1.0, float(raw.get('min_p_next_3') or DEFAULT_MIN_P_NEXT_3))),
         'min_confidence': max(0.0, min(1.0, float(raw.get('min_confidence') or DEFAULT_MIN_CONFIDENCE))),
+        'min_follow_score': max(0.0, float(raw.get('min_follow_score') or DEFAULT_MIN_FOLLOW_SCORE)),
+        'min_funding_drop_bps': max(0.0, float(raw.get('min_funding_drop_bps') or DEFAULT_MIN_FUNDING_DROP_BPS)),
+        'min_borrow_drop_pct': max(0.0, float(raw.get('min_borrow_drop_pct') or DEFAULT_MIN_BORROW_DROP_PCT)),
         'min_borrow_capacity_usdt': max(0.0, float(
             raw.get('min_borrow_capacity_usdt')
             if raw.get('min_borrow_capacity_usdt') is not None
@@ -556,7 +724,19 @@ def _annotate_filter_pass(row: Dict[str, Any], opts: Dict[str, Any]) -> Dict[str
     capacity = _as_float(row.get('borrow_capacity_usdt'), 0.0) or 0.0
     borrow_cost = _as_float(row.get('borrow_24h_bps'))
     expected = _as_float(row.get('expected_funding_bps'), 0.0) or 0.0
+    follow_score = _as_float(row.get('follow_score'), 0.0) or 0.0
+    min_funding_change = min(
+        _as_float(row.get('funding_change_1h_bps'), 0.0) or 0.0,
+        _as_float(row.get('funding_change_4h_bps'), 0.0) or 0.0,
+        _as_float(row.get('funding_change_12h_bps'), 0.0) or 0.0,
+    )
+    max_borrow_drop = _as_float(row.get('borrow_capacity_drop_max_pct'), 0.0) or 0.0
+    high_negative_count = _as_float(row.get('high_negative_count'), 0.0) or 0.0
 
+    row['follow_score_filter_pass'] = follow_score >= opts['min_follow_score']
+    row['funding_down_filter_pass'] = min_funding_change <= -opts['min_funding_drop_bps']
+    row['borrow_drop_filter_pass'] = max_borrow_drop >= opts['min_borrow_drop_pct']
+    row['history_high_negative_filter_pass'] = high_negative_count > 0
     row['probability_filter_pass'] = p2 >= opts['min_p_next_2'] or p3 >= opts['min_p_next_3']
     row['confidence_filter_pass'] = confidence >= opts['min_confidence']
     row['negative_funding_filter_pass'] = current_rate < 0
@@ -568,6 +748,10 @@ def _annotate_filter_pass(row: Dict[str, Any], opts: Dict[str, Any]) -> Dict[str
         and borrow_cost <= expected * opts['max_borrow_cost_ratio']
     )
     enabled_checks = [
+        'follow_score_filter_pass' if opts['follow_score_enabled'] else None,
+        'funding_down_filter_pass' if opts['funding_down_enabled'] else None,
+        'borrow_drop_filter_pass' if opts['borrow_drop_enabled'] else None,
+        'history_high_negative_filter_pass' if opts['history_high_negative_enabled'] else None,
         'probability_filter_pass' if opts['probability_enabled'] else None,
         'confidence_filter_pass' if opts['confidence_enabled'] else None,
         'negative_funding_filter_pass' if opts['negative_funding_enabled'] else None,
@@ -578,6 +762,10 @@ def _annotate_filter_pass(row: Dict[str, Any], opts: Dict[str, Any]) -> Dict[str
     checks = [key for key in enabled_checks if key]
     row['preborrow_filter_pass'] = all(bool(row.get(key)) for key in checks) if checks else True
     row['preborrow_filter_reason'] = (
+        f"跟随分>={opts['min_follow_score']:.0f}={'Y' if row['follow_score_filter_pass'] else 'N'};"
+        f"资金费下行>={opts['min_funding_drop_bps']:.1f}bps={'Y' if row['funding_down_filter_pass'] else 'N'};"
+        f"额度下降>={opts['min_borrow_drop_pct']:.0f}%={'Y' if row['borrow_drop_filter_pass'] else 'N'};"
+        f"历史高负={'Y' if row['history_high_negative_filter_pass'] else 'N'};"
         f"概率(p2>={opts['min_p_next_2']:.0%}或p3>={opts['min_p_next_3']:.0%})="
         f"{'Y' if row['probability_filter_pass'] else 'N'};"
         f"置信度>={opts['min_confidence']:.0%}={'Y' if row['confidence_filter_pass'] else 'N'};"
@@ -594,6 +782,10 @@ def _apply_prediction_filters(rows: List[Dict[str, Any]], options: Optional[Dict
     current = [_annotate_filter_pass(dict(row), opts) for row in rows]
     steps = [{'key': 'all', 'label': '全部观察池', 'enabled': True, 'count': len(current)}]
     filters = [
+        ('follow_score_enabled', 'follow_score_filter_pass', '跟随分'),
+        ('funding_down_enabled', 'funding_down_filter_pass', '资金费下行'),
+        ('borrow_drop_enabled', 'borrow_drop_filter_pass', '额度下降'),
+        ('history_high_negative_enabled', 'history_high_negative_filter_pass', '历史高负'),
         ('probability_enabled', 'probability_filter_pass', '概率候选'),
         ('confidence_enabled', 'confidence_filter_pass', '置信度'),
         ('negative_funding_enabled', 'negative_funding_filter_pass', '当前负费率'),
@@ -675,6 +867,10 @@ def refresh_reverse_funding_predictions(
         'base_asset', 'contract', 'strategy_tier', 'expected_funding_bps',
         'borrowable', 'borrow_capacity_usdt', 'borrow_hourly_rate',
         'borrow_24h_bps', 'max_borrowable_amount', 'borrow_snapshot_time',
+        'follow_score', 'follow_reason', 'funding_change_1h_bps',
+        'funding_change_4h_bps', 'funding_change_12h_bps',
+        'borrow_capacity_drop_1h_pct', 'borrow_capacity_drop_4h_pct',
+        'borrow_capacity_drop_12h_pct', 'borrow_capacity_drop_max_pct',
         'current_funding_rate_24h',
         'previous_funding_rate_24h', 'funding_rate_change', 'current_bucket',
         'current_bucket_label', 'sample_count', 'conditional_sample_count',
@@ -770,7 +966,7 @@ def _load_stored_prediction_page(
         SELECT *
         FROM mi_reverse_funding_prediction
         WHERE {where}
-        ORDER BY p_next_3 DESC, p_next_2 DESC, p_next_1 DESC, high_negative_frequency DESC, base_asset ASC
+        ORDER BY follow_score DESC, borrow_capacity_drop_max_pct DESC, p_next_3 DESC, p_next_2 DESC, base_asset ASC
     """
     with db_manager.get_cursor() as cursor:
         cursor.execute(data_sql, params)
