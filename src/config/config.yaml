@@ -350,6 +350,10 @@ margin:
     min_amount_usdt: 0.1
     snapshot_max_age_sec: 180
     hedge_balance_tolerance_pct: 5
+  danger_path:
+    enabled: true
+    mmr_pct: 300                           # 低于该 MMR 视为危险路径，强制刷新 Gate 风险快照
+    liq_distance_bps: 300                  # 空头价格距强平价小于该 bps 时进入危险路径
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数

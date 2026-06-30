@@ -4221,6 +4221,125 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertTrue(result['success'])
         ce.executor_client.topup_margin.assert_called_once_with('BANK_USDT', 15.0, dual_side='short')
 
+    def test_liq_price_danger_forces_topup_even_when_mmr_above_topup_threshold(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 300.0
+        ce.margin_danger_liq_distance_bps = 300.0
+        ce.margin_topup_target_rate_pct = 500.0
+        ce.margin_topup_min_gate_available = 0.0
+        ce.margin_topup_max_notional_multiplier = 0.0
+        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._insert_margin_topup_log = MagicMock()
+        ce._mark_margin_topup_success = MagicMock()
+        ce.executor_client = MagicMock()
+        ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
+
+        pos = self._topup_position(
+            gate_maintenance_margin_rate=400.0,
+            gate_contract_position_margin=4.0,
+            gate_contract_position_margin_equity=4.0,
+            gate_contract_maintenance_margin=1.0,
+            gate_liq_price=1.05,
+            gate_mark_price=1.03,
+        )
+
+        danger = ce._margin_danger_state(pos)
+        result = ce._check_and_topup_margin(pos, force_topup=danger['active'])
+
+        self.assertTrue(danger['active'])
+        self.assertTrue(result['success'])
+        ce.executor_client.topup_margin.assert_called_once_with('TUT_USDT', 1.0, dual_side='short')
+
+    def test_danger_path_closes_market_when_topup_fails_above_close_threshold(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 300.0
+        ce.margin_close_threshold_pct = 200.0
+        ce.margin_danger_liq_distance_bps = 300.0
+        ce.margin_topup_target_rate_pct = 500.0
+        ce.margin_topup_min_gate_available = 0.0
+        ce.margin_topup_max_notional_multiplier = 0.0
+        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._insert_margin_topup_log = MagicMock()
+        ce.executor_client = MagicMock()
+        ce.executor_client.topup_margin.return_value = {'success': False, 'message': 'Gate rejected'}
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': True,
+            'close_reason': 'margin_close',
+        })
+
+        pos = self._topup_position(
+            gate_maintenance_margin_rate=400.0,
+            gate_contract_position_margin=4.0,
+            gate_contract_position_margin_equity=4.0,
+            gate_contract_maintenance_margin=1.0,
+            gate_liq_price=1.05,
+            gate_mark_price=1.03,
+        )
+
+        results = ce.check_and_close([pos], {}, {'TUT': {'base_asset': 'TUT'}})
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]['action'], 'margin_topup')
+        self.assertFalse(results[0]['success'])
+        self.assertEqual(results[1]['close_reason'], 'margin_close')
+        ce._execute_close.assert_called_once()
+        args = ce._execute_close.call_args.args
+        self.assertEqual(args[1], 'margin_close')
+        self.assertIn('保证金危险路径', args[2])
+        self.assertIn('追保失效', args[2])
+
+    def test_danger_margin_close_uses_minimal_row_when_orderbook_missing(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 300.0
+        ce.margin_danger_liq_distance_bps = 300.0
+        ce.margin_topup_target_rate_pct = 500.0
+        ce.margin_topup_min_gate_available = 50.0
+        ce._get_latest_gate_available = MagicMock(return_value=50.5)
+        ce._insert_margin_topup_log = MagicMock()
+        ce.executor_client = MagicMock()
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': True,
+            'close_reason': 'margin_close',
+        })
+
+        pos = self._topup_position(
+            gate_maintenance_margin_rate=400.0,
+            gate_contract_position_margin=4.0,
+            gate_contract_position_margin_equity=4.0,
+            gate_contract_maintenance_margin=1.0,
+            gate_liq_price=1.05,
+            gate_mark_price=1.03,
+        )
+
+        results = ce.check_and_close([pos], {}, {})
+
+        self.assertEqual(results[-1]['close_reason'], 'margin_close')
+        args = ce._execute_close.call_args.args
+        self.assertEqual(args[3], {'base_asset': 'TUT'})
+
+    def test_needs_fresh_margin_risk_detects_mmr_and_liq_distance(self):
+        ce = make_closing_executor()
+        ce.margin_danger_mmr_pct = 300.0
+        ce.margin_danger_liq_distance_bps = 300.0
+
+        safe = self._topup_position(
+            gate_maintenance_margin_rate=450.0,
+            gate_liq_price=1.20,
+            gate_mark_price=1.00,
+        )
+        low_mmr = self._topup_position(gate_maintenance_margin_rate=250.0)
+        near_liq = self._topup_position(
+            gate_maintenance_margin_rate=450.0,
+            gate_liq_price=1.05,
+            gate_mark_price=1.03,
+        )
+
+        self.assertFalse(ce.needs_fresh_margin_risk([safe]))
+        self.assertTrue(ce.needs_fresh_margin_risk([low_mmr]))
+        self.assertTrue(ce.needs_fresh_margin_risk([near_liq]))
+
     def test_topup_success_grace_blocks_duplicate_local_positions(self):
         ce = make_closing_executor()
         ce.margin_topup_pct = 2000.0

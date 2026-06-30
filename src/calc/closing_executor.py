@@ -207,6 +207,15 @@ class ClosingExecutor:
         self.margin_topup_balance_tolerance_pct = config.get_float(
             'margin.topup.hedge_balance_tolerance_pct', 5.0
         )
+        self.margin_danger_path_enabled = config.get_bool('margin.danger_path.enabled', True)
+        self.margin_danger_mmr_pct = config.get_float(
+            'margin.danger_path.mmr_pct',
+            self.margin_topup_pct,
+        )
+        self.margin_danger_liq_distance_bps = max(
+            config.get_float('margin.danger_path.liq_distance_bps', 300.0),
+            0.0,
+        )
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -373,7 +382,15 @@ class ClosingExecutor:
             pre_gate_basis_bps = None
             future_protective_price = None
 
-            topup_result = self._check_and_topup_margin(pos, topup_contracts_this_run)
+            margin_danger = self._margin_danger_state(pos)
+            topup_result = self._check_and_topup_margin(
+                pos,
+                topup_contracts_this_run,
+                force_topup=bool(margin_danger.get('active')),
+                ignore_cooldown=bool(margin_danger.get('active')),
+                ignore_success_grace=bool(margin_danger.get('at_liq')),
+                return_failure_on_skip=bool(margin_danger.get('active')),
+            )
             if topup_result:
                 if not topup_result.get('suppress_result'):
                     results.append(topup_result)
@@ -381,19 +398,25 @@ class ClosingExecutor:
                     continue
 
             # 优先级 0：保证金爆仓风控（最高优先级，保证金/维持保证金低于阈值时立即平仓）
-            if self._check_margin_liquidation(pos):
+            if margin_danger.get('active') and not (topup_result and topup_result.get('success')):
+                close_reason = 'margin_close'
+                close_reason_detail = self._build_margin_close_detail(
+                    pos,
+                    '保证金危险路径',
+                    margin_danger,
+                    topup_result,
+                )
+                self._clear_position_close_state(ba, pos)
+            elif self._check_margin_liquidation(pos):
                 margin_rate = self._maintenance_margin_rate(pos)
                 close_reason = 'margin_close'
-                close_reason_detail = (
+                close_reason_detail = self._build_margin_close_detail(
+                    pos,
                     f"保证金风控|保证金/维持保证金{margin_rate:.2f}%"
-                    f"(<{self.margin_close_threshold_pct}%)"
+                    f"(<{self.margin_close_threshold_pct}%)",
+                    self._margin_danger_state(pos),
+                    topup_result,
                 )
-                gate_margin = pos.get('gate_contract_position_margin', pos.get('gate_position_margin'))
-                gate_maintenance = pos.get('gate_contract_maintenance_margin', pos.get('gate_maintenance_margin'))
-                if gate_margin is not None:
-                    close_reason_detail += f"|仓位保证金{float(gate_margin or 0):.4f}"
-                if gate_maintenance is not None:
-                    close_reason_detail += f"|维持保证金{float(gate_maintenance or 0):.4f}"
                 # 紧急平仓，清除谷底状态
                 self._clear_position_close_state(ba, pos)
             elif self._check_delist_risk_exit(pos):
@@ -471,8 +494,15 @@ class ClosingExecutor:
             # ── 执行平仓 ──
             orderbook_row = orderbook_rows_by_asset.get(ba)
             if not orderbook_row:
-                logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
-                continue
+                if close_reason in FAST_RISK_CLOSE_REASONS:
+                    orderbook_row = {'base_asset': ba}
+                    orderbook_rows_by_asset[ba] = orderbook_row
+                    logger.warning(
+                        f"风险平仓无完整盘口，使用市价兜底最小盘口行: {ba} | reason={close_reason}"
+                    )
+                else:
+                    logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
+                    continue
             if close_reason == 'take_profit':
                 notional_ok, notional_reason = self._check_spot_close_min_notional(pos, orderbook_row)
                 if not notional_ok:
@@ -924,10 +954,107 @@ class ClosingExecutor:
             return None
         return margin / maintenance * 100
 
+    def needs_fresh_margin_risk(self, positions: List[Dict]) -> bool:
+        """是否需要绕过 Gate 风险快照缓存，立刻刷新 MMR/强平价。"""
+        if not self.margin_danger_path_enabled:
+            return False
+        return any(
+            bool(self._margin_danger_state(pos).get('active'))
+            for pos in positions or []
+            if pos.get('status') == 'holding'
+        )
+
+    def _margin_danger_state(self, pos: Dict) -> Dict:
+        if not self.margin_danger_path_enabled:
+            return {'active': False, 'reasons': []}
+
+        reasons = []
+        margin_rate = self._maintenance_margin_rate(pos)
+        if margin_rate is not None and margin_rate <= self.margin_danger_mmr_pct:
+            reasons.append(f"MMR{margin_rate:.2f}%<={self.margin_danger_mmr_pct:.1f}%")
+
+        liq_price = _float_or_none(pos.get('gate_liq_price'))
+        ref_price = self._margin_danger_reference_price(pos)
+        liq_distance_bps = None
+        at_liq = False
+        if liq_price is not None and liq_price > 0 and ref_price is not None and ref_price > 0:
+            # 正向策略 Gate 腿为空头，价格上涨接近/穿过强平价时最危险。
+            liq_distance_bps = (liq_price - ref_price) / liq_price * 10000.0
+            at_liq = liq_distance_bps <= 0
+            if liq_distance_bps <= self.margin_danger_liq_distance_bps:
+                reasons.append(
+                    f"距强平价{liq_distance_bps:.1f}bps<="
+                    f"{self.margin_danger_liq_distance_bps:.1f}bps"
+                )
+
+        return {
+            'active': bool(reasons),
+            'reasons': reasons,
+            'margin_rate': margin_rate,
+            'ref_price': ref_price,
+            'liq_price': liq_price,
+            'liq_distance_bps': liq_distance_bps,
+            'at_liq': at_liq,
+        }
+
+    @staticmethod
+    def _margin_danger_reference_price(pos: Dict) -> Optional[float]:
+        for key in (
+            'current_future_price',
+            'gate_mark_price',
+            'future_close_vwap',
+            'future_open_price',
+        ):
+            value = _float_or_none(pos.get(key))
+            if value is not None and value > 0:
+                return value
+        return None
+
+    def _build_margin_close_detail(
+        self,
+        pos: Dict,
+        prefix: str,
+        danger: Optional[Dict] = None,
+        topup_result: Optional[Dict] = None,
+    ) -> str:
+        parts = [prefix]
+        margin_rate = self._maintenance_margin_rate(pos)
+        if margin_rate is not None and '保证金/维持保证金' not in prefix:
+            parts.append(f"保证金/维持保证金{margin_rate:.2f}%")
+        gate_margin = pos.get('gate_contract_position_margin', pos.get('gate_position_margin'))
+        gate_maintenance = pos.get('gate_contract_maintenance_margin', pos.get('gate_maintenance_margin'))
+        if gate_margin is not None:
+            parts.append(f"仓位保证金{float(gate_margin or 0):.4f}")
+        if gate_maintenance is not None:
+            parts.append(f"维持保证金{float(gate_maintenance or 0):.4f}")
+
+        danger = danger or {}
+        if danger.get('liq_price') is not None:
+            parts.append(f"强平价{float(danger['liq_price']):.8g}")
+        if danger.get('ref_price') is not None:
+            parts.append(f"参考价{float(danger['ref_price']):.8g}")
+        if danger.get('liq_distance_bps') is not None:
+            parts.append(f"距强平{float(danger['liq_distance_bps']):.1f}bps")
+        if danger.get('reasons'):
+            parts.append(f"危险判定({';'.join(danger['reasons'])})")
+
+        if topup_result and not topup_result.get('success'):
+            message = topup_result.get('message') or '追保未成功'
+            parts.append(f"追保失效({message})")
+        elif danger.get('active'):
+            parts.append("追保未执行或仍处危险")
+        parts.append("全量市价平仓")
+        return '|'.join(parts)
+
     def _check_and_topup_margin(
         self,
         pos: Dict,
         topup_contracts_this_run: Optional[Set[str]] = None,
+        *,
+        force_topup: bool = False,
+        ignore_cooldown: bool = False,
+        ignore_success_grace: bool = False,
+        return_failure_on_skip: bool = False,
     ) -> Optional[Dict]:
         """在紧急平仓前尝试自动追加 Gate 逐仓保证金。"""
         if not self.margin_topup_enabled:
@@ -936,13 +1063,13 @@ class ClosingExecutor:
         margin_rate = self._maintenance_margin_rate(pos)
         if margin_rate is None:
             return None
-        if margin_rate >= self.margin_topup_pct:
+        if margin_rate >= self.margin_topup_pct and not force_topup:
             return None
 
         ba = pos.get('base_asset', '')
         position_id = int(pos.get('id') or 0)
         contract = pos.get('future_contract') or f"{ba}_USDT"
-        if self._in_margin_topup_success_grace(pos, contract):
+        if not ignore_success_grace and self._in_margin_topup_success_grace(pos, contract):
             return {
                 'base_asset': ba,
                 'success': True,
@@ -951,8 +1078,22 @@ class ClosingExecutor:
                 'message': '追保成功后等待Gate风险快照刷新',
             }
         if topup_contracts_this_run is not None and contract in topup_contracts_this_run:
+            if return_failure_on_skip:
+                return {
+                    'base_asset': ba,
+                    'success': False,
+                    'action': 'margin_topup',
+                    'message': '同合约本轮已尝试追保',
+                    'topup_skipped': True,
+                }
             return None
-        if self._in_margin_topup_cooldown(position_id) or self._in_margin_topup_contract_cooldown(contract):
+        if (
+            not ignore_cooldown
+            and (
+                self._in_margin_topup_cooldown(position_id)
+                or self._in_margin_topup_contract_cooldown(contract)
+            )
+        ):
             return None
 
         hedge_balanced = self._is_hedge_balanced(pos)
@@ -962,6 +1103,8 @@ class ClosingExecutor:
             self._set_margin_topup_cooldown(position_id)
             self._set_margin_topup_contract_cooldown(contract)
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
+            if return_failure_on_skip:
+                return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
             return None
 
         last_at = pos.get('margin_topup_last_at')
@@ -970,7 +1113,11 @@ class ClosingExecutor:
                 last_at = datetime.strptime(last_at, '%Y-%m-%d %H:%M:%S')
             except ValueError:
                 last_at = None
-        if last_at and (datetime.now() - last_at).total_seconds() < self.margin_topup_cooldown_sec:
+        if (
+            not ignore_cooldown
+            and last_at
+            and (datetime.now() - last_at).total_seconds() < self.margin_topup_cooldown_sec
+        ):
             return None
 
         calc = self._calculate_margin_topup_amount(pos)
@@ -997,6 +1144,8 @@ class ClosingExecutor:
                 logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
                 if topup_contracts_this_run is not None:
                     topup_contracts_this_run.add(contract)
+                if return_failure_on_skip:
+                    return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
                 return None
             if topup_amount > remaining:
                 topup_amount = remaining
@@ -1016,6 +1165,8 @@ class ClosingExecutor:
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             if topup_contracts_this_run is not None:
                 topup_contracts_this_run.add(contract)
+            if return_failure_on_skip:
+                return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
             return None
         if gate_available - topup_amount < self.margin_topup_min_gate_available:
             message = (
@@ -1031,6 +1182,8 @@ class ClosingExecutor:
             logger.warning(f"自动追保跳过 | {ba} | position_id={position_id} | {message}")
             if topup_contracts_this_run is not None:
                 topup_contracts_this_run.add(contract)
+            if return_failure_on_skip:
+                return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
             return None
 
         exec_result = self.executor_client.topup_margin(contract, topup_amount, dual_side='short')

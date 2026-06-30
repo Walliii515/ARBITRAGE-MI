@@ -2248,6 +2248,9 @@ def _run_close_position_check_once():
             from calc.closing_executor import ClosingExecutor
             _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
         _configure_closing_executor(_closing_executor)
+        if _closing_executor.needs_fresh_margin_risk(positions):
+            _invalidate_gate_position_risk_cache('margin_danger_path')
+            attach_gate_position_risk(positions, _get_gate_position_risk_snapshot(force_refresh=True))
         results = _closing_executor.check_and_close(
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )
