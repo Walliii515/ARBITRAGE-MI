@@ -4335,10 +4335,26 @@ class TestMarginTopupCalculation(unittest.TestCase):
             gate_liq_price=1.05,
             gate_mark_price=1.03,
         )
+        missing_risk = self._topup_position(
+            gate_maintenance_margin_rate=None,
+            gate_liq_price=None,
+        )
 
         self.assertFalse(ce.needs_fresh_margin_risk([safe]))
         self.assertTrue(ce.needs_fresh_margin_risk([low_mmr]))
         self.assertTrue(ce.needs_fresh_margin_risk([near_liq]))
+        self.assertTrue(ce.needs_fresh_margin_risk([missing_risk]))
+
+    def test_missing_gate_margin_risk_refresh_can_be_disabled(self):
+        ce = make_closing_executor()
+        ce.margin_danger_missing_risk_force_refresh = False
+
+        missing_risk = self._topup_position(
+            gate_maintenance_margin_rate=None,
+            gate_liq_price=None,
+        )
+
+        self.assertFalse(ce.needs_fresh_margin_risk([missing_risk]))
 
     def test_topup_success_grace_blocks_duplicate_local_positions(self):
         ce = make_closing_executor()

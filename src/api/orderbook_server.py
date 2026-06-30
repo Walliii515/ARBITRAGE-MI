@@ -314,6 +314,7 @@ _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇
 _latest_account_summary_ts: float = 0.0
 _gate_position_risk_cache: List[Dict] = []
 _gate_position_risk_cache_ts: float = 0.0
+_last_margin_danger_force_refresh_ts: float = 0.0
 _delist_risk_report: Dict = {'items': [], 'summary': {'total': 0, 'critical': 0, 'warning': 0}}
 _delist_risk_report_ts: float = 0.0
 
@@ -2248,9 +2249,19 @@ def _run_close_position_check_once():
             from calc.closing_executor import ClosingExecutor
             _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
         _configure_closing_executor(_closing_executor)
+        global _last_margin_danger_force_refresh_ts
         if _closing_executor.needs_fresh_margin_risk(positions):
-            _invalidate_gate_position_risk_cache('margin_danger_path')
-            attach_gate_position_risk(positions, _get_gate_position_risk_snapshot(force_refresh=True))
+            now = time.time()
+            min_interval = max(
+                config.get_float('margin.danger_path.force_refresh_min_interval_sec', 2.0),
+                0.0,
+            )
+            if now - _last_margin_danger_force_refresh_ts < min_interval:
+                logger.debug(f"Gate保证金危险刷新跳过 | interval_guard={min_interval:.2f}s")
+            else:
+                _last_margin_danger_force_refresh_ts = now
+                _invalidate_gate_position_risk_cache('margin_danger_path')
+                attach_gate_position_risk(positions, _get_gate_position_risk_snapshot(force_refresh=True))
         results = _closing_executor.check_and_close(
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )

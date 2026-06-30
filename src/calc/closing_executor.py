@@ -216,6 +216,10 @@ class ClosingExecutor:
             config.get_float('margin.danger_path.liq_distance_bps', 300.0),
             0.0,
         )
+        self.margin_danger_missing_risk_force_refresh = config.get_bool(
+            'margin.danger_path.missing_risk_force_refresh',
+            True,
+        )
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -960,8 +964,22 @@ class ClosingExecutor:
             return False
         return any(
             bool(self._margin_danger_state(pos).get('active'))
+            or self._missing_gate_margin_risk(pos)
             for pos in positions or []
             if pos.get('status') == 'holding'
+        )
+
+    def _missing_gate_margin_risk(self, pos: Dict) -> bool:
+        """持仓仍有 Gate 腿，但缺少 MMR/强平价字段时需要刷新 Gate 风险。"""
+        if not self.margin_danger_missing_risk_force_refresh:
+            return False
+        future_qty = abs(_float_or_none(pos.get('future_open_qty')) or 0.0)
+        future_contract = str(pos.get('future_contract') or '').strip()
+        if future_qty <= 0 or not future_contract:
+            return False
+        return (
+            pos.get('gate_maintenance_margin_rate') is None
+            or pos.get('gate_liq_price') is None
         )
 
     def _margin_danger_state(self, pos: Dict) -> Dict:

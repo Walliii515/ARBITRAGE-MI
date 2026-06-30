@@ -354,6 +354,8 @@ margin:
     enabled: true
     mmr_pct: 300                           # 低于该 MMR 视为危险路径，强制刷新 Gate 风险快照
     liq_distance_bps: 300                  # 空头价格距强平价小于该 bps 时进入危险路径
+    missing_risk_force_refresh: true       # 持仓缺失 Gate MMR/强平价时强制刷新，避免静默无追保日志
+    force_refresh_min_interval_sec: 2      # 缺失/危险刷新最小间隔，防止 Gate REST 故障时打爆接口
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数
