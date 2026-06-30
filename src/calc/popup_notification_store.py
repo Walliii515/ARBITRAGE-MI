@@ -95,6 +95,12 @@ def upsert_popup_notification(
                 (user_id, dedup_key, source, type, title, message, payload, event_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+                source = COALESCE(VALUES(source), source),
+                type = VALUES(type),
+                title = VALUES(title),
+                message = VALUES(message),
+                payload = COALESCE(VALUES(payload), payload),
+                event_at = COALESCE(VALUES(event_at), event_at),
                 updated_at = CURRENT_TIMESTAMP
             """,
             (

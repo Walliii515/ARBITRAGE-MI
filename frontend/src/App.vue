@@ -272,12 +272,18 @@ async function maybeShowListingAlert() {
       return `${item.base_asset} Gate:${item.gate_contract || '-'} Binance:${item.binance_symbol || '-'} 24h=${gateVol.toFixed(0)}/${spotVol.toFixed(0)}`
     }).join('\n')
     const title = `交易对上新候选 ${items.length} 个`
+    const eventAt = items
+      .map((item: any) => item.last_seen_at)
+      .filter(Boolean)
+      .sort()
+      .pop()
     await addPopupNotification({
       title,
       message: preview,
       type: 'warning',
       source: 'listing_events',
       dedup_key: `listing_events:${fingerprint}`,
+      event_at: eventAt,
       payload: { items },
     })
     await refreshNotificationHistory(false)
