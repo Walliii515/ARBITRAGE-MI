@@ -197,9 +197,13 @@ class ClosingExecutor:
         )
         self.margin_topup_max_notional_multiplier = config.get_float(
             'margin.topup.max_topup_open_notional_multiplier',
-            2.0,
+            4.0,
         )
-        self.margin_topup_min_gate_available = config.get_float('margin.topup.min_gate_available', 50.0)
+        self.margin_topup_min_gate_available = config.get_float('margin.topup.min_gate_available', 0.0)
+        self.margin_topup_min_gate_available_ratio_pct = config.get_float(
+            'margin.topup.min_gate_available_ratio_pct',
+            5.0,
+        )
         self.margin_topup_cooldown_sec = config.get_int('margin.topup.cooldown_sec', 300)
         self.margin_topup_success_grace_sec = config.get_int('margin.topup.success_grace_sec', 20)
         self.margin_topup_min_amount = config.get_float('margin.topup.min_amount_usdt', 0.1)
@@ -1180,8 +1184,8 @@ class ClosingExecutor:
             if topup_amount < self.margin_topup_min_amount:
                 return None
 
-        gate_available = self._get_latest_gate_available()
-        if gate_available is None:
+        gate_capital = self._get_latest_gate_capital_snapshot()
+        if gate_capital is None:
             message = '无有效Gate资金快照，跳过自动追保'
             self._insert_margin_topup_log(
                 pos, topup_amount, calc['target_margin'], calc['margin_before'],
@@ -1195,10 +1199,12 @@ class ClosingExecutor:
             if return_failure_on_skip:
                 return {'base_asset': ba, 'success': False, 'action': 'margin_topup', 'message': message}
             return None
-        if gate_available - topup_amount < self.margin_topup_min_gate_available:
+        gate_available = gate_capital['available']
+        gate_reserve = self._calculate_gate_topup_reserve(gate_capital)
+        if gate_available - topup_amount < gate_reserve:
             message = (
                 f"Gate可用余额不足: available={gate_available:.4f}, "
-                f"topup={topup_amount:.4f}, reserve={self.margin_topup_min_gate_available:.4f}"
+                f"topup={topup_amount:.4f}, reserve={gate_reserve:.4f}"
             )
             self._insert_margin_topup_log(
                 pos, topup_amount, calc['target_margin'], calc['margin_before'],
@@ -1378,8 +1384,12 @@ class ClosingExecutor:
         return float(meta.get('maintenance_rate') or config.get_float('margin.default_maintenance_rate', 0.005))
 
     def _get_latest_gate_available(self) -> Optional[float]:
+        snapshot = self._get_latest_gate_capital_snapshot()
+        return snapshot.get('available') if snapshot else None
+
+    def _get_latest_gate_capital_snapshot(self) -> Optional[Dict[str, Optional[float]]]:
         sql = """
-            SELECT available_usdt, snapshot_at
+            SELECT available_usdt, equity_usdt, snapshot_at
             FROM mi_capital_snapshot
             WHERE exchange = 'gate'
             ORDER BY snapshot_at DESC
@@ -1398,7 +1408,17 @@ class ClosingExecutor:
                 snapshot_at = None
         if snapshot_at and (datetime.now() - snapshot_at).total_seconds() > self.margin_topup_snapshot_max_age_sec:
             return None
-        return float(row.get('available_usdt') or 0)
+        return {
+            'available': float(row.get('available_usdt') or 0),
+            'equity': _float_or_none(row.get('equity_usdt')),
+        }
+
+    def _calculate_gate_topup_reserve(self, gate_capital: Optional[Dict[str, Optional[float]]]) -> float:
+        fixed_reserve = max(float(self.margin_topup_min_gate_available or 0), 0.0)
+        ratio = max(float(self.margin_topup_min_gate_available_ratio_pct or 0), 0.0) / 100.0
+        equity = _float_or_none((gate_capital or {}).get('equity'))
+        ratio_reserve = equity * ratio if equity is not None and equity > 0 and ratio > 0 else 0.0
+        return max(fixed_reserve, ratio_reserve)
 
     def _mark_margin_topup_success(self, position_id: int, amount: float):
         if not position_id or amount <= 0:

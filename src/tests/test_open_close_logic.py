@@ -3999,6 +3999,10 @@ class TestMarginTopupCalculation(unittest.TestCase):
         pos.update(overrides)
         return pos
 
+    @staticmethod
+    def _gate_capital(available=100.0, equity=1000.0):
+        return {'available': available, 'equity': equity}
+
     def test_topup_success_amount_allocates_across_contract_rows(self):
         ce = make_closing_executor()
         rows = [
@@ -4074,7 +4078,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_min_gate_available = 0.0
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce._mark_margin_topup_success = MagicMock()
 
@@ -4097,6 +4101,11 @@ class TestMarginTopupCalculation(unittest.TestCase):
 
         self.assertTrue(result['success'])
         ce.executor_client.topup_margin.assert_called_once_with('TUT_USDT', 2.0, dual_side='short')
+
+    def test_default_topup_limit_multiplier_is_four(self):
+        ce = make_closing_executor()
+
+        self.assertEqual(ce.margin_topup_max_notional_multiplier, 4.0)
 
     def test_topup_amount_returns_none_without_gate_margin_fields(self):
         ce = make_closing_executor()
@@ -4196,7 +4205,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_min_gate_available = 50.0
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce._mark_margin_topup_success = MagicMock()
 
@@ -4228,7 +4237,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_target_rate_pct = 500.0
         ce.margin_topup_min_gate_available = 0.0
         ce.margin_topup_max_notional_multiplier = 0.0
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce._mark_margin_topup_success = MagicMock()
         ce.executor_client = MagicMock()
@@ -4258,7 +4267,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_target_rate_pct = 500.0
         ce.margin_topup_min_gate_available = 0.0
         ce.margin_topup_max_notional_multiplier = 0.0
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': False, 'message': 'Gate rejected'}
@@ -4295,7 +4304,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_danger_liq_distance_bps = 300.0
         ce.margin_topup_target_rate_pct = 500.0
         ce.margin_topup_min_gate_available = 50.0
-        ce._get_latest_gate_available = MagicMock(return_value=50.5)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(50.5, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce.executor_client = MagicMock()
         ce._execute_close = MagicMock(return_value={
@@ -4370,7 +4379,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_success_grace_sec = 20
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': True, 'message': 'ok'}
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce._mark_margin_topup_success = MagicMock()
 
@@ -4484,7 +4493,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_pct = 2000.0
         ce.margin_topup_target_rate_pct = 300.0
         ce.margin_topup_max_notional_multiplier = 0.0
-        ce._get_latest_gate_available = MagicMock(return_value=None)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=None)
         ce.executor_client = MagicMock()
         ce._insert_margin_topup_log = MagicMock()
         touched_contracts = set()
@@ -4502,7 +4511,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_target_rate_pct = 300.0
         ce.margin_topup_max_notional_multiplier = 0.0
         ce.margin_topup_min_gate_available = 50.0
-        ce._get_latest_gate_available = MagicMock(return_value=51.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(51.0, 1000.0))
         ce.executor_client = MagicMock()
         ce._insert_margin_topup_log = MagicMock()
         touched_contracts = set()
@@ -4514,6 +4523,25 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.executor_client.topup_margin.assert_not_called()
         self.assertIn('可用余额不足', ce._insert_margin_topup_log.call_args.args[9])
 
+    def test_topup_reserve_uses_gate_equity_ratio(self):
+        ce = make_closing_executor()
+        ce.margin_topup_pct = 2000.0
+        ce.margin_topup_target_rate_pct = 300.0
+        ce.margin_topup_max_notional_multiplier = 0.0
+        ce.margin_topup_min_gate_available = 0.0
+        ce.margin_topup_min_gate_available_ratio_pct = 5.0
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(51.0, 1000.0))
+        ce.executor_client = MagicMock()
+        ce._insert_margin_topup_log = MagicMock()
+        touched_contracts = set()
+
+        result = ce._check_and_topup_margin(self._topup_position(), touched_contracts)
+
+        self.assertIsNone(result)
+        self.assertEqual(touched_contracts, {'TUT_USDT'})
+        ce.executor_client.topup_margin.assert_not_called()
+        self.assertIn('reserve=50.0000', ce._insert_margin_topup_log.call_args.args[9])
+
     def test_topup_failure_is_reported_and_then_margin_close_can_proceed(self):
         ce = make_closing_executor()
         ce.margin_topup_pct = 2000.0
@@ -4521,7 +4549,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_target_rate_pct = 300.0
         ce.margin_topup_max_notional_multiplier = 0.0
         ce.margin_topup_min_gate_available = 0.0
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce.executor_client = MagicMock()
         ce.executor_client.topup_margin.return_value = {'success': False, 'message': 'Gate rejected'}
@@ -4550,7 +4578,7 @@ class TestMarginTopupCalculation(unittest.TestCase):
         ce.margin_topup_target_rate_pct = 300.0
         ce.margin_topup_max_notional_multiplier = 0.0
         ce.margin_topup_min_gate_available = 0.0
-        ce._get_latest_gate_available = MagicMock(return_value=100.0)
+        ce._get_latest_gate_capital_snapshot = MagicMock(return_value=self._gate_capital(100.0, 1000.0))
         ce._insert_margin_topup_log = MagicMock()
         ce._mark_margin_topup_success = MagicMock()
         ce.executor_client = MagicMock()
