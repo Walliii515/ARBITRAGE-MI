@@ -501,7 +501,7 @@ function toggleMenu() {
                     <i v-if="!item.read_at" class="notification-unread-dot"></i>
                     {{ item.title }}
                   </span>
-                  <span class="notification-time">{{ formatNotificationTime(item.created_at) }}</span>
+                  <span class="notification-time">{{ formatNotificationTime(item.event_at || item.created_at) }}</span>
                 </div>
                 <div class="notification-message">{{ item.message }}</div>
                 <div v-if="!item.read_at" class="notification-item-actions">
