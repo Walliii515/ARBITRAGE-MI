@@ -2250,15 +2250,24 @@ def _run_close_position_check_once():
             _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
         _configure_closing_executor(_closing_executor)
         global _last_margin_danger_force_refresh_ts
-        if _closing_executor.needs_fresh_margin_risk(positions):
+        margin_risk_refresh_summary = _closing_executor.margin_risk_refresh_summary(positions)
+        if margin_risk_refresh_summary.get('danger') or margin_risk_refresh_summary.get('missing'):
             now = time.time()
             min_interval = max(
                 config.get_float('margin.danger_path.force_refresh_min_interval_sec', 2.0),
                 0.0,
             )
             if now - _last_margin_danger_force_refresh_ts < min_interval:
-                logger.debug(f"Gate保证金危险刷新跳过 | interval_guard={min_interval:.2f}s")
+                logger.debug(
+                    f"Gate保证金风险刷新跳过 | interval_guard={min_interval:.2f}s "
+                    f"| danger={margin_risk_refresh_summary.get('danger')} "
+                    f"| missing={margin_risk_refresh_summary.get('missing')}"
+                )
             else:
+                logger.warning(
+                    f"Gate保证金风险刷新触发 | danger={margin_risk_refresh_summary.get('danger')} "
+                    f"| missing={margin_risk_refresh_summary.get('missing')}"
+                )
                 _last_margin_danger_force_refresh_ts = now
                 _invalidate_gate_position_risk_cache('margin_danger_path')
                 attach_gate_position_risk(positions, _get_gate_position_risk_snapshot(force_refresh=True))

@@ -4329,7 +4329,11 @@ class TestMarginTopupCalculation(unittest.TestCase):
             gate_liq_price=1.20,
             gate_mark_price=1.00,
         )
-        low_mmr = self._topup_position(gate_maintenance_margin_rate=250.0)
+        low_mmr = self._topup_position(
+            gate_maintenance_margin_rate=250.0,
+            gate_liq_price=1.20,
+            gate_mark_price=1.00,
+        )
         near_liq = self._topup_position(
             gate_maintenance_margin_rate=450.0,
             gate_liq_price=1.05,
@@ -4344,6 +4348,8 @@ class TestMarginTopupCalculation(unittest.TestCase):
         self.assertTrue(ce.needs_fresh_margin_risk([low_mmr]))
         self.assertTrue(ce.needs_fresh_margin_risk([near_liq]))
         self.assertTrue(ce.needs_fresh_margin_risk([missing_risk]))
+        summary = ce.margin_risk_refresh_summary([safe, low_mmr, missing_risk])
+        self.assertEqual(summary, {'danger': ['TUT'], 'missing': ['TUT']})
 
     def test_missing_gate_margin_risk_refresh_can_be_disabled(self):
         ce = make_closing_executor()

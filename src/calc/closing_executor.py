@@ -958,16 +958,25 @@ class ClosingExecutor:
             return None
         return margin / maintenance * 100
 
+    def margin_risk_refresh_summary(self, positions: List[Dict]) -> Dict:
+        """返回需要绕过 Gate 风险快照缓存的原因摘要。"""
+        summary = {'danger': [], 'missing': []}
+        if not self.margin_danger_path_enabled:
+            return summary
+        for pos in positions or []:
+            if pos.get('status') != 'holding':
+                continue
+            asset = pos.get('base_asset') or pos.get('future_contract') or ''
+            if self._margin_danger_state(pos).get('active'):
+                summary['danger'].append(asset)
+            if self._missing_gate_margin_risk(pos):
+                summary['missing'].append(asset)
+        return summary
+
     def needs_fresh_margin_risk(self, positions: List[Dict]) -> bool:
         """是否需要绕过 Gate 风险快照缓存，立刻刷新 MMR/强平价。"""
-        if not self.margin_danger_path_enabled:
-            return False
-        return any(
-            bool(self._margin_danger_state(pos).get('active'))
-            or self._missing_gate_margin_risk(pos)
-            for pos in positions or []
-            if pos.get('status') == 'holding'
-        )
+        summary = self.margin_risk_refresh_summary(positions)
+        return bool(summary.get('danger') or summary.get('missing'))
 
     def _missing_gate_margin_risk(self, pos: Dict) -> bool:
         """持仓仍有 Gate 腿，但缺少 MMR/强平价字段时需要刷新 Gate 风险。"""
