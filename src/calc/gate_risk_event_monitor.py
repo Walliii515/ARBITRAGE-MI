@@ -63,7 +63,7 @@ def build_default_gate_risk_event_monitor() -> 'GateRiskEventMonitor':
     remediation_cfg = ExchangeDesyncRemediationConfig(
         enabled=config.get_bool('exchange_risk_monitor.auto_remediate.enabled', True),
         action=str(config.get('exchange_risk_monitor.auto_remediate.action', 'sell_spot') or 'sell_spot'),
-        max_positions_per_run=config.get_int('exchange_risk_monitor.auto_remediate.max_positions_per_event', 20),
+        max_positions_per_run=config.get_int('exchange_risk_monitor.auto_remediate.max_positions_per_event', 0),
         min_spot_qty=config.get_float('exchange_risk_monitor.auto_remediate.min_spot_qty', 0.0),
         spot_open_fee=config.get_float('trade.fee.spot_open', 0.00075),
         spot_close_fee=config.get_float('trade.fee.spot_close', 0.00075),

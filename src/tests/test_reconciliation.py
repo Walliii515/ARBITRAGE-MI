@@ -264,6 +264,153 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
 
 class TestExchangeDesyncRemediator(unittest.TestCase):
+    def test_gate_risk_event_zero_limit_processes_all_matching_positions(self):
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_price': 0.025,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': order['target_qty'] * 0.025,
+                    'coverage_ratio': 0,
+                }
+
+        positions = [
+            {
+                'id': idx,
+                'base_asset': 'AI',
+                'spot_open_qty': 1.0,
+                'spot_open_price': 0.021,
+                'future_open_qty': 1.0,
+                'future_open_price': 0.0212,
+                'future_open_contracts': 1,
+                'spot_symbol': 'AIUSDT',
+                'future_contract': 'AI_USDT',
+            }
+            for idx in range(1, 26)
+        ]
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True, max_positions_per_run=0),
+        )
+        remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
+        remediator._load_positions_to_remediate = MagicMock(return_value=positions)
+        remediator._load_binance_available_qty = MagicMock(return_value=25.0)
+        remediator._insert_spot_order = MagicMock()
+        remediator._insert_synthetic_future_adl_order = MagicMock()
+        remediator._close_position = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'AI',
+            25.0,
+            {
+                'type': 'liquidation',
+                'detail': 'Gate强平|contract=AI_USDT|size=25|price=0.02708',
+                'future_close_price': 0.02708,
+            },
+            require_desynced=False,
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['positions'], 25)
+        self.assertEqual(result['matching_positions'], 25)
+        self.assertEqual(result['success_count'], 25)
+        self.assertEqual(remediator._close_position.call_count, 25)
+
+    def test_missing_gate_position_reuses_recent_liquidation_price(self):
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1}}
+
+        class FakeCursor:
+            def __init__(self):
+                self.params = None
+
+            def execute(self, _sql, params):
+                self.params = params
+
+            def fetchone(self):
+                return {
+                    'risk_type': 'liquidation',
+                    'event_at': datetime(2026, 6, 30, 11, 0, 59),
+                    'exchange_order_id': 'liq-1',
+                    'exchange_trade_id': 'trade-1',
+                    'fill_price': 0.02708,
+                    'size': 77087,
+                }
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, *args):
+                return False
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        cursor = FakeCursor()
+        with patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            risk = remediator._risk_with_recent_liquidation('AI', {
+                'type': 'missing_gate_position',
+                'event_at': datetime(2026, 6, 30, 11, 2, 19),
+                'detail': 'Gate实仓不匹配|contract=AI_USDT|local=13376|exchange=0',
+            })
+
+        self.assertEqual(risk['future_close_price'], 0.02708)
+        self.assertEqual(risk['future_exchange_order_id'], 'liq-1')
+        self.assertIn('复用最近Gate', risk['detail'])
+        self.assertEqual(cursor.params[0], 'AI')
+
+    def test_close_position_does_not_fallback_to_open_price_without_future_fill(self):
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1}}
+
+        class FakeCursor:
+            def __init__(self):
+                self.params = None
+
+            def execute(self, _sql, params):
+                self.params = params
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, *args):
+                return False
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        cursor = FakeCursor()
+        with patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            remediator._close_position(
+                {
+                    'id': 438,
+                    'base_asset': 'AI',
+                    'future_open_qty': 2927.0,
+                    'future_open_price': 0.0212,
+                },
+                {'exec_price': 0.025, 'exec_amount': 73.175},
+                {'type': 'missing_gate_position'},
+                '交易所断腿自动处置|missing_gate_position',
+                datetime(2026, 6, 30, 11, 2, 20),
+            )
+
+        self.assertIsNone(cursor.params['future_close_price'])
+        self.assertIsNone(cursor.params['future_close_amount'])
+        self.assertIsNone(cursor.params['close_spread_bps'])
+
     def test_gate_adl_reuses_prior_spot_fill_when_available_spot_is_zero(self):
         class FakeExecutor:
             contract_meta = {'BEL': {'quanto_multiplier': 1}}

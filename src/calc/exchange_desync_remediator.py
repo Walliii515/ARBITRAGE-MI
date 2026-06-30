@@ -7,7 +7,7 @@ Gate futures 被 ADL 自动减仓后，本地 holding 仍对应 Binance spot 多
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from calc.order_fee_resolver import build_order_execution_fields
@@ -65,6 +65,7 @@ class ExchangeDesyncRemediator:
             return {'attempted': False, 'reason': f'unsupported_action:{self.cfg.action}'}
         if missing_contracts <= 0:
             return {'attempted': False, 'reason': 'missing_contracts<=0'}
+        risk = self._risk_with_recent_liquidation(base_asset, risk)
 
         positions = self._load_positions_to_remediate(
             base_asset,
@@ -76,8 +77,8 @@ class ExchangeDesyncRemediator:
 
         available_qty = self._load_binance_available_qty(base_asset)
         remaining_available = available_qty
-        limit = max(int(self.cfg.max_positions_per_run or 1), 1)
-        selected_positions = positions[:limit]
+        limit = int(self.cfg.max_positions_per_run or 0)
+        selected_positions = positions if limit <= 0 else positions[:limit]
         if mark_positions:
             self._mark_positions_exchange_risk(selected_positions, risk)
 
@@ -536,6 +537,46 @@ class ExchangeDesyncRemediator:
         updated.setdefault('future_liquidity_role', 'taker')
         return updated
 
+    def _risk_with_recent_liquidation(self, base_asset: str, risk: Dict) -> Dict:
+        """对账兜底缺少成交价时，复用同标的最近 Gate 强平/ADL 事件价。"""
+        if _float(risk.get('future_close_price')) > 0:
+            return risk
+        event_at = risk.get('event_at')
+        if not isinstance(event_at, datetime):
+            event_at = datetime.now()
+        start_at = event_at - timedelta(minutes=10)
+        end_at = event_at + timedelta(seconds=30)
+        sql = """
+            SELECT risk_type, event_at, exchange_order_id, exchange_trade_id,
+                   fill_price, size
+            FROM mi_exchange_risk_event
+            WHERE UPPER(base_asset) = %s
+              AND risk_type IN ('liquidation', 'adl')
+              AND fill_price IS NOT NULL
+              AND fill_price > 0
+              AND event_at BETWEEN %s AND %s
+            ORDER BY event_at DESC, id DESC
+            LIMIT 1
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (base_asset, start_at, end_at))
+            row = cursor.fetchone()
+        if not row:
+            return risk
+        updated = dict(risk)
+        updated['future_close_price'] = _float(row.get('fill_price'))
+        updated['future_exchange_order_id'] = row.get('exchange_order_id')
+        updated['future_trade_id'] = row.get('exchange_trade_id')
+        updated['future_liquidity_role'] = 'taker'
+        updated['type'] = updated.get('type') or row.get('risk_type')
+        detail = str(updated.get('detail') or '')
+        updated['detail'] = (
+            f"{detail}|复用最近Gate{row.get('risk_type')}事件成交价:"
+            f"price={updated['future_close_price']},event_at={row.get('event_at')},"
+            f"order_id={row.get('exchange_order_id') or ''}"
+        )
+        return updated
+
     def _load_prior_spot_fill(self, position_id: int) -> Optional[Dict]:
         sql = """
             SELECT id, order_uuid, base_asset, spot_symbol, future_contract,
@@ -669,7 +710,13 @@ class ExchangeDesyncRemediator:
     def _insert_synthetic_future_adl_order(self, pos: Dict, order_uuid: str, risk: Dict, reason: str, now: datetime):
         base_asset = str(pos.get('base_asset') or '').upper()
         future_qty = _float(pos.get('future_open_qty'))
-        future_price = _float(risk.get('future_close_price') or pos.get('future_open_price'))
+        future_price = _float(risk.get('future_close_price'))
+        if future_price <= 0:
+            logger.warning(
+                "Gate 缺腿自动处置缺少期货成交价，跳过合成期货平仓单 | %s | position_id=%s",
+                base_asset, pos.get('id'),
+            )
+            return
         future_exec = {
             'exec_price': future_price,
             'exec_qty': future_qty,
@@ -759,7 +806,7 @@ class ExchangeDesyncRemediator:
 
     def _close_position(self, pos: Dict, spot_result: Dict, risk: Dict, reason: str, now: datetime):
         spot_price = _float(spot_result.get('exec_price'))
-        future_price = _float(risk.get('future_close_price') or pos.get('future_open_price'))
+        future_price = _float(risk.get('future_close_price'))
         future_qty = _float(pos.get('future_open_qty'))
         close_spread = calc_vwap_basis_bps(spot_price, future_price) if spot_price > 0 and future_price > 0 else None
         sql = """
@@ -780,9 +827,9 @@ class ExchangeDesyncRemediator:
                 'closed_at': now,
                 'close_reason': reason,
                 'spot_close_price': spot_price,
-                'future_close_price': future_price,
+                'future_close_price': future_price if future_price > 0 else None,
                 'spot_close_amount': spot_result.get('exec_amount'),
-                'future_close_amount': future_qty * future_price,
+                'future_close_amount': future_qty * future_price if future_price > 0 else None,
                 'close_spread_bps': round(close_spread, 2) if close_spread is not None else None,
                 'position_id': pos.get('id'),
             })
