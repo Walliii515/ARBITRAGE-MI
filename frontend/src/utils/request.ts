@@ -1,4 +1,4 @@
-import { removeToken, getToken, markUserActivity } from './auth'
+import { removeToken, getToken } from './auth'
 import { ElMessage } from 'element-plus'
 import router from '../router'
 
@@ -11,9 +11,6 @@ interface RequestOptions extends RequestInit {
 
 export async function request(url: string, options: RequestOptions = {}): Promise<Response> {
   const token = getToken()
-  
-  // 更新活动时间
-  markUserActivity()
   
   // 构建完整 URL
   const fullUrl = options.baseURL ? `${options.baseURL}${url}` : `${API_BASE}${url}`

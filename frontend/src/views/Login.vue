@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { User, Lock } from '@element-plus/icons-vue'
-import { setToken, updateActivityTime } from '../utils/auth'
+import { setToken } from '../utils/auth'
 import { ElMessage } from 'element-plus'
 
 const router = useRouter()
@@ -35,7 +35,6 @@ async function handleLogin() {
     
     const data = await response.json()
     setToken(data.token)
-    updateActivityTime()
     ElMessage.success('登录成功')
     router.push('/')
   } catch (error: any) {

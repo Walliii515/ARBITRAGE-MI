@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { isLoggedIn, isSessionExpired, removeToken } from '../utils/auth'
+import { isLoggedIn } from '../utils/auth'
 
 const ROUTE_CHUNK_RELOAD_KEY = 'route_chunk_reload_attempted'
 
@@ -122,11 +122,6 @@ router.beforeEach((to) => {
     return { path: '/' }
   }
 
-  if (loggedIn && isSessionExpired()) {
-    // session 已过期 -> 清除 token 并跳转登录
-    removeToken()
-    return { name: 'login' }
-  }
 })
 
 router.afterEach(() => {

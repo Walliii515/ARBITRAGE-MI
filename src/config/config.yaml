@@ -5,8 +5,8 @@
 auth:
   # Token 签名密钥 (生产环境务必修改为强随机字符串)
   secret_key: 'arbitrage-mi-secret-key-2026'
-  # Token 有效期 (秒)，默认 1 小时
-  token_expire_seconds: 36000
+  # Token 有效期 (秒)，7天
+  token_expire_seconds: 604800
 
 trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
