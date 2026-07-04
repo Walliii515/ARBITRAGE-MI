@@ -4,6 +4,7 @@ from datetime import datetime
 from api.trading_api import (
     _append_unique_notification,
     _build_forward_signal_filters,
+    _filter_capital_transfer_transient_rows,
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
 )
@@ -84,6 +85,33 @@ class ReconciliationLatestQueryTests(unittest.TestCase):
         self.assertIn('UPPER(TRIM(c.base_asset)) COLLATE utf8mb4_unicode_ci', sql)
         self.assertIn('UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci', sql)
         self.assertIn('s.snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)', sql)
+
+
+class CapitalHistoryFilterTests(unittest.TestCase):
+    def test_transfer_intermediate_total_equity_drop_is_hidden_after_recovery(self):
+        rows = [
+            {'snapshot_at': '2026-07-04 11:09:50', 'exchange': 'total', 'equity_usdt': 11504.23},
+            {'snapshot_at': '2026-07-04 11:19:05', 'exchange': 'total', 'equity_usdt': 10306.14},
+            {'snapshot_at': '2026-07-04 11:24:11', 'exchange': 'total', 'equity_usdt': 11506.38},
+        ]
+
+        filtered = _filter_capital_transfer_transient_rows(rows)
+
+        self.assertEqual([row['snapshot_at'] for row in filtered], [
+            '2026-07-04 11:09:50',
+            '2026-07-04 11:24:11',
+        ])
+
+    def test_sustained_total_equity_change_is_kept(self):
+        rows = [
+            {'snapshot_at': '2026-07-04 11:09:50', 'exchange': 'total', 'equity_usdt': 11504.23},
+            {'snapshot_at': '2026-07-04 11:19:05', 'exchange': 'total', 'equity_usdt': 10306.14},
+            {'snapshot_at': '2026-07-04 11:24:11', 'exchange': 'total', 'equity_usdt': 10310.38},
+        ]
+
+        filtered = _filter_capital_transfer_transient_rows(rows)
+
+        self.assertEqual(filtered, rows)
 
 
 if __name__ == '__main__':

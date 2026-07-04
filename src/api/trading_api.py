@@ -734,6 +734,88 @@ _CAPITAL_HISTORY_INTERVALS = {
     '10m': 600,
     '1h': 3600,
 }
+_CAPITAL_TRANSFER_OUTLIER_RELATIVE_CHANGE = 0.05
+_CAPITAL_TRANSFER_RECOVERY_TOLERANCE = 0.015
+_CAPITAL_TRANSFER_MAX_RECOVERY_SECONDS = 30 * 60
+
+
+def _capital_row_time(row: Dict[str, Any]) -> Optional[datetime]:
+    value = row.get('snapshot_at')
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+    return None
+
+
+def _capital_row_equity(row: Dict[str, Any]) -> Optional[float]:
+    try:
+        value = float(row.get('equity_usdt'))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _relative_gap(value: float, reference: float) -> float:
+    if abs(reference) <= 1e-9:
+        return 0.0
+    return abs(value - reference) / abs(reference)
+
+
+def _filter_capital_transfer_transient_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Hide short-lived total-equity transfer intermediate states from charts.
+
+    Cross-exchange transfers can be sampled after funds leave one venue and before
+    they arrive at the other. Keep raw snapshots in DB, but suppress the temporary
+    total row once a nearby later sample confirms equity recovered.
+    """
+    total_rows = [(idx, row) for idx, row in enumerate(rows) if row.get('exchange') == 'total']
+    if len(total_rows) < 3:
+        return rows
+
+    remove_indexes: set[int] = set()
+    pos = 0
+    while pos < len(total_rows) - 1:
+        prev_idx, prev = total_rows[pos]
+        prev_equity = _capital_row_equity(prev)
+        prev_time = _capital_row_time(prev)
+        next_idx, next_row = total_rows[pos + 1]
+        next_equity = _capital_row_equity(next_row)
+        if prev_equity is None or prev_time is None or next_equity is None:
+            pos += 1
+            continue
+
+        if _relative_gap(next_equity, prev_equity) < _CAPITAL_TRANSFER_OUTLIER_RELATIVE_CHANGE:
+            pos += 1
+            continue
+
+        recovery_pos: Optional[int] = None
+        for scan_pos in range(pos + 2, len(total_rows)):
+            _, candidate = total_rows[scan_pos]
+            candidate_time = _capital_row_time(candidate)
+            candidate_equity = _capital_row_equity(candidate)
+            if candidate_time is None or candidate_equity is None:
+                continue
+            if (candidate_time - prev_time).total_seconds() > _CAPITAL_TRANSFER_MAX_RECOVERY_SECONDS:
+                break
+            if _relative_gap(candidate_equity, prev_equity) <= _CAPITAL_TRANSFER_RECOVERY_TOLERANCE:
+                recovery_pos = scan_pos
+                break
+
+        if recovery_pos is None:
+            pos += 1
+            continue
+
+        for outlier_pos in range(pos + 1, recovery_pos):
+            remove_indexes.add(total_rows[outlier_pos][0])
+        pos = recovery_pos
+
+    if not remove_indexes:
+        return rows
+    return [row for idx, row in enumerate(rows) if idx not in remove_indexes]
 
 
 def _reconciliation_ignore_clause(table_alias: str = '') -> tuple[str, List[Any]]:
@@ -1214,8 +1296,10 @@ async def get_capital_history(
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, [bucket_sec, bucket_sec, *params])
         rows = cursor.fetchall()
+    serialized_rows = _serialize_rows(rows)
+    serialized_rows = _filter_capital_transfer_transient_rows(serialized_rows)
     return {
-        'rows': _serialize_rows(rows),
+        'rows': serialized_rows,
         'interval': interval if interval in _CAPITAL_HISTORY_INTERVALS else '10m',
         'window': {'hours': hours} if hours is not None else {'days': days},
     }
