@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
 import { ElMessageBox } from 'element-plus'
+import { QuestionFilled } from '@element-plus/icons-vue'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
 
@@ -46,6 +47,11 @@ type ChartModeKey =
 type ChartSeriesGroup = 'asset' | 'pnl' | 'ratio'
 type ChartMetricOption = { key: ChartMetric; label: string; group: ChartSeriesGroup; color: string }
 type ChartModeOption = { key: ChartModeKey; label: string }
+type OpenRiskConfig = {
+  min_available_ratio?: number
+  min_binance_available_ratio?: number
+  min_gate_available_ratio?: number
+}
 type ChartLineType = 'solid' | 'dashed'
 type ChartSeriesType = 'line' | 'bar'
 type ChartSeries = {
@@ -69,6 +75,11 @@ const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
 const showSummaryDetails = ref(false)
 const bnbBuying = ref(false)
+const openRiskConfig = ref<OpenRiskConfig>({
+  min_available_ratio: 0.10,
+  min_binance_available_ratio: 0.02,
+  min_gate_available_ratio: 0.15,
+})
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -316,6 +327,50 @@ function occupiedAmount(row: CapitalRow | undefined, exchange: string): number |
   return row?.position_value_usdt
 }
 
+function availableRatio(row: CapitalRow | undefined): number | null {
+  const available = Number(row?.available_usdt ?? NaN)
+  const equity = Number(row?.equity_usdt ?? NaN)
+  if (!Number.isFinite(available) || !Number.isFinite(equity) || equity <= 0) return null
+  return (available / equity) * 100
+}
+
+function minAvailableRatio(exchange: string): number | null {
+  if (exchange === 'binance') {
+    return Number(openRiskConfig.value.min_binance_available_ratio ?? openRiskConfig.value.min_available_ratio ?? 0) * 100
+  }
+  if (exchange === 'gate') {
+    return Number(openRiskConfig.value.min_gate_available_ratio ?? openRiskConfig.value.min_available_ratio ?? 0) * 100
+  }
+  return null
+}
+
+function formatAvailableRatio(exchange: string, row: CapitalRow | undefined): string {
+  const ratio = availableRatio(row)
+  if (ratio == null) return '-'
+  const minRatio = minAvailableRatio(exchange)
+  const ratioText = formatPercent(ratio)
+  return minRatio == null ? ratioText : `${ratioText} / ${formatPercent(minRatio)}`
+}
+
+function availableStatusClass(exchange: string, row: CapitalRow | undefined): string {
+  const ratio = availableRatio(row)
+  const minRatio = minAvailableRatio(exchange)
+  if (ratio == null || minRatio == null || minRatio <= 0) return 'available-ok'
+  if (ratio < minRatio) return 'available-danger'
+  if (ratio < minRatio * 1.2) return 'available-warning'
+  return 'available-ok'
+}
+
+function availableHelpText(exchange: string): string {
+  if (exchange === 'binance') {
+    return `Binance 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，主要用于手续费、BNB不足和现货腿兜底。`
+  }
+  if (exchange === 'gate') {
+    return `Gate 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，用于给逐仓追保和风险处置留空间；实际追保后最低保留 2%。`
+  }
+  return '合计可用资金仅用于观察，不参与单交易所开仓预留风控。'
+}
+
 function formatTooltipTime(value: unknown): string {
   const rawValue = Array.isArray(value) ? value[0] : value
   const numericValue = typeof rawValue === 'number'
@@ -470,6 +525,24 @@ async function fetchCapital() {
   }
 }
 
+async function fetchOpenRiskConfig() {
+  try {
+    const res = await get('/api/trading/open/status')
+    const data = await res.json()
+    openRiskConfig.value = {
+      min_available_ratio: Number(data.min_available_ratio ?? openRiskConfig.value.min_available_ratio),
+      min_binance_available_ratio: Number(
+        data.min_binance_available_ratio ?? data.min_available_ratio ?? openRiskConfig.value.min_binance_available_ratio
+      ),
+      min_gate_available_ratio: Number(
+        data.min_gate_available_ratio ?? data.min_available_ratio ?? openRiskConfig.value.min_gate_available_ratio
+      ),
+    }
+  } catch {
+    // 页面展示使用默认阈值兜底；交易风控仍以后端配置为准。
+  }
+}
+
 async function fetchHistory() {
   loading.value = true
   try {
@@ -575,6 +648,7 @@ function setWindow(window: TimeWindowKey) {
 }
 
 onMounted(async () => {
+  await fetchOpenRiskConfig()
   await fetchCapital()
   await initChart()
 })
@@ -647,10 +721,26 @@ onBeforeUnmount(() => {
           </strong>
         </div>
         <div class="metric-row available-row">
-          <span>可用资金</span>
-          <strong class="available-value">
+          <span class="metric-label-with-help">
+            <span>可用资金</span>
+            <el-popover trigger="click" placement="top" width="260">
+              <template #reference>
+                <el-button class="help-icon-button" text circle size="small" aria-label="可用资金提醒逻辑">
+                  <el-icon><QuestionFilled /></el-icon>
+                </el-button>
+              </template>
+              <div class="available-help">{{ availableHelpText(exchange) }}</div>
+            </el-popover>
+          </span>
+          <strong class="available-value" :class="availableStatusClass(exchange, latestByExchange[exchange])">
             <span>{{ formatAmount(latestByExchange[exchange]?.available_usdt) }}</span>
             <span v-if="hasAmount(latestByExchange[exchange]?.available_usdt)" class="metric-unit">USDT</span>
+            <span
+              v-if="hasAmount(latestByExchange[exchange]?.available_usdt)"
+              class="available-ratio"
+            >
+              {{ formatAvailableRatio(exchange, latestByExchange[exchange]) }}
+            </span>
           </strong>
         </div>
         <div class="metric-row">
@@ -825,6 +915,27 @@ onBeforeUnmount(() => {
   text-align: right;
 }
 
+.metric-label-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 72px;
+}
+
+.help-icon-button {
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  padding: 0;
+  color: var(--app-text-muted);
+}
+
+.available-help {
+  color: var(--app-text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .metric-unit,
 .metric-separator {
   color: var(--app-text-muted) !important;
@@ -852,6 +963,27 @@ onBeforeUnmount(() => {
   color: #1677ff !important;
   font-size: 14px;
   font-weight: 700;
+  max-width: 72%;
+}
+
+.available-ratio {
+  width: 100%;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.available-value.available-ok {
+  color: #1677ff !important;
+}
+
+.available-value.available-warning {
+  color: #e6a23c !important;
+}
+
+.available-value.available-danger {
+  color: #f56c6c !important;
 }
 
 .pnl-positive {

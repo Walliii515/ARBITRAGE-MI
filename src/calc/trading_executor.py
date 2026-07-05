@@ -47,6 +47,8 @@ class TradingExecutorConfig:
     open_amount_usdt: float = 5.0
     reduced_open_amount_multiplier: float = 0.6
     min_available_ratio: float = 0.10
+    min_binance_available_ratio: Optional[float] = None
+    min_gate_available_ratio: Optional[float] = None
     max_asset_exposure_ratio: float = 0.10
     quality_scale_in_enabled: bool = False
     quality_scale_in_enhanced_ratio: float = 0.20
@@ -287,7 +289,18 @@ class TradingExecutor:
         self._holding_future_margin_cache_by_asset: Dict[str, float] = {}
         self._holding_weighted_basis_by_asset: Dict[str, float] = {}
         self._holding_exchange_risk_by_asset: Dict[str, bool] = {}
-        self.min_available_ratio = max(float(cfg.min_available_ratio or 0), 0.0)
+        fallback_available_ratio = max(float(cfg.min_available_ratio or 0), 0.0)
+        self.min_available_ratio = fallback_available_ratio
+        self.min_binance_available_ratio = (
+            fallback_available_ratio
+            if cfg.min_binance_available_ratio is None
+            else max(float(cfg.min_binance_available_ratio or 0), 0.0)
+        )
+        self.min_gate_available_ratio = (
+            fallback_available_ratio
+            if cfg.min_gate_available_ratio is None
+            else max(float(cfg.min_gate_available_ratio or 0), 0.0)
+        )
         self.max_asset_exposure_ratio = max(float(cfg.max_asset_exposure_ratio or 0), 0.0)
         self.quality_scale_in_enabled = bool(cfg.quality_scale_in_enabled)
         self.quality_scale_in_enhanced_ratio = max(float(cfg.quality_scale_in_enhanced_ratio or 0), 0.0)
@@ -2094,26 +2107,26 @@ class TradingExecutor:
             return False, f"资金风控(Binance可用{binance_available:.2f}<需{spot_required:.2f}USDT)"
         if gate_available < gate_required:
             return False, f"资金风控(Gate可用{gate_available:.2f}<需{gate_required:.2f}USDT)"
-        if self.min_available_ratio > 0:
+        if self.min_binance_available_ratio > 0 or self.min_gate_available_ratio > 0:
             if binance_total <= 0:
                 return False, '资金风控(Binance总资金无效)'
             if gate_total <= 0:
                 return False, '资金风控(Gate总资金无效)'
             binance_after = binance_available - spot_required
             gate_after = gate_available - gate_required
-            min_binance_available = binance_total * self.min_available_ratio
-            min_gate_available = gate_total * self.min_available_ratio
+            min_binance_available = binance_total * self.min_binance_available_ratio
+            min_gate_available = gate_total * self.min_gate_available_ratio
             if binance_after < min_binance_available:
                 return (
                     False,
                     f"资金风控(Binance下单后可用{binance_after:.2f}<"
-                    f"总资金{self.min_available_ratio:.0%}={min_binance_available:.2f}USDT)"
+                    f"总资金{self.min_binance_available_ratio:.0%}={min_binance_available:.2f}USDT)"
                 )
             if gate_after < min_gate_available:
                 return (
                     False,
                     f"资金风控(Gate下单后可用{gate_after:.2f}<"
-                    f"总资金{self.min_available_ratio:.0%}={min_gate_available:.2f}USDT)"
+                    f"总资金{self.min_gate_available_ratio:.0%}={min_gate_available:.2f}USDT)"
                 )
         margin_ok, margin_reason = self._check_binance_margin_level()
         if not margin_ok:

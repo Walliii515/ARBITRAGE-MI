@@ -1383,6 +1383,14 @@ async def open_status():
         'open_paused': _open_paused,
         'reverse_open_paused': _reverse_open_paused,
         'min_available_ratio': config.get_float('trade.open.min_available_ratio', 0.10),
+        'min_binance_available_ratio': config.get_float(
+            'trade.open.min_binance_available_ratio',
+            config.get_float('trade.open.min_available_ratio', 0.10),
+        ),
+        'min_gate_available_ratio': config.get_float(
+            'trade.open.min_gate_available_ratio',
+            config.get_float('trade.open.min_available_ratio', 0.10),
+        ),
         'max_asset_exposure_ratio': config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
     }
 
@@ -1778,6 +1786,14 @@ def _run_open_position_check_once():
                     config.get_float('trade.market_profile.thin_bursty.open_amount_multiplier', 0.6),
                 ),
                 min_available_ratio=config.get_float('trade.open.min_available_ratio', 0.10),
+                min_binance_available_ratio=config.get_float(
+                    'trade.open.min_binance_available_ratio',
+                    config.get_float('trade.open.min_available_ratio', 0.10),
+                ),
+                min_gate_available_ratio=config.get_float(
+                    'trade.open.min_gate_available_ratio',
+                    config.get_float('trade.open.min_available_ratio', 0.10),
+                ),
                 max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.10),
                 quality_scale_in_enabled=config.get_bool('trade.open.quality_scale_in.enabled', False),
                 quality_scale_in_enhanced_ratio=config.get_float(

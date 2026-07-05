@@ -57,7 +57,9 @@ trade:
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
-    min_available_ratio: 0.10               # Binance/Gate 下单后可用资金不得低于各自总资金的比例
+    min_available_ratio: 0.10               # 兼容旧字段；未配置分交易所阈值时使用
+    min_binance_available_ratio: 0.02       # Binance 下单后可用资金最低比例；主要预留手续费/现货兜底
+    min_gate_available_ratio: 0.15          # Gate 下单后可用资金最低比例；预留给追保/风险处置
     max_asset_exposure_ratio: 0.10          # 单标的 spot开仓额 / future当前保证金 均不得超过各自总资金比例
     quality_scale_in:
       enabled: true                         # 普通单标的额度用完后，极优机会允许进入增强额度
@@ -345,7 +347,7 @@ margin:
     target_maintenance_margin_rate_pct: 500
     max_topup_open_notional_multiplier: 4   # 累计追保金额最多为开仓名义金额的倍数；同合约多笔会按合约聚合
     min_gate_available: 0                   # 固定Gate可用余额预留(USDT)，0表示仅按比例预留
-    min_gate_available_ratio_pct: 5         # 追保后Gate可用余额至少保留Gate总资产的比例
+    min_gate_available_ratio_pct: 2         # 追保后Gate可用余额至少保留Gate总资产的比例
     cooldown_sec: 1
     success_grace_sec: 20                  # 追保成功后等待 Gate 风险快照刷新，期间不重复追保/不按旧 MMR 平仓
     min_amount_usdt: 0.1

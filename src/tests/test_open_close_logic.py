@@ -86,6 +86,8 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           funding_entry_enabled=True,
                           funding_carry_enabled=False,
                           min_available_ratio=0.10,
+                          min_binance_available_ratio=None,
+                          min_gate_available_ratio=None,
                           max_asset_exposure_ratio=0.10,
                           quality_scale_in_enabled=False,
                           quality_scale_in_enhanced_ratio=0.20,
@@ -127,6 +129,8 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_entry_enabled=funding_entry_enabled,
         funding_carry_enabled=funding_carry_enabled,
         min_available_ratio=min_available_ratio,
+        min_binance_available_ratio=min_binance_available_ratio,
+        min_gate_available_ratio=min_gate_available_ratio,
         max_asset_exposure_ratio=max_asset_exposure_ratio,
         quality_scale_in_enabled=quality_scale_in_enabled,
         quality_scale_in_enhanced_ratio=quality_scale_in_enhanced_ratio,
@@ -1777,6 +1781,42 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertFalse(te._pass_risk_check(row))
         self.assertIn('Gate下单后可用', te._get_risk_fail_reason(row))
+
+    def test_exchange_available_ratio_uses_split_thresholds(self):
+        te = make_trading_executor(
+            min_binance_available_ratio=0.02,
+            min_gate_available_ratio=0.15,
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 10.0
+        te._account_summary = {
+            'binance': {'available': 123.0, 'net_value': 1000.0},
+            'gate': {'available': 160.0, 'net_value': 1000.0},
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate下单后可用', reason)
+        self.assertIn('总资金15%', reason)
+
+    def test_binance_available_ratio_allows_lower_fee_buffer(self):
+        te = make_trading_executor(
+            min_binance_available_ratio=0.02,
+            min_gate_available_ratio=0.15,
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 10.0
+        te._account_summary = {
+            'binance': {'available': 123.0, 'net_value': 1000.0},
+            'gate': {'available': 170.0, 'net_value': 1000.0},
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertTrue(ok, reason)
 
     def test_asset_exposure_ratio_blocks_new_open(self):
         te = make_trading_executor(
