@@ -166,7 +166,6 @@ def _position_pnl_config() -> PnlConfig:
             config.get_float('trade.fee.future_close', 0.00075),
         ),
         risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
-        margin_leverage=config.get_float('margin.leverage', 2.0),
         margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
     )
 

@@ -34,7 +34,6 @@ DIFF_RATIO_EPSILON = 1e-12
 class ReconciliationConfig:
     enabled: bool = True
     retention_days: int = 30
-    leverage: int = 2
     ignored_binance_spot_assets: Set[str] = field(default_factory=lambda: {'BNB'})
     mark_exchange_risk: bool = True
     adl_lookback_sec: int = 24 * 3600
@@ -72,7 +71,7 @@ def get_forward_gate_leverage() -> float:
     """Gate leverage for forward strategy futures; 0 means cross margin."""
     return config.get_float(
         'margin.forward_open_leverage',
-        config.get_float('margin.leverage', 2.0),
+        0.0,
     )
 
 
@@ -118,7 +117,6 @@ def build_default_reconciler() -> 'Reconciler':
     cfg = ReconciliationConfig(
         enabled=config.get_bool('reconciliation.enabled', True),
         retention_days=config.get_int('reconciliation.retention_days', 30),
-        leverage=config.get_int('margin.leverage', 2),
         ignored_binance_spot_assets=get_ignored_binance_spot_assets(),
         mark_exchange_risk=config.get_bool('reconciliation.mark_exchange_risk', True),
         adl_lookback_sec=config.get_int('reconciliation.adl_lookback_sec', 24 * 3600),

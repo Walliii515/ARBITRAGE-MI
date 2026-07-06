@@ -261,7 +261,6 @@ _pnl_cfg = PnlConfig(
     future_taker_open_fee=FUTURE_TAKER_OPEN_FEE,
     future_taker_close_fee=FUTURE_TAKER_CLOSE_FEE,
     risk_relief_bps=RISK_RELIEF_BPS,
-    margin_leverage=config.get_float('margin.leverage', 2.0),
     margin_default_mmr=config.get_float('margin.default_maintenance_rate', 0.005),
 )
 _reverse_pnl_cfg = ReversePnlConfig(open_amount_usdt=OPEN_AMOUNT_USDT)
@@ -1954,7 +1953,7 @@ def _run_open_position_check_once():
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
                 capital_gate_leverage=config.get_float(
                     'margin.forward_open_leverage',
-                    config.get_float('margin.leverage', 2.0),
+                    0.0,
                 ),
                 binance_margin_required=config.get_bool('account_capital.binance_margin.enabled', False),
                 binance_margin_min_open_level=config.get_float(

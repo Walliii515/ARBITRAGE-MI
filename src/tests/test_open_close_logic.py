@@ -4078,7 +4078,6 @@ class TestMarginDangerPath(unittest.TestCase):
             future_open_fee=0,
             future_close_fee=0,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4226,7 +4225,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_taker_open_fee=0.0005,
             future_taker_close_fee=0.0005,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4264,7 +4262,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_taker_open_fee=0.0005,
             future_taker_close_fee=0.0005,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4304,7 +4301,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_taker_open_fee=0.0005,
             future_taker_close_fee=0.0005,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4345,7 +4341,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_taker_open_fee=0.0005,
             future_taker_close_fee=0.0005,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4392,7 +4387,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_taker_open_fee=0.0005,
             future_taker_close_fee=0.0005,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4430,7 +4424,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_taker_open_fee=0.0005,
             future_taker_close_fee=0.0005,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 
@@ -4462,7 +4455,6 @@ class TestPositionPnlFees(unittest.TestCase):
             future_open_fee=0.0002,
             future_close_fee=0.0002,
             risk_relief_bps=0,
-            margin_leverage=2.0,
             margin_default_mmr=0.005,
         )
 

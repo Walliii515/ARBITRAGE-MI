@@ -101,7 +101,7 @@ def _load_meta_and_init():
         _exchange_config = _build_exchange_config('forward')
         leverage = config.get_int(
             'margin.forward_open_leverage',
-            config.get_int('margin.leverage', 2),
+            0,
         )
         _executor = RealExecutor(_exchange_config, _contract_meta, spot_meta=_spot_meta, leverage=leverage)
     else:

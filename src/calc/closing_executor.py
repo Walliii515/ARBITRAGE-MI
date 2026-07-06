@@ -32,6 +32,7 @@ from calc.dynamic_take_profit import (
     evaluate_dynamic_take_profit,
     format_dynamic_take_profit,
 )
+from calc.reconciliation import get_forward_gate_leverage
 
 logger = get_logger(__name__)
 
@@ -152,7 +153,7 @@ class ClosingExecutor:
         self.fee_future_close = config.get_float('trade.fee.future_close', 0.00075)
         self.fee_future_taker_open = config.get_float('trade.fee.future_taker_open', self.fee_future_open)
         self.fee_future_taker_close = config.get_float('trade.fee.future_taker_close', self.fee_future_close)
-        self.margin_leverage = max(config.get_float('margin.leverage', 2.0), 1.0)
+        self.forward_gate_leverage = get_forward_gate_leverage()
         # 全部手续费 BPS（正数，用于止盈阈值累加）
         self.fee_full_bps = -calc_full_fee_bps(
             self.fee_spot_open, self.fee_spot_close,
@@ -2151,7 +2152,7 @@ class ClosingExecutor:
         if leverage is None and pos.get('id') is not None:
             leverage = self._load_position_future_open_leverage(int(pos.get('id')))
         if leverage is None:
-            leverage = self.margin_leverage
+            leverage = self.forward_gate_leverage
         leverage = float(leverage)
         if abs(leverage) < 1e-9:
             return 0.0

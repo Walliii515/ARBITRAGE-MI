@@ -21,7 +21,6 @@ class PnlConfig:
     risk_relief_bps: float
     future_taker_open_fee: float = 0.0005
     future_taker_close_fee: float = 0.0005
-    margin_leverage: float = 2.0
     margin_default_mmr: float = 0.005
 
 
