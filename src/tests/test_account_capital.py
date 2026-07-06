@@ -84,6 +84,38 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(row['detail']['equity_formula'], 'gate_total_plus_unrealized_pnl')
         self.assertEqual(row['detail']['gate_cross_risk']['status'], 'idle')
 
+    def test_gate_cross_initial_margin_counts_as_used_margin(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor({
+                'available': '4431.333487254757',
+                'total': '4434.801087909632',
+                'unrealised_pnl': '-0.24766',
+                'position_margin': '0',
+                'isolated_position_margin': '0',
+                'position_initial_margin': '0',
+                'order_margin': '0',
+                'cross_initial_margin': '3.066220654875',
+                'cross_order_margin': '0',
+            }),
+            AccountCapitalConfig(),
+        )
+        pnl = {
+            'gate_realized_pnl': 0.0,
+            'funding_pnl': 0.0,
+            'gate_fee_cost': 0.0,
+            'window': {},
+        }
+
+        row = snapshotter._build_gate_row(datetime(2026, 7, 6, 18, 4, 17), pnl)
+
+        self.assertAlmostEqual(row['margin_used_usdt'], 3.066220654875)
+        self.assertAlmostEqual(row['position_value_usdt'], 3.066220654875)
+        self.assertEqual(row['locked_usdt'], 0.0)
+        self.assertAlmostEqual(
+            row['detail']['margin_used_components']['cross_initial_margin'],
+            3.066220654875,
+        )
+
     def test_gate_row_includes_cross_margin_risk_detail(self):
         snapshotter = AccountCapitalSnapshotter(
             FakeCapitalExecutor(

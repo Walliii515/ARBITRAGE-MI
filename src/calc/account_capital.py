@@ -227,8 +227,18 @@ class AccountCapitalSnapshotter:
         position_margin = _float(account.get('position_margin'))
         isolated_position_margin = _float(account.get('isolated_position_margin'))
         position_initial_margin = _float(account.get('position_initial_margin'))
+        cross_initial_margin = _float(account.get('cross_initial_margin'))
         order_margin = _float(account.get('order_margin'))
-        margin_used = max(position_margin, isolated_position_margin, position_initial_margin) + order_margin
+        cross_order_margin = _float(account.get('cross_order_margin'))
+        margin_used = (
+            max(
+                position_margin,
+                isolated_position_margin,
+                position_initial_margin,
+                cross_initial_margin,
+            )
+            + max(order_margin, cross_order_margin)
+        )
         if _has_value(account.get('total')):
             # Gate futures `total` is wallet balance including isolated margin, but it does
             # not include unrealized PnL. Add it here so equity matches net account value.
@@ -257,6 +267,14 @@ class AccountCapitalSnapshotter:
                 'account': account,
                 'raw_total_usdt': total,
                 'account_unrealized_pnl': account_unrealized,
+                'margin_used_components': {
+                    'position_margin': position_margin,
+                    'isolated_position_margin': isolated_position_margin,
+                    'position_initial_margin': position_initial_margin,
+                    'cross_initial_margin': cross_initial_margin,
+                    'order_margin': order_margin,
+                    'cross_order_margin': cross_order_margin,
+                },
                 'strategy_future_floating_pnl': strategy_future_floating,
                 'equity_formula': equity_formula,
                 'gate_cross_risk': gate_cross_risk,
