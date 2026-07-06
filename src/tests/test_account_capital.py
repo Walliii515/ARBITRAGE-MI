@@ -127,6 +127,81 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertAlmostEqual(risk['worst_contract_mmr_pct'], 200.0)
         self.assertEqual(risk['top_risks'][0]['contract'], 'AI_USDT')
 
+    def test_gate_cross_risk_notification_uses_status_cooldown_bucket(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(),
+            AccountCapitalConfig(
+                gate_cross_warning_notify_cooldown_sec=3600,
+                gate_cross_danger_notify_cooldown_sec=300,
+            ),
+        )
+        risk = {
+            'status': 'warning',
+            'status_label': '预警',
+            'position_count': 3,
+            'account_mmr_pct': 420.12,
+            'available_ratio_pct': 13.2,
+            'margin_usage_pct': 55.5,
+            'maintenance_margin_usdt': 12.34,
+            'nearest_liq_contract': 'AI_USDT',
+            'nearest_liq_distance_bps': 580.0,
+            'worst_contract': 'AI_USDT',
+            'worst_contract_mmr_pct': 220.0,
+            'thresholds': {
+                'warning_mmr_pct': 500,
+                'warning_liq_distance_bps': 600,
+                'danger_mmr_pct': 300,
+                'danger_liq_distance_bps': 300,
+            },
+        }
+
+        item = snapshotter._build_gate_cross_risk_notification(
+            datetime(2026, 7, 6, 11, 59, 59),
+            risk,
+        )
+
+        self.assertEqual(item['title'], 'Gate 全仓风险预警')
+        self.assertEqual(item['type'], 'warning')
+        self.assertEqual(item['source'], 'gate_cross_risk')
+        self.assertEqual(item['dedup_key'], 'gate_cross_risk:warning:20260706110000')
+        self.assertIn('全仓MMR=420.12%', item['message'])
+        self.assertIn('最近强平距离=580.00bps', item['message'])
+        self.assertIn('阈值=MMR≤500.00%,强平距离≤600.00bps', item['message'])
+
+    def test_gate_cross_risk_danger_notification_uses_shorter_bucket(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(),
+            AccountCapitalConfig(gate_cross_danger_notify_cooldown_sec=300),
+        )
+        risk = {
+            'status': 'danger',
+            'account_mmr_pct': 260,
+            'nearest_liq_distance_bps': 120,
+            'thresholds': {
+                'danger_mmr_pct': 300,
+                'danger_liq_distance_bps': 300,
+            },
+        }
+
+        item = snapshotter._build_gate_cross_risk_notification(
+            datetime(2026, 7, 6, 11, 59, 59),
+            risk,
+        )
+
+        self.assertEqual(item['title'], 'Gate 全仓风险告急')
+        self.assertEqual(item['type'], 'error')
+        self.assertEqual(item['dedup_key'], 'gate_cross_risk:danger:20260706115500')
+
+    def test_gate_cross_risk_safe_notification_is_silent(self):
+        snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
+
+        item = snapshotter._build_gate_cross_risk_notification(
+            datetime(2026, 7, 6, 11, 59, 59),
+            {'status': 'safe'},
+        )
+
+        self.assertIsNone(item)
+
     def test_total_equity_uses_corrected_gate_equity(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
         binance = {

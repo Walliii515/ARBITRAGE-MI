@@ -370,6 +370,9 @@ account_capital:
     warning_liq_distance_bps: 600
     danger_liq_distance_bps: 300
     min_available_pct: 15
+    notification_enabled: true
+    warning_notification_cooldown_sec: 3600
+    danger_notification_cooldown_sec: 300
 
 # 基础持仓对账配置（Binance 现货 + Gate 期货；可识别 Gate ADL/断腿并标记持仓风险）
 reconciliation:

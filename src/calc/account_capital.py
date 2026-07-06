@@ -10,11 +10,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+from calc.popup_notification_store import upsert_popup_notification
 from calc.reconciliation import build_exchange_config
 from calc.real_executor import RealExecutor
 from common.config import config
 from common.database import db_manager
+from common.logger import get_logger
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+
+logger = get_logger(__name__)
 
 @dataclass
 class AccountCapitalConfig:
@@ -28,6 +32,9 @@ class AccountCapitalConfig:
     gate_cross_warning_liq_distance_bps: float = 600.0
     gate_cross_danger_liq_distance_bps: float = 300.0
     gate_cross_min_available_pct: float = 15.0
+    gate_cross_notify_enabled: bool = True
+    gate_cross_warning_notify_cooldown_sec: int = 3600
+    gate_cross_danger_notify_cooldown_sec: int = 300
 
 
 def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
@@ -73,6 +80,18 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
                 'account_capital.gate_cross_risk.min_available_pct',
                 config.get_float('trade.open.min_gate_available_ratio', 0.15) * 100,
             ),
+            gate_cross_notify_enabled=config.get_bool(
+                'account_capital.gate_cross_risk.notification_enabled',
+                True,
+            ),
+            gate_cross_warning_notify_cooldown_sec=config.get_int(
+                'account_capital.gate_cross_risk.warning_notification_cooldown_sec',
+                3600,
+            ),
+            gate_cross_danger_notify_cooldown_sec=config.get_int(
+                'account_capital.gate_cross_risk.danger_notification_cooldown_sec',
+                300,
+            ),
         ),
     )
 
@@ -92,11 +111,13 @@ class AccountCapitalSnapshotter:
         total = self._build_total_row(snapshot_at, binance, gate, pnl)
         rows = [binance, gate, total]
         self._insert_rows(rows)
+        notification_count = self._record_gate_cross_risk_notification(snapshot_at, gate)
         self.cleanup_old_snapshots()
         return {
             'success': True,
             'snapshot_at': snapshot_at.strftime('%Y-%m-%d %H:%M:%S'),
             'summary': self.rows_to_summary(rows),
+            'notifications': {'gate_cross_risk': notification_count},
         }
 
     def get_latest_summary(self) -> Optional[Dict]:
@@ -376,6 +397,72 @@ class AccountCapitalSnapshotter:
         ):
             return 'warning'
         return 'safe'
+
+    def _record_gate_cross_risk_notification(self, snapshot_at: datetime, gate_row: Dict) -> int:
+        item = self._build_gate_cross_risk_notification(
+            snapshot_at,
+            _capital_detail(gate_row).get('gate_cross_risk') or {},
+        )
+        if not item:
+            return 0
+        try:
+            upsert_popup_notification(**item)
+            return 1
+        except Exception as exc:
+            logger.warning(
+                "Gate 全仓风险铃铛消息写入失败 | status=%s error=%s",
+                (item.get('payload') or {}).get('status'),
+                exc,
+                exc_info=True,
+            )
+            return 0
+
+    def _build_gate_cross_risk_notification(self, snapshot_at: datetime, risk: Dict) -> Optional[Dict]:
+        if not self.cfg.gate_cross_notify_enabled:
+            return None
+        status = str(risk.get('status') or '').strip().lower()
+        if status not in {'warning', 'danger'}:
+            return None
+
+        cooldown = (
+            self.cfg.gate_cross_danger_notify_cooldown_sec
+            if status == 'danger'
+            else self.cfg.gate_cross_warning_notify_cooldown_sec
+        )
+        label = _gate_cross_risk_status_label(status)
+        thresholds = risk.get('thresholds') or {}
+        nearest_contract = risk.get('nearest_liq_contract')
+        worst_contract = risk.get('worst_contract')
+        message_parts = [
+            f"状态={label}",
+            f"全仓MMR={_format_pct(risk.get('account_mmr_pct'))}",
+            f"最近强平距离={_format_bps(risk.get('nearest_liq_distance_bps'))}",
+            f"最近强平合约={_format_contract(nearest_contract)}",
+            f"最弱合约MMR={_format_pct(risk.get('worst_contract_mmr_pct'))}",
+            f"最弱合约={_format_contract(worst_contract)}",
+            f"可用率={_format_pct(risk.get('available_ratio_pct'))}",
+            f"占用率={_format_pct(risk.get('margin_usage_pct'))}",
+            f"维持保证金={_format_usdt(risk.get('maintenance_margin_usdt'))}",
+            f"持仓数={risk.get('position_count') if risk.get('position_count') is not None else '-'}",
+            (
+                "阈值="
+                f"MMR≤{_format_pct(thresholds.get(f'{status}_mmr_pct'))},"
+                f"强平距离≤{_format_bps(thresholds.get(f'{status}_liq_distance_bps'))}"
+            ),
+        ]
+        title = 'Gate 全仓风险告急' if status == 'danger' else 'Gate 全仓风险预警'
+        return {
+            'title': title,
+            'message': ' | '.join(message_parts),
+            'type': 'error' if status == 'danger' else 'warning',
+            'source': 'gate_cross_risk',
+            'dedup_key': (
+                f"gate_cross_risk:{status}:"
+                f"{_notification_bucket(snapshot_at, max(int(cooldown or 0), 1))}"
+            ),
+            'event_at': snapshot_at,
+            'payload': risk,
+        }
 
     def _build_total_row(self, snapshot_at: datetime, binance: Dict, gate: Dict, pnl: Dict) -> Dict:
         realized_pnl = _float(binance.get('realized_pnl_usdt')) + _float(gate.get('realized_pnl_usdt'))
@@ -677,6 +764,41 @@ def _gate_cross_risk_status_label(status: str) -> str:
         'warning': '预警',
         'danger': '危险',
     }.get(status, status or '-')
+
+
+def _notification_bucket(value: datetime, cooldown_sec: int) -> str:
+    timestamp = int(value.timestamp())
+    bucket_start = timestamp - (timestamp % max(int(cooldown_sec or 1), 1))
+    return datetime.fromtimestamp(bucket_start).strftime('%Y%m%d%H%M%S')
+
+
+def _format_number(value, digits: int = 2) -> str:
+    parsed = _float_or_none(value)
+    if parsed is None:
+        return '-'
+    return f"{parsed:.{digits}f}"
+
+
+def _format_pct(value) -> str:
+    text = _format_number(value, 2)
+    return '-' if text == '-' else f"{text}%"
+
+
+def _format_bps(value) -> str:
+    text = _format_number(value, 2)
+    return '-' if text == '-' else f"{text}bps"
+
+
+def _format_usdt(value) -> str:
+    text = _format_number(value, 2)
+    return '-' if text == '-' else f"{text} USDT"
+
+
+def _format_contract(value) -> str:
+    text = str(value or '').strip()
+    if not text or text.lower() == 'null':
+        return '-'
+    return text
 
 
 def _has_value(value) -> bool:
