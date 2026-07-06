@@ -7,7 +7,13 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from calc.reconciliation import Reconciler, ReconciliationConfig, normalize_asset_set
+from calc.reconciliation import (
+    Reconciler,
+    ReconciliationConfig,
+    build_default_reconciler,
+    get_forward_gate_leverage,
+    normalize_asset_set,
+)
 from calc.exchange_desync_remediator import (
     ExchangeDesyncRemediationConfig,
     ExchangeDesyncRemediator,
@@ -15,6 +21,24 @@ from calc.exchange_desync_remediator import (
 
 
 class TestReconciliationIgnoreAssets(unittest.TestCase):
+    def test_forward_gate_leverage_preserves_cross_margin_zero(self):
+        with patch('calc.reconciliation.config.get_float') as get_float:
+            get_float.side_effect = lambda key, default=None: (
+                0.0 if key == 'margin.forward_open_leverage' else default
+            )
+
+            self.assertEqual(get_forward_gate_leverage(), 0.0)
+
+    def test_default_reconciler_uses_forward_gate_leverage(self):
+        with patch('calc.reconciliation.fetch_contract_meta', return_value={}), \
+                patch('calc.reconciliation.fetch_spot_meta', return_value={}), \
+                patch('calc.reconciliation.build_exchange_config', return_value=object()), \
+                patch('calc.reconciliation.get_forward_gate_leverage', return_value=0.0), \
+                patch('calc.reconciliation.RealExecutor') as executor_cls:
+            build_default_reconciler()
+
+        self.assertEqual(executor_cls.call_args.kwargs['leverage'], 0.0)
+
     def test_normalize_asset_set_accepts_list_and_csv(self):
         self.assertEqual(normalize_asset_set(['bnb', ' USDT ', None, '']), {'BNB', 'USDT'})
         self.assertEqual(normalize_asset_set('bnb, fdusd'), {'BNB', 'FDUSD'})

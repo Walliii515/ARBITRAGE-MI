@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from calc.popup_notification_store import upsert_popup_notification
-from calc.reconciliation import build_exchange_config
+from calc.reconciliation import build_exchange_config, get_forward_gate_leverage
 from calc.real_executor import RealExecutor
 from common.config import config
 from common.database import db_manager
@@ -44,7 +44,7 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
         build_exchange_config(),
         contract_meta=contract_meta,
         spot_meta=spot_meta,
-        leverage=config.get_int('margin.leverage', 2),
+        leverage=get_forward_gate_leverage(),
     )
     return AccountCapitalSnapshotter(
         executor,

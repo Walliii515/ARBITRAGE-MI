@@ -3,10 +3,15 @@ import os
 import sys
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from calc.account_capital import AccountCapitalSnapshotter, AccountCapitalConfig
+from calc.account_capital import (
+    AccountCapitalConfig,
+    AccountCapitalSnapshotter,
+    build_default_capital_snapshotter,
+)
 
 
 class FakeCapitalExecutor:
@@ -43,6 +48,16 @@ class FakeCapitalExecutor:
 
 
 class TestAccountCapitalSnapshotter(unittest.TestCase):
+    def test_default_snapshotter_uses_forward_gate_leverage(self):
+        with patch('calc.account_capital.fetch_contract_meta', return_value={}), \
+                patch('calc.account_capital.fetch_spot_meta', return_value={}), \
+                patch('calc.account_capital.build_exchange_config', return_value=object()), \
+                patch('calc.account_capital.get_forward_gate_leverage', return_value=0.0), \
+                patch('calc.account_capital.RealExecutor') as executor_cls:
+            build_default_capital_snapshotter()
+
+        self.assertEqual(executor_cls.call_args.kwargs['leverage'], 0.0)
+
     def test_gate_equity_includes_unrealized_pnl(self):
         snapshotter = AccountCapitalSnapshotter(
             FakeCapitalExecutor({

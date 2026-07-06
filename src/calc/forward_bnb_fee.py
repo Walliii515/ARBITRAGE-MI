@@ -7,7 +7,7 @@ from typing import Dict
 from uuid import uuid4
 
 from calc.real_executor import RealExecutor
-from calc.reconciliation import build_exchange_config
+from calc.reconciliation import build_exchange_config, get_forward_gate_leverage
 from common.logger import get_logger
 
 
@@ -68,7 +68,9 @@ class ForwardBnbFeeBuyer:
 
 
 def build_default_forward_bnb_fee_buyer() -> ForwardBnbFeeBuyer:
-    return ForwardBnbFeeBuyer(RealExecutor(build_exchange_config()))
+    return ForwardBnbFeeBuyer(
+        RealExecutor(build_exchange_config(), leverage=get_forward_gate_leverage())
+    )
 
 
 def _validate_usdt_amount(amount: float) -> float:
