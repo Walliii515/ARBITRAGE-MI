@@ -191,6 +191,7 @@ const channelFormatter = (params: ValueFormatterParams) => {
 function formatLeverage(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return ''
   const n = Number(value)
+  if (Math.abs(n) < 1e-9) return '全仓'
   return `${Number.isInteger(n) ? n.toFixed(0) : formatDecimal(n, 2)}x`
 }
 

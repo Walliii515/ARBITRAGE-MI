@@ -4192,6 +4192,58 @@ class TestMarginDangerPath(unittest.TestCase):
         self.assertAlmostEqual(state['liq_distance_bps'], 194.174757, places=5)
         self.assertFalse(state['active'])
 
+    def test_cross_margin_zero_position_margin_does_not_trigger_mmr_close(self):
+        ce = make_closing_executor()
+        ce.forward_gate_leverage = 0.0
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': None}
+        pos = self._risk_position(
+            gate_maintenance_margin_rate=0.0,
+            gate_contract_position_margin=0.0,
+            gate_contract_position_margin_equity=0.0,
+            gate_contract_maintenance_margin=2.4506,
+            gate_position_margin=0.0,
+            gate_position_margin_equity=0.0,
+            gate_maintenance_margin=2.4506,
+            gate_liq_price=9.90629,
+            gate_mark_price=0.13827722,
+        )
+
+        state = ce._margin_danger_state(pos)
+
+        self.assertIsNone(state['margin_rate'])
+        self.assertGreater(state['liq_distance_bps'], ce.margin_danger_liq_distance_bps)
+        self.assertFalse(state['active'])
+
+    def test_cross_margin_uses_account_mmr_snapshot_for_danger_path(self):
+        ce = make_closing_executor()
+        ce.forward_gate_leverage = 0.0
+        ce.margin_danger_mmr_pct = 300.0
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': {
+                'account_mmr_pct': 250.0,
+                'account_equity_usdt': 4434.8311,
+                'maintenance_margin_usdt': 1773.9324,
+            },
+        }
+        pos = self._risk_position(
+            gate_maintenance_margin_rate=0.0,
+            gate_contract_position_margin=0.0,
+            gate_contract_position_margin_equity=0.0,
+            gate_contract_maintenance_margin=2.4506,
+            gate_liq_price=9.90629,
+            gate_mark_price=0.13827722,
+        )
+
+        state = ce._margin_danger_state(pos)
+        detail = ce._build_margin_close_detail(pos, '保证金危险路径', state)
+
+        self.assertTrue(state['active'])
+        self.assertEqual(state['margin_rate'], 250.0)
+        self.assertIn('MMR250.00%<=300.0%', ';'.join(state['reasons']))
+        self.assertIn('全仓权益4434.8311', detail)
+        self.assertIn('全仓维持保证金1773.9324', detail)
+
     def test_close_order_preserves_cross_margin_future_leverage_zero(self):
         ce = make_closing_executor()
         pos = self._risk_position(future_open_leverage=0.0)
