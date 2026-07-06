@@ -3877,7 +3877,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
                 self.assertEqual(group['execution_sequence'], 'future_then_spot')
                 self.assertEqual(group['execution_reason'], reason)
 
-    def test_manual_close_keeps_protective_ioc(self):
+    def test_manual_close_uses_gate_market_without_protective_ioc(self):
         self.ce.executor_client.channel = 'Live'
         self.ce.future_maker_close_enabled = True
         self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
@@ -3895,9 +3895,9 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 
         future_order = group['future_order']
         self.assertNotIn('execution_style', future_order)
-        self.assertEqual(future_order['protective_price'], 101.23)
+        self.assertNotIn('protective_price', future_order)
 
-    def test_manual_close_uses_protective_ioc_when_maker_close_enabled(self):
+    def test_manual_close_passes_no_protective_price_when_maker_close_enabled(self):
         self.ce.executor_client.channel = 'Live'
         self.ce.future_maker_close_enabled = True
         self.ce.future_maker_close_allowed_tiers = {'A', 'B'}
@@ -3915,8 +3915,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         })
 
         kwargs = self.ce._execute_close.call_args.kwargs
-        self.assertIsNotNone(kwargs.get('future_protective_price'))
-        self.assertGreater(kwargs['future_protective_price'], 100.0)
+        self.assertIsNone(kwargs.get('future_protective_price'))
 
 
 class TestGatePositionRiskEnrichment(unittest.TestCase):

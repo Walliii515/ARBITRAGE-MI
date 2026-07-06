@@ -298,6 +298,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
         remediator._load_positions_to_remediate = MagicMock(return_value=positions)
         remediator._load_binance_available_qty = MagicMock(return_value=25.0)
+        remediator._load_prior_future_fill = MagicMock(return_value=None)
         remediator._insert_spot_order = MagicMock()
         remediator._insert_synthetic_future_adl_order = MagicMock()
         remediator._close_position = MagicMock()
@@ -419,6 +420,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             FakeExecutor(),
             ExchangeDesyncRemediationConfig(enabled=True),
         )
+        remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
         remediator._load_positions_to_remediate = MagicMock(return_value=[{
             'id': 222,
             'base_asset': 'BEL',
@@ -483,6 +485,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             FakeExecutor(),
             ExchangeDesyncRemediationConfig(enabled=True),
         )
+        remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
         pos = {
             'id': 222,
             'base_asset': 'BEL',
@@ -537,6 +540,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             executor,
             ExchangeDesyncRemediationConfig(enabled=True),
         )
+        remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
         remediator._load_positions_to_remediate = MagicMock(return_value=[{
             'id': 293,
             'base_asset': 'AI',

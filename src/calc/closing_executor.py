@@ -528,8 +528,11 @@ class ClosingExecutor:
                         'message': notional_reason,
                     })
                     continue
-            if close_reason not in FAST_RISK_CLOSE_REASONS and self.protective_ioc_enabled and (
-                not self.future_maker_close_enabled or close_reason == 'manual'
+            if (
+                close_reason not in FAST_RISK_CLOSE_REASONS
+                and close_reason != 'manual'
+                and self.protective_ioc_enabled
+                and not self.future_maker_close_enabled
             ):
                 slippage_bps = (
                     self.protective_ioc_take_profit_slippage_bps
@@ -2092,22 +2095,12 @@ class ClosingExecutor:
         if margin_rate is not None:
             parts.append(f"保证金/维持保证金{float(margin_rate):.2f}%")
         close_reason_detail = '|'.join(parts)
-        future_protective_price = None
-        if self.protective_ioc_enabled:
-            future_protective_price = self._future_close_protective_price(
-                orderbook_row,
-                self.protective_ioc_risk_slippage_bps,
-            )
-            if future_protective_price is not None:
-                close_reason_detail = (
-                    f"{close_reason_detail}|保护IOC(future_buy≤{future_protective_price})"
-                )
         return self._execute_close(
             pos,
             close_reason,
             close_reason_detail,
             orderbook_row,
-            future_protective_price=future_protective_price,
+            future_protective_price=None,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -2204,7 +2197,7 @@ class ClosingExecutor:
             'target_qty': float(pos.get('future_open_qty') or 0),
             'target_amount': target_amount,
         }
-        if future_protective_price is not None:
+        if future_protective_price is not None and close_reason != 'manual':
             future_order['protective_price'] = future_protective_price
         if close_reason not in FAST_RISK_CLOSE_REASONS and close_reason != 'manual':
             self._apply_future_maker_close(pos, orderbook_row or {}, future_order, close_reason)
