@@ -484,17 +484,7 @@ async def get_position_orders(position_id: int):
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, [position_id])
         rows = cursor.fetchall()
-        cursor.execute(
-            """
-                SELECT *
-                FROM mi_margin_topup_log
-                WHERE position_id = %s
-                ORDER BY id ASC
-            """,
-            [position_id],
-        )
-        topup_rows = cursor.fetchall()
-    return {'orders': _serialize_rows(rows), 'topup_logs': _serialize_rows(topup_rows)}
+    return {'orders': _serialize_rows(rows)}
 
 
 @router.get('/orders/grouped')
@@ -2064,7 +2054,7 @@ async def get_reverse_positions(
 async def get_reverse_position_orders(position_id: int):
     """获取指定反向持仓的全部订单明细（弹窗用）。"""
     rows = list_reverse_position_orders(position_id)
-    return {'orders': _serialize_rows(rows), 'topup_logs': []}
+    return {'orders': _serialize_rows(rows)}
 
 
 @router.get('/reverse-orders')

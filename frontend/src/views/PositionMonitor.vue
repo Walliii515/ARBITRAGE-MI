@@ -7,7 +7,6 @@ import type {
   GridApi,
   GridReadyEvent,
   ValueFormatterParams,
-  ValueGetterParams,
 } from 'ag-grid-community'
 import { ElPopover } from 'element-plus'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -76,13 +75,7 @@ interface PositionRow {
   total_pnl_bps: number | null
   total_pnl: number | null
   fee_cost: number | null
-  margin_topup_count: number | null
-  margin_topup_total: number | null
-  margin_topup_last_at: string | null
-  margin_initial: number | null
-  current_margin: number | null
   gate_mark_price: number | null
-  gate_liq_price: number | null
   gate_contract_position_margin: number | null
   gate_contract_position_margin_equity: number | null
   gate_contract_unrealised_pnl: number | null
@@ -91,7 +84,6 @@ interface PositionRow {
   gate_position_margin_equity: number | null
   gate_unrealised_pnl: number | null
   gate_maintenance_margin: number | null
-  gate_maintenance_margin_rate: number | null
   gate_position_size: number | null
   gate_risk_updated_at: string | null
   exchange_risk_status: string | null
@@ -812,84 +804,6 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellStyle: pnlCellStyle,
   },
   {
-    headerName: '追加次数',
-    field: 'margin_topup_count',
-    width: 100,
-    type: 'numericColumn',
-    enableCellChangeFlash: true,
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: (params: ValueFormatterParams) => {
-      if (params.value == null) return '0'
-      return String(params.value)
-    },
-  },
-  {
-    headerName: '追加金额',
-    field: 'margin_topup_total',
-    width: 110,
-    type: 'numericColumn',
-    enableCellChangeFlash: true,
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: pnlFormatter,
-  },
-  {
-    headerName: '当前保证金',
-    field: 'current_margin',
-    width: 120,
-    type: 'numericColumn',
-    enableCellChangeFlash: true,
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueGetter: (params: ValueGetterParams<PositionRow>) => {
-      const row = params.data
-      if (!row) return null
-      return row.gate_position_margin ?? row.current_margin
-    },
-    valueFormatter: pnlFormatter,
-  },
-  {
-    headerName: '保证金/维持保证金',
-    field: 'gate_maintenance_margin_rate',
-    width: 155,
-    type: 'numericColumn',
-    enableCellChangeFlash: true,
-    cellClass: 'ag-right-aligned-cell',
-    headerClass: 'ag-right-aligned-header',
-    valueFormatter: (params: ValueFormatterParams) => {
-      if (params.value == null) return ''
-      return Number(params.value).toFixed(2) + '%'
-    },
-	    cellStyle: (params: any) => {
-	      const value = params.value as number | null
-	      if (value == null) return { color: '#909399', fontWeight: '400' }
-	      if (value >= 350) return { color: '#67c23a', fontWeight: '400' }
-	      if (value >= 250) return { color: '#95d475', fontWeight: '400' }
-	      if (value >= 150) return { color: '#e6a23c', fontWeight: '400' }
-	      return { color: '#f56c6c', fontWeight: '700' }
-	    },
-    tooltipValueGetter: (params: any) => {
-      const row = params.data as PositionRow | undefined
-      if (!row || row.gate_maintenance_margin_rate == null) return null
-      const parts = [
-        `保证金/维持保证金: ${Number(row.gate_maintenance_margin_rate).toFixed(2)}%`,
-        row.gate_position_margin != null ? `仓位保证金: ${formatAmount(row.gate_position_margin)}` : null,
-        row.gate_unrealised_pnl != null ? `未实现盈亏: ${formatAmount(row.gate_unrealised_pnl)}` : null,
-        row.gate_position_margin_equity != null ? `仓位权益: ${formatAmount(row.gate_position_margin_equity)}` : null,
-        row.gate_maintenance_margin != null ? `维持保证金: ${formatAmount(row.gate_maintenance_margin)}` : null,
-        row.gate_contract_position_margin != null ? `合约总保证金: ${formatAmount(row.gate_contract_position_margin)}` : null,
-        row.gate_contract_unrealised_pnl != null ? `合约总未实现盈亏: ${formatAmount(row.gate_contract_unrealised_pnl)}` : null,
-        row.gate_contract_position_margin_equity != null ? `合约总权益: ${formatAmount(row.gate_contract_position_margin_equity)}` : null,
-        row.gate_contract_maintenance_margin != null ? `合约总维持保证金: ${formatAmount(row.gate_contract_maintenance_margin)}` : null,
-        row.gate_mark_price != null ? `标记价: ${formatDecimal(row.gate_mark_price)}` : null,
-        row.gate_liq_price != null ? `强平价: ${formatDecimal(row.gate_liq_price)}` : null,
-        row.gate_risk_updated_at ? `更新时间: ${row.gate_risk_updated_at}` : null,
-      ].filter(Boolean)
-      return parts.join('\n')
-    },
-  },
-  {
     headerName: '平仓基差(bps)',
     field: 'close_spread_bps',
     width: 120,
@@ -950,8 +864,7 @@ const getRowId = (params: GetRowIdParams<PositionRow>) =>
 const getRowClass = (params: any) => {
   if (params.data?.exchange_risk_status === 'desynced') return 'position-row-exchange-risk'
   if (params.data?.delist_risks?.length) return 'position-row-exchange-risk'
-  const count = Number(params.data?.margin_topup_count || 0)
-  return count > 0 ? 'position-row-topup' : ''
+  return ''
 }
 
 /* ───── 外部过滤 ───── */
@@ -1085,16 +998,7 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     realized_pnl: realizedPnl,
     total_pnl_bps: sumField('total_pnl_bps'),
     total_pnl: totalPnl,
-    margin_topup_count: null,
-    margin_topup_total: sumField('margin_topup_total'),
-    margin_topup_last_at: null,
-    margin_initial: sumField('margin_initial'),
-    current_margin: rows.reduce((sum, row) => {
-      const value = row.gate_position_margin ?? row.current_margin
-      return sum + (typeof value === 'number' ? value : 0)
-    }, 0),
     gate_mark_price: null,
-    gate_liq_price: null,
     gate_contract_position_margin: null,
     gate_contract_position_margin_equity: null,
     gate_contract_unrealised_pnl: null,
@@ -1103,7 +1007,6 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     gate_position_margin_equity: sumField('gate_position_margin_equity'),
     gate_unrealised_pnl: sumField('gate_unrealised_pnl'),
     gate_maintenance_margin: sumField('gate_maintenance_margin'),
-    gate_maintenance_margin_rate: null,
     gate_position_size: sumField('gate_position_size'),
     gate_risk_updated_at: null,
     exchange_risk_status: null,
@@ -1677,10 +1580,6 @@ onUnmounted(() => {
   width: 100%;
   height: calc(100vh - 340px);
   min-height: 420px;
-}
-
-.orderbook-grid :deep(.position-row-topup) {
-  background-color: rgba(230, 162, 60, 0.08);
 }
 
 .orderbook-grid :deep(.position-row-exchange-risk) {

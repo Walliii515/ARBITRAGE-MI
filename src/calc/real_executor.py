@@ -73,7 +73,7 @@ class RealExecutor:
             f'RealExecutor 已初始化: env={self.config.env}, '
             f'binance={self.config.binance_base_url}, '
             f'gate={self.config.gate_base_url}, '
-            f'leverage={self.leverage}(逐仓)'
+            f'gate_margin_mode={self._gate_margin_mode_label()}'
         )
 
     def execute(self, order_group: Dict, orderbook_row: Dict) -> Dict:
@@ -1270,7 +1270,7 @@ class RealExecutor:
     # ──────────────────────────────────────────────────────────────────
 
     def _ensure_open_leverage(self, future_order: Dict) -> tuple[bool, str]:
-        """开仓前确认 Gate 逐仓杠杆；已有仓位杠杆不匹配时拒单，避免改动历史仓位。"""
+        """开仓前确认 Gate 保证金模式；已有仓位模式不匹配时拒单，避免改动历史仓位。"""
         if future_order.get('order_side') != 'open':
             return True, ''
         base_asset = future_order.get('base_asset', '')
@@ -1279,7 +1279,7 @@ class RealExecutor:
 
     def _ensure_leverage(self, contract: str) -> tuple[bool, str]:
         """
-        确保合约已设置为逐仓模式 + 指定杠杆倍数
+        确保合约已设置为目标保证金模式
 
         Gate API: POST /api/v4/futures/usdt/positions/{contract}/leverage
         - leverage > 0: 逐仓模式（isolated margin），值为杠杆倍数
@@ -1299,12 +1299,12 @@ class RealExecutor:
             current_leverage = self._float_or_none(existing.get('leverage'))
             if current_leverage is not None and abs(current_leverage - float(self.leverage)) < 1e-9:
                 self._leverage_set.add(contract)
-                logger.info(f"Gate 已有仓位杠杆匹配 | {contract} | 逐仓 {self.leverage}x")
+                logger.info(f"Gate 已有仓位保证金模式匹配 | {contract} | {self._gate_margin_mode_label()}")
                 return True, ''
             msg = (
-                f"Gate已有仓位，禁止修改杠杆 | {contract} | "
-                f"current={current_leverage if current_leverage is not None else 'unknown'}x,"
-                f"target={self.leverage}x"
+                f"Gate已有仓位，禁止修改保证金模式 | {contract} | "
+                f"current={self._gate_margin_mode_label(current_leverage)},"
+                f"target={self._gate_margin_mode_label()}"
             )
             logger.warning(msg)
             return False, msg
@@ -1318,7 +1318,7 @@ class RealExecutor:
             resp = self._session.post(url, headers=headers, timeout=self.config.timeout_sec)
             if resp.status_code == 200:
                 self._leverage_set.add(contract)
-                logger.info(f"Gate 杠杆设置成功 | {contract} | 逐仓 {self.leverage}x")
+                logger.info(f"Gate 保证金模式设置成功 | {contract} | {self._gate_margin_mode_label()}")
                 return True, ''
             else:
                 msg = f"Gate 杠杆设置失败 | {contract} | HTTP {resp.status_code}: {resp.text[:150]}"
@@ -1349,6 +1349,14 @@ class RealExecutor:
         except (TypeError, ValueError):
             return None
 
+    def _gate_margin_mode_label(self, leverage: Optional[float] = None) -> str:
+        value = self._float_or_none(self.leverage if leverage is None else leverage)
+        if value is not None and abs(value) < 1e-9:
+            return '全仓'
+        if value is None:
+            return 'unknown'
+        return f'逐仓 {value:g}x'
+
     def _place_gate_futures_order(self, order: Dict) -> Dict:
         """
         向 Gate 发送期货市价单
@@ -1360,7 +1368,7 @@ class RealExecutor:
         contract = order.get('future_contract') or f"{base_asset}_USDT"
         target_qty = float(order.get('target_qty', 0))
 
-        # 开仓前确保逐仓 + 杠杆设置；平仓/reduce-only 不修改已有仓位杠杆。
+        # 开仓前确保 Gate 保证金模式；平仓/reduce-only 不修改已有仓位。
         leverage_ok, leverage_reason = self._ensure_open_leverage(order)
         if not leverage_ok:
             return {'success': False, 'reason': leverage_reason}
@@ -1828,74 +1836,6 @@ class RealExecutor:
                 logger.warning("Gate account_book reached 10000 row cap for capital snapshot")
                 break
         return all_rows
-
-    def topup_gate_margin(self, contract: str, amount: float, dual_side: str = 'short') -> Dict:
-        """
-        追加 Gate 逐仓保证金。
-
-        API:
-        - dual mode: POST /api/v4/futures/usdt/dual_comp/positions/{contract}/margin?change=...&dual_side=...
-        - single mode: POST /api/v4/futures/usdt/positions/{contract}/margin?change=...
-        """
-        contract = str(contract or '').upper()
-        change = round(float(amount or 0), 6)
-        dual_side = str(dual_side or 'short').lower()
-        if dual_side == 'short':
-            dual_side = 'dual_short'
-        elif dual_side == 'long':
-            dual_side = 'dual_long'
-        if not contract or change <= 0:
-            return {'success': False, 'message': f'追加金额无效: contract={contract}, amount={amount}'}
-        if dual_side not in ('dual_long', 'dual_short'):
-            return {'success': False, 'message': f'追加方向无效: dual_side={dual_side}'}
-
-        try:
-            resp, mode = self._post_gate_margin_topup(contract, change, dual_side)
-            if (
-                resp.status_code == 400
-                and 'dual_side is set while not in dual-mode' in (resp.text or '')
-            ):
-                logger.warning(
-                    f"Gate 追加保证金切换为单向持仓接口 | {contract} | "
-                    f"side={dual_side} | amount={change:.6f} | reason={resp.text[:120]}"
-                )
-                resp, mode = self._post_gate_margin_topup(contract, change, None)
-            if resp.status_code not in (200, 201):
-                return {
-                    'success': False,
-                    'message': f'Gate追保失败 HTTP {resp.status_code}: {resp.text[:200]}',
-                }
-            data = resp.json() if resp.text else {}
-            logger.info(f"Gate 追加保证金成功 | {contract} | mode={mode} | side={dual_side} | amount={change:.6f}")
-            return {
-                'success': True,
-                'message': 'Gate追保成功',
-                'data': data,
-                'amount': change,
-                'dual_side': dual_side,
-                'mode': mode,
-            }
-        except requests.exceptions.Timeout:
-            return {'success': False, 'message': f'Gate追保请求超时({self.config.timeout_sec}s)'}
-        except requests.exceptions.ConnectionError as e:
-            return {'success': False, 'message': f'Gate追保连接失败: {str(e)[:100]}'}
-        except Exception as e:
-            logger.error(f"Gate 追加保证金异常 | {contract} | {e}", exc_info=True)
-            return {'success': False, 'message': f'Gate追保异常: {str(e)[:100]}'}
-
-    def _post_gate_margin_topup(self, contract: str, change: float, dual_side: Optional[str]):
-        if dual_side:
-            api_path = f'/api/v4/futures/usdt/dual_comp/positions/{contract}/margin'
-            query_string = urlencode({'change': f'{change:.6f}', 'dual_side': dual_side})
-            mode = 'dual'
-        else:
-            api_path = f'/api/v4/futures/usdt/positions/{contract}/margin'
-            query_string = urlencode({'change': f'{change:.6f}'})
-            mode = 'single'
-        headers = self._gate_sign('POST', api_path, query_string, '')
-        url = f"{self.config.gate_base_url}{api_path}?{query_string}"
-        resp = self._session.post(url, headers=headers, timeout=self.config.timeout_sec)
-        return resp, mode
 
     # ──────────────────────────────────────────────────────────────────
     # 辅助方法

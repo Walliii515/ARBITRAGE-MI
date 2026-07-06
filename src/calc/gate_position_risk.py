@@ -6,8 +6,8 @@ Gate 的强平预警邮件使用合约聚合仓位口径；本地 mi_trade_posit
 可能把同一合约拆成多条持仓，因此这里按 Gate contract 将同一风险值
 贴到所有本地持仓行。
 
-Gate 页面展示的 MMR 口径是 仓位权益 / 维持保证金，其中仓位权益等于
-逐仓保证金加未实现盈亏。只用 margin / maintenance_margin 会在浮亏时
+Gate 页面展示的 MMR 口径是仓位权益 / 维持保证金。系统优先使用
+交易所返回的 margin/margin_equity/maintenance_margin 快照，避免本地估算
 高估安全度，导致系统晚于交易所预警。
 """
 from datetime import datetime
@@ -24,10 +24,6 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
     }
     contract_open_notional = {
         contract: sum(_position_open_notional(pos) for pos in rows)
-        for contract, rows in holdings_by_contract.items()
-    }
-    contract_topup_total = {
-        contract: sum(_float(pos.get('margin_topup_total')) for pos in rows)
         for contract, rows in holdings_by_contract.items()
     }
     for pos in positions:
@@ -56,7 +52,6 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
         pos['gate_contract_maintenance_margin'] = maintenance_margin
         pos['gate_contract_local_position_count'] = len(holdings_by_contract.get(contract) or [])
         pos['gate_contract_open_notional'] = contract_open_notional.get(contract, 0.0)
-        pos['gate_contract_margin_topup_total'] = contract_topup_total.get(contract, 0.0)
         pos['gate_position_margin'] = margin * share
         pos['gate_position_margin_equity'] = margin_equity * share
         pos['gate_unrealised_pnl'] = unrealised_pnl * share
@@ -139,7 +134,6 @@ def _clear_gate_risk_fields(pos: Dict) -> None:
     pos['gate_contract_maintenance_margin'] = None
     pos['gate_contract_local_position_count'] = None
     pos['gate_contract_open_notional'] = None
-    pos['gate_contract_margin_topup_total'] = None
     pos['gate_position_margin'] = None
     pos['gate_position_margin_equity'] = None
     pos['gate_unrealised_pnl'] = None

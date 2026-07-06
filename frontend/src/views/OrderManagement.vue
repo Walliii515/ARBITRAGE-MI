@@ -42,20 +42,6 @@ interface OrderRow {
   reject_reason: string | null
 }
 
-interface TopupRow {
-  id: number
-  position_id: number
-  topup_amount: number | null
-  target_margin_usdt: number | null
-  margin_before_usdt: number | null
-  liq_distance_before: number | null
-  liq_distance_after: number | null
-  gate_available_before: number | null
-  success: number | boolean | null
-  error_msg: string | null
-  created_at: string | null
-}
-
 /** 持仓行类型（来自 mi_trade_position 表） */
 interface PositionRow {
   id: number
@@ -130,7 +116,6 @@ const assetOptions = computed(() => {
 /** 订单详情弹窗 */
 const detailDialogVisible = ref(false)
 const detailOrders = ref<OrderRow[]>([])
-const detailTopups = ref<TopupRow[]>([])
 const detailPositionId = ref<number | null>(null)
 const detailLoading = ref(false)
 
@@ -179,11 +164,6 @@ const amountFormatter = (params: ValueFormatterParams) => {
 const bpsFormatter = (params: ValueFormatterParams) => {
   if (params.value == null) return ''
   return Number(params.value).toFixed(2) + ' bps'
-}
-
-function formatPercentValue(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(Number(value))) return ''
-  return `${Number(value).toFixed(2)}%`
 }
 
 const timeFormatter = (params: ValueFormatterParams) => {
@@ -428,14 +408,12 @@ async function openDetailDialog(positionId: number | null) {
   if (positionId == null) return
   detailPositionId.value = positionId
   detailOrders.value = []
-  detailTopups.value = []
   detailDialogVisible.value = true
   detailLoading.value = true
   try {
     const res = await get(`/api/trading/positions/${positionId}/orders`)
     const data = await res.json()
     detailOrders.value = data.orders || []
-    detailTopups.value = data.topup_logs || []
   } catch {
     showError('加载订单明细失败')
   } finally {
@@ -878,24 +856,6 @@ onUnmounted(() => {
         <el-table-column prop="reject_reason" label="原因" min-width="140" show-overflow-tooltip />
         <el-table-column prop="created_at" label="时间" width="160" :formatter="(row: OrderRow) => formatTime(row.created_at)" />
       </el-table>
-      <div class="detail-section-title detail-section-title--spaced">Gate追保记录</div>
-      <el-table :data="detailTopups" v-loading="detailLoading" border stripe size="small" style="width: 100%">
-        <el-table-column prop="topup_amount" label="追加金额" width="100" align="right" :formatter="(row: TopupRow) => formatAmount(row.topup_amount)" />
-        <el-table-column prop="margin_before_usdt" label="追加前保证金" width="120" align="right" :formatter="(row: TopupRow) => formatAmount(row.margin_before_usdt)" />
-        <el-table-column prop="target_margin_usdt" label="目标保证金" width="110" align="right" :formatter="(row: TopupRow) => formatAmount(row.target_margin_usdt)" />
-        <el-table-column prop="gate_available_before" label="Gate可用" width="100" align="right" :formatter="(row: TopupRow) => formatAmount(row.gate_available_before)" />
-        <el-table-column prop="liq_distance_before" label="追保前比例" width="105" align="right" :formatter="(row: TopupRow) => formatPercentValue(row.liq_distance_before)" />
-        <el-table-column prop="liq_distance_after" label="预计后比例" width="105" align="right" :formatter="(row: TopupRow) => formatPercentValue(row.liq_distance_after)" />
-        <el-table-column prop="success" label="结果" width="80">
-          <template #default="{ row }">
-            <span :style="{ color: row.success ? '#67c23a' : '#f56c6c' }">
-              {{ row.success ? '成功' : '失败' }}
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="error_msg" label="说明" min-width="150" show-overflow-tooltip />
-        <el-table-column prop="created_at" label="时间" width="160" :formatter="(row: TopupRow) => formatTime(row.created_at)" />
-      </el-table>
     </el-dialog>
   </div>
 </template>
@@ -1035,10 +995,6 @@ onUnmounted(() => {
   font-size: 13px;
   font-weight: 600;
   color: var(--app-text);
-}
-
-.detail-section-title--spaced {
-  margin-top: 16px;
 }
 
 /* 汇总行背景色 */

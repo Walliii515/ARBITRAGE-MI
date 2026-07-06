@@ -1813,7 +1813,7 @@ def _run_open_position_check_once():
                 ),
                 quality_scale_in_min_gate_margin_rate_pct=config.get_float(
                     'trade.open.quality_scale_in.min_gate_margin_rate_pct',
-                    config.get_float('margin.topup_pct', 250.0)
+                    250.0
                 ),
                 quality_scale_in_cooldown_sec=config.get_int(
                     'trade.open.quality_scale_in.cooldown_sec', 300
@@ -2291,10 +2291,6 @@ def _run_close_position_check_once():
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )
 
-        if _has_successful_margin_topup(results):
-            _invalidate_gate_position_risk_cache('margin_topup_success')
-            _get_gate_position_risk_snapshot(force_refresh=True)
-
         if results:
             _record_auto_risk_close_notifications(results, event_at=datetime.now())
 
@@ -2327,13 +2323,6 @@ async def _close_position_loop():
     while True:
         await asyncio.sleep(interval)
         await loop.run_in_executor(_critical_close_executor, _run_close_position_check_once)
-
-
-def _has_successful_margin_topup(results: List[Dict]) -> bool:
-    return any(
-        result.get('success') and result.get('action') == 'margin_topup'
-        for result in results or []
-    )
 
 
 def _build_auto_risk_close_notification(result: Dict, event_at: Optional[datetime] = None) -> Optional[Dict]:

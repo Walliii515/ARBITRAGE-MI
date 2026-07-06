@@ -539,8 +539,6 @@ class TradingExecutor:
                 if ba not in self._holding_margin_rate or margin_rate < self._holding_margin_rate[ba]:
                     self._holding_margin_rate[ba] = margin_rate
             margin = self._float_or_none(pos.get('gate_position_margin'))
-            if margin is None:
-                margin = self._float_or_none(pos.get('current_margin'))
             if margin is not None:
                 future_margin_by_asset[ba] = future_margin_by_asset.get(ba, 0.0) + max(float(margin), 0.0)
         self._holding_future_margin_cache_by_asset = future_margin_by_asset
@@ -569,7 +567,6 @@ class TradingExecutor:
                     COALESCE(SUM(
                         COALESCE(ABS(p.future_open_price * p.future_open_qty), p.spot_open_amount, 0)
                         / GREATEST(COALESCE(fo.future_open_leverage, %s), 1)
-                        + COALESCE(p.margin_topup_total, 0)
                     ), 0) AS future_margin,
                     COALESCE(
                         SUM(

@@ -59,7 +59,7 @@ trade:
     reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
     min_available_ratio: 0.10               # 兼容旧字段；未配置分交易所阈值时使用
     min_binance_available_ratio: 0.02       # Binance 下单后可用资金最低比例；主要预留手续费/现货兜底
-    min_gate_available_ratio: 0.15          # Gate 下单后可用资金最低比例；预留给追保/风险处置
+    min_gate_available_ratio: 0.15          # Gate 下单后可用资金最低比例；预留给全仓风险处置
     max_asset_exposure_ratio: 0.10          # 单标的 spot开仓额 / future当前保证金 均不得超过各自总资金比例
     quality_scale_in:
       enabled: true                         # 普通单标的额度用完后，极优机会允许进入增强额度
@@ -68,7 +68,7 @@ trade:
       min_basis_improvement_bps: 8          # 优质加仓最低基差改善要求
       basis_improvement_ratio: 0.25         # 相对已有加权入场基差的改善比例
       max_basis_improvement_bps: 20         # 优质加仓最高基差改善要求，避免高基差仓位阈值过硬
-      min_gate_margin_rate_pct: 250         # Gate MMR 已知且低于追保触发线时，禁止使用增强额度
+      min_gate_margin_rate_pct: 250         # Gate MMR 已知且过低时，禁止使用增强额度
       cooldown_sec: 300                     # 同标的增强加仓成功后的冷却
     presignal_reject_log_cooldown_sec: 300  # 预信号风控拒绝落库限流；用于复盘“页面满足但未进信号”
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
@@ -325,39 +325,25 @@ trade:
     funding_sync_lookback_days: 7           # Gate fund 流水回看天数，用于重启/漏记回补
     funding_update_offset_sec: 10           # 每个整点后多少秒检查资金费入账
     push_interval_sec: 5                    # 实时数据推送间隔（秒）
-    gate_risk_cache_sec: 10                 # Gate 实仓风险快照缓存秒数；用于追保/风险平仓判断
+    gate_risk_cache_sec: 10                 # Gate 实仓风险快照缓存秒数；用于风险平仓判断
 
-# 保证金风控配置（逐仓模式）
+# 保证金风控配置（Gate 全仓模式）
 margin:
   # 默认杠杆倍数（历史仓位/展示兜底；不要用来覆盖已有仓位）
   leverage: 5
-  # 正向套利新开 Gate future 逐仓杠杆；只影响新开仓，不修改已有仓位
-  forward_open_leverage: 10
+  # 正向套利新开 Gate future 全仓模式；Gate API leverage=0 表示 cross margin
+  forward_open_leverage: 0
   # 默认维持保证金率（当合约表无数据时的回退值）
   default_maintenance_rate: 0.005
   # 保证金/维持保证金预警阈值(%): 低于此值时禁止该标的新开仓
   warning_pct: 300
-  # 保证金/维持保证金自动追加阈值(%): 低于此值时先尝试追保
-  topup_pct: 300
   # 保证金/维持保证金紧急平仓阈值(%): 低于此值时由系统主动市价平仓，避免等交易所强平
   close_threshold_pct: 200
-  # 自动追加保证金策略：补到目标 保证金/维持保证金 比例
-  topup:
-    enabled: true
-    target_maintenance_margin_rate_pct: 500
-    max_topup_open_notional_multiplier: 4   # 累计追保金额最多为开仓名义金额的倍数；同合约多笔会按合约聚合
-    min_gate_available: 0                   # 固定Gate可用余额预留(USDT)，0表示仅按比例预留
-    min_gate_available_ratio_pct: 2         # 追保后Gate可用余额至少保留Gate总资产的比例
-    cooldown_sec: 1
-    success_grace_sec: 20                  # 追保成功后等待 Gate 风险快照刷新，期间不重复追保/不按旧 MMR 平仓
-    min_amount_usdt: 0.1
-    snapshot_max_age_sec: 180
-    hedge_balance_tolerance_pct: 5
   danger_path:
     enabled: true
     mmr_pct: 300                           # 低于该 MMR 视为危险路径，强制刷新 Gate 风险快照
     liq_distance_bps: 300                  # 空头价格距强平价小于该 bps 时进入危险路径
-    missing_risk_force_refresh: true       # 持仓缺失 Gate MMR/强平价时强制刷新，避免静默无追保日志
+    missing_risk_force_refresh: true       # 持仓缺失 Gate MMR/强平价时强制刷新
     force_refresh_min_interval_sec: 2      # 缺失/危险刷新最小间隔，防止 Gate REST 故障时打爆接口
 
 # 真实成交引擎配置（仅 real_executor_service 使用）

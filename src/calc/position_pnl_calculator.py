@@ -60,13 +60,6 @@ def _float_or_none(value) -> Optional[float]:
         return None
 
 
-def _position_margin_leverage(pos: Dict, cfg: PnlConfig) -> float:
-    leverage = _float_or_none(pos.get('future_open_leverage'))
-    if leverage is None or leverage <= 0:
-        leverage = cfg.margin_leverage
-    return max(float(leverage or 1.0), 1.0)
-
-
 def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
     future_open_fee = _float_or_none(pos.get('future_open_fee_rate'))
     future_close_fee = _float_or_none(pos.get('future_close_fee_rate'))
@@ -329,22 +322,15 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
                 pos['floating_pnl_total'], 0, funding_pnl, fee_cost_usdt
             )
 
-            # ── 保证金风控指标注入（逐仓模式空头爆仓价 + 距爆仓距离）──
+            # ── 全仓模式下不再计算单仓逐仓强平价；账户级风险由 Gate 账户快照负责。
             maintenance_rate = c_meta.get('maintenance_rate') or margin_default_mmr
-            margin_leverage = _position_margin_leverage(pos, cfg)
-            pos['margin_leverage'] = margin_leverage
-            initial_margin = future_open_price * future_qty / margin_leverage
-            topup_total = float(pos.get('margin_topup_total') or 0)
-            total_margin = initial_margin + topup_total
-            pos['margin_initial'] = round(initial_margin, 6)
-            pos['current_margin'] = round(total_margin, 6)
-            liq_price = future_open_price + total_margin / future_qty - maintenance_rate * future_open_price
-            pos['liq_price'] = round(liq_price, 6)
-            if current_future > 0:
-                liq_distance_pct = (liq_price - current_future) / current_future * 100
-                pos['liq_distance_pct'] = round(liq_distance_pct, 2)
-            else:
-                pos['liq_distance_pct'] = None
+            future_notional = future_open_price * future_qty
+            pos['future_open_notional'] = round(future_notional, 6)
+            pos['estimated_maintenance_margin'] = round(future_notional * maintenance_rate, 6)
+            pos['margin_initial'] = None
+            pos['current_margin'] = None
+            pos['liq_price'] = None
+            pos['liq_distance_pct'] = None
         else:
             pos['current_spot_price'] = None
             pos['current_future_price'] = None

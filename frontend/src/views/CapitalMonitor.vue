@@ -366,7 +366,7 @@ function availableHelpText(exchange: string): string {
     return `Binance 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，主要用于手续费、BNB不足和现货腿兜底。`
   }
   if (exchange === 'gate') {
-    return `Gate 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，用于给逐仓追保和风险处置留空间；实际追保后最低保留 2%。`
+    return `Gate 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，用于给全仓风险处置留空间。`
   }
   return '合计可用资金仅用于观察，不参与单交易所开仓预留风控。'
 }

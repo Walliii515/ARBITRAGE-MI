@@ -83,13 +83,6 @@ class ExecuteRequest(BaseModel):
     orderbook_row: dict
 
 
-class MarginTopupRequest(BaseModel):
-    """虚拟追加保证金请求体"""
-    contract: str
-    amount: float
-    dual_side: str = 'short'
-
-
 def _json_default(obj):
     """JSON 序列化兜底"""
     if isinstance(obj, Decimal):
@@ -121,22 +114,6 @@ async def execute(req: ExecuteRequest):
             'spot_order': None,
             'future_order': None
         }
-
-
-@app.post('/api/margin/topup')
-async def margin_topup(req: MarginTopupRequest):
-    """虚拟盘追保：不调用交易所，仅返回成功，由主服务更新本地追保记录。"""
-    amount = round(float(req.amount or 0), 6)
-    if amount <= 0:
-        return {'success': False, 'message': f'追加金额无效: {amount}'}
-    return {
-        'success': True,
-        'message': '虚拟追保成功',
-        'contract': req.contract,
-        'amount': amount,
-        'dual_side': req.dual_side,
-        'virtual': True,
-    }
 
 
 @app.post('/api/reload')
