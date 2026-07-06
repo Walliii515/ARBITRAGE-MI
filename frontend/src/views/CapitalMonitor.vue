@@ -432,9 +432,17 @@ function availableHelpText(exchange: string): string {
     return `Binance 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，主要用于手续费、BNB不足和现货腿兜底。`
   }
   if (exchange === 'gate') {
-    return `Gate 开仓后可用资金最低保留 ${formatPercent(minAvailableRatio(exchange))}，用于给全仓风险处置留空间。`
+    return [
+      `开仓预留: Gate 每笔正向开仓前都会检查“本次下单后可用资金 / Gate净值”是否仍 >= ${formatPercent(minAvailableRatio(exchange))}。低于该值时只拦截新的正向开仓，不会自动切换左侧“暂停正向开仓”，已有持仓和平仓逻辑不受影响。`,
+      '系统主动平仓: 持仓监控会刷新 Gate 全仓 MMR 和强平价。MMR <= 300% 或正向空头距强平价 <= 300bps 时进入危险路径，系统按保证金风控全量市价平仓；若已低于 200% 也会作为兜底保证金风控触发。',
+      '交易所强平/ADL: 以 Gate 返回的 liq_price 和交易所风控为准。页面在“Gate 全仓风险”里看全仓MMR、最近强平距离、最弱合约MMR；发生交易所强平/ADL 后，Gate风险WS/持仓对账会写入铃铛和交易所风险。'
+    ].join('\n\n')
   }
   return '合计可用资金仅用于观察，不参与单交易所开仓预留风控。'
+}
+
+function availableHelpWidth(exchange: string): number {
+  return exchange === 'gate' ? 520 : 260
 }
 
 function gateRiskStatusClass(status: string | null | undefined): string {
@@ -895,7 +903,7 @@ onBeforeUnmount(() => {
         <div class="metric-row available-row">
           <span class="metric-label-with-help">
             <span>可用资金</span>
-            <el-popover trigger="click" placement="top" width="260">
+            <el-popover trigger="click" placement="top" :width="availableHelpWidth(exchange)">
               <template #reference>
                 <el-button class="help-icon-button" text circle size="small" aria-label="可用资金提醒逻辑">
                   <el-icon><QuestionFilled /></el-icon>
@@ -1300,6 +1308,7 @@ onBeforeUnmount(() => {
   color: var(--app-text);
   font-size: 12px;
   line-height: 1.6;
+  white-space: pre-line;
 }
 
 .metric-unit,
