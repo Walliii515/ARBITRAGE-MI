@@ -1209,18 +1209,18 @@ async def get_capital_latest():
             COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.bnb_fee_asset.free')) AS DECIMAL(28,12)) AS bnb_available,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.bnb_fee_asset.free_value_usdt')) AS DECIMAL(28,12)) AS bnb_available_usdt,
-            JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.status')) AS gate_cross_risk_status,
-            JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.status_label')) AS gate_cross_risk_status_label,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.position_count')) AS UNSIGNED) AS gate_cross_position_count,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_mmr_pct')) AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.available_ratio_pct')) AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.margin_usage_pct')) AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.maintenance_margin_usdt')) AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.position_equity_usdt')) AS DECIMAL(28,12)) AS gate_cross_position_equity_usdt,
-            JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.nearest_liq_contract')) AS gate_cross_nearest_liq_contract,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.nearest_liq_distance_bps')) AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
-            JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.worst_contract')) AS gate_cross_worst_contract,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.worst_contract_mmr_pct')) AS DECIMAL(28,12)) AS gate_cross_worst_contract_mmr_pct
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.status')), 'null') AS gate_cross_risk_status,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.status_label')), 'null') AS gate_cross_risk_status_label,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.position_count')), 'null') AS UNSIGNED) AS gate_cross_position_count,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.available_ratio_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.margin_usage_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.maintenance_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.position_equity_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_position_equity_usdt,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.nearest_liq_contract')), 'null') AS gate_cross_nearest_liq_contract,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.worst_contract')), 'null') AS gate_cross_worst_contract,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.worst_contract_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_worst_contract_mmr_pct
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
@@ -1279,18 +1279,18 @@ async def get_capital_history(
             COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.bnb_fee_asset.free')) AS DECIMAL(28,12)) AS bnb_available,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.bnb_fee_asset.free_value_usdt')) AS DECIMAL(28,12)) AS bnb_available_usdt,
-            JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status')) AS gate_cross_risk_status,
-            JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status_label')) AS gate_cross_risk_status_label,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.position_count')) AS UNSIGNED) AS gate_cross_position_count,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_mmr_pct')) AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.available_ratio_pct')) AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.margin_usage_pct')) AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.maintenance_margin_usdt')) AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.position_equity_usdt')) AS DECIMAL(28,12)) AS gate_cross_position_equity_usdt,
-            JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_contract')) AS gate_cross_nearest_liq_contract,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_distance_bps')) AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
-            JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.worst_contract')) AS gate_cross_worst_contract,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.worst_contract_mmr_pct')) AS DECIMAL(28,12)) AS gate_cross_worst_contract_mmr_pct
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status')), 'null') AS gate_cross_risk_status,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status_label')), 'null') AS gate_cross_risk_status_label,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.position_count')), 'null') AS UNSIGNED) AS gate_cross_position_count,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.available_ratio_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.margin_usage_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.maintenance_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.position_equity_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_position_equity_usdt,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_contract')), 'null') AS gate_cross_nearest_liq_contract,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.worst_contract')), 'null') AS gate_cross_worst_contract,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.worst_contract_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_worst_contract_mmr_pct
         FROM mi_capital_snapshot s
         INNER JOIN (
             SELECT
