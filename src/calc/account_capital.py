@@ -23,6 +23,11 @@ class AccountCapitalConfig:
     binance_margin_enabled: bool = True
     binance_margin_warning_level: float = 3.0
     binance_margin_min_open_level: float = 2.5
+    gate_cross_warning_mmr_pct: float = 500.0
+    gate_cross_danger_mmr_pct: float = 300.0
+    gate_cross_warning_liq_distance_bps: float = 600.0
+    gate_cross_danger_liq_distance_bps: float = 300.0
+    gate_cross_min_available_pct: float = 15.0
 
 
 def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
@@ -47,6 +52,26 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
             binance_margin_min_open_level=config.get_float(
                 'account_capital.binance_margin.min_open_margin_level',
                 2.5,
+            ),
+            gate_cross_warning_mmr_pct=config.get_float(
+                'account_capital.gate_cross_risk.warning_mmr_pct',
+                500.0,
+            ),
+            gate_cross_danger_mmr_pct=config.get_float(
+                'account_capital.gate_cross_risk.danger_mmr_pct',
+                config.get_float('margin.danger_path.mmr_pct', 300.0),
+            ),
+            gate_cross_warning_liq_distance_bps=config.get_float(
+                'account_capital.gate_cross_risk.warning_liq_distance_bps',
+                max(config.get_float('margin.danger_path.liq_distance_bps', 300.0) * 2, 600.0),
+            ),
+            gate_cross_danger_liq_distance_bps=config.get_float(
+                'account_capital.gate_cross_risk.danger_liq_distance_bps',
+                config.get_float('margin.danger_path.liq_distance_bps', 300.0),
+            ),
+            gate_cross_min_available_pct=config.get_float(
+                'account_capital.gate_cross_risk.min_available_pct',
+                config.get_float('trade.open.min_gate_available_ratio', 0.15) * 100,
             ),
         ),
     )
@@ -113,6 +138,7 @@ class AccountCapitalSnapshotter:
                 'unrealized_pnl': gate.get('unrealized_pnl_usdt', 0),
                 'fees': gate.get('fee_cost_usdt', 0),
                 'net_value': gate.get('equity_usdt', 0),
+                'cross_risk': _capital_detail(gate).get('gate_cross_risk'),
             },
             'total': {
                 'used': total.get('position_value_usdt', 0),
@@ -191,6 +217,7 @@ class AccountCapitalSnapshotter:
             equity = available + margin_used + account_unrealized
             equity_formula = 'available_plus_margin_plus_unrealized_pnl'
         strategy_future_floating = pnl.get('gate_future_floating_pnl', account_unrealized)
+        gate_cross_risk = self._build_gate_cross_risk(account, equity, available, margin_used)
         return {
             'snapshot_at': snapshot_at,
             'exchange': 'gate',
@@ -211,11 +238,144 @@ class AccountCapitalSnapshotter:
                 'account_unrealized_pnl': account_unrealized,
                 'strategy_future_floating_pnl': strategy_future_floating,
                 'equity_formula': equity_formula,
+                'gate_cross_risk': gate_cross_risk,
                 'pnl_window': pnl.get('window'),
                 'pnl_source': pnl.get('source'),
                 'gate_strategy_realized': pnl.get('gate_strategy_realized'),
             },
         }
+
+    def _build_gate_cross_risk(
+        self,
+        account: Dict,
+        equity: float,
+        available: float,
+        margin_used: float,
+    ) -> Dict:
+        try:
+            positions = self.executor.fetch_gate_futures_positions()
+        except AttributeError:
+            return {'enabled': False, 'error': 'executor_missing_gate_position_reader'}
+        except Exception as exc:
+            return {'enabled': True, 'error': str(exc)[:300]}
+
+        active_positions = [pos for pos in positions or [] if abs(_float(pos.get('size'))) > 0]
+        total_maintenance = 0.0
+        total_position_margin = 0.0
+        total_position_equity = 0.0
+        nearest_liq = None
+        worst_mmr = None
+        top_risks = []
+
+        for pos in active_positions:
+            maintenance = _float(pos.get('maintenance_margin'))
+            margin = _float(pos.get('margin'))
+            unrealized = _float(pos.get('unrealised_pnl') or pos.get('unrealized_pnl'))
+            position_equity = margin + unrealized
+            mmr_pct = position_equity / maintenance * 100 if maintenance > 0 else None
+            liq_distance_bps = _gate_liq_distance_bps(pos)
+
+            total_maintenance += max(maintenance, 0.0)
+            total_position_margin += max(margin, 0.0)
+            total_position_equity += position_equity
+
+            item = {
+                'contract': pos.get('contract'),
+                'side': 'short' if _float(pos.get('size')) < 0 else 'long',
+                'size': _round(_float(pos.get('size')), 8),
+                'margin_usdt': _round(margin),
+                'position_equity_usdt': _round(position_equity),
+                'maintenance_margin_usdt': _round(maintenance),
+                'mmr_pct': _round(mmr_pct),
+                'liq_distance_bps': _round(liq_distance_bps),
+                'mark_price': _round(_float_or_none(pos.get('mark_price')), 10),
+                'liq_price': _round(_float_or_none(pos.get('liq_price')), 10),
+            }
+            top_risks.append(item)
+
+            if mmr_pct is not None and (worst_mmr is None or mmr_pct < worst_mmr['mmr_pct']):
+                worst_mmr = item
+            if liq_distance_bps is not None and (
+                nearest_liq is None or liq_distance_bps < nearest_liq['liq_distance_bps']
+            ):
+                nearest_liq = item
+
+        account_mmr_pct = equity / total_maintenance * 100 if total_maintenance > 0 else None
+        available_ratio_pct = available / equity * 100 if equity > 0 else None
+        margin_usage_pct = margin_used / equity * 100 if equity > 0 else None
+        top_risks.sort(key=lambda item: (
+            item['mmr_pct'] is None,
+            item['mmr_pct'] if item['mmr_pct'] is not None else 10**9,
+            item['liq_distance_bps'] is None,
+            item['liq_distance_bps'] if item['liq_distance_bps'] is not None else 10**9,
+        ))
+        status = self._gate_cross_risk_status(
+            active_count=len(active_positions),
+            account_mmr_pct=account_mmr_pct,
+            nearest_liq_distance_bps=nearest_liq.get('liq_distance_bps') if nearest_liq else None,
+            available_ratio_pct=available_ratio_pct,
+        )
+
+        return {
+            'enabled': True,
+            'status': status,
+            'status_label': _gate_cross_risk_status_label(status),
+            'position_count': len(active_positions),
+            'account_equity_usdt': _round(equity),
+            'available_usdt': _round(available),
+            'available_ratio_pct': _round(available_ratio_pct),
+            'margin_used_usdt': _round(margin_used),
+            'margin_usage_pct': _round(margin_usage_pct),
+            'maintenance_margin_usdt': _round(total_maintenance),
+            'position_margin_usdt': _round(total_position_margin),
+            'position_equity_usdt': _round(total_position_equity),
+            'account_mmr_pct': _round(account_mmr_pct),
+            'nearest_liq_contract': nearest_liq.get('contract') if nearest_liq else None,
+            'nearest_liq_distance_bps': nearest_liq.get('liq_distance_bps') if nearest_liq else None,
+            'worst_contract': worst_mmr.get('contract') if worst_mmr else None,
+            'worst_contract_mmr_pct': worst_mmr.get('mmr_pct') if worst_mmr else None,
+            'thresholds': {
+                'warning_mmr_pct': self.cfg.gate_cross_warning_mmr_pct,
+                'danger_mmr_pct': self.cfg.gate_cross_danger_mmr_pct,
+                'warning_liq_distance_bps': self.cfg.gate_cross_warning_liq_distance_bps,
+                'danger_liq_distance_bps': self.cfg.gate_cross_danger_liq_distance_bps,
+                'min_available_pct': self.cfg.gate_cross_min_available_pct,
+            },
+            'top_risks': top_risks[:5],
+            'raw_account_keys': sorted(account.keys()),
+        }
+
+    def _gate_cross_risk_status(
+        self,
+        *,
+        active_count: int,
+        account_mmr_pct: Optional[float],
+        nearest_liq_distance_bps: Optional[float],
+        available_ratio_pct: Optional[float],
+    ) -> str:
+        if active_count <= 0:
+            return 'idle'
+        if (
+            (account_mmr_pct is not None and account_mmr_pct <= self.cfg.gate_cross_danger_mmr_pct)
+            or (
+                nearest_liq_distance_bps is not None
+                and nearest_liq_distance_bps <= self.cfg.gate_cross_danger_liq_distance_bps
+            )
+        ):
+            return 'danger'
+        if (
+            (account_mmr_pct is not None and account_mmr_pct <= self.cfg.gate_cross_warning_mmr_pct)
+            or (
+                nearest_liq_distance_bps is not None
+                and nearest_liq_distance_bps <= self.cfg.gate_cross_warning_liq_distance_bps
+            )
+            or (
+                available_ratio_pct is not None
+                and available_ratio_pct <= self.cfg.gate_cross_min_available_pct
+            )
+        ):
+            return 'warning'
+        return 'safe'
 
     def _build_total_row(self, snapshot_at: datetime, binance: Dict, gate: Dict, pnl: Dict) -> Dict:
         realized_pnl = _float(binance.get('realized_pnl_usdt')) + _float(gate.get('realized_pnl_usdt'))
@@ -488,6 +648,35 @@ def _float_or_none(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _round(value: Optional[float], digits: int = 6) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gate_liq_distance_bps(pos: Dict) -> Optional[float]:
+    mark = _float_or_none(pos.get('mark_price'))
+    liq = _float_or_none(pos.get('liq_price'))
+    size = _float(pos.get('size'))
+    if mark is None or liq is None or mark <= 0 or liq <= 0 or size == 0:
+        return None
+    if size < 0:
+        return (liq - mark) / mark * 10000.0
+    return (mark - liq) / mark * 10000.0
+
+
+def _gate_cross_risk_status_label(status: str) -> str:
+    return {
+        'idle': '无持仓',
+        'safe': '安全',
+        'warning': '预警',
+        'danger': '危险',
+    }.get(status, status or '-')
 
 
 def _has_value(value) -> bool:

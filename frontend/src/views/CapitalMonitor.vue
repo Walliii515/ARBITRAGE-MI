@@ -24,6 +24,18 @@ interface CapitalRow {
   gross_total_pnl_usdt: number | null
   bnb_available?: number | null
   bnb_available_usdt?: number | null
+  gate_cross_risk_status?: string | null
+  gate_cross_risk_status_label?: string | null
+  gate_cross_position_count?: number | null
+  gate_cross_mmr_pct?: number | null
+  gate_cross_available_ratio_pct?: number | null
+  gate_cross_margin_usage_pct?: number | null
+  gate_cross_maintenance_margin_usdt?: number | null
+  gate_cross_position_equity_usdt?: number | null
+  gate_cross_nearest_liq_contract?: string | null
+  gate_cross_nearest_liq_distance_bps?: number | null
+  gate_cross_worst_contract?: string | null
+  gate_cross_worst_contract_mmr_pct?: number | null
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -38,13 +50,18 @@ type ChartMetric =
   | 'gross_total_pnl_usdt'
   | 'daily_realized_pnl_usdt'
   | 'daily_return_pct'
+  | 'gate_cross_mmr_pct'
+  | 'gate_cross_available_ratio_pct'
+  | 'gate_cross_margin_usage_pct'
+  | 'gate_cross_nearest_liq_distance_bps'
 type ChartModeKey =
   | 'equity_usdt'
   | 'unrealized_pnl_usdt'
   | 'realized_breakdown'
   | 'gross_total_pnl_usdt'
   | 'daily_return'
-type ChartSeriesGroup = 'asset' | 'pnl' | 'ratio'
+  | 'gate_cross_risk'
+type ChartSeriesGroup = 'asset' | 'pnl' | 'ratio' | 'bps'
 type ChartMetricOption = { key: ChartMetric; label: string; group: ChartSeriesGroup; color: string }
 type ChartModeOption = { key: ChartModeKey; label: string }
 type OpenRiskConfig = {
@@ -93,6 +110,10 @@ const metricOptions: ChartMetricOption[] = [
   { key: 'gross_total_pnl_usdt', label: '总盈亏', group: 'pnl', color: '#f56c6c' },
   { key: 'daily_realized_pnl_usdt', label: '每日净已实现收益', group: 'pnl', color: '#409eff' },
   { key: 'daily_return_pct', label: '每日收益率', group: 'ratio', color: '#14b8a6' },
+  { key: 'gate_cross_mmr_pct', label: '全仓MMR', group: 'ratio', color: '#67c23a' },
+  { key: 'gate_cross_available_ratio_pct', label: '可用率', group: 'ratio', color: '#1677ff' },
+  { key: 'gate_cross_margin_usage_pct', label: '占用率', group: 'ratio', color: '#e6a23c' },
+  { key: 'gate_cross_nearest_liq_distance_bps', label: '强平距离', group: 'bps', color: '#f56c6c' },
 ]
 
 const chartModeOptions: ChartModeOption[] = [
@@ -101,12 +122,20 @@ const chartModeOptions: ChartModeOption[] = [
   { key: 'realized_breakdown', label: '收益趋势' },
   { key: 'gross_total_pnl_usdt', label: '总盈亏' },
   { key: 'daily_return', label: '每日收益' },
+  { key: 'gate_cross_risk', label: '全仓风险' },
 ]
 
 const realizedBreakdownMetrics: ChartMetric[] = [
   'realized_pnl_usdt',
   'funding_pnl_usdt',
   'total_pnl_usdt',
+]
+
+const gateCrossRiskMetrics: ChartMetric[] = [
+  'gate_cross_mmr_pct',
+  'gate_cross_available_ratio_pct',
+  'gate_cross_margin_usage_pct',
+  'gate_cross_nearest_liq_distance_bps',
 ]
 
 const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
@@ -126,9 +155,32 @@ const latestByExchange = computed(() => {
   return result
 })
 
+const gateCrossRiskRow = computed(() => latestByExchange.value.gate)
+const chartExchange = computed<ExchangeKey>(() => (
+  selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
+))
+
 const chartSeries = computed<ChartSeries[]>(() => {
   const rows = historyRows.value
-    .filter((row) => row.exchange === selectedExchange.value)
+    .filter((row) => row.exchange === chartExchange.value)
+  if (selectedChartMode.value === 'gate_cross_risk') {
+    return gateCrossRiskMetrics.map((metric): ChartSeries => {
+      const option = metricOptions.find((item) => item.key === metric)!
+      return {
+        exchange: 'gate',
+        metric,
+        label: `Gate ${option.label}`,
+        color: option.color,
+        group: option.group,
+        points: rows.map((row) => ({
+          time: row.snapshot_at,
+          value: chartMetricValue(row, metric),
+        })),
+        lineType: 'solid' as const,
+        seriesType: 'line' as const,
+      }
+    })
+  }
   if (selectedChartMode.value === 'daily_return') {
     return buildDailyReturnSeries(rows)
   }
@@ -136,7 +188,7 @@ const chartSeries = computed<ChartSeries[]>(() => {
   const metrics: ChartMetric[] = selectedChartMode.value === 'realized_breakdown'
     ? realizedBreakdownMetrics
     : [selectedChartMode.value as ChartMetric]
-  const latestEquity = latestByExchange.value[selectedExchange.value]?.equity_usdt
+  const latestEquity = latestByExchange.value[chartExchange.value]?.equity_usdt
     ?? rows[rows.length - 1]?.equity_usdt
   const series: ChartSeries[] = metrics.map((metric): ChartSeries => {
     const option = metricOptions.find((item) => item.key === metric)!
@@ -145,9 +197,9 @@ const chartSeries = computed<ChartSeries[]>(() => {
       value: chartMetricValue(row, metric, latestEquity),
     }))
     return {
-      exchange: selectedExchange.value,
+      exchange: chartExchange.value,
       metric,
-      label: `${exchangeLabel(selectedExchange.value)} ${option.label}`,
+      label: `${exchangeLabel(chartExchange.value)} ${option.label}`,
       color: option.color,
       group: option.group,
       points,
@@ -157,9 +209,9 @@ const chartSeries = computed<ChartSeries[]>(() => {
   })
   if (selectedChartMode.value === 'gross_total_pnl_usdt' && series[0]?.points.length > 1) {
     series.push({
-      exchange: selectedExchange.value,
+      exchange: chartExchange.value,
       metric: 'gross_total_pnl_usdt',
-      label: `${exchangeLabel(selectedExchange.value)} 总盈亏趋势`,
+      label: `${exchangeLabel(chartExchange.value)} 总盈亏趋势`,
       color: '#ff8f1f',
       group: 'pnl',
       points: buildTrendPoints(series[0].points),
@@ -204,9 +256,9 @@ function buildDailyReturnSeries(rows: CapitalRow[]): ChartSeries[] {
 
   return [
     {
-      exchange: selectedExchange.value,
+      exchange: chartExchange.value,
       metric: 'daily_realized_pnl_usdt',
-      label: `${exchangeLabel(selectedExchange.value)} 每日净已实现收益`,
+      label: `${exchangeLabel(chartExchange.value)} 每日净已实现收益`,
       color: '#409eff',
       group: 'pnl',
       points: profitPoints,
@@ -214,9 +266,9 @@ function buildDailyReturnSeries(rows: CapitalRow[]): ChartSeries[] {
       seriesType: 'bar',
     },
     {
-      exchange: selectedExchange.value,
+      exchange: chartExchange.value,
       metric: 'daily_return_pct',
-      label: `${exchangeLabel(selectedExchange.value)} 每日收益率`,
+      label: `${exchangeLabel(chartExchange.value)} 每日收益率`,
       color: '#14b8a6',
       group: 'ratio',
       points: returnPoints,
@@ -280,6 +332,11 @@ function formatPercent(value: number | null | undefined): string {
   return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
 }
 
+function formatBps(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} bps`
+}
+
 function hasAmount(value: number | null | undefined): boolean {
   return value != null && Number.isFinite(Number(value))
 }
@@ -296,12 +353,14 @@ function chartMetricValue(row: CapitalRow, metric: ChartMetric, latestEquity?: n
 }
 
 function formatSeriesValue(value: number, group: ChartSeriesGroup): string {
+  if (group === 'bps') return formatBps(value)
   return group === 'ratio' ? formatPercent(value) : `${formatAmount(value)} USDT`
 }
 
 function chartYAxisIndex(group: ChartSeriesGroup): number {
   if (group === 'asset') return 0
   if (group === 'ratio') return 2
+  if (group === 'bps') return 3
   return 1
 }
 
@@ -371,6 +430,28 @@ function availableHelpText(exchange: string): string {
   return '合计可用资金仅用于观察，不参与单交易所开仓预留风控。'
 }
 
+function gateRiskStatusClass(status: string | null | undefined): string {
+  if (status === 'danger') return 'risk-danger'
+  if (status === 'warning') return 'risk-warning'
+  if (status === 'safe') return 'risk-safe'
+  return 'risk-idle'
+}
+
+function gateRiskStatusLabel(row: CapitalRow | undefined): string {
+  return row?.gate_cross_risk_status_label || (
+    row?.gate_cross_risk_status === 'danger' ? '危险'
+      : row?.gate_cross_risk_status === 'warning' ? '预警'
+        : row?.gate_cross_risk_status === 'safe' ? '安全'
+          : row?.gate_cross_risk_status === 'idle' ? '无持仓'
+            : '未采集'
+  )
+}
+
+function formatRiskContract(contract: string | null | undefined, fallback = '-'): string {
+  if (!contract || contract === 'null') return fallback
+  return contract.replace(/_USDT$/i, '')
+}
+
 function formatTooltipTime(value: unknown): string {
   const rawValue = Array.isArray(value) ? value[0] : value
   const numericValue = typeof rawValue === 'number'
@@ -414,7 +495,7 @@ function buildChartOption(): EChartsOption {
   return {
     color: chartSeries.value.map((series) => series.color),
     animation: false,
-    grid: { top: 44, right: 112, bottom: 56, left: 72 },
+    grid: { top: 44, right: 164, bottom: 56, left: 72 },
     legend: {
       type: 'scroll',
       top: 0,
@@ -477,6 +558,18 @@ function buildChartOption(): EChartsOption {
         axisLabel: {
           color: mutedColor,
           formatter: (value: number) => formatPercent(value),
+        },
+        splitLine: { show: false },
+      },
+      {
+        type: 'value',
+        name: 'bps',
+        scale: true,
+        position: 'right',
+        offset: 108,
+        axisLabel: {
+          color: mutedColor,
+          formatter: (value: number) => `${Number(value).toFixed(0)} bps`,
         },
         splitLine: { show: false },
       },
@@ -552,7 +645,7 @@ async function fetchHistory() {
     if (selectedChartMode.value === 'daily_return' && window.hours != null) params.set('days', '1')
     else if (window.hours != null) params.set('hours', String(window.hours))
     else params.set('days', String(window.days || 7))
-    params.set('exchange', selectedExchange.value)
+    params.set('exchange', chartExchange.value)
     params.set('interval', dailyHistoryInterval())
     const historyRes = await get(`/api/trading/capital/history?${params.toString()}`)
     const history = await historyRes.json()
@@ -805,13 +898,72 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <div class="gate-risk-panel">
+      <div class="gate-risk-header">
+        <div>
+          <span class="gate-risk-title">Gate 全仓风险</span>
+        </div>
+        <span
+          class="risk-badge"
+          :class="gateRiskStatusClass(gateCrossRiskRow?.gate_cross_risk_status)"
+        >
+          {{ gateRiskStatusLabel(gateCrossRiskRow) }}
+        </span>
+      </div>
+      <div class="gate-risk-grid">
+        <div class="risk-metric">
+          <span>全仓MMR</span>
+          <strong :class="gateRiskStatusClass(gateCrossRiskRow?.gate_cross_risk_status)">
+            {{ formatPercent(gateCrossRiskRow?.gate_cross_mmr_pct) }}
+          </strong>
+        </div>
+        <div class="risk-metric">
+          <span>可用率</span>
+          <strong>{{ formatPercent(gateCrossRiskRow?.gate_cross_available_ratio_pct) }}</strong>
+        </div>
+        <div class="risk-metric">
+          <span>占用率</span>
+          <strong>{{ formatPercent(gateCrossRiskRow?.gate_cross_margin_usage_pct) }}</strong>
+        </div>
+        <div class="risk-metric">
+          <span>维持保证金</span>
+          <strong>
+            {{ formatAmount(gateCrossRiskRow?.gate_cross_maintenance_margin_usdt) }}
+            <small v-if="hasAmount(gateCrossRiskRow?.gate_cross_maintenance_margin_usdt)">USDT</small>
+          </strong>
+        </div>
+        <div class="risk-metric">
+          <span>持仓权益</span>
+          <strong>
+            {{ formatAmount(gateCrossRiskRow?.gate_cross_position_equity_usdt) }}
+            <small v-if="hasAmount(gateCrossRiskRow?.gate_cross_position_equity_usdt)">USDT</small>
+          </strong>
+        </div>
+        <div class="risk-metric">
+          <span>最近强平距离</span>
+          <strong>{{ formatBps(gateCrossRiskRow?.gate_cross_nearest_liq_distance_bps) }}</strong>
+          <em>{{ formatRiskContract(gateCrossRiskRow?.gate_cross_nearest_liq_contract) }}</em>
+        </div>
+        <div class="risk-metric">
+          <span>最弱合约MMR</span>
+          <strong>{{ formatPercent(gateCrossRiskRow?.gate_cross_worst_contract_mmr_pct) }}</strong>
+          <em>{{ formatRiskContract(gateCrossRiskRow?.gate_cross_worst_contract) }}</em>
+        </div>
+        <div class="risk-metric">
+          <span>Gate持仓数</span>
+          <strong>{{ gateCrossRiskRow?.gate_cross_position_count ?? '-' }}</strong>
+        </div>
+      </div>
+    </div>
+
     <div class="chart-panel">
       <div class="chart-header">
-        <span>资金趋势</span>
+        <span>{{ selectedChartMode === 'gate_cross_risk' ? 'Gate 全仓风险趋势' : '资金趋势' }}</span>
         <el-radio-group
           v-model="selectedExchange"
           size="small"
           class="exchange-selector"
+          :disabled="selectedChartMode === 'gate_cross_risk'"
         >
           <el-radio-button label="binance">binance</el-radio-button>
           <el-radio-button label="gate">gate</el-radio-button>
@@ -877,6 +1029,109 @@ onBeforeUnmount(() => {
   background: var(--app-surface);
   border-radius: 6px;
   padding: 12px 14px;
+}
+
+.gate-risk-panel {
+  border: 1px solid var(--app-border);
+  background: var(--app-surface);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.gate-risk-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.gate-risk-title {
+  color: var(--app-text);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.risk-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 58px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.risk-safe {
+  color: #67c23a !important;
+  border-color: color-mix(in srgb, #67c23a 45%, var(--app-border));
+}
+
+.risk-warning {
+  color: #e6a23c !important;
+  border-color: color-mix(in srgb, #e6a23c 50%, var(--app-border));
+}
+
+.risk-danger {
+  color: #f56c6c !important;
+  border-color: color-mix(in srgb, #f56c6c 55%, var(--app-border));
+}
+
+.risk-idle {
+  color: var(--app-text-muted) !important;
+}
+
+.gate-risk-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  background: var(--app-border);
+}
+
+.risk-metric {
+  display: grid;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 10px;
+  row-gap: 2px;
+  min-height: 44px;
+  padding: 8px 10px;
+  background: var(--app-surface);
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.risk-metric strong {
+  min-width: 0;
+  color: var(--app-text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.risk-metric small {
+  margin-left: 2px;
+  color: var(--app-text-muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.risk-metric em {
+  grid-column: 2;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-style: normal;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .card-header {
@@ -1050,6 +1305,15 @@ onBeforeUnmount(() => {
 
 @media (max-width: 900px) {
   .summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .gate-risk-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .gate-risk-grid {
     grid-template-columns: 1fr;
   }
 

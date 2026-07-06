@@ -10,14 +10,25 @@ from calc.account_capital import AccountCapitalSnapshotter, AccountCapitalConfig
 
 
 class FakeCapitalExecutor:
-    def __init__(self, gate_account=None, binance_balances=None, binance_prices=None, margin_account=None):
+    def __init__(
+        self,
+        gate_account=None,
+        gate_positions=None,
+        binance_balances=None,
+        binance_prices=None,
+        margin_account=None,
+    ):
         self.gate_account = gate_account or {}
+        self.gate_positions = gate_positions or []
         self.binance_balances = binance_balances or []
         self.binance_prices = binance_prices or {}
         self.margin_account = margin_account
 
     def fetch_gate_futures_account(self):
         return dict(self.gate_account)
+
+    def fetch_gate_futures_positions(self):
+        return [dict(pos) for pos in self.gate_positions]
 
     def fetch_binance_account_balances(self):
         return list(self.binance_balances)
@@ -56,6 +67,65 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(row['unrealized_pnl_usdt'], 7.5)
         self.assertEqual(row['detail']['raw_total_usdt'], 120.0)
         self.assertEqual(row['detail']['equity_formula'], 'gate_total_plus_unrealized_pnl')
+        self.assertEqual(row['detail']['gate_cross_risk']['status'], 'idle')
+
+    def test_gate_row_includes_cross_margin_risk_detail(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(
+                gate_account={
+                    'available': '60',
+                    'total': '100',
+                    'unrealised_pnl': '-10',
+                    'position_margin': '40',
+                    'order_margin': '0',
+                },
+                gate_positions=[
+                    {
+                        'contract': 'AI_USDT',
+                        'size': '-100',
+                        'margin': '35',
+                        'unrealised_pnl': '-5',
+                        'maintenance_margin': '15',
+                        'mark_price': '0.0300',
+                        'liq_price': '0.0306',
+                    },
+                    {
+                        'contract': 'HMSTR_USDT',
+                        'size': '-1000',
+                        'margin': '10',
+                        'unrealised_pnl': '1',
+                        'maintenance_margin': '2',
+                        'mark_price': '0.0010',
+                        'liq_price': '0.0014',
+                    },
+                ],
+            ),
+            AccountCapitalConfig(
+                gate_cross_warning_mmr_pct=500,
+                gate_cross_danger_mmr_pct=300,
+                gate_cross_warning_liq_distance_bps=600,
+                gate_cross_danger_liq_distance_bps=300,
+                gate_cross_min_available_pct=15,
+            ),
+        )
+        pnl = {
+            'gate_realized_pnl': 0.0,
+            'funding_pnl': 0.0,
+            'gate_fee_cost': 0.0,
+            'window': {},
+        }
+
+        row = snapshotter._build_gate_row(datetime(2026, 6, 9, 12, 0, 0), pnl)
+        risk = row['detail']['gate_cross_risk']
+
+        self.assertEqual(risk['status'], 'danger')
+        self.assertEqual(risk['position_count'], 2)
+        self.assertAlmostEqual(risk['account_mmr_pct'], 529.411765, places=5)
+        self.assertEqual(risk['nearest_liq_contract'], 'AI_USDT')
+        self.assertAlmostEqual(risk['nearest_liq_distance_bps'], 200.0, places=5)
+        self.assertEqual(risk['worst_contract'], 'AI_USDT')
+        self.assertAlmostEqual(risk['worst_contract_mmr_pct'], 200.0)
+        self.assertEqual(risk['top_risks'][0]['contract'], 'AI_USDT')
 
     def test_total_equity_uses_corrected_gate_equity(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
