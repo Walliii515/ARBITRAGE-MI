@@ -69,6 +69,13 @@ const selectedExchange = ref<ExchangeKey>('total')
 const selectedInterval = ref<HistoryInterval>('10m')
 const showSummaryDetails = ref(false)
 const bnbBuying = ref(false)
+const clearDialogVisible = ref(false)
+const clearingRange = ref(false)
+const clearRange = ref<[string, string] | null>(null)
+const clearDefaultTime = [
+  new Date(2000, 0, 1, 0, 0, 0),
+  new Date(2000, 0, 1, 23, 59, 59),
+]
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -514,6 +521,77 @@ async function runSnapshot() {
   }
 }
 
+function formatLocalDateTime(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  const second = String(date.getSeconds()).padStart(2, '0')
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`
+}
+
+function parseLocalDateTime(value: string): number {
+  return new Date(value.replace(' ', 'T')).getTime()
+}
+
+function openClearDialog() {
+  const end = new Date()
+  const start = new Date(end.getTime() - 60 * 60 * 1000)
+  clearRange.value = [formatLocalDateTime(start), formatLocalDateTime(end)]
+  clearDialogVisible.value = true
+}
+
+async function clearCapitalRange() {
+  const range = clearRange.value
+  if (!range || range.length !== 2 || !range[0] || !range[1]) {
+    showError('请选择清理时间段')
+    return
+  }
+  const [startAt, endAt] = range
+  if (parseLocalDateTime(startAt) > parseLocalDateTime(endAt)) {
+    showError('开始时间不能晚于结束时间')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `确认清理 ${startAt} 到 ${endAt} 的资金监控数据？`,
+      '清理资金监控数据',
+      {
+        confirmButtonText: '确认清理',
+        cancelButtonText: '取消',
+        type: 'warning',
+      }
+    )
+  } catch {
+    return
+  }
+
+  clearingRange.value = true
+  try {
+    const res = await post('/api/trading/capital/clear-range', {
+      start_at: startAt,
+      end_at: endAt,
+    })
+    const data = await res.json()
+    if (data.success) {
+      const backup = data.backup_table ? `，备份表 ${data.backup_table}` : ''
+      showSuccess(`${data.message || '清理完成'}${backup}`)
+      clearDialogVisible.value = false
+      await fetchCapital()
+    } else {
+      showError(data.message || '清理失败')
+    }
+  } catch (e: any) {
+    if (e?.message && !e.message.includes('未授权') && !e.message.includes('权限不足')) {
+      showError(`清理请求失败: ${e.message}`)
+    }
+  } finally {
+    clearingRange.value = false
+  }
+}
+
 async function buyBnbFeeAsset() {
   const binance = latestByExchange.value.binance
   let amount = 0
@@ -616,6 +694,7 @@ onBeforeUnmount(() => {
         </el-button>
       </el-button-group>
       <el-button size="small" :loading="loading" @click="fetchCapital">刷新</el-button>
+      <el-button size="small" type="danger" plain @click="openClearDialog">清理时间段</el-button>
       <el-button size="small" @click="showSummaryDetails = !showSummaryDetails">
         {{ showSummaryDetails ? '收起详情' : '详细' }}
       </el-button>
@@ -758,6 +837,38 @@ onBeforeUnmount(() => {
         <div v-if="!historyRows.length" class="empty-text">暂无资金快照</div>
       </div>
     </div>
+
+    <el-dialog
+      v-model="clearDialogVisible"
+      title="清理资金监控数据"
+      width="460px"
+      append-to-body
+    >
+      <div class="clear-range-dialog">
+        <el-date-picker
+          v-model="clearRange"
+          type="datetimerange"
+          format="YYYY-MM-DD HH:mm:ss"
+          value-format="YYYY-MM-DD HH:mm:ss"
+          :default-time="clearDefaultTime"
+          start-placeholder="开始时间"
+          end-placeholder="结束时间"
+          range-separator="至"
+          class="clear-range-picker"
+        />
+      </div>
+      <template #footer>
+        <el-button size="small" @click="clearDialogVisible = false">取消</el-button>
+        <el-button
+          size="small"
+          type="danger"
+          :loading="clearingRange"
+          @click="clearCapitalRange"
+        >
+          确认清理
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -914,6 +1025,15 @@ onBeforeUnmount(() => {
   pointer-events: none;
   color: var(--app-text-muted);
   font-size: 13px;
+}
+
+.clear-range-dialog {
+  display: flex;
+  width: 100%;
+}
+
+.clear-range-picker {
+  width: 100%;
 }
 
 @media (max-width: 900px) {
