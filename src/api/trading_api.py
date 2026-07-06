@@ -96,6 +96,11 @@ class PopupNotificationMarkReadRequest(BaseModel):
     ids: Optional[List[int]] = None
 
 
+class CapitalClearRangeRequest(BaseModel):
+    start_at: str
+    end_at: str
+
+
 def _subscribe_listing_asset_orderbook(base_asset: str) -> Dict[str, Any]:
     asset = (base_asset or '').strip().upper()
     if not asset:
@@ -1188,6 +1193,18 @@ async def run_reconciliation_now():
 
 # ─── 真实资金快照 ────────────────────────────────────────────────────────────
 
+def _parse_capital_range_datetime(value: str, field_name: str) -> datetime:
+    text = (value or '').strip()
+    if not text:
+        raise HTTPException(status_code=400, detail=f'{field_name} 不能为空')
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    raise HTTPException(status_code=400, detail=f'{field_name} 格式必须为 YYYY-MM-DD HH:mm:ss')
+
+
 @router.get('/capital/latest')
 async def get_capital_latest():
     """返回最新资金快照汇总。"""
@@ -1342,6 +1359,79 @@ async def run_capital_snapshot_now():
     finally:
         with _capital_lock:
             _capital_running = False
+
+
+@router.post('/capital/clear-range', dependencies=[Depends(verify_token_dependency)])
+async def clear_capital_snapshot_range(req: CapitalClearRangeRequest):
+    """按时间段清理资金快照数据，清理前自动备份命中行。"""
+    start_at = _parse_capital_range_datetime(req.start_at, 'start_at')
+    end_at = _parse_capital_range_datetime(req.end_at, 'end_at')
+    if start_at > end_at:
+        raise HTTPException(status_code=400, detail='开始时间不能晚于结束时间')
+
+    backup_table = f"mi_capital_snapshot_backup_clear_range_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    try:
+        with db_manager.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS row_count,
+                        MIN(snapshot_at) AS first_snapshot_at,
+                        MAX(snapshot_at) AS last_snapshot_at
+                    FROM mi_capital_snapshot
+                    WHERE snapshot_at BETWEEN %s AND %s
+                    """,
+                    (start_at, end_at),
+                )
+                summary = cursor.fetchone() or {}
+                row_count = int(summary.get('row_count') or 0)
+                if row_count <= 0:
+                    return {
+                        'success': True,
+                        'deleted': 0,
+                        'backup_table': None,
+                        'message': '指定时间段没有资金监控数据',
+                    }
+
+                cursor.execute(
+                    f"""
+                    CREATE TABLE `{backup_table}` AS
+                    SELECT *
+                    FROM mi_capital_snapshot
+                    WHERE snapshot_at BETWEEN %s AND %s
+                    """,
+                    (start_at, end_at),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM mi_capital_snapshot
+                    WHERE snapshot_at BETWEEN %s AND %s
+                    """,
+                    (start_at, end_at),
+                )
+                deleted = cursor.rowcount
+
+        logger.warning(
+            '资金监控数据已按时间段清理: start=%s end=%s deleted=%s backup=%s',
+            start_at.strftime('%Y-%m-%d %H:%M:%S'),
+            end_at.strftime('%Y-%m-%d %H:%M:%S'),
+            deleted,
+            backup_table,
+        )
+        return {
+            'success': True,
+            'deleted': deleted,
+            'backup_table': backup_table,
+            'first_snapshot_at': _serialize_row({'value': summary.get('first_snapshot_at')})['value'],
+            'last_snapshot_at': _serialize_row({'value': summary.get('last_snapshot_at')})['value'],
+            'message': f'已清理 {deleted} 条资金监控数据',
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('资金监控数据按时间段清理失败: %s', exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'清理失败: {exc}')
 
 
 @router.post('/capital/binance-bnb/buy', dependencies=[Depends(verify_token_dependency)])
