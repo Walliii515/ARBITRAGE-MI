@@ -492,7 +492,9 @@ class TradingExecutor:
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
-        self.capital_gate_leverage = max(float(cfg.capital_gate_leverage or 1.0), 1.0)
+        self.capital_gate_leverage = float(
+            cfg.capital_gate_leverage if cfg.capital_gate_leverage is not None else 1.0
+        )
         self.binance_margin_required = bool(cfg.binance_margin_required)
         self.binance_margin_min_open_level = float(cfg.binance_margin_min_open_level or 0.0)
         self._account_summary: Optional[Dict] = None
@@ -604,7 +606,7 @@ class TradingExecutor:
                 GROUP BY p.base_asset
             """
             with db_manager.get_cursor() as cursor:
-                cursor.execute(sql, (self.capital_gate_leverage,))
+                cursor.execute(sql, (self._capital_gate_margin_divisor(),))
                 rows = cursor.fetchall()
             spot_amounts: Dict[str, float] = {}
             future_margins: Dict[str, float] = {}
@@ -892,7 +894,7 @@ class TradingExecutor:
                     spot_amount = spot_amount if spot_amount is not None else fallback_amount
                     future_margin = (
                         (future_amount if future_amount is not None else fallback_amount)
-                        / self.capital_gate_leverage
+                        / self._capital_gate_margin_divisor()
                     )
                     ba = str(base_asset or '').upper()
                     self._holding_spot_amount_by_asset[ba] = (
@@ -2097,7 +2099,7 @@ class TradingExecutor:
         amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
         spot_required = amount * (1 + self._fee_spot_open)
         gate_required = (
-            amount / self.capital_gate_leverage
+            amount / self._capital_gate_margin_divisor()
             + amount * self._fee_future_open
         )
         if binance_available < spot_required:
@@ -2185,7 +2187,7 @@ class TradingExecutor:
         spot_after = self._holding_spot_amount_by_asset.get(ba, 0.0) + amount
         future_margin_after = (
             self._holding_future_margin_by_asset.get(ba, 0.0)
-            + amount / self.capital_gate_leverage
+            + amount / self._capital_gate_margin_divisor()
         )
         spot_limit = binance_total * self.max_asset_exposure_ratio
         future_limit = gate_total * self.max_asset_exposure_ratio
@@ -3526,6 +3528,14 @@ class TradingExecutor:
         if market_key == 'future_order':
             return self.capital_gate_leverage
         return 1.0
+
+    def _capital_gate_margin_divisor(self) -> float:
+        """资金占用估算除数；Gate 全仓模式(leverage=0)按 1x 保守占用估算。"""
+        try:
+            leverage = float(self.capital_gate_leverage)
+        except (TypeError, ValueError):
+            leverage = 1.0
+        return max(leverage, 1.0)
     
     def _create_position(self, order_group: Dict, exec_result: Dict) -> int:
         """创建持仓记录，返回 position_id"""

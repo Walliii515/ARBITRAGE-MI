@@ -103,6 +103,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           high_basis_min_entry_buffer_bps=25.0,
                           high_basis_min_net_edge_bps=20.0,
                           presignal_reject_log_cooldown_sec=300,
+                          capital_gate_leverage=2.0,
                           contract_meta=None,
                           spot_meta=None,
                           asset_profile_meta=None):
@@ -146,6 +147,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         high_basis_min_entry_buffer_bps=high_basis_min_entry_buffer_bps,
         high_basis_min_net_edge_bps=high_basis_min_net_edge_bps,
         presignal_reject_log_cooldown_sec=presignal_reject_log_cooldown_sec,
+        capital_gate_leverage=capital_gate_leverage,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
@@ -1817,6 +1819,32 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         ok, reason = te._check_account_capital(100.0)
 
         self.assertTrue(ok, reason)
+
+    def test_cross_margin_leverage_zero_is_preserved_for_future_order_record(self):
+        te = make_trading_executor(capital_gate_leverage=0.0)
+
+        self.assertEqual(te.capital_gate_leverage, 0.0)
+        self.assertEqual(te._order_leg_leverage('future_order'), 0.0)
+        self.assertEqual(te._order_leg_leverage('spot_order'), 1.0)
+
+    def test_cross_margin_capital_check_uses_one_x_conservative_divisor(self):
+        te = make_trading_executor(
+            capital_gate_leverage=0.0,
+            min_binance_available_ratio=0,
+            min_gate_available_ratio=0,
+        )
+        te.capital_required = True
+        te._fee_future_open = 0
+        te._account_summary = {
+            'binance': {'available': 200.0, 'net_value': 1000.0},
+            'gate': {'available': 50.0, 'net_value': 1000.0},
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate可用50.00<需100.00USDT', reason)
 
     def test_asset_exposure_ratio_blocks_new_open(self):
         te = make_trading_executor(
@@ -4149,6 +4177,28 @@ class TestMarginDangerPath(unittest.TestCase):
         )
 
         self.assertFalse(ce.needs_fresh_margin_risk([missing_risk]))
+
+    def test_liq_distance_uses_current_price_as_bps_denominator(self):
+        ce = make_closing_executor()
+        ce.margin_danger_mmr_pct = 300.0
+        ce.margin_danger_liq_distance_bps = 192.0
+        pos = self._risk_position(
+            gate_maintenance_margin_rate=450.0,
+            gate_liq_price=1.05,
+            gate_mark_price=1.03,
+        )
+
+        state = ce._margin_danger_state(pos)
+
+        self.assertAlmostEqual(state['liq_distance_bps'], 194.174757, places=5)
+        self.assertFalse(state['active'])
+
+    def test_close_order_preserves_cross_margin_future_leverage_zero(self):
+        ce = make_closing_executor()
+        pos = self._risk_position(future_open_leverage=0.0)
+
+        self.assertEqual(ce._position_future_leverage(pos), 0.0)
+        self.assertEqual(ce._order_leg_leverage('future_order', pos), 0.0)
 
 
 class TestPositionPnlFees(unittest.TestCase):

@@ -972,7 +972,7 @@ class ClosingExecutor:
         at_liq = False
         if liq_price is not None and liq_price > 0 and ref_price is not None and ref_price > 0:
             # 正向策略 Gate 腿为空头，价格上涨接近/穿过强平价时最危险。
-            liq_distance_bps = (liq_price - ref_price) / liq_price * 10000.0
+            liq_distance_bps = (liq_price - ref_price) / ref_price * 10000.0
             at_liq = liq_distance_bps <= 0
             if liq_distance_bps <= self.margin_danger_liq_distance_bps:
                 reasons.append(
@@ -2148,11 +2148,14 @@ class ClosingExecutor:
 
     def _position_future_leverage(self, pos: Dict) -> float:
         leverage = _float_or_none(pos.get('future_open_leverage'))
-        if (leverage is None or leverage <= 0) and pos.get('id') is not None:
+        if leverage is None and pos.get('id') is not None:
             leverage = self._load_position_future_open_leverage(int(pos.get('id')))
-        if leverage is None or leverage <= 0:
+        if leverage is None:
             leverage = self.margin_leverage
-        return max(float(leverage or 1.0), 1.0)
+        leverage = float(leverage)
+        if abs(leverage) < 1e-9:
+            return 0.0
+        return max(leverage, 1.0)
 
     def _load_position_future_open_leverage(self, position_id: int) -> Optional[float]:
         sql = """
