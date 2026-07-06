@@ -52,7 +52,7 @@ trade:
 
   # ─── 开仓策略 ───
   open:
-    amount_usdt: 100                       # 单笔开仓金额（USDT）
+    amount_usdt: 160                       # 单笔开仓金额（USDT）
     reduced_amount_multiplier: 0.6         # 降档开仓倍率；funding carry/薄盘金额 = amount_usdt * 该倍率
     check_interval_sec: 0.2                 # 开仓检查间隔（秒）；WS 盘口 100ms、循环 200ms，采样不浪费
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
