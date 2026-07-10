@@ -499,6 +499,7 @@ class TradingExecutor:
         self.binance_margin_min_open_level = float(cfg.binance_margin_min_open_level or 0.0)
         self._account_summary: Optional[Dict] = None
         self._account_summary_ts: float = 0.0
+        self._delist_open_block_by_asset: Dict[str, List[Dict]] = {}
     
     def set_orderbook_managers(self, gate_manager, spot_manager):
         """
@@ -511,6 +512,16 @@ class TradingExecutor:
         self._gate_manager = gate_manager
         self._spot_manager = spot_manager
         logger.info('OrderBookManager 已注入 TradingExecutor（最终风控旁路就绪）')
+
+    def set_delist_risk_report(self, report: Optional[Dict]):
+        """注入异步刷新得到的下架风险报告；开仓路径只读内存缓存做硬拦截。"""
+        grouped: Dict[str, List[Dict]] = {}
+        for item in (report or {}).get('items', []) or []:
+            asset = str(item.get('base_asset') or '').strip().upper()
+            if not asset:
+                continue
+            grouped.setdefault(asset, []).append(item)
+        self._delist_open_block_by_asset = grouped
 
     def update_account_capital_status(self, account_summary: Optional[Dict], snapshot_ts: float):
         """更新交易所真实资金缓存，供开仓热路径只读。"""
@@ -658,6 +669,18 @@ class TradingExecutor:
                 if str(base_asset or '').upper() in exchange_risk_blocked_assets:
                     reason = '交易所仓位风险(desynced)暂停开仓'
                     self._resolve_signal(base_asset, 'conditions_lost', reason)
+                    self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
+                    continue
+
+                delist_ok, delist_reason = self._check_delist_open_block(base_asset)
+                if not delist_ok:
+                    self._resolve_signal(base_asset, 'conditions_lost', delist_reason)
+                    self._record_presignal_rejection(
+                        base_asset,
+                        delist_reason,
+                        row.get('open_vwap_basis_bps'),
+                    )
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     continue
@@ -946,6 +969,36 @@ class TradingExecutor:
             # 兼容尚未执行迁移的环境；迁移部署后会自动生效。
             logger.warning(f"读取交易所风险资产失败，跳过开仓风险资产过滤: {e}")
             return set()
+
+    def _check_delist_open_block(self, base_asset: str) -> tuple[bool, str]:
+        """已识别下架风险的标的禁止新增开仓。"""
+        risks = self._delist_open_block_risks(base_asset)
+        if not risks:
+            return True, ''
+        return False, self._format_delist_open_block_reason(risks)
+
+    def _delist_open_block_risks(self, base_asset: str) -> List[Dict]:
+        asset = str(base_asset or '').strip().upper()
+        if not asset:
+            return []
+        return list(self._delist_open_block_by_asset.get(asset) or [])
+
+    @staticmethod
+    def _format_delist_open_block_reason(risks: List[Dict]) -> str:
+        fragments = []
+        for item in risks[:3]:
+            exchange = item.get('exchange') or 'unknown'
+            market_type = item.get('market_type') or ''
+            status = item.get('status') or item.get('risk_type') or ''
+            delist_at = item.get('delist_at') or 'NA'
+            days_left = item.get('days_left')
+            message = item.get('message') or ''
+            days_text = 'NA' if days_left is None else str(days_left)
+            fragments.append(
+                f"{exchange}/{market_type}:{status}|delist_at={delist_at}|"
+                f"days_left={days_text}|{message}"
+            )
+        return '下架风险禁止开仓|' + ' || '.join(fragments)
 
     def _annotate_resiliency_row(self, row: Dict) -> None:
         """Attach per-asset contract multiplier for shared depth calculations."""
@@ -2005,6 +2058,10 @@ class TradingExecutor:
         """
         base_asset = row.get('base_asset', '')
 
+        delist_ok, _delist_reason = self._check_delist_open_block(base_asset)
+        if not delist_ok:
+            return False
+
         # 保证金风控检查：该标的现有持仓保证金/维持保证金比例过低时禁止加仓
         if base_asset in self._holding_margin_rate:
             if self._holding_margin_rate[base_asset] < self.margin_warning_pct:
@@ -2882,6 +2939,7 @@ class TradingExecutor:
             '单标的资金',
             '保证金风控',
             '交易所仓位风险',
+            '下架风险禁止开仓',
             '开仓金额低于最小名义值',
         ))
 
@@ -2904,6 +2962,10 @@ class TradingExecutor:
     def _get_risk_fail_reason(self, row: Dict) -> str:
         """识别风控失败的具体原因（用于信号日志）"""
         base_asset = row.get('base_asset', '')
+
+        delist_ok, delist_reason = self._check_delist_open_block(base_asset)
+        if not delist_ok:
+            return delist_reason
 
         # 保证金风控检查
         if base_asset in self._holding_margin_rate:

@@ -1601,6 +1601,72 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertEqual(row.get('_entry_high_basis_amount_usdt'), te.open_amount_usdt * 0.5)
         self.assertIn('高基差通道', row.get('_open_channel_reason', ''))
 
+    def test_delist_risk_report_blocks_new_open_even_when_signal_is_good(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=10.0,
+            min_funding_support_bps=8.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'NFP': {'p20': 0.0}},
+            close_vwap_threshold_meta={'NFP': {'close_basis_p20': -100}},
+        )
+        te.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'NFP',
+                'exchange': 'binance',
+                'market_type': 'spot',
+                'risk_type': 'delist_schedule',
+                'risk_level': 'critical',
+                'status': 'scheduled',
+                'delist_at': (datetime.now() + timedelta(days=5)).strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 5,
+                'message': 'Binance现货已进入下架计划',
+            }],
+        })
+        row = self._row('NFP', 80.0, 0.0030)
+        row.update({
+            'funding_rate_24h_avg_bps': 12.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('下架风险禁止开仓', reason)
+        self.assertIn('binance/spot:scheduled', reason)
+
+    def test_check_and_open_skips_delist_risk_before_executor_call(self):
+        te = make_trading_executor()
+        te.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'NFP',
+                'exchange': 'binance',
+                'market_type': 'spot',
+                'risk_type': 'delist_schedule',
+                'risk_level': 'critical',
+                'status': 'scheduled',
+                'delist_at': (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 1,
+                'message': 'Binance现货已进入下架计划',
+            }],
+        })
+        te.executor_client.execute = MagicMock()
+        te._resolve_signal = MagicMock()
+        te._record_presignal_rejection = MagicMock()
+        row = self._row('NFP', 80.0, 0.0030)
+
+        with (
+            patch.object(te, '_refresh_holding_exposure_from_db'),
+            patch.object(te, '_load_exchange_risk_blocked_assets', return_value=set()),
+            patch.object(te, '_load_open_cooldown_from_db'),
+        ):
+            results = te.check_and_open([row])
+
+        self.assertEqual(results, [])
+        te.executor_client.execute.assert_not_called()
+        reason = te._resolve_signal.call_args.args[2]
+        self.assertIn('下架风险禁止开仓', reason)
+        te._record_presignal_rejection.assert_called_once()
+
     def test_open_reason_starts_with_funding_channel_label(self):
         te = make_trading_executor(
             min_funding_rate_bps=10.0,

@@ -806,11 +806,20 @@ def _refresh_delist_risk_report_once() -> Dict:
     _delist_risk_report = report
     _delist_risk_report_ts = time.time()
     summary = report.get('summary') or {}
+    risk_assets = sorted({
+        str(item.get('base_asset') or '').strip().upper()
+        for item in (report.get('items') or [])
+        if str(item.get('base_asset') or '').strip()
+    })
+    assets_text = ','.join(risk_assets[:20]) if risk_assets else '-'
+    if len(risk_assets) > 20:
+        assets_text = f"{assets_text},...(+{len(risk_assets) - 20})"
     logger.info(
-        '下架风险缓存刷新完成: total=%s critical=%s warning=%s',
+        '下架风险缓存刷新完成: total=%s critical=%s warning=%s assets=%s',
         summary.get('total', 0),
         summary.get('critical', 0),
         summary.get('warning', 0),
+        assets_text,
     )
     return report
 
@@ -1968,6 +1977,8 @@ def _run_open_position_check_once():
             )
             _trading_executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
 
+        if hasattr(_trading_executor, 'set_delist_risk_report'):
+            _trading_executor.set_delist_risk_report(_delist_risk_report)
         _trading_executor.update_account_capital_status(_latest_account_summary, _latest_account_summary_ts)
         results = _trading_executor.check_and_open(merged_rows)
 
