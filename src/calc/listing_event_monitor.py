@@ -297,6 +297,7 @@ def list_listing_events(
     *,
     action_status: Optional[str] = None,
     candidate_status: Optional[str] = None,
+    monitor_status: Optional[str] = None,
     actionable_only: bool = False,
     limit: int = 200,
 ) -> List[Dict[str, Any]]:
@@ -308,12 +309,15 @@ def list_listing_events(
         params.append(action_status)
     if candidate_status and candidate_status != 'all':
         if candidate_status == 'added_to_monitor':
-            conditions.append("e.action_status = 'added_to_monitor'")
+            monitor_status = 'added'
         else:
             conditions.append('e.candidate_status = %s')
             params.append(candidate_status)
-            if candidate_status == 'matched':
-                conditions.append("e.action_status <> 'added_to_monitor'")
+    if monitor_status and monitor_status != 'all':
+        if monitor_status == 'added':
+            conditions.append("(e.action_status = 'added_to_monitor' OR COALESCE(b.is_valid, '') = 'Y')")
+        elif monitor_status == 'not_added':
+            conditions.append("NOT (e.action_status = 'added_to_monitor' OR COALESCE(b.is_valid, '') = 'Y')")
     if actionable_only:
         conditions.append('e.is_actionable = 1')
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ''

@@ -11,6 +11,7 @@ import { showError, showSuccess, showWarning } from '../utils/message'
 type CandidateStatus = 'matched' | 'gate_only' | 'binance_only'
 type CandidateFilter = CandidateStatus | 'added_to_monitor' | 'all'
 type ActionStatus = 'pending' | 'acknowledged' | 'ignored' | 'disabled' | 'added_to_monitor'
+type MonitorFilter = 'not_added' | 'added' | 'all'
 
 interface ListingEventRow {
   id: number
@@ -41,8 +42,9 @@ const loading = ref(false)
 const actionLoading = ref(false)
 const rowData = ref<ListingEventRow[]>([])
 const summary = ref<Record<string, any>>({})
-const actionFilter = ref<ActionStatus | 'all'>('pending')
+const actionFilter = ref<ActionStatus | 'all'>('all')
 const candidateFilter = ref<CandidateFilter>('matched')
+const monitorFilter = ref<MonitorFilter>('not_added')
 const { gridContainerRef, setupGridCopy } = useGridCopy()
 void gridContainerRef
 
@@ -73,13 +75,27 @@ function actionText(value: string) {
 }
 
 function displayCandidateText(data?: ListingEventRow | null) {
-  if (data?.action_status === 'added_to_monitor') return '已加入'
   return candidateText(data?.candidate_status || '')
 }
 
 function displayCandidateColor(data?: ListingEventRow | null) {
-  if (data?.action_status === 'added_to_monitor') return '#67c23a'
   if (data?.candidate_status === 'matched') return '#409eff'
+  return '#e6a23c'
+}
+
+function isAddedToMonitor(data?: ListingEventRow | null) {
+  return data?.action_status === 'added_to_monitor' || String(data?.base_asset_is_valid || '').toUpperCase() === 'Y'
+}
+
+function monitorText(data?: ListingEventRow | null) {
+  if (isAddedToMonitor(data)) return '已加入监控'
+  if (data?.action_status === 'disabled' || String(data?.base_asset_is_valid || '').toUpperCase() === 'N') return '已失效'
+  return '未加入监控'
+}
+
+function monitorColor(data?: ListingEventRow | null) {
+  if (isAddedToMonitor(data)) return '#67c23a'
+  if (data?.action_status === 'disabled' || String(data?.base_asset_is_valid || '').toUpperCase() === 'N') return '#909399'
   return '#e6a23c'
 }
 
@@ -112,6 +128,15 @@ const columnDefs: ColDef<ListingEventRow>[] = [
     cellRenderer: (params: ICellRendererParams<ListingEventRow>) => {
       const color = displayCandidateColor(params.data)
       return `<span style="color:${color}">${displayCandidateText(params.data)}</span>`
+    },
+  },
+  {
+    headerName: '监控状态',
+    colId: 'monitor_status',
+    width: 115,
+    cellRenderer: (params: ICellRendererParams<ListingEventRow>) => {
+      const color = monitorColor(params.data)
+      return `<span style="color:${color}">${monitorText(params.data)}</span>`
     },
   },
   {
@@ -257,6 +282,7 @@ async function fetchRows() {
     const params = new URLSearchParams()
     if (actionFilter.value !== 'all') params.set('action_status', actionFilter.value)
     if (candidateFilter.value !== 'all') params.set('candidate_status', candidateFilter.value)
+    if (monitorFilter.value !== 'all') params.set('monitor_status', monitorFilter.value)
     params.set('limit', '500')
     const res = await get(`/api/trading/listing-events?${params.toString()}`)
     const data = await res.json()
@@ -276,6 +302,7 @@ async function fetchRows() {
 function handleCandidateFilterChange() {
   if (candidateFilter.value === 'added_to_monitor') {
     actionFilter.value = 'all'
+    monitorFilter.value = 'added'
   }
   fetchRows()
 }
@@ -410,6 +437,11 @@ onMounted(fetchRows)
           <el-radio-button value="acknowledged">已读</el-radio-button>
           <el-radio-button value="ignored">已忽略</el-radio-button>
           <el-radio-button value="disabled">已失效</el-radio-button>
+        </el-radio-group>
+        <el-radio-group v-model="monitorFilter" size="small" @change="fetchRows">
+          <el-radio-button value="not_added">未加入监控</el-radio-button>
+          <el-radio-button value="added">已加入监控</el-radio-button>
+          <el-radio-button value="all">全部监控状态</el-radio-button>
         </el-radio-group>
         <el-button size="small" :loading="loading" @click="fetchRows">刷新</el-button>
         <el-button size="small" type="primary" :loading="loading" @click="refreshEvents">扫描上新</el-button>

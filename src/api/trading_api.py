@@ -1689,6 +1689,7 @@ async def get_delist_risks(
 async def get_listing_events(
     action_status: Optional[str] = Query(None, description="处理状态过滤：pending/acknowledged/ignored/disabled/added_to_monitor/all"),
     candidate_status: Optional[str] = Query(None, description="候选状态过滤：matched/gate_only/binance_only/added_to_monitor/all"),
+    monitor_status: Optional[str] = Query(None, description="监控状态过滤：not_added/added/all"),
     actionable_only: bool = Query(False, description="仅展示可提醒候选"),
     limit: int = Query(200, ge=1, le=1000),
 ):
@@ -1696,6 +1697,7 @@ async def get_listing_events(
     rows = list_listing_events(
         action_status=action_status,
         candidate_status=candidate_status,
+        monitor_status=monitor_status,
         actionable_only=actionable_only,
         limit=limit,
     )
