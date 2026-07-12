@@ -1886,6 +1886,87 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertTrue(ok, reason)
 
+    def test_gate_cross_risk_warning_blocks_new_open(self):
+        te = make_trading_executor(
+            min_binance_available_ratio=0.02,
+            min_gate_available_ratio=0.15,
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 0.0
+        te._account_summary = {
+            'binance': {'available': 500.0, 'net_value': 1000.0},
+            'gate': {
+                'available': 500.0,
+                'net_value': 1000.0,
+                'cross_risk': {
+                    'status': 'warning',
+                    'status_label': '预警',
+                    'account_mmr_pct': 420.12,
+                    'nearest_liq_distance_bps': 780.5,
+                    'available_ratio_pct': 50.0,
+                },
+            },
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate全仓风险预警', reason)
+        self.assertIn('MMR=420.1%', reason)
+
+    def test_gate_cross_risk_safe_allows_new_open(self):
+        te = make_trading_executor(
+            min_binance_available_ratio=0.02,
+            min_gate_available_ratio=0.15,
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 0.0
+        te._account_summary = {
+            'binance': {'available': 500.0, 'net_value': 1000.0},
+            'gate': {
+                'available': 500.0,
+                'net_value': 1000.0,
+                'cross_risk': {
+                    'status': 'safe',
+                    'account_mmr_pct': 1200.0,
+                    'available_ratio_pct': 50.0,
+                },
+            },
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertTrue(ok, reason)
+
+    def test_gate_cross_risk_warning_from_detail_blocks_new_open(self):
+        te = make_trading_executor(
+            min_binance_available_ratio=0.02,
+            min_gate_available_ratio=0.15,
+        )
+        te.capital_required = True
+        te.capital_gate_leverage = 0.0
+        te._account_summary = {
+            'binance': {'available': 500.0, 'net_value': 1000.0},
+            'gate': {
+                'available': 500.0,
+                'net_value': 1000.0,
+                'detail': {
+                    'gate_cross_risk': {
+                        'status': 'warning',
+                        'account_mmr_pct': 499.9,
+                    },
+                },
+            },
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate全仓风险预警', reason)
+
     def test_cross_margin_leverage_zero_is_preserved_for_future_order_record(self):
         te = make_trading_executor(capital_gate_leverage=0.0)
 

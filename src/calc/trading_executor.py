@@ -2149,6 +2149,10 @@ class TradingExecutor:
 
         binance = self._account_summary.get('binance') or {}
         gate = self._account_summary.get('gate') or {}
+        gate_risk_reason = self._gate_cross_risk_open_block_reason(gate)
+        if gate_risk_reason:
+            return False, gate_risk_reason
+
         binance_available = float(binance.get('available') or 0)
         gate_available = float(gate.get('available') or 0)
         binance_total = float(binance.get('net_value') or binance.get('equity') or 0)
@@ -2188,6 +2192,41 @@ class TradingExecutor:
         if not margin_ok:
             return False, margin_reason
         return True, ''
+
+    def _gate_cross_risk_open_block_reason(self, gate_summary: Dict) -> Optional[str]:
+        """Gate 全仓账户进入预警/危险状态时，禁止所有正向新开仓。"""
+        risk = self._extract_gate_cross_risk(gate_summary)
+        if not risk:
+            return None
+        status = str(risk.get('status') or '').strip().lower()
+        if status not in {'warning', 'danger'}:
+            return None
+        status_label = risk.get('status_label') or ('危险' if status == 'danger' else '预警')
+        parts = [f"资金风控(Gate全仓风险{status_label}"]
+        account_mmr = self._float_or_none(risk.get('account_mmr_pct'))
+        if account_mmr is not None:
+            parts.append(f"MMR={account_mmr:.1f}%")
+        liq_distance = self._float_or_none(risk.get('nearest_liq_distance_bps'))
+        if liq_distance is not None:
+            parts.append(f"距强平={liq_distance:.1f}bps")
+        available_ratio = self._float_or_none(risk.get('available_ratio_pct'))
+        if available_ratio is not None:
+            parts.append(f"可用率={available_ratio:.1f}%")
+        return '|'.join(parts) + ')'
+
+    @staticmethod
+    def _extract_gate_cross_risk(gate_summary: Dict) -> Optional[Dict]:
+        if not isinstance(gate_summary, dict):
+            return None
+        risk = gate_summary.get('cross_risk')
+        if isinstance(risk, dict):
+            return risk
+        detail = gate_summary.get('detail')
+        if isinstance(detail, dict):
+            risk = detail.get('gate_cross_risk')
+            if isinstance(risk, dict):
+                return risk
+        return None
 
     def _check_binance_margin_level(self) -> tuple:
         if not self.capital_required or not self.binance_margin_required:
