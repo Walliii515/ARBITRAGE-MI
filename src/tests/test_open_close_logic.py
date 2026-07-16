@@ -4308,6 +4308,7 @@ class TestMarginDangerPath(unittest.TestCase):
 
     def test_needs_fresh_margin_risk_detects_mmr_and_liq_distance(self):
         ce = make_closing_executor()
+        ce.forward_gate_leverage = 10.0
         ce.margin_danger_mmr_pct = 300.0
         ce.margin_danger_liq_distance_bps = 300.0
 

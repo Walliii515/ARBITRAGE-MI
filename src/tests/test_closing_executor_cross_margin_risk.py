@@ -64,6 +64,20 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
             _risk_position(gate_liq_price=None),
         ]))
 
+    def test_cross_margin_does_not_fallback_to_stale_contract_mmr(self):
+        ce = make_closing_executor()
+        ce.forward_gate_leverage = 0.0
+        ce.margin_close_threshold_pct = 200.0
+        ce.margin_danger_mmr_pct = 300.0
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': None}
+
+        pos = _risk_position(gate_maintenance_margin_rate=0.6)
+        state = ce._margin_danger_state(pos)
+
+        self.assertIsNone(ce._maintenance_margin_rate(pos))
+        self.assertFalse(ce._check_margin_liquidation(pos))
+        self.assertNotIn('MMR0.60%', ';'.join(state['reasons']))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -912,9 +912,7 @@ class ClosingExecutor:
     def _maintenance_margin_rate(self, pos: Dict) -> Optional[float]:
         """Gate 聚合仓位口径：仓位权益 / 维持保证金 * 100，越高越安全。"""
         if self._is_forward_cross_margin():
-            account_mmr = self._latest_gate_cross_account_mmr()
-            if account_mmr is not None:
-                return account_mmr
+            return self._latest_gate_cross_account_mmr()
 
         value = pos.get('gate_maintenance_margin_rate')
         if value is not None:
@@ -1011,8 +1009,6 @@ class ClosingExecutor:
         if future_qty <= 0 or not future_contract:
             return False
         if self._is_forward_cross_margin():
-            if pos.get('gate_maintenance_margin_rate') is not None:
-                return pos.get('gate_liq_price') is None
             return (
                 self._latest_gate_cross_account_mmr() is None
                 or pos.get('gate_liq_price') is None
