@@ -76,6 +76,7 @@ interface PositionRow {
   delist_risk_summary?: string | null
   // 子查询注入字段
   channel: string | null
+  gate_leverage: number | null
   order_count: number | null
 }
 
@@ -291,6 +292,15 @@ const columnDefs = computed((): ColDef[] => [
     field: 'channel',
     width: 90,
     valueFormatter: channelFormatter,
+  },
+  {
+    headerName: 'Gate杠杆',
+    field: 'gate_leverage',
+    width: 95,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (params) => formatLeverage(params.value),
   },
   {
     headerName: '开仓金额',

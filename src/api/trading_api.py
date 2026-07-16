@@ -445,6 +445,15 @@ async def get_orders(
                t.open_basis_p20 AS open_vwap_threshold_bps,
                t.{close_threshold_col} AS close_vwap_threshold_bps,
                (SELECT o.channel FROM mi_trade_order o WHERE o.position_id = p.id LIMIT 1) AS channel,
+               (
+                   SELECT o.leverage
+                   FROM mi_trade_order o
+                   WHERE o.position_id = p.id
+                     AND o.order_side = 'open'
+                     AND o.market_type = 'future'
+                   ORDER BY o.id ASC
+                   LIMIT 1
+               ) AS gate_leverage,
                (SELECT COUNT(*) FROM mi_trade_order o WHERE o.position_id = p.id) AS order_count
         FROM mi_trade_position p
         LEFT JOIN mi_base_asset b

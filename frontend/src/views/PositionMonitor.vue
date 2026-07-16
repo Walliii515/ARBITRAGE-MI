@@ -804,6 +804,16 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellStyle: pnlCellStyle,
   },
   {
+    headerName: 'Gate保证金占用',
+    field: 'gate_position_margin',
+    width: 135,
+    type: 'numericColumn',
+    enableCellChangeFlash: true,
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: pnlFormatter,
+  },
+  {
     headerName: '平仓基差(bps)',
     field: 'close_spread_bps',
     width: 120,
