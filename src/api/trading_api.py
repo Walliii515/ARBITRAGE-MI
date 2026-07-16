@@ -855,6 +855,43 @@ def _should_emit_reconciliation_notification(row: Dict[str, Any], latest_snapsho
     return not _db_bool(previous_is_match)
 
 
+def _format_reconciliation_notification(row: Dict[str, Any], dedup_key: str) -> Dict[str, Any]:
+    base_asset = row.get('base_asset') or '-'
+    exchange = row.get('exchange') or '-'
+    exchange_label = str(exchange).capitalize() if exchange != '-' else '-'
+    dimension = row.get('dimension') or '-'
+    detail = row.get('detail') if isinstance(row.get('detail'), dict) else {}
+    is_error = base_asset == '__ERROR__' or dimension == 'error'
+
+    if is_error:
+        error_msg = detail.get('error_msg') or '未返回持仓数据'
+        title = f"持仓对账拉取失败: {exchange_label}"
+        message = f"{exchange_label} 对账接口错误: {error_msg}"
+        status = 'error'
+    else:
+        title = f"持仓对账不一致: {base_asset}"
+        message = (
+            f"{exchange} {dimension} "
+            f"local={row.get('local_value') if row.get('local_value') is not None else '-'} "
+            f"exchange={row.get('exchange_value') if row.get('exchange_value') is not None else '-'} "
+            f"diff={row.get('diff_value') if row.get('diff_value') is not None else '-'}"
+        )
+        status = 'mismatch'
+
+    return {
+        'dedup_key': dedup_key,
+        'source': 'reconciliation',
+        'severity': 'warning',
+        'title': title,
+        'message': message,
+        'event_at': row.get('snapshot_at'),
+        'base_asset': base_asset,
+        'risk_type': dimension,
+        'status': status,
+        'detail': row,
+    }
+
+
 def _append_unique_notification(
     items: List[Dict[str, Any]],
     seen_keys: set[str],
@@ -1012,23 +1049,11 @@ def _build_recent_risk_notification_items(hours: int = 24, limit: int = 50) -> L
             row.get('local_value'),
             row.get('exchange_value'),
         )
-        _append_unique_notification(items, seen_notification_keys, {
-            'dedup_key': dedup_key,
-            'source': 'reconciliation',
-            'severity': 'warning',
-            'title': f"持仓对账不一致: {base_asset}",
-            'message': (
-                f"{exchange} {dimension} "
-                f"local={row.get('local_value') if row.get('local_value') is not None else '-'} "
-                f"exchange={row.get('exchange_value') if row.get('exchange_value') is not None else '-'} "
-                f"diff={row.get('diff_value') if row.get('diff_value') is not None else '-'}"
-            ),
-            'event_at': row.get('snapshot_at'),
-            'base_asset': base_asset,
-            'risk_type': dimension,
-            'status': 'mismatch',
-            'detail': row,
-        })
+        _append_unique_notification(
+            items,
+            seen_notification_keys,
+            _format_reconciliation_notification(row, dedup_key),
+        )
 
     items.sort(key=lambda item: str(item.get('event_at') or ''), reverse=True)
     return items[:limit]

@@ -5,6 +5,7 @@ from api.trading_api import (
     _append_unique_notification,
     _build_forward_signal_filters,
     _filter_capital_transfer_transient_rows,
+    _format_reconciliation_notification,
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
 )
@@ -74,6 +75,42 @@ class ReconciliationNotificationTests(unittest.TestCase):
         _append_unique_notification(items, seen, {'dedup_key': 'reconciliation:ASR', 'event_at': '11:51'})
 
         self.assertEqual(items, [{'dedup_key': 'reconciliation:ASR', 'event_at': '11:52'}])
+
+    def test_reconciliation_error_notification_uses_fetch_failure_copy(self):
+        row = {
+            'snapshot_at': datetime(2026, 7, 16, 18, 20, 39),
+            'exchange': 'gate',
+            'base_asset': '__ERROR__',
+            'dimension': 'error',
+            'local_value': None,
+            'exchange_value': None,
+            'diff_value': None,
+            'detail': {'error_msg': 'Read timed out. (read timeout=10)'},
+        }
+
+        item = _format_reconciliation_notification(row, 'reconciliation:gate:__ERROR__')
+
+        self.assertEqual(item['title'], '持仓对账拉取失败: Gate')
+        self.assertEqual(item['message'], 'Gate 对账接口错误: Read timed out. (read timeout=10)')
+        self.assertEqual(item['status'], 'error')
+
+    def test_reconciliation_position_mismatch_notification_copy_is_unchanged(self):
+        row = {
+            'snapshot_at': datetime(2026, 7, 16, 18, 20, 39),
+            'exchange': 'binance',
+            'base_asset': 'BEL',
+            'dimension': 'position',
+            'local_value': 100,
+            'exchange_value': 95,
+            'diff_value': -5,
+            'detail': {},
+        }
+
+        item = _format_reconciliation_notification(row, 'reconciliation:binance:BEL')
+
+        self.assertEqual(item['title'], '持仓对账不一致: BEL')
+        self.assertEqual(item['message'], 'binance position local=100 exchange=95 diff=-5')
+        self.assertEqual(item['status'], 'mismatch')
 
 
 class ReconciliationLatestQueryTests(unittest.TestCase):

@@ -1667,6 +1667,31 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertIn('下架风险禁止开仓', reason)
         te._record_presignal_rejection.assert_called_once()
 
+    def test_check_and_open_skips_desynced_asset_before_executor_call(self):
+        te = make_trading_executor()
+        te.executor_client.execute = MagicMock()
+        te._resolve_signal = MagicMock()
+        row = self._row('BEL', 80.0, 0.0030)
+        te._peak_state['BEL'] = {'peak_bps': 90.0}
+        te._open_resiliency.observe_shock('BEL', row)
+
+        with (
+            patch.object(te, '_refresh_holding_exposure_from_db'),
+            patch.object(te, '_load_exchange_risk_blocked_assets', return_value={'BEL'}),
+            patch.object(te, '_load_open_cooldown_from_db'),
+        ):
+            results = te.check_and_open([row])
+
+        self.assertEqual(results, [])
+        te.executor_client.execute.assert_not_called()
+        te._resolve_signal.assert_called_once_with(
+            'BEL',
+            'conditions_lost',
+            '交易所仓位风险(desynced)暂停开仓',
+        )
+        self.assertNotIn('BEL', te._peak_state)
+        self.assertNotIn('BEL', te._open_resiliency._state)
+
     def test_open_reason_starts_with_funding_channel_label(self):
         te = make_trading_executor(
             min_funding_rate_bps=10.0,
