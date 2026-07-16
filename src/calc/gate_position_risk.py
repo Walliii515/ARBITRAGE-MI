@@ -37,7 +37,10 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
             _clear_gate_risk_fields(pos)
             continue
 
-        margin = _float(gate_pos.get('margin'))
+        # Cross margin positions return margin=0; initial_margin is Gate's occupied margin snapshot.
+        raw_margin = _float(gate_pos.get('margin'))
+        initial_margin = _float(gate_pos.get('initial_margin'))
+        margin = raw_margin if raw_margin > 0 else initial_margin
         unrealised_pnl = _float(gate_pos.get('unrealised_pnl'))
         raw_margin_equity = margin + unrealised_pnl
         margin_equity = raw_margin_equity if margin > 0 else None
