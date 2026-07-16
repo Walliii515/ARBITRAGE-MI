@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from calc.account_capital import (
     AccountCapitalConfig,
     AccountCapitalSnapshotter,
+    GateCrossRiskNotifier,
     build_default_capital_snapshotter,
 )
 
@@ -57,14 +58,45 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
 
         self.assertEqual(executor_cls.call_args.kwargs['leverage'], 0.0)
 
+    def test_gate_row_reuses_shared_cross_risk_snapshot(self):
+        class NoPositionReadExecutor(FakeCapitalExecutor):
+            def fetch_gate_futures_positions(self):
+                raise AssertionError('capital snapshot must not refetch Gate positions')
+
+        shared_risk = {
+            'enabled': True,
+            'status': 'safe',
+            'account_mmr_pct': 1200.0,
+            'source': 'gate_account_api',
+        }
+        snapshotter = AccountCapitalSnapshotter(
+            NoPositionReadExecutor({
+                'available': '100',
+                'total': '120',
+                'unrealised_pnl': '0',
+            }),
+            AccountCapitalConfig(),
+            gate_cross_risk_provider=lambda: shared_risk,
+        )
+        pnl = {
+            'gate_realized_pnl': 0.0,
+            'funding_pnl': 0.0,
+            'gate_fee_cost': 0.0,
+            'window': {},
+        }
+
+        row = snapshotter._build_gate_row(datetime(2026, 7, 16, 22, 0, 0), pnl)
+
+        self.assertIs(row['detail']['gate_cross_risk'], shared_risk)
+
     def test_gate_equity_includes_unrealized_pnl(self):
         snapshotter = AccountCapitalSnapshotter(
             FakeCapitalExecutor({
                 'available': '100',
                 'total': '120',
                 'unrealised_pnl': '7.5',
-                'position_margin': '20',
-                'order_margin': '0',
+                'cross_initial_margin': '20',
+                'cross_order_margin': '0',
             }),
             AccountCapitalConfig(),
         )
@@ -89,10 +121,6 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
                 'available': '4431.333487254757',
                 'total': '4434.801087909632',
                 'unrealised_pnl': '-0.24766',
-                'position_margin': '0',
-                'isolated_position_margin': '0',
-                'position_initial_margin': '0',
-                'order_margin': '0',
                 'cross_initial_margin': '3.066220654875',
                 'cross_order_margin': '0',
             }),
@@ -122,14 +150,15 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
                     'available': '60',
                     'total': '100',
                     'unrealised_pnl': '-10',
-                    'position_margin': '40',
-                    'order_margin': '0',
+                    'cross_initial_margin': '40',
+                    'cross_order_margin': '0',
+                    'cross_mmr': '5.29411765',
                 },
                 gate_positions=[
                     {
                         'contract': 'AI_USDT',
                         'size': '-100',
-                        'margin': '35',
+                        'initial_margin': '35',
                         'unrealised_pnl': '-5',
                         'maintenance_margin': '15',
                         'mark_price': '0.0300',
@@ -138,7 +167,7 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
                     {
                         'contract': 'HMSTR_USDT',
                         'size': '-1000',
-                        'margin': '10',
+                        'initial_margin': '10',
                         'unrealised_pnl': '1',
                         'maintenance_margin': '2',
                         'mark_price': '0.0010',
@@ -167,27 +196,27 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(risk['status'], 'danger')
         self.assertEqual(risk['position_count'], 2)
         self.assertAlmostEqual(risk['account_mmr_pct'], 529.411765, places=5)
+        self.assertEqual(risk['initial_margin_usdt'], 40.0)
         self.assertEqual(risk['nearest_liq_contract'], 'AI_USDT')
         self.assertAlmostEqual(risk['nearest_liq_distance_bps'], 200.0, places=5)
-        self.assertEqual(risk['worst_contract'], 'AI_USDT')
-        self.assertAlmostEqual(risk['worst_contract_mmr_pct'], 200.0)
         self.assertEqual(risk['top_risks'][0]['contract'], 'AI_USDT')
+        self.assertEqual(risk['top_risks'][0]['initial_margin_usdt'], 35.0)
 
-    def test_gate_cross_risk_does_not_use_zero_margin_contract_pnl_as_mmr(self):
+    def test_gate_cross_risk_does_not_publish_contract_mmr(self):
         snapshotter = AccountCapitalSnapshotter(
             FakeCapitalExecutor(
                 gate_account={
                     'available': '4053.58',
                     'total': '4215.30',
                     'unrealised_pnl': '1.2',
-                    'position_margin': '0',
                     'cross_initial_margin': '158.74',
-                    'order_margin': '0',
+                    'cross_order_margin': '0',
+                    'cross_mmr': '1081.15384615',
                 },
                 gate_positions=[{
                     'contract': 'AI_USDT',
                     'size': '-100',
-                    'margin': '0',
+                    'initial_margin': '158.74',
                     'unrealised_pnl': '0.21',
                     'maintenance_margin': '3.9',
                     'mark_price': '0.138',
@@ -207,10 +236,11 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         risk = row['detail']['gate_cross_risk']
 
         self.assertAlmostEqual(risk['account_mmr_pct'], 108115.384615, places=5)
-        self.assertIsNone(risk['worst_contract'])
-        self.assertIsNone(risk['worst_contract_mmr_pct'])
-        self.assertIsNone(risk['top_risks'][0]['position_equity_usdt'])
-        self.assertIsNone(risk['top_risks'][0]['mmr_pct'])
+        self.assertNotIn('worst_contract', risk)
+        self.assertNotIn('worst_contract_mmr_pct', risk)
+        self.assertNotIn('position_equity_usdt', risk)
+        self.assertNotIn('mmr_pct', risk['top_risks'][0])
+        self.assertEqual(risk['top_risks'][0]['initial_margin_usdt'], 158.74)
 
     def test_gate_cross_risk_notification_uses_status_cooldown_bucket(self):
         snapshotter = AccountCapitalSnapshotter(
@@ -227,11 +257,10 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'account_mmr_pct': 420.12,
             'available_ratio_pct': 13.2,
             'margin_usage_pct': 55.5,
+            'initial_margin_usdt': 24.68,
             'maintenance_margin_usdt': 12.34,
             'nearest_liq_contract': 'AI_USDT',
             'nearest_liq_distance_bps': 580.0,
-            'worst_contract': 'AI_USDT',
-            'worst_contract_mmr_pct': 220.0,
             'thresholds': {
                 'warning_mmr_pct': 500,
                 'warning_liq_distance_bps': 600,
@@ -251,6 +280,8 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(item['dedup_key'], 'gate_cross_risk:warning:20260706110000')
         self.assertIn('全仓MMR=420.12%', item['message'])
         self.assertIn('最近强平距离=580.00bps', item['message'])
+        self.assertIn('初始保证金=24.68 USDT', item['message'])
+        self.assertNotIn('最弱合约MMR', item['message'])
         self.assertIn('阈值=MMR≤500.00%,强平距离≤600.00bps', item['message'])
 
     def test_gate_cross_risk_danger_notification_uses_shorter_bucket(self):
@@ -286,6 +317,53 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         )
 
         self.assertIsNone(item)
+
+    def test_gate_cross_risk_unknown_notification_includes_collection_health(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(),
+            AccountCapitalConfig(gate_cross_unknown_notify_cooldown_sec=300),
+        )
+
+        item = snapshotter._build_gate_cross_risk_notification(
+            datetime(2026, 7, 16, 11, 59, 59),
+            {
+                'status': 'unknown',
+                'health_label': '部分异常',
+                'account_age_sec': 0.2,
+                'positions_age_sec': 6.4,
+                'latency_ms': 120.5,
+                'source': 'gate_account_api',
+                'error': 'Gate positions: timeout',
+            },
+        )
+
+        self.assertEqual(item['title'], 'Gate 全仓风险数据异常')
+        self.assertEqual(item['type'], 'error')
+        self.assertEqual(item['dedup_key'], 'gate_cross_risk:unknown:20260716115500')
+        self.assertIn('数据健康=部分异常', item['message'])
+        self.assertIn('账户数据年龄=0.20s', item['message'])
+        self.assertIn('持仓数据年龄=6.40s', item['message'])
+        self.assertIn('错误=Gate positions: timeout', item['message'])
+
+    def test_gate_cross_risk_notifier_skips_same_second_level_bucket(self):
+        notifier = GateCrossRiskNotifier(AccountCapitalConfig(
+            gate_cross_warning_notify_cooldown_sec=3600,
+        ))
+        risk = {
+            'status': 'warning',
+            'thresholds': {
+                'warning_mmr_pct': 500,
+                'warning_liq_distance_bps': 600,
+            },
+        }
+
+        with patch('calc.account_capital.upsert_popup_notification') as upsert:
+            first = notifier.record(datetime(2026, 7, 16, 11, 1, 0), risk)
+            duplicate = notifier.record(datetime(2026, 7, 16, 11, 2, 0), risk)
+
+        self.assertEqual(first, 1)
+        self.assertEqual(duplicate, 0)
+        upsert.assert_called_once()
 
     def test_total_equity_uses_corrected_gate_equity(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())

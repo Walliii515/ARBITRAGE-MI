@@ -48,10 +48,19 @@ from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_
 from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 from calc.reverse_position_pnl_calculator import ReversePnlConfig, calculate_reverse_realtime_pnl
 from calc.gate_position_risk import attach_gate_position_risk
+from calc.gate_cross_risk import (
+    GateCrossRiskMonitor,
+    build_default_gate_cross_risk_monitor,
+    gate_cross_risk_health,
+)
 from calc.vwap_snapshot_recorder import record_vwap_snapshots
 from calc.reconciliation import build_default_reconciler
 from calc.gate_risk_event_monitor import build_default_gate_risk_event_monitor
-from calc.account_capital import build_default_capital_snapshotter
+from calc.account_capital import (
+    GateCrossRiskNotifier,
+    build_default_capital_snapshotter,
+    build_default_gate_cross_risk_notifier,
+)
 from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.reverse_arbitrage import ReverseArbitrageConfig, enrich_reverse_opportunities
 from calc.reverse_research_store import (
@@ -313,6 +322,8 @@ _latest_account_summary: Optional[Dict] = None  # 最新交易所资金快照汇
 _latest_account_summary_ts: float = 0.0
 _gate_position_risk_cache: List[Dict] = []
 _gate_position_risk_cache_ts: float = 0.0
+_gate_cross_risk_monitor: Optional[GateCrossRiskMonitor] = None
+_gate_cross_risk_notifier: Optional[GateCrossRiskNotifier] = None
 _last_margin_danger_force_refresh_ts: float = 0.0
 _delist_risk_report: Dict = {'items': [], 'summary': {'total': 0, 'critical': 0, 'warning': 0}}
 _delist_risk_report_ts: float = 0.0
@@ -1035,6 +1046,7 @@ async def lifespan(app: FastAPI):
                 logger.error(f'内存缓存刷新失败: {e}')
 
     asyncio.create_task(_refresh_meta_cache_loop())
+    asyncio.create_task(_gate_cross_risk_loop())
     asyncio.create_task(_open_position_loop())
     asyncio.create_task(_reverse_signal_loop())
     asyncio.create_task(_close_position_loop())
@@ -1491,6 +1503,85 @@ async def _ensure_orderbook_row_for_close(base_asset: str) -> Dict:
     raise HTTPException(status_code=503, detail=f'标的 {ba} 已补订阅但暂未收到完整盘口，无法执行平仓: {message}')
 
 
+def _get_live_gate_cross_risk_snapshot() -> Optional[Dict]:
+    monitor = _gate_cross_risk_monitor
+    return monitor.get_snapshot() if monitor is not None else None
+
+
+def _build_live_gate_cross_risk_payload(
+    snapshot: Optional[Dict],
+    *,
+    now_ts: Optional[float] = None,
+) -> Dict:
+    risk = dict(snapshot) if isinstance(snapshot, dict) else {
+        'enabled': True,
+        'status': 'unknown',
+        'status_label': '未知',
+        'source': 'gate_cross_risk_monitor',
+        'error': 'Gate全仓风险采集尚未产生快照',
+        'account_fetched_at_ts': None,
+        'positions_fetched_at_ts': None,
+    }
+    risk.update(gate_cross_risk_health(
+        risk,
+        now_ts=now_ts,
+        max_age_sec=config.get_float('account_capital.gate_cross_risk.max_age_sec', 5.0),
+    ))
+    return risk
+
+
+def _get_gate_cross_risk_notifier() -> GateCrossRiskNotifier:
+    global _gate_cross_risk_notifier
+    if _gate_cross_risk_notifier is None:
+        _gate_cross_risk_notifier = build_default_gate_cross_risk_notifier()
+    return _gate_cross_risk_notifier
+
+
+def _refresh_gate_cross_risk_once() -> Dict:
+    global _gate_cross_risk_monitor
+    if _gate_cross_risk_monitor is None:
+        _gate_cross_risk_monitor = build_default_gate_cross_risk_monitor()
+    snapshot = _gate_cross_risk_monitor.refresh()
+    _get_gate_cross_risk_notifier().record(datetime.now(), snapshot)
+    return snapshot
+
+
+def _record_gate_cross_risk_collection_failure(exc: Exception) -> int:
+    risk = _build_live_gate_cross_risk_payload({
+        'enabled': True,
+        'status': 'unknown',
+        'status_label': '未知',
+        'source': 'gate_cross_risk_loop',
+        'error': str(exc)[:300],
+        'account_fetched_at_ts': None,
+        'positions_fetched_at_ts': None,
+    })
+    return _get_gate_cross_risk_notifier().record(datetime.now(), risk)
+
+
+@app.get(
+    '/api/trading/capital/gate-cross-risk/live',
+    dependencies=[Depends(verify_token_dependency)],
+)
+async def get_live_gate_cross_risk():
+    """Return the second-level Gate cross-risk snapshot and input health."""
+    return {'risk': _build_live_gate_cross_risk_payload(_get_live_gate_cross_risk_snapshot())}
+
+
+def _account_summary_with_live_gate_cross_risk() -> Optional[Dict]:
+    risk = _get_live_gate_cross_risk_snapshot()
+    if not isinstance(risk, dict):
+        return _latest_account_summary
+
+    summary = dict(_latest_account_summary or {})
+    gate_summary = dict(summary.get('gate') or {})
+    gate_summary['cross_risk'] = risk
+    summary['gate'] = gate_summary
+    if not summary.get('snapshot_at'):
+        summary['snapshot_at'] = risk.get('fetched_at')
+    return summary
+
+
 def _configure_closing_executor(executor):
     if svc:
         executor.set_orderbook_managers(svc.gate_manager, svc.spot_manager)
@@ -1498,6 +1589,8 @@ def _configure_closing_executor(executor):
         executor.set_delist_risk_report(_delist_risk_report)
     if hasattr(executor, 'set_reconciliation_trigger'):
         executor.set_reconciliation_trigger(_trigger_reconciliation_once)
+    if hasattr(executor, 'set_gate_cross_risk_provider'):
+        executor.set_gate_cross_risk_provider(_get_live_gate_cross_risk_snapshot)
     return executor
 
 
@@ -1818,10 +1911,6 @@ def _run_open_position_check_once():
                 quality_scale_in_max_basis_improvement_bps=config.get_float(
                     'trade.open.quality_scale_in.max_basis_improvement_bps', 20.0
                 ),
-                quality_scale_in_min_gate_margin_rate_pct=config.get_float(
-                    'trade.open.quality_scale_in.min_gate_margin_rate_pct',
-                    250.0
-                ),
                 quality_scale_in_cooldown_sec=config.get_int(
                     'trade.open.quality_scale_in.cooldown_sec', 300
                 ),
@@ -1849,7 +1938,6 @@ def _run_open_position_check_once():
                 peak_monitor_timeout_sec=config.get_int('trade.peak_pullback.monitor_timeout_sec', 60),
                 peak_timeout_cooldown_sec=config.get_int('trade.peak_pullback.timeout_cooldown_sec', 10),
                 sustain_sec=config.get_float('trade.peak_pullback.sustain_sec', 5.0),
-                margin_warning_pct=config.get_float('margin.warning_pct', 8.0),
                 risk_relief_bps=config.get_float('trade.open.risk_relief_bps', 10),
                 resiliency_enabled=config.get_bool('trade.resiliency.enabled', True),
                 resiliency_window_sec=config.get_float('trade.resiliency.window_sec', 3.0),
@@ -1959,6 +2047,9 @@ def _run_open_position_check_once():
                 ),
                 capital_required=config.get_trade_mode() != 'virtual',
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
+                gate_cross_risk_max_age_sec=config.get_float(
+                    'account_capital.gate_cross_risk.max_age_sec', 5.0
+                ),
                 binance_margin_required=config.get_bool('account_capital.binance_margin.enabled', False),
                 binance_margin_min_open_level=config.get_float(
                     'account_capital.binance_margin.min_open_margin_level',
@@ -1974,7 +2065,10 @@ def _run_open_position_check_once():
 
         if hasattr(_trading_executor, 'set_delist_risk_report'):
             _trading_executor.set_delist_risk_report(_delist_risk_report)
-        _trading_executor.update_account_capital_status(_latest_account_summary, _latest_account_summary_ts)
+        _trading_executor.update_account_capital_status(
+            _account_summary_with_live_gate_cross_risk(),
+            _latest_account_summary_ts,
+        )
         results = _trading_executor.check_and_open(merged_rows)
 
         if results and event_loop and broadcast_queue:
@@ -2175,19 +2269,85 @@ async def _position_funding_loop():
         await asyncio.sleep(interval)
 
 
+def _publish_close_position_results(results: List[Dict]) -> None:
+    if not results:
+        return
+    _record_auto_risk_close_notifications(results, event_at=datetime.now())
+    if not any(result.get('success') for result in results):
+        return
+    if not event_loop or not broadcast_queue:
+        return
+
+    payload = {
+        'type': 'close_position_result',
+        'results': results,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    asyncio.run_coroutine_threadsafe(broadcast_queue.put(payload), event_loop)
+    order_payload = {
+        'type': 'order_update',
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    asyncio.run_coroutine_threadsafe(broadcast_queue.put(order_payload), event_loop)
+
+
 def _run_close_position_check_once():
-    """平仓关键路径：在专用线程中运行，避免被 API/WS 广播事件循环阻塞。"""
+    """Run emergency account-risk exits before the ordinary orderbook close path."""
     start = time.monotonic()
     try:
+        tracker = PositionTracker(_contract_meta)
+        positions = tracker.get_holding_positions()
+        if not positions:
+            return
+
+        global _closing_executor
+        if _closing_executor is None:
+            from calc.closing_executor import ClosingExecutor
+            _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
+        _configure_closing_executor(_closing_executor)
+
+        # This snapshot is REST-backed and independent of the orderbook service/WS.
+        attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())
+        global _last_margin_danger_force_refresh_ts
+        margin_risk_refresh_summary = _closing_executor.margin_risk_refresh_summary(positions)
+        if margin_risk_refresh_summary.get('danger') or margin_risk_refresh_summary.get('missing'):
+            now = time.time()
+            min_interval = max(
+                config.get_float(
+                    'account_capital.gate_cross_risk.force_refresh_min_interval_sec', 2.0
+                ),
+                0.0,
+            )
+            if now - _last_margin_danger_force_refresh_ts < min_interval:
+                logger.debug(
+                    f"Gate保证金风险刷新跳过 | interval_guard={min_interval:.2f}s "
+                    f"| danger={margin_risk_refresh_summary.get('danger')} "
+                    f"| missing={margin_risk_refresh_summary.get('missing')}"
+                )
+            else:
+                logger.warning(
+                    f"Gate保证金风险刷新触发 | danger={margin_risk_refresh_summary.get('danger')} "
+                    f"| missing={margin_risk_refresh_summary.get('missing')}"
+                )
+                _last_margin_danger_force_refresh_ts = now
+                _invalidate_gate_position_risk_cache('margin_danger_path')
+                attach_gate_position_risk(
+                    positions,
+                    _get_gate_position_risk_snapshot(force_refresh=True),
+                )
+
+        emergency_results = _closing_executor.check_and_close_margin_danger(positions, {})
+        if emergency_results:
+            _publish_close_position_results(emergency_results)
+            return
+
+        # Everything below is the ordinary close path and may depend on live books.
         if not svc or svc.state != SERVICE_RUNNING:
             return
-
         if _is_real_executor and not _exchange_connectivity_ok:
             return
-
         if not svc._gate_ws_connected() or not svc._binance_ws_connected():
             return
-
         if not (svc.gate_manager and svc.spot_manager):
             return
 
@@ -2210,62 +2370,12 @@ def _run_close_position_check_once():
                     'future_close_vwap': float(future_cv),
                 }
 
-        tracker = PositionTracker(_contract_meta)
-        positions = tracker.get_holding_positions()
-        if not positions:
-            return
         tracker.attach_funding_histories(positions)
-
         calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
-        attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())
-
-        global _closing_executor
-        if _closing_executor is None:
-            from calc.closing_executor import ClosingExecutor
-            _closing_executor = ClosingExecutor(_contract_meta, _spot_meta, _funding_rate_p40_meta)
-        _configure_closing_executor(_closing_executor)
-        global _last_margin_danger_force_refresh_ts
-        margin_risk_refresh_summary = _closing_executor.margin_risk_refresh_summary(positions)
-        if margin_risk_refresh_summary.get('danger') or margin_risk_refresh_summary.get('missing'):
-            now = time.time()
-            min_interval = max(
-                config.get_float('margin.danger_path.force_refresh_min_interval_sec', 2.0),
-                0.0,
-            )
-            if now - _last_margin_danger_force_refresh_ts < min_interval:
-                logger.debug(
-                    f"Gate保证金风险刷新跳过 | interval_guard={min_interval:.2f}s "
-                    f"| danger={margin_risk_refresh_summary.get('danger')} "
-                    f"| missing={margin_risk_refresh_summary.get('missing')}"
-                )
-            else:
-                logger.warning(
-                    f"Gate保证金风险刷新触发 | danger={margin_risk_refresh_summary.get('danger')} "
-                    f"| missing={margin_risk_refresh_summary.get('missing')}"
-                )
-                _last_margin_danger_force_refresh_ts = now
-                _invalidate_gate_position_risk_cache('margin_danger_path')
-                attach_gate_position_risk(positions, _get_gate_position_risk_snapshot(force_refresh=True))
         results = _closing_executor.check_and_close(
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )
-
-        if results:
-            _record_auto_risk_close_notifications(results, event_at=datetime.now())
-
-        if any(r.get('success') for r in results):
-            if event_loop and broadcast_queue:
-                payload = {
-                    'type': 'close_position_result',
-                    'results': results,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                asyncio.run_coroutine_threadsafe(broadcast_queue.put(payload), event_loop)
-                order_payload = {
-                    'type': 'order_update',
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                asyncio.run_coroutine_threadsafe(broadcast_queue.put(order_payload), event_loop)
+        _publish_close_position_results(results)
     except Exception as e:
         logger.error(f"平仓检查失败: {e}", exc_info=True)
     finally:
@@ -2353,6 +2463,18 @@ def _get_gate_position_risk_snapshot(force_refresh: bool = False) -> List[Dict]:
     global _gate_position_risk_cache, _gate_position_risk_cache_ts
     if config.get_trade_mode() == 'virtual':
         return []
+
+    monitor = _gate_cross_risk_monitor
+    if monitor is not None:
+        try:
+            if force_refresh:
+                monitor.refresh()
+            if monitor.positions_fetched_at_ts > 0:
+                _gate_position_risk_cache = monitor.get_positions()
+                _gate_position_risk_cache_ts = monitor.positions_fetched_at_ts
+                return _gate_position_risk_cache
+        except Exception as e:
+            logger.warning(f"共享 Gate 持仓风险快照读取失败: {e}", exc_info=True)
 
     now = time.time()
     ttl_sec = max(10, config.get_int('trade.position.gate_risk_cache_sec', 30))
@@ -2505,8 +2627,8 @@ async def _position_realtime_push():
             calculate_realtime_pnl(positions, _build_position_close_vwaps(), _contract_meta, _pnl_cfg)
             attach_gate_position_risk(positions, _get_gate_position_risk_snapshot())
             
-            # 资金汇总来自交易所真实资金快照（分钟级刷新）
-            account_summary = _latest_account_summary
+            # 资金金额按分钟刷新；Gate 全仓风险使用共享的秒级实时快照。
+            account_summary = _account_summary_with_live_gate_cross_risk()
             
             # 推送（不含 funding_history，保持消息精简）
             payload = {
@@ -2555,6 +2677,30 @@ async def _reverse_position_realtime_push():
             logger.error(f"反向持仓实时推送失败: {e}", exc_info=True)
 
 
+async def _gate_cross_risk_loop():
+    """Refresh the shared Gate cross-margin risk snapshot independently of charts."""
+    if config.get_trade_mode() == 'virtual':
+        logger.info('virtual 模式跳过 Gate 全仓实时风险采集')
+        return
+
+    interval = max(
+        0.5,
+        config.get_float('account_capital.gate_cross_risk.poll_interval_sec', 1.0),
+    )
+    while True:
+        try:
+            snapshot = await asyncio.to_thread(_refresh_gate_cross_risk_once)
+            if snapshot.get('error'):
+                logger.warning(
+                    'Gate 全仓实时风险采集部分失败: %s',
+                    snapshot.get('error'),
+                )
+        except Exception as e:
+            logger.error(f'Gate 全仓实时风险采集失败: {e}', exc_info=True)
+            await asyncio.to_thread(_record_gate_cross_risk_collection_failure, e)
+        await asyncio.sleep(interval)
+
+
 async def _account_capital_snapshot_loop():
     """分钟级采集交易所真实资金并落库，同时刷新开仓风控缓存。"""
     global _latest_account_summary, _latest_account_summary_ts
@@ -2570,7 +2716,9 @@ async def _account_capital_snapshot_loop():
         try:
             strategy_pnl = _build_strategy_position_pnl_summary()
             result = await asyncio.to_thread(
-                lambda: build_default_capital_snapshotter().run_once(strategy_pnl)
+                lambda: build_default_capital_snapshotter(
+                    gate_cross_risk_provider=_get_live_gate_cross_risk_snapshot,
+                ).run_once(strategy_pnl)
             )
             _latest_account_summary = result.get('summary')
             _latest_account_summary_ts = time.time()

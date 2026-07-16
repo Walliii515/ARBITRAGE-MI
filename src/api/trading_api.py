@@ -1265,12 +1265,21 @@ async def get_capital_latest():
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.available_ratio_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.margin_usage_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.initial_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_initial_margin_usdt,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.maintenance_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.position_equity_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_position_equity_usdt,
             NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.nearest_liq_contract')), 'null') AS gate_cross_nearest_liq_contract,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.worst_contract')), 'null') AS gate_cross_worst_contract,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.worst_contract_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_worst_contract_mmr_pct
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.health_status')), 'null') AS gate_cross_health_status,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.health_label')), 'null') AS gate_cross_health_label,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.observed_status')), 'null') AS gate_cross_observed_status,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.source')), 'null') AS gate_cross_source,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.error')), 'null') AS gate_cross_error,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.fetched_at')), 'null') AS gate_cross_fetched_at,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_age_sec')), 'null') AS DECIMAL(28,12)) AS gate_cross_account_age_sec,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.positions_age_sec')), 'null') AS DECIMAL(28,12)) AS gate_cross_positions_age_sec,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_account_latency_ms,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.positions_latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_positions_latency_ms,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_latency_ms
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
@@ -1335,12 +1344,21 @@ async def get_capital_history(
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.available_ratio_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.margin_usage_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.initial_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_initial_margin_usdt,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.maintenance_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.position_equity_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_position_equity_usdt,
             NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_contract')), 'null') AS gate_cross_nearest_liq_contract,
             CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.worst_contract')), 'null') AS gate_cross_worst_contract,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.worst_contract_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_worst_contract_mmr_pct
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.health_status')), 'null') AS gate_cross_health_status,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.health_label')), 'null') AS gate_cross_health_label,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.observed_status')), 'null') AS gate_cross_observed_status,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.source')), 'null') AS gate_cross_source,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.error')), 'null') AS gate_cross_error,
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.fetched_at')), 'null') AS gate_cross_fetched_at,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_age_sec')), 'null') AS DECIMAL(28,12)) AS gate_cross_account_age_sec,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.positions_age_sec')), 'null') AS DECIMAL(28,12)) AS gate_cross_positions_age_sec,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_account_latency_ms,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.positions_latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_positions_latency_ms,
+            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_latency_ms
         FROM mi_capital_snapshot s
         INNER JOIN (
             SELECT

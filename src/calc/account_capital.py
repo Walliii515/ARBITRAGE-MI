@@ -6,10 +6,17 @@
 聚合已实现收益、资金费和手续费，写入 mi_capital_snapshot；开仓逻辑读取最新缓存即可。
 """
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
+from calc.gate_cross_risk import (
+    GateCrossRiskThresholds,
+    build_gate_cross_risk,
+    gate_account_metrics,
+    gate_cross_risk_health,
+)
 from calc.popup_notification_store import upsert_popup_notification
 from calc.reconciliation import build_exchange_config
 from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
@@ -35,9 +42,122 @@ class AccountCapitalConfig:
     gate_cross_notify_enabled: bool = True
     gate_cross_warning_notify_cooldown_sec: int = 3600
     gate_cross_danger_notify_cooldown_sec: int = 300
+    gate_cross_unknown_notify_cooldown_sec: int = 300
 
 
-def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
+class GateCrossRiskNotifier:
+    """Write status-bucketed Gate cross-risk alerts without polling the DB every second."""
+
+    def __init__(self, cfg: Optional[AccountCapitalConfig] = None):
+        self.cfg = cfg or AccountCapitalConfig()
+        self._last_recorded_dedup_key: Optional[str] = None
+
+    def record(self, event_at: datetime, risk: Dict) -> int:
+        item = self.build_notification(event_at, risk)
+        if not item:
+            return 0
+        dedup_key = item.get('dedup_key')
+        if dedup_key and dedup_key == self._last_recorded_dedup_key:
+            return 0
+        try:
+            upsert_popup_notification(**item)
+            self._last_recorded_dedup_key = dedup_key
+            return 1
+        except Exception as exc:
+            logger.warning(
+                "Gate 全仓风险铃铛消息写入失败 | status=%s error=%s",
+                (item.get('payload') or {}).get('status'),
+                exc,
+                exc_info=True,
+            )
+            return 0
+
+    def build_notification(self, event_at: datetime, risk: Dict) -> Optional[Dict]:
+        if not self.cfg.gate_cross_notify_enabled:
+            return None
+        status = str(risk.get('status') or '').strip().lower()
+        if status not in {'warning', 'danger', 'unknown'}:
+            return None
+
+        if status == 'unknown':
+            cooldown = self.cfg.gate_cross_unknown_notify_cooldown_sec
+            title = 'Gate 全仓风险数据异常'
+            notification_type = 'error'
+            message_parts = [
+                '状态=未知',
+                f"数据健康={risk.get('health_label') or '-'}",
+                f"账户数据年龄={_format_seconds(risk.get('account_age_sec'))}",
+                f"持仓数据年龄={_format_seconds(risk.get('positions_age_sec'))}",
+                f"采集耗时={_format_milliseconds(risk.get('latency_ms'))}",
+                f"数据源={risk.get('source') or '-'}",
+                f"错误={str(risk.get('error') or 'Gate全仓风险不可判定')[:300]}",
+            ]
+        else:
+            cooldown = (
+                self.cfg.gate_cross_danger_notify_cooldown_sec
+                if status == 'danger'
+                else self.cfg.gate_cross_warning_notify_cooldown_sec
+            )
+            label = _gate_cross_risk_status_label(status)
+            thresholds = risk.get('thresholds') or {}
+            nearest_contract = risk.get('nearest_liq_contract')
+            message_parts = [
+                f"状态={label}",
+                f"全仓MMR={_format_pct(risk.get('account_mmr_pct'))}",
+                f"最近强平距离={_format_bps(risk.get('nearest_liq_distance_bps'))}",
+                f"最近强平合约={_format_contract(nearest_contract)}",
+                f"可用率={_format_pct(risk.get('available_ratio_pct'))}",
+                f"占用率={_format_pct(risk.get('margin_usage_pct'))}",
+                f"初始保证金={_format_usdt(risk.get('initial_margin_usdt'))}",
+                f"维持保证金={_format_usdt(risk.get('maintenance_margin_usdt'))}",
+                f"持仓数={risk.get('position_count') if risk.get('position_count') is not None else '-'}",
+                (
+                    "阈值="
+                    f"MMR≤{_format_pct(thresholds.get(f'{status}_mmr_pct'))},"
+                    f"强平距离≤{_format_bps(thresholds.get(f'{status}_liq_distance_bps'))}"
+                ),
+            ]
+            title = 'Gate 全仓风险告急' if status == 'danger' else 'Gate 全仓风险预警'
+            notification_type = 'error' if status == 'danger' else 'warning'
+
+        return {
+            'title': title,
+            'message': ' | '.join(message_parts),
+            'type': notification_type,
+            'source': 'gate_cross_risk',
+            'dedup_key': (
+                f"gate_cross_risk:{status}:"
+                f"{_notification_bucket(event_at, max(int(cooldown or 0), 1))}"
+            ),
+            'event_at': event_at,
+            'payload': risk,
+        }
+
+
+def build_default_gate_cross_risk_notifier() -> GateCrossRiskNotifier:
+    return GateCrossRiskNotifier(AccountCapitalConfig(
+        gate_cross_notify_enabled=config.get_bool(
+            'account_capital.gate_cross_risk.notification_enabled',
+            True,
+        ),
+        gate_cross_warning_notify_cooldown_sec=config.get_int(
+            'account_capital.gate_cross_risk.warning_notification_cooldown_sec',
+            3600,
+        ),
+        gate_cross_danger_notify_cooldown_sec=config.get_int(
+            'account_capital.gate_cross_risk.danger_notification_cooldown_sec',
+            300,
+        ),
+        gate_cross_unknown_notify_cooldown_sec=config.get_int(
+            'account_capital.gate_cross_risk.unknown_notification_cooldown_sec',
+            300,
+        ),
+    ))
+
+
+def build_default_capital_snapshotter(
+    gate_cross_risk_provider: Optional[Callable[[], Optional[Dict]]] = None,
+) -> 'AccountCapitalSnapshotter':
     contract_meta = fetch_contract_meta()
     spot_meta = fetch_spot_meta()
     executor = RealExecutor(
@@ -66,15 +186,15 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
             ),
             gate_cross_danger_mmr_pct=config.get_float(
                 'account_capital.gate_cross_risk.danger_mmr_pct',
-                config.get_float('margin.danger_path.mmr_pct', 300.0),
+                300.0,
             ),
             gate_cross_warning_liq_distance_bps=config.get_float(
                 'account_capital.gate_cross_risk.warning_liq_distance_bps',
-                max(config.get_float('margin.danger_path.liq_distance_bps', 300.0) * 2, 600.0),
+                600.0,
             ),
             gate_cross_danger_liq_distance_bps=config.get_float(
                 'account_capital.gate_cross_risk.danger_liq_distance_bps',
-                config.get_float('margin.danger_path.liq_distance_bps', 300.0),
+                300.0,
             ),
             gate_cross_min_available_pct=config.get_float(
                 'account_capital.gate_cross_risk.min_available_pct',
@@ -92,16 +212,28 @@ def build_default_capital_snapshotter() -> 'AccountCapitalSnapshotter':
                 'account_capital.gate_cross_risk.danger_notification_cooldown_sec',
                 300,
             ),
+            gate_cross_unknown_notify_cooldown_sec=config.get_int(
+                'account_capital.gate_cross_risk.unknown_notification_cooldown_sec',
+                300,
+            ),
         ),
+        gate_cross_risk_provider=gate_cross_risk_provider,
     )
 
 
 class AccountCapitalSnapshotter:
     """账户资金快照器。"""
 
-    def __init__(self, executor: RealExecutor, cfg: Optional[AccountCapitalConfig] = None):
+    def __init__(
+        self,
+        executor: RealExecutor,
+        cfg: Optional[AccountCapitalConfig] = None,
+        gate_cross_risk_provider: Optional[Callable[[], Optional[Dict]]] = None,
+    ):
         self.executor = executor
         self.cfg = cfg or AccountCapitalConfig()
+        self._gate_cross_risk_provider = gate_cross_risk_provider
+        self._gate_cross_risk_notifier = GateCrossRiskNotifier(self.cfg)
 
     def run_once(self, strategy_pnl_summary: Optional[Dict] = None) -> Dict:
         snapshot_at = datetime.now()
@@ -221,40 +353,37 @@ class AccountCapitalSnapshotter:
 
     def _build_gate_row(self, snapshot_at: datetime, pnl: Dict) -> Dict:
         account = self.executor.fetch_gate_futures_account()
-        available = _float(account.get('available'))
-        total = _float(account.get('total'))
-        account_unrealized = _float(account.get('unrealised_pnl') or account.get('unrealized_pnl'))
-        position_margin = _float(account.get('position_margin'))
-        isolated_position_margin = _float(account.get('isolated_position_margin'))
-        position_initial_margin = _float(account.get('position_initial_margin'))
-        cross_initial_margin = _float(account.get('cross_initial_margin'))
-        order_margin = _float(account.get('order_margin'))
-        cross_order_margin = _float(account.get('cross_order_margin'))
-        margin_used = (
-            max(
-                position_margin,
-                isolated_position_margin,
-                position_initial_margin,
-                cross_initial_margin,
-            )
-            + max(order_margin, cross_order_margin)
-        )
+        metrics = gate_account_metrics(account)
+        available = metrics['available']
+        total = metrics['total']
+        account_unrealized = metrics['unrealized']
+        cross_initial_margin = metrics['cross_initial_margin']
+        cross_order_margin = metrics['cross_order_margin']
+        margin_used = metrics['margin_used']
         if _has_value(account.get('total')):
-            # Gate futures `total` is wallet balance including isolated margin, but it does
-            # not include unrealized PnL. Add it here so equity matches net account value.
+            # Gate futures `total` excludes unrealized PnL.
             equity = total + account_unrealized
             equity_formula = 'gate_total_plus_unrealized_pnl'
         else:
             equity = available + margin_used + account_unrealized
             equity_formula = 'available_plus_margin_plus_unrealized_pnl'
         strategy_future_floating = pnl.get('gate_future_floating_pnl', account_unrealized)
-        gate_cross_risk = self._build_gate_cross_risk(account, equity, available, margin_used)
+        gate_cross_risk = None
+        if self._gate_cross_risk_provider is not None:
+            gate_cross_risk = self._gate_cross_risk_provider()
+        if not isinstance(gate_cross_risk, dict):
+            gate_cross_risk = self._build_gate_cross_risk(
+                account,
+                metrics['risk_equity'],
+                metrics['risk_available'],
+                margin_used,
+            )
         return {
             'snapshot_at': snapshot_at,
             'exchange': 'gate',
             'equity_usdt': equity,
             'available_usdt': available,
-            'locked_usdt': order_margin,
+            'locked_usdt': cross_order_margin,
             'position_value_usdt': margin_used,
             'margin_used_usdt': margin_used,
             'unrealized_pnl_usdt': strategy_future_floating,
@@ -268,11 +397,7 @@ class AccountCapitalSnapshotter:
                 'raw_total_usdt': total,
                 'account_unrealized_pnl': account_unrealized,
                 'margin_used_components': {
-                    'position_margin': position_margin,
-                    'isolated_position_margin': isolated_position_margin,
-                    'position_initial_margin': position_initial_margin,
                     'cross_initial_margin': cross_initial_margin,
-                    'order_margin': order_margin,
                     'cross_order_margin': cross_order_margin,
                 },
                 'strategy_future_floating_pnl': strategy_future_floating,
@@ -293,201 +418,62 @@ class AccountCapitalSnapshotter:
     ) -> Dict:
         try:
             positions = self.executor.fetch_gate_futures_positions()
-        except AttributeError:
-            return {'enabled': False, 'error': 'executor_missing_gate_position_reader'}
         except Exception as exc:
-            return {'enabled': True, 'error': str(exc)[:300]}
-
-        active_positions = [pos for pos in positions or [] if abs(_float(pos.get('size'))) > 0]
-        total_maintenance = 0.0
-        total_position_margin = 0.0
-        total_position_equity = 0.0
-        nearest_liq = None
-        worst_mmr = None
-        top_risks = []
-
-        for pos in active_positions:
-            maintenance = _float(pos.get('maintenance_margin'))
-            margin = _float(pos.get('margin'))
-            unrealized = _float(pos.get('unrealised_pnl') or pos.get('unrealized_pnl'))
-            raw_position_equity = margin + unrealized
-            position_equity = raw_position_equity
-            mmr_pct = position_equity / maintenance * 100 if maintenance > 0 else None
-            if maintenance > 0 and margin <= 0:
-                # Gate 全仓模式下单合约 position.margin 可能为 0；真实风险看账户级
-                # equity / 总维持保证金，不能用单合约浮盈/亏展示成伪 MMR。
-                position_equity = None
-                mmr_pct = None
-            liq_distance_bps = _gate_liq_distance_bps(pos)
-
-            total_maintenance += max(maintenance, 0.0)
-            total_position_margin += max(margin, 0.0)
-            if position_equity is not None:
-                total_position_equity += position_equity
-
-            item = {
-                'contract': pos.get('contract'),
-                'side': 'short' if _float(pos.get('size')) < 0 else 'long',
-                'size': _round(_float(pos.get('size')), 8),
-                'margin_usdt': _round(margin),
-                'position_equity_usdt': _round(position_equity),
-                'maintenance_margin_usdt': _round(maintenance),
-                'mmr_pct': _round(mmr_pct),
-                'liq_distance_bps': _round(liq_distance_bps),
-                'mark_price': _round(_float_or_none(pos.get('mark_price')), 10),
-                'liq_price': _round(_float_or_none(pos.get('liq_price')), 10),
+            fetched_at_ts = time.time()
+            risk = {
+                'enabled': True,
+                'status': 'unknown',
+                'status_label': '未知',
+                'source': 'account_capital_fallback',
+                'error': str(exc)[:300] or 'executor_missing_gate_position_reader',
+                'fetched_at': datetime.fromtimestamp(fetched_at_ts).strftime('%Y-%m-%d %H:%M:%S'),
+                'fetched_at_ts': fetched_at_ts,
+                'account_fetched_at_ts': fetched_at_ts,
+                'positions_fetched_at_ts': None,
+                'account_latency_ms': None,
+                'positions_latency_ms': None,
+                'latency_ms': None,
             }
-            top_risks.append(item)
+            risk.update(gate_cross_risk_health(risk, now_ts=fetched_at_ts))
+            return risk
 
-            if mmr_pct is not None and (worst_mmr is None or mmr_pct < worst_mmr['mmr_pct']):
-                worst_mmr = item
-            if liq_distance_bps is not None and (
-                nearest_liq is None or liq_distance_bps < nearest_liq['liq_distance_bps']
-            ):
-                nearest_liq = item
-
-        account_mmr_pct = equity / total_maintenance * 100 if total_maintenance > 0 else None
-        available_ratio_pct = available / equity * 100 if equity > 0 else None
-        margin_usage_pct = margin_used / equity * 100 if equity > 0 else None
-        top_risks.sort(key=lambda item: (
-            item['mmr_pct'] is None,
-            item['mmr_pct'] if item['mmr_pct'] is not None else 10**9,
-            item['liq_distance_bps'] is None,
-            item['liq_distance_bps'] if item['liq_distance_bps'] is not None else 10**9,
-        ))
-        status = self._gate_cross_risk_status(
-            active_count=len(active_positions),
-            account_mmr_pct=account_mmr_pct,
-            nearest_liq_distance_bps=nearest_liq.get('liq_distance_bps') if nearest_liq else None,
-            available_ratio_pct=available_ratio_pct,
+        fetched_at_ts = time.time()
+        risk = build_gate_cross_risk(
+            account,
+            positions,
+            equity=equity,
+            available=available,
+            margin_used=margin_used,
+            thresholds=GateCrossRiskThresholds(
+                warning_mmr_pct=self.cfg.gate_cross_warning_mmr_pct,
+                danger_mmr_pct=self.cfg.gate_cross_danger_mmr_pct,
+                warning_liq_distance_bps=self.cfg.gate_cross_warning_liq_distance_bps,
+                danger_liq_distance_bps=self.cfg.gate_cross_danger_liq_distance_bps,
+                min_available_pct=self.cfg.gate_cross_min_available_pct,
+            ),
         )
-
-        return {
-            'enabled': True,
-            'status': status,
-            'status_label': _gate_cross_risk_status_label(status),
-            'position_count': len(active_positions),
-            'account_equity_usdt': _round(equity),
-            'available_usdt': _round(available),
-            'available_ratio_pct': _round(available_ratio_pct),
-            'margin_used_usdt': _round(margin_used),
-            'margin_usage_pct': _round(margin_usage_pct),
-            'maintenance_margin_usdt': _round(total_maintenance),
-            'position_margin_usdt': _round(total_position_margin),
-            'position_equity_usdt': _round(total_position_equity),
-            'account_mmr_pct': _round(account_mmr_pct),
-            'nearest_liq_contract': nearest_liq.get('contract') if nearest_liq else None,
-            'nearest_liq_distance_bps': nearest_liq.get('liq_distance_bps') if nearest_liq else None,
-            'worst_contract': worst_mmr.get('contract') if worst_mmr else None,
-            'worst_contract_mmr_pct': worst_mmr.get('mmr_pct') if worst_mmr else None,
-            'thresholds': {
-                'warning_mmr_pct': self.cfg.gate_cross_warning_mmr_pct,
-                'danger_mmr_pct': self.cfg.gate_cross_danger_mmr_pct,
-                'warning_liq_distance_bps': self.cfg.gate_cross_warning_liq_distance_bps,
-                'danger_liq_distance_bps': self.cfg.gate_cross_danger_liq_distance_bps,
-                'min_available_pct': self.cfg.gate_cross_min_available_pct,
-            },
-            'top_risks': top_risks[:5],
-            'raw_account_keys': sorted(account.keys()),
-        }
-
-    def _gate_cross_risk_status(
-        self,
-        *,
-        active_count: int,
-        account_mmr_pct: Optional[float],
-        nearest_liq_distance_bps: Optional[float],
-        available_ratio_pct: Optional[float],
-    ) -> str:
-        if active_count <= 0:
-            return 'idle'
-        if (
-            (account_mmr_pct is not None and account_mmr_pct <= self.cfg.gate_cross_danger_mmr_pct)
-            or (
-                nearest_liq_distance_bps is not None
-                and nearest_liq_distance_bps <= self.cfg.gate_cross_danger_liq_distance_bps
-            )
-        ):
-            return 'danger'
-        if (
-            (account_mmr_pct is not None and account_mmr_pct <= self.cfg.gate_cross_warning_mmr_pct)
-            or (
-                nearest_liq_distance_bps is not None
-                and nearest_liq_distance_bps <= self.cfg.gate_cross_warning_liq_distance_bps
-            )
-            or (
-                available_ratio_pct is not None
-                and available_ratio_pct <= self.cfg.gate_cross_min_available_pct
-            )
-        ):
-            return 'warning'
-        return 'safe'
+        risk.update({
+            'source': 'account_capital_fallback',
+            'error': None,
+            'fetched_at': datetime.fromtimestamp(fetched_at_ts).strftime('%Y-%m-%d %H:%M:%S'),
+            'fetched_at_ts': fetched_at_ts,
+            'account_fetched_at_ts': fetched_at_ts,
+            'positions_fetched_at_ts': fetched_at_ts,
+            'account_latency_ms': None,
+            'positions_latency_ms': None,
+            'latency_ms': None,
+        })
+        risk.update(gate_cross_risk_health(risk, now_ts=fetched_at_ts))
+        return risk
 
     def _record_gate_cross_risk_notification(self, snapshot_at: datetime, gate_row: Dict) -> int:
-        item = self._build_gate_cross_risk_notification(
+        return self._gate_cross_risk_notifier.record(
             snapshot_at,
             _capital_detail(gate_row).get('gate_cross_risk') or {},
         )
-        if not item:
-            return 0
-        try:
-            upsert_popup_notification(**item)
-            return 1
-        except Exception as exc:
-            logger.warning(
-                "Gate 全仓风险铃铛消息写入失败 | status=%s error=%s",
-                (item.get('payload') or {}).get('status'),
-                exc,
-                exc_info=True,
-            )
-            return 0
 
     def _build_gate_cross_risk_notification(self, snapshot_at: datetime, risk: Dict) -> Optional[Dict]:
-        if not self.cfg.gate_cross_notify_enabled:
-            return None
-        status = str(risk.get('status') or '').strip().lower()
-        if status not in {'warning', 'danger'}:
-            return None
-
-        cooldown = (
-            self.cfg.gate_cross_danger_notify_cooldown_sec
-            if status == 'danger'
-            else self.cfg.gate_cross_warning_notify_cooldown_sec
-        )
-        label = _gate_cross_risk_status_label(status)
-        thresholds = risk.get('thresholds') or {}
-        nearest_contract = risk.get('nearest_liq_contract')
-        worst_contract = risk.get('worst_contract')
-        message_parts = [
-            f"状态={label}",
-            f"全仓MMR={_format_pct(risk.get('account_mmr_pct'))}",
-            f"最近强平距离={_format_bps(risk.get('nearest_liq_distance_bps'))}",
-            f"最近强平合约={_format_contract(nearest_contract)}",
-            f"最弱合约MMR={_format_pct(risk.get('worst_contract_mmr_pct'))}",
-            f"最弱合约={_format_contract(worst_contract)}",
-            f"可用率={_format_pct(risk.get('available_ratio_pct'))}",
-            f"占用率={_format_pct(risk.get('margin_usage_pct'))}",
-            f"维持保证金={_format_usdt(risk.get('maintenance_margin_usdt'))}",
-            f"持仓数={risk.get('position_count') if risk.get('position_count') is not None else '-'}",
-            (
-                "阈值="
-                f"MMR≤{_format_pct(thresholds.get(f'{status}_mmr_pct'))},"
-                f"强平距离≤{_format_bps(thresholds.get(f'{status}_liq_distance_bps'))}"
-            ),
-        ]
-        title = 'Gate 全仓风险告急' if status == 'danger' else 'Gate 全仓风险预警'
-        return {
-            'title': title,
-            'message': ' | '.join(message_parts),
-            'type': 'error' if status == 'danger' else 'warning',
-            'source': 'gate_cross_risk',
-            'dedup_key': (
-                f"gate_cross_risk:{status}:"
-                f"{_notification_bucket(snapshot_at, max(int(cooldown or 0), 1))}"
-            ),
-            'event_at': snapshot_at,
-            'payload': risk,
-        }
+        return self._gate_cross_risk_notifier.build_notification(snapshot_at, risk)
 
     def _build_total_row(self, snapshot_at: datetime, binance: Dict, gate: Dict, pnl: Dict) -> Dict:
         realized_pnl = _float(binance.get('realized_pnl_usdt')) + _float(gate.get('realized_pnl_usdt'))
@@ -788,6 +774,7 @@ def _gate_cross_risk_status_label(status: str) -> str:
         'safe': '安全',
         'warning': '预警',
         'danger': '危险',
+        'unknown': '未知',
     }.get(status, status or '-')
 
 
@@ -817,6 +804,16 @@ def _format_bps(value) -> str:
 def _format_usdt(value) -> str:
     text = _format_number(value, 2)
     return '-' if text == '-' else f"{text} USDT"
+
+
+def _format_seconds(value) -> str:
+    text = _format_number(value, 2)
+    return '-' if text == '-' else f"{text}s"
+
+
+def _format_milliseconds(value) -> str:
+    text = _format_number(value, 1)
+    return '-' if text == '-' else f"{text}ms"
 
 
 def _format_contract(value) -> str:

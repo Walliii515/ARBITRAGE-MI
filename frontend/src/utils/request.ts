@@ -7,13 +7,15 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
 interface RequestOptions extends RequestInit {
   baseURL?: string
+  silent?: boolean
 }
 
 export async function request(url: string, options: RequestOptions = {}): Promise<Response> {
   const token = getToken()
+  const { baseURL, silent = false, ...fetchOptions } = options
   
   // 构建完整 URL
-  const fullUrl = options.baseURL ? `${options.baseURL}${url}` : `${API_BASE}${url}`
+  const fullUrl = baseURL ? `${baseURL}${url}` : `${API_BASE}${url}`
   
   // 添加 Authorization header
   const headers = new Headers(options.headers || {})
@@ -24,7 +26,7 @@ export async function request(url: string, options: RequestOptions = {}): Promis
   
   try {
     const response = await fetch(fullUrl, {
-      ...options,
+      ...fetchOptions,
       headers,
     })
     
@@ -44,7 +46,7 @@ export async function request(url: string, options: RequestOptions = {}): Promis
     
     return response
   } catch (error: any) {
-    if (error.message !== '未授权' && error.message !== '权限不足') {
+    if (!silent && error.message !== '未授权' && error.message !== '权限不足') {
       ElMessage.error(`请求失败: ${error.message}`)
     }
     throw error

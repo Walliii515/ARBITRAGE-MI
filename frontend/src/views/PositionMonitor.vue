@@ -76,12 +76,10 @@ interface PositionRow {
   total_pnl: number | null
   fee_cost: number | null
   gate_mark_price: number | null
-  gate_contract_position_margin: number | null
-  gate_contract_position_margin_equity: number | null
+  gate_contract_initial_margin: number | null
   gate_contract_unrealised_pnl: number | null
   gate_contract_maintenance_margin: number | null
-  gate_position_margin: number | null
-  gate_position_margin_equity: number | null
+  gate_initial_margin: number | null
   gate_unrealised_pnl: number | null
   gate_maintenance_margin: number | null
   gate_position_size: number | null
@@ -804,8 +802,8 @@ const columnDefs = computed<ColDef<PositionRow>[]>(() => [
     cellStyle: pnlCellStyle,
   },
   {
-    headerName: 'Gate保证金占用',
-    field: 'gate_position_margin',
+    headerName: 'Gate初始保证金',
+    field: 'gate_initial_margin',
     width: 135,
     type: 'numericColumn',
     enableCellChangeFlash: true,
@@ -1009,12 +1007,10 @@ const pinnedBottomRowData = computed<PositionRow[]>(() => {
     total_pnl_bps: sumField('total_pnl_bps'),
     total_pnl: totalPnl,
     gate_mark_price: null,
-    gate_contract_position_margin: null,
-    gate_contract_position_margin_equity: null,
+    gate_contract_initial_margin: null,
     gate_contract_unrealised_pnl: null,
     gate_contract_maintenance_margin: null,
-    gate_position_margin: sumField('gate_position_margin'),
-    gate_position_margin_equity: sumField('gate_position_margin_equity'),
+    gate_initial_margin: sumField('gate_initial_margin'),
     gate_unrealised_pnl: sumField('gate_unrealised_pnl'),
     gate_maintenance_margin: sumField('gate_maintenance_margin'),
     gate_position_size: sumField('gate_position_size'),

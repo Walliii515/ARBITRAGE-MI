@@ -326,10 +326,6 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             future_notional = future_open_price * future_qty
             pos['future_open_notional'] = round(future_notional, 6)
             pos['estimated_maintenance_margin'] = round(future_notional * maintenance_rate, 6)
-            pos['margin_initial'] = None
-            pos['current_margin'] = None
-            pos['liq_price'] = None
-            pos['liq_distance_pct'] = None
         else:
             pos['current_spot_price'] = None
             pos['current_future_price'] = None
@@ -342,9 +338,5 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['realized_pnl'] = None
             pos['total_pnl_bps'] = None
             pos['total_pnl'] = None
-            pos['margin_initial'] = None
-            pos['current_margin'] = None
-            pos['liq_price'] = None
-            pos['liq_distance_pct'] = None
 
     return positions

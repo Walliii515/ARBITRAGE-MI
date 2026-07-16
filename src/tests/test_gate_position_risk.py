@@ -9,7 +9,7 @@ from calc.gate_position_risk import attach_gate_position_risk
 
 
 class TestGatePositionRisk(unittest.TestCase):
-    def test_cross_margin_zero_position_margin_does_not_create_pseudo_mmr(self):
+    def test_cross_position_uses_exchange_initial_margin(self):
         positions = [{
             'status': 'holding',
             'base_asset': 'AI',
@@ -19,7 +19,8 @@ class TestGatePositionRisk(unittest.TestCase):
         gate_positions = [{
             'contract': 'AI_USDT',
             'size': '-100',
-            'margin': '0',
+            'margin': '99',
+            'initial_margin': '12.5',
             'unrealised_pnl': '0.21',
             'maintenance_margin': '3.9',
             'mark_price': '0.138',
@@ -28,13 +29,12 @@ class TestGatePositionRisk(unittest.TestCase):
 
         attach_gate_position_risk(positions, gate_positions)
 
-        self.assertEqual(positions[0]['gate_contract_position_margin'], 0.0)
-        self.assertIsNone(positions[0]['gate_contract_position_margin_equity'])
+        self.assertEqual(positions[0]['gate_contract_initial_margin'], 12.5)
+        self.assertEqual(positions[0]['gate_initial_margin'], 12.5)
         self.assertEqual(positions[0]['gate_contract_unrealised_pnl'], 0.21)
         self.assertEqual(positions[0]['gate_contract_maintenance_margin'], 3.9)
-        self.assertIsNone(positions[0]['gate_maintenance_margin_rate'])
 
-    def test_isolated_position_margin_keeps_contract_mmr(self):
+    def test_missing_initial_margin_is_not_backfilled_from_margin(self):
         positions = [{
             'status': 'holding',
             'base_asset': 'AI',
@@ -51,8 +51,10 @@ class TestGatePositionRisk(unittest.TestCase):
 
         attach_gate_position_risk(positions, gate_positions)
 
-        self.assertEqual(positions[0]['gate_contract_position_margin_equity'], 9.0)
-        self.assertEqual(positions[0]['gate_maintenance_margin_rate'], 300.0)
+        self.assertIsNone(positions[0]['gate_contract_initial_margin'])
+        self.assertIsNone(positions[0]['gate_initial_margin'])
+        self.assertEqual(positions[0]['gate_contract_unrealised_pnl'], -1.0)
+        self.assertEqual(positions[0]['gate_contract_maintenance_margin'], 3.0)
 
 
 if __name__ == '__main__':

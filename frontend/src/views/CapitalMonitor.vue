@@ -30,12 +30,46 @@ interface CapitalRow {
   gate_cross_mmr_pct?: number | null
   gate_cross_available_ratio_pct?: number | null
   gate_cross_margin_usage_pct?: number | null
+  gate_cross_initial_margin_usdt?: number | null
   gate_cross_maintenance_margin_usdt?: number | null
-  gate_cross_position_equity_usdt?: number | null
   gate_cross_nearest_liq_contract?: string | null
   gate_cross_nearest_liq_distance_bps?: number | null
-  gate_cross_worst_contract?: string | null
-  gate_cross_worst_contract_mmr_pct?: number | null
+  gate_cross_health_status?: string | null
+  gate_cross_health_label?: string | null
+  gate_cross_observed_status?: string | null
+  gate_cross_source?: string | null
+  gate_cross_error?: string | null
+  gate_cross_fetched_at?: string | null
+  gate_cross_account_age_sec?: number | null
+  gate_cross_positions_age_sec?: number | null
+  gate_cross_account_latency_ms?: number | null
+  gate_cross_positions_latency_ms?: number | null
+  gate_cross_latency_ms?: number | null
+}
+
+interface GateCrossRiskSnapshot {
+  status?: string | null
+  status_label?: string | null
+  position_count?: number | null
+  account_mmr_pct?: number | null
+  available_ratio_pct?: number | null
+  margin_usage_pct?: number | null
+  initial_margin_usdt?: number | null
+  maintenance_margin_usdt?: number | null
+  nearest_liq_contract?: string | null
+  nearest_liq_distance_bps?: number | null
+  health_status?: string | null
+  health_label?: string | null
+  observed_status?: string | null
+  source?: string | null
+  error?: string | null
+  fetched_at?: string | null
+  account_age_sec?: number | null
+  positions_age_sec?: number | null
+  max_age_sec?: number | null
+  account_latency_ms?: number | null
+  positions_latency_ms?: number | null
+  latency_ms?: number | null
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -84,6 +118,8 @@ type ChartSeries = {
 
 const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
+const liveGateRisk = ref<GateCrossRiskSnapshot | null>(null)
+const liveGateRiskRequestError = ref('')
 const loading = ref(false)
 const running = ref(false)
 const selectedWindow = ref<TimeWindowKey>('7d')
@@ -107,6 +143,7 @@ const openRiskConfig = ref<OpenRiskConfig>({
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
+let gateRiskTimer: ReturnType<typeof setInterval> | null = null
 
 const metricOptions: ChartMetricOption[] = [
   { key: 'equity_usdt', label: '总资产', group: 'asset', color: '#67c23a' },
@@ -163,6 +200,39 @@ const latestByExchange = computed(() => {
 })
 
 const gateCrossRiskRow = computed(() => latestByExchange.value.gate)
+const gateCrossRisk = computed<GateCrossRiskSnapshot>(() => {
+  if (liveGateRisk.value) return liveGateRisk.value
+  const row = gateCrossRiskRow.value
+  return {
+    status: row?.gate_cross_risk_status,
+    status_label: row?.gate_cross_risk_status_label,
+    position_count: row?.gate_cross_position_count,
+    account_mmr_pct: row?.gate_cross_mmr_pct,
+    available_ratio_pct: row?.gate_cross_available_ratio_pct,
+    margin_usage_pct: row?.gate_cross_margin_usage_pct,
+    initial_margin_usdt: row?.gate_cross_initial_margin_usdt,
+    maintenance_margin_usdt: row?.gate_cross_maintenance_margin_usdt,
+    nearest_liq_contract: row?.gate_cross_nearest_liq_contract,
+    nearest_liq_distance_bps: row?.gate_cross_nearest_liq_distance_bps,
+    health_status: row?.gate_cross_health_status,
+    health_label: row?.gate_cross_health_label,
+    observed_status: row?.gate_cross_observed_status,
+    source: row?.gate_cross_source,
+    error: row?.gate_cross_error,
+    fetched_at: row?.gate_cross_fetched_at,
+    account_age_sec: row?.gate_cross_account_age_sec,
+    positions_age_sec: row?.gate_cross_positions_age_sec,
+    account_latency_ms: row?.gate_cross_account_latency_ms,
+    positions_latency_ms: row?.gate_cross_positions_latency_ms,
+    latency_ms: row?.gate_cross_latency_ms,
+  }
+})
+const gateRiskHealthStatus = computed(() => (
+  liveGateRiskRequestError.value ? 'unavailable' : gateCrossRisk.value.health_status
+))
+const gateRiskHealthError = computed(() => (
+  liveGateRiskRequestError.value || gateCrossRisk.value.error || ''
+))
 const chartExchange = computed<ExchangeKey>(() => (
   selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
 ))
@@ -435,7 +505,7 @@ function availableHelpText(exchange: string): string {
     return [
       `开仓预留: Gate 每笔正向开仓前都会检查“本次下单后可用资金 / Gate净值”是否仍 >= ${formatPercent(minAvailableRatio(exchange))}。低于该值时只拦截新的正向开仓，不会自动切换左侧“暂停正向开仓”，已有持仓和平仓逻辑不受影响。`,
       '系统主动平仓: 持仓监控会刷新 Gate 全仓 MMR 和强平价。MMR <= 300% 或正向空头距强平价 <= 300bps 时进入危险路径，系统按保证金风控全量市价平仓；若已低于 200% 也会作为兜底保证金风控触发。',
-      '交易所强平/ADL: 以 Gate 返回的 liq_price 和交易所风控为准。页面在“Gate 全仓风险”里看全仓MMR、最近强平距离、最弱合约MMR；发生交易所强平/ADL 后，Gate风险WS/持仓对账会写入铃铛和交易所风险。'
+      '交易所强平/ADL: 以 Gate 返回的 liq_price 和交易所风控为准。页面在“Gate 全仓风险”里看全仓MMR和最近强平距离；发生交易所强平/ADL 后，Gate风险WS/持仓对账会写入铃铛和交易所风险。'
     ].join('\n\n')
   }
   return '合计可用资金仅用于观察，不参与单交易所开仓预留风控。'
@@ -448,18 +518,56 @@ function availableHelpWidth(exchange: string): number {
 function gateRiskStatusClass(status: string | null | undefined): string {
   if (status === 'danger') return 'risk-danger'
   if (status === 'warning') return 'risk-warning'
+  if (status === 'unknown') return 'risk-warning'
   if (status === 'safe') return 'risk-safe'
   return 'risk-idle'
 }
 
-function gateRiskStatusLabel(row: CapitalRow | undefined): string {
-  return row?.gate_cross_risk_status_label || (
-    row?.gate_cross_risk_status === 'danger' ? '危险'
-      : row?.gate_cross_risk_status === 'warning' ? '预警'
-        : row?.gate_cross_risk_status === 'safe' ? '安全'
-          : row?.gate_cross_risk_status === 'idle' ? '无持仓'
+function gateRiskStatusLabel(risk: GateCrossRiskSnapshot): string {
+  return risk.status_label || (
+    risk.status === 'danger' ? '危险'
+      : risk.status === 'warning' ? '预警'
+        : risk.status === 'safe' ? '安全'
+          : risk.status === 'idle' ? '无持仓'
+            : risk.status === 'unknown' ? '未知'
             : '未采集'
   )
+}
+
+function gateRiskHealthClass(status: string | null | undefined): string {
+  if (status === 'healthy') return 'risk-safe'
+  if (status === 'degraded' || status === 'stale') return 'risk-warning'
+  if (status === 'unavailable') return 'risk-danger'
+  return 'risk-idle'
+}
+
+function gateRiskHealthLabel(): string {
+  if (liveGateRiskRequestError.value) return '接口异常'
+  return gateCrossRisk.value.health_label || (
+    gateCrossRisk.value.health_status === 'healthy' ? '正常'
+      : gateCrossRisk.value.health_status === 'degraded' ? '部分异常'
+        : gateCrossRisk.value.health_status === 'stale' ? '数据陈旧'
+          : gateCrossRisk.value.health_status === 'unavailable' ? '不可用'
+            : '未采集'
+  )
+}
+
+function formatAge(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  const seconds = Math.max(Number(value), 0)
+  return seconds < 10 ? `${seconds.toFixed(1)}s` : `${seconds.toFixed(0)}s`
+}
+
+function formatLatency(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return `${Number(value).toFixed(0)}ms`
+}
+
+function formatRiskSource(value: string | null | undefined): string {
+  if (value === 'gate_account_api') return 'Gate REST'
+  if (value === 'gate_cross_risk_loop') return '风险采集器'
+  if (value === 'gate_cross_risk_monitor') return '风险监控器'
+  return value || '-'
 }
 
 function formatRiskContract(contract: string | null | undefined, fallback = '-'): string {
@@ -616,6 +724,21 @@ async function initChart() {
   updateChart()
   resizeObserver = new ResizeObserver(() => chart?.resize())
   resizeObserver.observe(chartRef.value)
+}
+
+async function fetchLiveGateRisk() {
+  try {
+    const res = await get('/api/trading/capital/gate-cross-risk/live', { silent: true })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    if (!data?.risk || typeof data.risk !== 'object') {
+      throw new Error('实时风险响应缺少risk字段')
+    }
+    liveGateRisk.value = data.risk
+    liveGateRiskRequestError.value = ''
+  } catch (e: any) {
+    liveGateRiskRequestError.value = e?.message || '实时风险接口不可用'
+  }
 }
 
 async function fetchCapital() {
@@ -828,8 +951,10 @@ function setWindow(window: TimeWindowKey) {
 
 onMounted(async () => {
   await fetchOpenRiskConfig()
+  await fetchLiveGateRisk()
   await fetchCapital()
   await initChart()
+  gateRiskTimer = setInterval(fetchLiveGateRisk, 2000)
 })
 
 watch([historyRows, selectedChartMode, selectedExchange], () => {
@@ -845,6 +970,8 @@ watch(selectedChartMode, () => {
 })
 
 onBeforeUnmount(() => {
+  if (gateRiskTimer) clearInterval(gateRiskTimer)
+  gateRiskTimer = null
   resizeObserver?.disconnect()
   resizeObserver = null
   chart?.dispose()
@@ -987,59 +1114,82 @@ onBeforeUnmount(() => {
 
     <div class="gate-risk-panel">
       <div class="gate-risk-header">
-        <div>
+        <div class="gate-risk-heading">
           <span class="gate-risk-title">Gate 全仓风险</span>
+          <span class="gate-risk-subtitle">{{ gateCrossRisk.fetched_at || '等待实时采集' }}</span>
         </div>
-        <span
-          class="risk-badge"
-          :class="gateRiskStatusClass(gateCrossRiskRow?.gate_cross_risk_status)"
-        >
-          {{ gateRiskStatusLabel(gateCrossRiskRow) }}
-        </span>
+        <div class="gate-risk-badges">
+          <span class="risk-badge" :class="gateRiskHealthClass(gateRiskHealthStatus)">
+            {{ gateRiskHealthLabel() }}
+          </span>
+          <span class="risk-badge" :class="gateRiskStatusClass(gateCrossRisk.status)">
+            {{ gateRiskStatusLabel(gateCrossRisk) }}
+          </span>
+        </div>
       </div>
       <div class="gate-risk-grid">
         <div class="risk-metric">
           <span>全仓MMR</span>
-          <strong :class="gateRiskStatusClass(gateCrossRiskRow?.gate_cross_risk_status)">
-            {{ formatPercent(gateCrossRiskRow?.gate_cross_mmr_pct) }}
+          <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
+            {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
           </strong>
         </div>
         <div class="risk-metric">
           <span>可用率</span>
-          <strong>{{ formatPercent(gateCrossRiskRow?.gate_cross_available_ratio_pct) }}</strong>
+          <strong>{{ formatPercent(gateCrossRisk.available_ratio_pct) }}</strong>
         </div>
         <div class="risk-metric">
           <span>占用率</span>
-          <strong>{{ formatPercent(gateCrossRiskRow?.gate_cross_margin_usage_pct) }}</strong>
+          <strong>{{ formatPercent(gateCrossRisk.margin_usage_pct) }}</strong>
         </div>
         <div class="risk-metric">
           <span>维持保证金</span>
           <strong>
-            {{ formatAmount(gateCrossRiskRow?.gate_cross_maintenance_margin_usdt) }}
-            <small v-if="hasAmount(gateCrossRiskRow?.gate_cross_maintenance_margin_usdt)">USDT</small>
+            {{ formatAmount(gateCrossRisk.maintenance_margin_usdt) }}
+            <small v-if="hasAmount(gateCrossRisk.maintenance_margin_usdt)">USDT</small>
           </strong>
         </div>
         <div class="risk-metric">
-          <span>持仓权益</span>
+          <span>初始保证金</span>
           <strong>
-            {{ formatAmount(gateCrossRiskRow?.gate_cross_position_equity_usdt) }}
-            <small v-if="hasAmount(gateCrossRiskRow?.gate_cross_position_equity_usdt)">USDT</small>
+            {{ formatAmount(gateCrossRisk.initial_margin_usdt) }}
+            <small v-if="hasAmount(gateCrossRisk.initial_margin_usdt)">USDT</small>
           </strong>
         </div>
         <div class="risk-metric">
           <span>最近强平距离</span>
-          <strong>{{ formatBps(gateCrossRiskRow?.gate_cross_nearest_liq_distance_bps) }}</strong>
-          <em>{{ formatRiskContract(gateCrossRiskRow?.gate_cross_nearest_liq_contract) }}</em>
-        </div>
-        <div class="risk-metric">
-          <span>最弱合约MMR</span>
-          <strong>{{ formatPercent(gateCrossRiskRow?.gate_cross_worst_contract_mmr_pct) }}</strong>
-          <em>{{ formatRiskContract(gateCrossRiskRow?.gate_cross_worst_contract) }}</em>
+          <strong>{{ formatBps(gateCrossRisk.nearest_liq_distance_bps) }}</strong>
+          <em>{{ formatRiskContract(gateCrossRisk.nearest_liq_contract) }}</em>
         </div>
         <div class="risk-metric">
           <span>Gate持仓数</span>
-          <strong>{{ gateCrossRiskRow?.gate_cross_position_count ?? '-' }}</strong>
+          <strong>{{ gateCrossRisk.position_count ?? '-' }}</strong>
         </div>
+        <div class="risk-metric">
+          <span>数据健康</span>
+          <strong :class="gateRiskHealthClass(gateRiskHealthStatus)">{{ gateRiskHealthLabel() }}</strong>
+        </div>
+        <div class="risk-metric">
+          <span>账户数据年龄</span>
+          <strong>{{ formatAge(gateCrossRisk.account_age_sec) }}</strong>
+          <em>上限 {{ formatAge(gateCrossRisk.max_age_sec) }}</em>
+        </div>
+        <div class="risk-metric">
+          <span>持仓数据年龄</span>
+          <strong>{{ formatAge(gateCrossRisk.positions_age_sec) }}</strong>
+        </div>
+        <div class="risk-metric">
+          <span>采集耗时</span>
+          <strong>{{ formatLatency(gateCrossRisk.latency_ms) }}</strong>
+          <em>账户 {{ formatLatency(gateCrossRisk.account_latency_ms) }} / 持仓 {{ formatLatency(gateCrossRisk.positions_latency_ms) }}</em>
+        </div>
+        <div class="risk-metric">
+          <span>数据源</span>
+          <strong>{{ formatRiskSource(gateCrossRisk.source) }}</strong>
+        </div>
+      </div>
+      <div v-if="gateRiskHealthError" class="risk-health-error">
+        {{ gateRiskHealthError }}
       </div>
     </div>
 
@@ -1171,6 +1321,26 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
+.gate-risk-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.gate-risk-subtitle {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.gate-risk-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .risk-badge {
   display: inline-flex;
   align-items: center;
@@ -1251,6 +1421,17 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.risk-health-error {
+  margin-top: 8px;
+  border-left: 3px solid #f56c6c;
+  padding: 6px 9px;
+  background: color-mix(in srgb, #f56c6c 8%, var(--app-surface));
+  color: #f56c6c;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .card-header {
@@ -1440,6 +1621,12 @@ onBeforeUnmount(() => {
   .gate-risk-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .gate-risk-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 
   .gate-risk-grid {

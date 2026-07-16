@@ -10,44 +10,81 @@ from tests.test_open_close_logic import make_trading_executor
 
 
 class TestTradingExecutorGateCrossMarginRisk(unittest.TestCase):
-    def test_open_guard_uses_account_mmr(self):
+    @staticmethod
+    def _executor_with_risk(risk):
         te = make_trading_executor()
-        te.margin_warning_pct = 300.0
+        te.capital_required = True
+        te.gate_cross_risk_max_age_sec = 5.0
         te._account_summary = {
+            'binance': {'available': 1000.0, 'net_value': 1000.0},
             'gate': {
-                'cross_risk': {
-                    'enabled': True,
-                    'status': 'safe',
-                    'account_mmr_pct': 3349.5,
-                },
+                'available': 1000.0,
+                'net_value': 1000.0,
+                'cross_risk': risk,
             },
         }
         te._account_summary_ts = time.time()
+        return te
 
-        self.assertAlmostEqual(te._gate_cross_account_mmr_pct(), 3349.5)
-        self.assertNotIn(
-            '保证金风控',
-            te._get_risk_fail_reason({'base_asset': 'AI'}),
-        )
+    def test_fresh_safe_risk_allows_open(self):
+        te = self._executor_with_risk({
+            'enabled': True,
+            'status': 'safe',
+            'account_mmr_pct': 3349.5,
+            'account_fetched_at_ts': time.time(),
+        })
 
-    def test_open_guard_blocks_low_account_mmr(self):
-        te = make_trading_executor()
-        te.margin_warning_pct = 300.0
-        te._account_summary = {
-            'gate': {
-                'cross_risk': {
-                    'enabled': True,
-                    'status': 'danger',
-                    'account_mmr_pct': 250.0,
-                },
-            },
-        }
-        te._account_summary_ts = time.time()
+        ok, reason = te._check_account_capital(10.0)
 
-        self.assertEqual(
-            te._get_risk_fail_reason({'base_asset': 'AI'}),
-            '保证金风控(Gate全仓MMR250.0%<300.0%)',
-        )
+        self.assertTrue(ok, reason)
+
+    def test_warning_risk_blocks_open(self):
+        te = self._executor_with_risk({
+            'enabled': True,
+            'status': 'warning',
+            'account_mmr_pct': 420.0,
+            'account_fetched_at_ts': time.time(),
+        })
+
+        ok, reason = te._check_account_capital(10.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate全仓风险预警', reason)
+
+    def test_missing_risk_snapshot_blocks_open(self):
+        te = self._executor_with_risk(None)
+
+        ok, reason = te._check_account_capital(10.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate全仓风险未知', reason)
+        self.assertIn('无实时风险快照', reason)
+
+    def test_error_snapshot_blocks_open(self):
+        te = self._executor_with_risk({
+            'enabled': True,
+            'status': 'unknown',
+            'error': 'Gate positions: timeout',
+            'account_fetched_at_ts': time.time(),
+        })
+
+        ok, reason = te._check_account_capital(10.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Gate positions: timeout', reason)
+
+    def test_stale_snapshot_blocks_open(self):
+        te = self._executor_with_risk({
+            'enabled': True,
+            'status': 'safe',
+            'account_mmr_pct': 1200.0,
+            'account_fetched_at_ts': time.time() - 10.0,
+        })
+
+        ok, reason = te._check_account_capital(10.0)
+
+        self.assertFalse(ok)
+        self.assertIn('快照过期', reason)
 
 if __name__ == '__main__':
     unittest.main()

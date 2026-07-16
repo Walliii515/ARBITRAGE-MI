@@ -56,7 +56,6 @@ class TradingExecutorConfig:
     quality_scale_in_min_basis_improvement_bps: float = 8.0
     quality_scale_in_basis_improvement_ratio: float = 0.25
     quality_scale_in_max_basis_improvement_bps: float = 20.0
-    quality_scale_in_min_gate_margin_rate_pct: float = 250.0
     quality_scale_in_cooldown_sec: int = 300
     presignal_reject_log_cooldown_sec: int = 300
     reject_cooldown_sec: int = 60
@@ -84,9 +83,6 @@ class TradingExecutorConfig:
     peak_monitor_timeout_sec: int = 60
     peak_timeout_cooldown_sec: int = 10
     sustain_sec: float = 5.0                # 峰值监控最低持续秒数（过滤脉冲信号）
-
-    # ─── 保证金风控 ───
-    margin_warning_pct: float = 8.0
 
     # ─── 风险缓释 ───
     risk_relief_bps: float = 10.0
@@ -184,6 +180,7 @@ class TradingExecutorConfig:
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
     capital_max_age_sec: int = 180
+    gate_cross_risk_max_age_sec: float = 5.0
     binance_margin_required: bool = False
     binance_margin_min_open_level: float = 2.5
 
@@ -279,8 +276,6 @@ class TradingExecutor:
         self._last_realtime_rate_bps: Dict[str, float] = {}
         self._last_realtime_funding_info: Dict[str, Dict] = {}
 
-        # Gate 全仓账户 MMR 低于此值时禁止开仓
-        self.margin_warning_pct = cfg.margin_warning_pct
         self._holding_spot_amount_by_asset: Dict[str, float] = {}
         self._holding_weighted_basis_by_asset: Dict[str, float] = {}
         self._holding_exchange_risk_by_asset: Dict[str, bool] = {}
@@ -310,9 +305,6 @@ class TradingExecutor:
         self.quality_scale_in_max_basis_improvement_bps = max(
             float(cfg.quality_scale_in_max_basis_improvement_bps or 0),
             self.quality_scale_in_min_basis_improvement_bps,
-        )
-        self.quality_scale_in_min_gate_margin_rate_pct = float(
-            cfg.quality_scale_in_min_gate_margin_rate_pct or 0
         )
         self.quality_scale_in_cooldown_sec = max(int(cfg.quality_scale_in_cooldown_sec or 0), 0)
         self._quality_scale_in_last_time: Dict[str, datetime] = {}
@@ -487,6 +479,7 @@ class TradingExecutor:
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
+        self.gate_cross_risk_max_age_sec = max(float(cfg.gate_cross_risk_max_age_sec or 0), 0.0)
         self.binance_margin_required = bool(cfg.binance_margin_required)
         self.binance_margin_min_open_level = float(cfg.binance_margin_min_open_level or 0.0)
         self._account_summary: Optional[Dict] = None
@@ -519,15 +512,6 @@ class TradingExecutor:
         """更新交易所真实资金缓存，供开仓热路径只读。"""
         self._account_summary = account_summary
         self._account_summary_ts = float(snapshot_ts or 0)
-
-    def _gate_cross_account_mmr_pct(self) -> Optional[float]:
-        if not self._account_summary:
-            return None
-        gate_summary = self._account_summary.get('gate') or {}
-        risk = self._extract_gate_cross_risk(gate_summary)
-        if not risk:
-            return None
-        return self._float_or_none(risk.get('account_mmr_pct'))
 
     def _refresh_holding_exposure_from_db(self):
         """
@@ -1989,7 +1973,7 @@ class TradingExecutor:
     def _pass_risk_check(self, row: Dict) -> bool:
         """
         风控规则检查:
-        0. 保证金风控: 该标的现有持仓 保证金/维持保证金 < warning_pct 时禁止开仓
+        0. Gate 全仓状态、交易所资金与单币集中度检查
         1. 稳定 funding 通道或新高 funding 通道达标
         2. 开仓盘口覆盖 <= 阈值
         3. 开仓基差 >= funding-adjusted entry_floor
@@ -1999,11 +1983,6 @@ class TradingExecutor:
 
         delist_ok, _delist_reason = self._check_delist_open_block(base_asset)
         if not delist_ok:
-            return False
-
-        # Gate 正向仓位固定为全仓模式，开仓只看账户级 MMR。
-        margin_rate = self._gate_cross_account_mmr_pct()
-        if margin_rate is not None and margin_rate < self.margin_warning_pct:
             return False
 
         channel_ok, _channel_reason = self._check_open_channel_support(row)
@@ -2131,13 +2110,29 @@ class TradingExecutor:
         return True, ''
 
     def _gate_cross_risk_open_block_reason(self, gate_summary: Dict) -> Optional[str]:
-        """Gate 全仓账户进入预警/危险状态时，禁止所有正向新开仓。"""
+        """Gate cross-risk must be fresh and explicitly safe/idle before opening."""
         risk = self._extract_gate_cross_risk(gate_summary)
         if not risk:
-            return None
+            return '资金风控(Gate全仓风险未知|无实时风险快照)'
         status = str(risk.get('status') or '').strip().lower()
-        if status not in {'warning', 'danger'}:
+        fetched_at_ts = self._float_or_none(risk.get('account_fetched_at_ts'))
+        if fetched_at_ts is None:
+            fetched_at_ts = self._float_or_none(risk.get('fetched_at_ts'))
+        if self.gate_cross_risk_max_age_sec > 0:
+            if fetched_at_ts is None:
+                return '资金风控(Gate全仓风险未知|快照无时间戳)'
+            age = max(time.time() - fetched_at_ts, 0.0)
+            if age > self.gate_cross_risk_max_age_sec:
+                return (
+                    f"资金风控(Gate全仓风险未知|快照过期"
+                    f"{age:.1f}s>{self.gate_cross_risk_max_age_sec:.1f}s)"
+                )
+
+        if status in {'safe', 'idle'} and not risk.get('error'):
             return None
+        if status not in {'warning', 'danger'}:
+            detail = str(risk.get('error') or f'状态={status or "missing"}')[:120]
+            return f"资金风控(Gate全仓风险未知|{detail})"
         status_label = risk.get('status_label') or ('危险' if status == 'danger' else '预警')
         parts = [f"资金风控(Gate全仓风险{status_label}"]
         account_mmr = self._float_or_none(risk.get('account_mmr_pct'))
@@ -2305,20 +2300,11 @@ class TradingExecutor:
         if self._holding_exchange_risk_by_asset.get(base_asset):
             return False, '存在交易所仓位风险'
 
-        margin_rate = self._gate_cross_account_mmr_pct()
-        if margin_rate is not None and margin_rate < self.quality_scale_in_min_gate_margin_rate_pct:
-            return (
-                False,
-                f"MMR {margin_rate:.1f}%<{self.quality_scale_in_min_gate_margin_rate_pct:.1f}%"
-            )
-        margin_label = f"{margin_rate:.0f}%" if margin_rate is not None else "NA"
-
         return (
             True,
             f"优质加仓额度({self.max_asset_exposure_ratio:.0%}->{self.quality_scale_in_enhanced_ratio:.0%},"
             f"funding={funding_bps:.1f}bps,"
-            f"basis_improve={improvement:.1f}/{required_improvement:.1f}bps,"
-            f"MMR={margin_label})"
+            f"basis_improve={improvement:.1f}/{required_improvement:.1f}bps)"
         )
 
     def _quality_scale_in_required_improvement_bps(self, existing_basis_bps: float) -> float:
@@ -2913,14 +2899,6 @@ class TradingExecutor:
         delist_ok, delist_reason = self._check_delist_open_block(base_asset)
         if not delist_ok:
             return delist_reason
-
-        # Gate 正向仓位固定为全仓模式，开仓只看账户级 MMR。
-        margin_rate = self._gate_cross_account_mmr_pct()
-        if margin_rate is not None and margin_rate < self.margin_warning_pct:
-            return (
-                f"保证金风控(Gate全仓MMR"
-                f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
-            )
 
         channel_ok, channel_reason = self._check_open_channel_support(row)
         if not channel_ok:

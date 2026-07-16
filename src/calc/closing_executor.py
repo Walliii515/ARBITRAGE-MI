@@ -13,6 +13,7 @@
 import time
 import uuid
 import json
+import threading
 from datetime import datetime, timedelta
 from typing import Callable, List, Dict, Optional
 
@@ -186,21 +187,23 @@ class ClosingExecutor:
         self._close_quality_guard_cooldown: Dict[tuple, datetime] = {}
 
         # Gate 全仓保证金风控配置
-        self.margin_close_threshold_pct = config.get_float('margin.close_threshold_pct', 5.0)
-        self.margin_danger_path_enabled = config.get_bool('margin.danger_path.enabled', True)
+        self.margin_danger_path_enabled = True
         self.margin_danger_mmr_pct = config.get_float(
-            'margin.danger_path.mmr_pct',
+            'account_capital.gate_cross_risk.danger_mmr_pct',
             300.0,
         )
         self.margin_danger_liq_distance_bps = max(
-            config.get_float('margin.danger_path.liq_distance_bps', 300.0),
+            config.get_float('account_capital.gate_cross_risk.danger_liq_distance_bps', 300.0),
             0.0,
         )
-        self.margin_danger_missing_risk_force_refresh = config.get_bool(
-            'margin.danger_path.missing_risk_force_refresh',
-            True,
+        self.margin_danger_missing_risk_force_refresh = True
+        self.gate_cross_risk_max_age_sec = max(
+            config.get_float('account_capital.gate_cross_risk.max_age_sec', 5.0),
+            0.0,
         )
         self._gate_cross_risk_cache: Dict[str, object] = {'ts': 0.0, 'risk': None}
+        self._margin_close_inflight = set()
+        self._margin_close_inflight_lock = threading.Lock()
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -213,6 +216,7 @@ class ClosingExecutor:
         self._gate_manager = None
         self._spot_manager = None
         self._reconciliation_trigger: Optional[Callable[[str, str], None]] = None
+        self._gate_cross_risk_provider: Optional[Callable[[], Optional[Dict]]] = None
 
         self._close_resiliency_max_basis_rebound_bps = config.get_float(
             'trade.close_resiliency.max_basis_rebound_bps', 8.0
@@ -308,6 +312,13 @@ class ClosingExecutor:
         """注入后台对账触发器，用于断腿风险出现后尽快走现有兜底链路。"""
         self._reconciliation_trigger = callback
 
+    def set_gate_cross_risk_provider(
+        self,
+        callback: Optional[Callable[[], Optional[Dict]]],
+    ):
+        """Inject the shared real-time Gate cross-risk snapshot provider."""
+        self._gate_cross_risk_provider = callback
+
     def set_delist_risk_report(self, report: Optional[Dict]):
         """注入异步刷新得到的下架风险报告；平仓关键路径只读内存。"""
         grouped: Dict[str, List[Dict]] = {}
@@ -321,6 +332,98 @@ class ClosingExecutor:
     # ──────────────────────────────────────────────────────────────────
     # 公共入口
     # ──────────────────────────────────────────────────────────────────
+
+    def check_and_close_margin_danger(
+        self,
+        positions: List[Dict],
+        orderbook_rows_by_asset: Optional[Dict[str, Dict]] = None,
+    ) -> List[Dict]:
+        """Execute the Gate cross-margin emergency path without market-data gates.
+
+        Only a fresh shared Gate risk snapshot may trigger this path. Account MMR
+        danger applies to every forward holding; liquidation-distance danger only
+        applies to the affected contract. Failed attempts are retried on the next
+        risk loop and never enter the ordinary close cooldown.
+        """
+        if not self.margin_danger_path_enabled:
+            return []
+
+        cross_risk = self._latest_gate_cross_risk()
+        if not self._is_gate_cross_risk_fresh(cross_risk):
+            return []
+
+        rows = orderbook_rows_by_asset or {}
+        results = []
+        for pos in positions or []:
+            if pos.get('status') != 'holding':
+                continue
+
+            danger = self._margin_danger_state(pos, cross_risk=cross_risk)
+            if not danger.get('active'):
+                continue
+
+            base_asset = str(pos.get('base_asset') or '').upper()
+            inflight_key = self._margin_close_key(pos)
+            if not self._claim_margin_close(inflight_key):
+                logger.warning(
+                    "保证金危险平仓已有执行中的请求，跳过重复提交 | %s | position_id=%s",
+                    base_asset,
+                    pos.get('id'),
+                )
+                continue
+
+            orderbook_row = rows.get(base_asset) or {'base_asset': base_asset}
+            detail = self._build_margin_close_detail(
+                pos,
+                '保证金危险路径',
+                danger,
+                cross_risk=cross_risk,
+            )
+            self._clear_position_close_state(base_asset, pos)
+            try:
+                result = self._execute_close(
+                    pos,
+                    'margin_close',
+                    detail,
+                    orderbook_row,
+                    pre_gate_basis_bps=None,
+                    future_protective_price=None,
+                )
+                result.setdefault('position_id', pos.get('id'))
+                results.append(result)
+                if result.get('success'):
+                    logger.critical(
+                        "Gate全仓危险平仓成功 | %s | position_id=%s | %s",
+                        base_asset,
+                        pos.get('id'),
+                        ';'.join(danger.get('reasons') or []),
+                    )
+                else:
+                    logger.critical(
+                        "Gate全仓危险平仓失败，将在下一轮立即重试 | %s | position_id=%s | msg=%s",
+                        base_asset,
+                        pos.get('id'),
+                        result.get('message'),
+                    )
+            except Exception as exc:
+                logger.critical(
+                    "Gate全仓危险平仓异常，将在下一轮立即重试 | %s | position_id=%s | %s",
+                    base_asset,
+                    pos.get('id'),
+                    exc,
+                    exc_info=True,
+                )
+                results.append({
+                    'position_id': pos.get('id'),
+                    'base_asset': base_asset,
+                    'success': False,
+                    'close_reason': 'margin_close',
+                    'message': str(exc),
+                })
+            finally:
+                self._release_margin_close(inflight_key)
+
+        return results
 
     def check_and_close(
         self,
@@ -366,29 +469,7 @@ class ClosingExecutor:
             pre_gate_basis_bps = None
             future_protective_price = None
 
-            margin_danger = self._margin_danger_state(pos)
-
-            # 优先级 0：Gate 全仓保证金风险（最高优先级，危险路径直接平仓）
-            if margin_danger.get('active'):
-                close_reason = 'margin_close'
-                close_reason_detail = self._build_margin_close_detail(
-                    pos,
-                    '保证金危险路径',
-                    margin_danger,
-                )
-                self._clear_position_close_state(ba, pos)
-            elif self._check_margin_liquidation(pos):
-                margin_rate = self._maintenance_margin_rate(pos)
-                close_reason = 'margin_close'
-                close_reason_detail = self._build_margin_close_detail(
-                    pos,
-                    f"保证金风控|保证金/维持保证金{margin_rate:.2f}%"
-                    f"(<{self.margin_close_threshold_pct}%)",
-                    self._margin_danger_state(pos),
-                )
-                # 紧急平仓，清除谷底状态
-                self._clear_position_close_state(ba, pos)
-            elif self._check_delist_risk_exit(pos):
+            if self._check_delist_risk_exit(pos):
                 close_reason = 'delist_risk_exit'
                 close_reason_detail = self._build_delist_risk_exit_detail(pos)
                 self._clear_position_close_state(ba, pos)
@@ -898,28 +979,73 @@ class ClosingExecutor:
             return 'watch'
         return 'none'
 
-    def _check_margin_liquidation(self, pos: Dict) -> bool:
-        """
-        保证金爆仓风控（优先级 0）：
-        当 Gate 全仓账户 MMR 低于平仓阈值时触发两端同时平仓。
-        """
-        margin_rate = self._maintenance_margin_rate(pos)
-        if margin_rate is None:
+    @staticmethod
+    def _margin_close_key(pos: Dict) -> tuple:
+        position_id = pos.get('id')
+        if position_id is not None:
+            return ('position', str(position_id))
+        return (
+            'contract',
+            str(pos.get('future_contract') or ''),
+            str(pos.get('base_asset') or ''),
+        )
+
+    def _claim_margin_close(self, key: tuple) -> bool:
+        with self._margin_close_inflight_lock:
+            if key in self._margin_close_inflight:
+                return False
+            self._margin_close_inflight.add(key)
+            return True
+
+    def _release_margin_close(self, key: tuple) -> None:
+        with self._margin_close_inflight_lock:
+            self._margin_close_inflight.discard(key)
+
+    def _risk_timestamp_is_fresh(self, risk: Optional[Dict], field: str) -> bool:
+        if not isinstance(risk, dict):
             return False
-        return margin_rate < self.margin_close_threshold_pct
+        if self.gate_cross_risk_max_age_sec <= 0:
+            return True
+        fetched_at_ts = _float_or_none(risk.get(field))
+        if fetched_at_ts is None or fetched_at_ts <= 0:
+            return False
+        age_sec = time.time() - fetched_at_ts
+        return -5.0 <= age_sec <= self.gate_cross_risk_max_age_sec
 
-    def _maintenance_margin_rate(self, pos: Dict) -> Optional[float]:
-        """Gate 正向仓位固定全仓，使用账户权益 / 总维持保证金。"""
-        return self._latest_gate_cross_account_mmr()
+    def _is_gate_cross_risk_fresh(self, risk: Optional[Dict]) -> bool:
+        return self._risk_timestamp_is_fresh(risk, 'account_fetched_at_ts')
 
-    def _latest_gate_cross_account_mmr(self) -> Optional[float]:
-        risk = self._latest_gate_cross_risk()
-        if not risk:
+    def _is_gate_position_risk_fresh(self, risk: Optional[Dict]) -> bool:
+        return self._risk_timestamp_is_fresh(risk, 'positions_fetched_at_ts')
+
+    def _maintenance_margin_rate(
+        self,
+        pos: Dict,
+        cross_risk: Optional[Dict] = None,
+    ) -> Optional[float]:
+        """Gate 正向仓位固定全仓，读取新鲜的官方账户 cross_mmr。"""
+        return self._latest_gate_cross_account_mmr(cross_risk)
+
+    def _latest_gate_cross_account_mmr(
+        self,
+        cross_risk: Optional[Dict] = None,
+    ) -> Optional[float]:
+        risk = cross_risk if cross_risk is not None else self._latest_gate_cross_risk()
+        if not self._is_gate_cross_risk_fresh(risk):
             return None
         return _float_or_none(risk.get('account_mmr_pct'))
 
     def _latest_gate_cross_risk(self) -> Optional[Dict]:
         now = time.time()
+        if self._gate_cross_risk_provider is not None:
+            try:
+                risk = self._gate_cross_risk_provider()
+                if isinstance(risk, dict):
+                    self._gate_cross_risk_cache = {'ts': now, 'risk': risk}
+                    return risk
+            except Exception as exc:
+                logger.warning("读取实时 Gate 全仓风险失败: %s", exc, exc_info=True)
+
         if now - float(self._gate_cross_risk_cache.get('ts') or 0.0) <= 5.0:
             risk = self._gate_cross_risk_cache.get('risk')
             return risk if isinstance(risk, dict) else None
@@ -956,13 +1082,14 @@ class ClosingExecutor:
         summary = {'danger': [], 'missing': []}
         if not self.margin_danger_path_enabled:
             return summary
+        cross_risk = self._latest_gate_cross_risk()
         for pos in positions or []:
             if pos.get('status') != 'holding':
                 continue
             asset = pos.get('base_asset') or pos.get('future_contract') or ''
-            if self._margin_danger_state(pos).get('active'):
+            if self._margin_danger_state(pos, cross_risk=cross_risk).get('active'):
                 summary['danger'].append(asset)
-            if self._missing_gate_margin_risk(pos):
+            if self._missing_gate_margin_risk(pos, cross_risk=cross_risk):
                 summary['missing'].append(asset)
         return summary
 
@@ -971,7 +1098,11 @@ class ClosingExecutor:
         summary = self.margin_risk_refresh_summary(positions)
         return bool(summary.get('danger') or summary.get('missing'))
 
-    def _missing_gate_margin_risk(self, pos: Dict) -> bool:
+    def _missing_gate_margin_risk(
+        self,
+        pos: Dict,
+        cross_risk: Optional[Dict] = None,
+    ) -> bool:
         """持仓仍有 Gate 腿，但缺少 MMR/强平价字段时需要刷新 Gate 风险。"""
         if not self.margin_danger_missing_risk_force_refresh:
             return False
@@ -979,25 +1110,46 @@ class ClosingExecutor:
         future_contract = str(pos.get('future_contract') or '').strip()
         if future_qty <= 0 or not future_contract:
             return False
+        risk = cross_risk if cross_risk is not None else self._latest_gate_cross_risk()
+        risk_status = str((risk or {}).get('status') or '').strip().lower()
         return (
-            self._latest_gate_cross_account_mmr() is None
+            risk_status in {'', 'idle', 'unknown'}
+            or self._latest_gate_cross_account_mmr(risk) is None
+            or not self._is_gate_position_risk_fresh(risk)
             or pos.get('gate_liq_price') is None
         )
 
-    def _margin_danger_state(self, pos: Dict) -> Dict:
+    def _margin_danger_state(
+        self,
+        pos: Dict,
+        cross_risk: Optional[Dict] = None,
+    ) -> Dict:
         if not self.margin_danger_path_enabled:
             return {'active': False, 'reasons': []}
 
+        risk = cross_risk if cross_risk is not None else self._latest_gate_cross_risk()
+        risk_status = str((risk or {}).get('status') or '').strip().lower()
         reasons = []
-        margin_rate = self._maintenance_margin_rate(pos)
-        if margin_rate is not None and margin_rate <= self.margin_danger_mmr_pct:
+        margin_rate = self._maintenance_margin_rate(pos, risk)
+        if (
+            risk_status == 'danger'
+            and margin_rate is not None
+            and margin_rate <= self.margin_danger_mmr_pct
+        ):
             reasons.append(f"MMR{margin_rate:.2f}%<={self.margin_danger_mmr_pct:.1f}%")
 
         liq_price = _float_or_none(pos.get('gate_liq_price'))
         ref_price = self._margin_danger_reference_price(pos)
         liq_distance_bps = None
         at_liq = False
-        if liq_price is not None and liq_price > 0 and ref_price is not None and ref_price > 0:
+        if (
+            risk_status == 'danger'
+            and self._is_gate_position_risk_fresh(risk)
+            and liq_price is not None
+            and liq_price > 0
+            and ref_price is not None
+            and ref_price > 0
+        ):
             # 正向策略 Gate 腿为空头，价格上涨接近/穿过强平价时最危险。
             liq_distance_bps = (liq_price - ref_price) / ref_price * 10000.0
             at_liq = liq_distance_bps <= 0
@@ -1015,13 +1167,14 @@ class ClosingExecutor:
             'liq_price': liq_price,
             'liq_distance_bps': liq_distance_bps,
             'at_liq': at_liq,
+            'risk_status': risk_status or 'unknown',
         }
 
     @staticmethod
     def _margin_danger_reference_price(pos: Dict) -> Optional[float]:
         for key in (
-            'current_future_price',
             'gate_mark_price',
+            'current_future_price',
             'future_close_vwap',
             'future_open_price',
         ):
@@ -1035,12 +1188,13 @@ class ClosingExecutor:
         pos: Dict,
         prefix: str,
         danger: Optional[Dict] = None,
+        cross_risk: Optional[Dict] = None,
     ) -> str:
         parts = [prefix]
-        margin_rate = self._maintenance_margin_rate(pos)
+        margin_rate = self._maintenance_margin_rate(pos, cross_risk)
         if margin_rate is not None and '保证金/维持保证金' not in prefix:
             parts.append(f"保证金/维持保证金{margin_rate:.2f}%")
-        cross_risk = self._latest_gate_cross_risk() or {}
+        cross_risk = cross_risk or self._latest_gate_cross_risk() or {}
         account_equity = _float_or_none(cross_risk.get('account_equity_usdt'))
         total_maintenance = _float_or_none(cross_risk.get('maintenance_margin_usdt'))
         if account_equity is not None:

@@ -68,7 +68,6 @@ trade:
       min_basis_improvement_bps: 8          # 优质加仓最低基差改善要求
       basis_improvement_ratio: 0.25         # 相对已有加权入场基差的改善比例
       max_basis_improvement_bps: 20         # 优质加仓最高基差改善要求，避免高基差仓位阈值过硬
-      min_gate_margin_rate_pct: 250         # Gate MMR 已知且过低时，禁止使用增强额度
       cooldown_sec: 300                     # 同标的增强加仓成功后的冷却
     presignal_reject_log_cooldown_sec: 300  # 预信号风控拒绝落库限流；用于复盘“页面满足但未进信号”
     vwap_basis_threshold_bps: 50            # 全局回退VWAP基差阈值（bps）
@@ -331,16 +330,6 @@ trade:
 margin:
   # 默认维持保证金率（当合约表无数据时的回退值）
   default_maintenance_rate: 0.005
-  # Gate 全仓账户 MMR 开仓下限(%): 低于此值时禁止所有正向新开仓
-  warning_pct: 300
-  # Gate 全仓账户 MMR 紧急平仓阈值(%): 低于此值时由系统主动市价平仓
-  close_threshold_pct: 200
-  danger_path:
-    enabled: true
-    mmr_pct: 300                           # 低于该 MMR 视为危险路径，强制刷新 Gate 风险快照
-    liq_distance_bps: 300                  # 空头价格距强平价小于该 bps 时进入危险路径
-    missing_risk_force_refresh: true       # 持仓缺失 Gate MMR/强平价时强制刷新
-    force_refresh_min_interval_sec: 2      # 缺失/危险刷新最小间隔，防止 Gate REST 故障时打爆接口
 
 # 真实成交引擎配置（仅 real_executor_service 使用）
 # API Key/Secret 从 .env 环境变量读取，此处仅配置其他运行参数
@@ -361,6 +350,9 @@ account_capital:
     warning_margin_level: 3.0
     min_open_margin_level: 2.5
   gate_cross_risk:
+    poll_interval_sec: 1
+    max_age_sec: 5
+    force_refresh_min_interval_sec: 2
     warning_mmr_pct: 500
     danger_mmr_pct: 300
     warning_liq_distance_bps: 600
@@ -369,6 +361,7 @@ account_capital:
     notification_enabled: true
     warning_notification_cooldown_sec: 3600
     danger_notification_cooldown_sec: 300
+    unknown_notification_cooldown_sec: 300
 
 # 基础持仓对账配置（Binance 现货 + Gate 期货；可识别 Gate ADL/断腿并标记持仓风险）
 reconciliation:

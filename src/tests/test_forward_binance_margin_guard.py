@@ -1,6 +1,7 @@
 # coding: utf-8
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -35,6 +36,11 @@ class TestForwardBinanceMarginGuard(unittest.TestCase):
                 'gate': {
                     'available': 1000.0,
                     'net_value': 2000.0,
+                    'cross_risk': {
+                        'status': 'safe',
+                        'account_mmr_pct': 1200.0,
+                        'account_fetched_at_ts': time.time(),
+                    },
                 },
             },
             9999999999,
