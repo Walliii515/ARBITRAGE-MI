@@ -313,9 +313,9 @@ class AccountCapitalSnapshotter:
             raw_position_equity = margin + unrealized
             position_equity = raw_position_equity
             mmr_pct = position_equity / maintenance * 100 if maintenance > 0 else None
-            if maintenance > 0 and margin <= 0 and raw_position_equity <= 0:
+            if maintenance > 0 and margin <= 0:
                 # Gate 全仓模式下单合约 position.margin 可能为 0；真实风险看账户级
-                # equity / 总维持保证金，不能把单合约 0 margin 展示成 0% MMR。
+                # equity / 总维持保证金，不能用单合约浮盈/亏展示成伪 MMR。
                 position_equity = None
                 mmr_pct = None
             liq_distance_bps = _gate_liq_distance_bps(pos)

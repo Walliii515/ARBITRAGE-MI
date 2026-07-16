@@ -528,6 +528,26 @@ class TradingExecutor:
         self._account_summary = account_summary
         self._account_summary_ts = float(snapshot_ts or 0)
 
+    def _is_gate_cross_margin(self) -> bool:
+        try:
+            return abs(float(self.capital_gate_leverage)) < 1e-9
+        except (TypeError, ValueError):
+            return False
+
+    def _gate_cross_account_mmr_pct(self) -> Optional[float]:
+        if not self._account_summary:
+            return None
+        gate_summary = self._account_summary.get('gate') or {}
+        risk = self._extract_gate_cross_risk(gate_summary)
+        if not risk:
+            return None
+        return self._float_or_none(risk.get('account_mmr_pct'))
+
+    def _effective_holding_margin_rate(self, base_asset: str) -> Optional[float]:
+        if self._is_gate_cross_margin():
+            return self._gate_cross_account_mmr_pct()
+        return self._holding_margin_rate.get(base_asset)
+
     def update_holding_margin_status(self, positions: List[Dict]):
         """
         更新持仓的 Gate 保证金/维持保证金缓存（由 _margin_status_loop 每 5s 调用一次）
@@ -2062,10 +2082,10 @@ class TradingExecutor:
         if not delist_ok:
             return False
 
-        # 保证金风控检查：该标的现有持仓保证金/维持保证金比例过低时禁止加仓
-        if base_asset in self._holding_margin_rate:
-            if self._holding_margin_rate[base_asset] < self.margin_warning_pct:
-                return False
+        # 保证金风控检查：逐仓看单标的，Gate 全仓看账户级 MMR。
+        margin_rate = self._effective_holding_margin_rate(base_asset)
+        if margin_rate is not None and margin_rate < self.margin_warning_pct:
+            return False
 
         channel_ok, _channel_reason = self._check_open_channel_support(row)
         if not channel_ok:
@@ -2397,7 +2417,7 @@ class TradingExecutor:
         if self._holding_exchange_risk_by_asset.get(base_asset):
             return False, '存在交易所仓位风险'
 
-        margin_rate = self._holding_margin_rate.get(base_asset)
+        margin_rate = self._effective_holding_margin_rate(base_asset)
         if margin_rate is not None and margin_rate < self.quality_scale_in_min_gate_margin_rate_pct:
             return (
                 False,
@@ -3006,14 +3026,14 @@ class TradingExecutor:
         if not delist_ok:
             return delist_reason
 
-        # 保证金风控检查
-        if base_asset in self._holding_margin_rate:
-            margin_rate = self._holding_margin_rate[base_asset]
-            if margin_rate < self.margin_warning_pct:
-                return (
-                    f"保证金风控(保证金/维持保证金"
-                    f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
-                )
+        # 保证金风控检查：逐仓看单标的，Gate 全仓看账户级 MMR。
+        margin_rate = self._effective_holding_margin_rate(base_asset)
+        if margin_rate is not None and margin_rate < self.margin_warning_pct:
+            label = "Gate全仓MMR" if self._is_gate_cross_margin() else "保证金/维持保证金"
+            return (
+                f"保证金风控({label}"
+                f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
+            )
 
         channel_ok, channel_reason = self._check_open_channel_support(row)
         if not channel_ok:

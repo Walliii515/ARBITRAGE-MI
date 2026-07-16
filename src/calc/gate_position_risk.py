@@ -39,9 +39,12 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
 
         margin = _float(gate_pos.get('margin'))
         unrealised_pnl = _float(gate_pos.get('unrealised_pnl'))
-        margin_equity = margin + unrealised_pnl
+        raw_margin_equity = margin + unrealised_pnl
+        margin_equity = raw_margin_equity if margin > 0 else None
         maintenance_margin = _float(gate_pos.get('maintenance_margin'))
-        rate = margin_equity / maintenance_margin * 100 if maintenance_margin > 0 else None
+        rate = margin_equity / maintenance_margin * 100 if (
+            margin_equity is not None and maintenance_margin > 0
+        ) else None
         share = _position_share(pos, holdings_by_contract.get(contract), contract_weights.get(contract, 0))
 
         pos['gate_mark_price'] = _float_or_none(gate_pos.get('mark_price'))
@@ -53,7 +56,7 @@ def attach_gate_position_risk(positions: List[Dict], gate_positions: Iterable[Di
         pos['gate_contract_local_position_count'] = len(holdings_by_contract.get(contract) or [])
         pos['gate_contract_open_notional'] = contract_open_notional.get(contract, 0.0)
         pos['gate_position_margin'] = margin * share
-        pos['gate_position_margin_equity'] = margin_equity * share
+        pos['gate_position_margin_equity'] = margin_equity * share if margin_equity is not None else None
         pos['gate_unrealised_pnl'] = unrealised_pnl * share
         pos['gate_maintenance_margin'] = maintenance_margin * share
         pos['gate_maintenance_margin_rate'] = round(rate, 2) if rate is not None else None

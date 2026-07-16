@@ -1010,6 +1010,13 @@ class ClosingExecutor:
         future_contract = str(pos.get('future_contract') or '').strip()
         if future_qty <= 0 or not future_contract:
             return False
+        if self._is_forward_cross_margin():
+            if pos.get('gate_maintenance_margin_rate') is not None:
+                return pos.get('gate_liq_price') is None
+            return (
+                self._latest_gate_cross_account_mmr() is None
+                or pos.get('gate_liq_price') is None
+            )
         return (
             pos.get('gate_maintenance_margin_rate') is None
             or pos.get('gate_liq_price') is None
