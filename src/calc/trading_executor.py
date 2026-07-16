@@ -184,7 +184,6 @@ class TradingExecutorConfig:
     # ─── 交易所真实资金风控 ───
     capital_required: bool = False
     capital_max_age_sec: int = 180
-    capital_gate_leverage: float = 2.0
     binance_margin_required: bool = False
     binance_margin_min_open_level: float = 2.5
 
@@ -280,13 +279,9 @@ class TradingExecutor:
         self._last_realtime_rate_bps: Dict[str, float] = {}
         self._last_realtime_funding_info: Dict[str, Dict] = {}
 
-        # 保证金风控：保证金/维持保证金低于此值时禁止开仓
+        # Gate 全仓账户 MMR 低于此值时禁止开仓
         self.margin_warning_pct = cfg.margin_warning_pct
-        # 持仓 Gate 保证金/维持保证金缓存: base_asset -> min(gate_maintenance_margin_rate)
-        self._holding_margin_rate: Dict[str, float] = {}
         self._holding_spot_amount_by_asset: Dict[str, float] = {}
-        self._holding_future_margin_by_asset: Dict[str, float] = {}
-        self._holding_future_margin_cache_by_asset: Dict[str, float] = {}
         self._holding_weighted_basis_by_asset: Dict[str, float] = {}
         self._holding_exchange_risk_by_asset: Dict[str, bool] = {}
         fallback_available_ratio = max(float(cfg.min_available_ratio or 0), 0.0)
@@ -492,9 +487,6 @@ class TradingExecutor:
 
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
-        self.capital_gate_leverage = float(
-            cfg.capital_gate_leverage if cfg.capital_gate_leverage is not None else 1.0
-        )
         self.binance_margin_required = bool(cfg.binance_margin_required)
         self.binance_margin_min_open_level = float(cfg.binance_margin_min_open_level or 0.0)
         self._account_summary: Optional[Dict] = None
@@ -528,12 +520,6 @@ class TradingExecutor:
         self._account_summary = account_summary
         self._account_summary_ts = float(snapshot_ts or 0)
 
-    def _is_gate_cross_margin(self) -> bool:
-        try:
-            return abs(float(self.capital_gate_leverage)) < 1e-9
-        except (TypeError, ValueError):
-            return False
-
     def _gate_cross_account_mmr_pct(self) -> Optional[float]:
         if not self._account_summary:
             return None
@@ -543,51 +529,12 @@ class TradingExecutor:
             return None
         return self._float_or_none(risk.get('account_mmr_pct'))
 
-    def _effective_holding_margin_rate(self, base_asset: str) -> Optional[float]:
-        if self._is_gate_cross_margin():
-            return self._gate_cross_account_mmr_pct()
-        return self._holding_margin_rate.get(base_asset)
-
-    def update_holding_margin_status(self, positions: List[Dict]):
-        """
-        更新持仓的 Gate 保证金/维持保证金缓存（由 _margin_status_loop 每 5s 调用一次）
-
-        同时维护每个标的的 Gate 当前保证金缓存，用于单标的资金占用上限。
-
-        Args:
-            positions: 已由 calculate_realtime_pnl 和 attach_gate_position_risk 富化的持仓列表
-        """
-        self._holding_margin_rate.clear()
-        future_margin_by_asset: Dict[str, float] = {}
-        for pos in positions:
-            if pos.get('status') != 'holding':
-                continue
-            ba = str(pos.get('base_asset') or '').upper()
-            if not ba:
-                continue
-            margin_rate = pos.get('gate_maintenance_margin_rate')
-            if margin_rate is not None:
-                margin_rate = float(margin_rate)
-                # 同一标的多个仓位时，取最小保证金/维持保证金比例（最危险的）
-                if ba not in self._holding_margin_rate or margin_rate < self._holding_margin_rate[ba]:
-                    self._holding_margin_rate[ba] = margin_rate
-            margin = self._float_or_none(pos.get('gate_position_margin'))
-            if margin is not None:
-                future_margin_by_asset[ba] = future_margin_by_asset.get(ba, 0.0) + max(float(margin), 0.0)
-        self._holding_future_margin_cache_by_asset = future_margin_by_asset
-        for ba, margin in future_margin_by_asset.items():
-            self._holding_future_margin_by_asset[ba] = max(
-                self._holding_future_margin_by_asset.get(ba, 0.0),
-                margin,
-            )
-
     def _refresh_holding_exposure_from_db(self):
         """
         从 DB 实时刷新各标的资金占用（每轮 check_and_open 开始时调用）。
 
         设计目的：
         - 现货按开仓金额汇总；
-        - 期货按当前保证金汇总，优先使用 margin_loop 的交易所实时缓存，DB 估算兜底；
         - 与 DB 单一真理源一致，避免内存资金占用与 DB 偏离。
 
         热路径开销：单次 SELECT + GROUP BY，在 holding 仓位有限（<<100）时延迟 < 5ms，可接受。
@@ -597,10 +544,6 @@ class TradingExecutor:
                 SELECT
                     p.base_asset,
                     COALESCE(SUM(p.spot_open_amount), 0) AS spot_amount,
-                    COALESCE(SUM(
-                        COALESCE(ABS(p.future_open_price * p.future_open_qty), p.spot_open_amount, 0)
-                        / GREATEST(COALESCE(fo.future_open_leverage, %s), 1)
-                    ), 0) AS future_margin,
                     COALESCE(
                         SUM(
                             CASE
@@ -625,22 +568,13 @@ class TradingExecutor:
                         END
                     ) AS has_exchange_risk
                 FROM mi_trade_position p
-                LEFT JOIN (
-                    SELECT position_id, MAX(leverage) AS future_open_leverage
-                    FROM mi_trade_order
-                    WHERE order_side = 'open'
-                      AND market_type = 'future'
-                      AND status = 'executed'
-                    GROUP BY position_id
-                ) fo ON fo.position_id = p.id
                 WHERE p.status = 'holding'
                 GROUP BY p.base_asset
             """
             with db_manager.get_cursor() as cursor:
-                cursor.execute(sql, (self._capital_gate_margin_divisor(),))
+                cursor.execute(sql)
                 rows = cursor.fetchall()
             spot_amounts: Dict[str, float] = {}
-            future_margins: Dict[str, float] = {}
             weighted_basis: Dict[str, float] = {}
             exchange_risk: Dict[str, bool] = {}
             for r in rows:
@@ -648,14 +582,10 @@ class TradingExecutor:
                 if not ba:
                     continue
                 spot_amounts[ba] = float(r.get('spot_amount') or 0.0)
-                future_margins[ba] = float(r.get('future_margin') or 0.0)
                 if r.get('weighted_basis_bps') is not None:
                     weighted_basis[ba] = float(r.get('weighted_basis_bps'))
                 exchange_risk[ba] = bool(int(r.get('has_exchange_risk') or 0))
-            for ba, margin in self._holding_future_margin_cache_by_asset.items():
-                future_margins[ba] = max(future_margins.get(ba, 0.0), float(margin or 0.0))
             self._holding_spot_amount_by_asset = spot_amounts
-            self._holding_future_margin_by_asset = future_margins
             self._holding_weighted_basis_by_asset = weighted_basis
             self._holding_exchange_risk_by_asset = exchange_risk
         except Exception as e:
@@ -930,21 +860,11 @@ class TradingExecutor:
                     spot_amount = self._float_or_none(
                         (exec_result.get('spot_order') or {}).get('exec_amount')
                     )
-                    future_amount = self._float_or_none(
-                        (exec_result.get('future_order') or {}).get('exec_amount')
-                    )
                     fallback_amount = self._active_open_amount_usdt(row)
                     spot_amount = spot_amount if spot_amount is not None else fallback_amount
-                    future_margin = (
-                        (future_amount if future_amount is not None else fallback_amount)
-                        / self._capital_gate_margin_divisor()
-                    )
                     ba = str(base_asset or '').upper()
                     self._holding_spot_amount_by_asset[ba] = (
                         self._holding_spot_amount_by_asset.get(ba, 0.0) + max(spot_amount, 0.0)
-                    )
-                    self._holding_future_margin_by_asset[ba] = (
-                        self._holding_future_margin_by_asset.get(ba, 0.0) + max(future_margin, 0.0)
                     )
                     self._last_open_time[base_asset] = datetime.now()
                     if row.get('_quality_scale_in_used'):
@@ -953,8 +873,7 @@ class TradingExecutor:
                         f"开仓成功 | {base_asset} | "
                         f"spot_vwap={exec_result['spot_order']['exec_price']} | "
                         f"future_vwap={exec_result['future_order']['exec_price']} | "
-                        f"spot_exposure={self._holding_spot_amount_by_asset[ba]:.2f}USDT | "
-                        f"future_margin={self._holding_future_margin_by_asset[ba]:.2f}USDT"
+                        f"spot_exposure={self._holding_spot_amount_by_asset[ba]:.2f}USDT"
                     )
                 else:
                     logger.warning(f"开仓拒单 | {base_asset} | reason={exec_result['message']}")
@@ -2082,8 +2001,8 @@ class TradingExecutor:
         if not delist_ok:
             return False
 
-        # 保证金风控检查：逐仓看单标的，Gate 全仓看账户级 MMR。
-        margin_rate = self._effective_holding_margin_rate(base_asset)
+        # Gate 正向仓位固定为全仓模式，开仓只看账户级 MMR。
+        margin_rate = self._gate_cross_account_mmr_pct()
         if margin_rate is not None and margin_rate < self.margin_warning_pct:
             return False
 
@@ -2155,7 +2074,7 @@ class TradingExecutor:
         amount_usdt: Optional[float] = None,
         row: Optional[Dict] = None,
     ) -> bool:
-        """单标的资金占用检查：spot 开仓额、future 当前保证金分别不超过各自账户阈值。"""
+        """单标的集中度检查：使用等额 Binance 现货腿的名义金额。"""
         return self._check_asset_exposure(base_asset, amount_usdt, row)[0]
 
     def _check_account_capital(self, amount_usdt: Optional[float] = None) -> tuple:
@@ -2179,10 +2098,8 @@ class TradingExecutor:
         gate_total = float(gate.get('net_value') or gate.get('equity') or 0)
         amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
         spot_required = amount * (1 + self._fee_spot_open)
-        gate_required = (
-            amount / self._capital_gate_margin_divisor()
-            + amount * self._fee_future_open
-        )
+        # 全仓初始保证金由 Gate 动态计算；这里保守预留完整名义金额并计入开仓手续费。
+        gate_required = amount + amount * self._fee_future_open
         if binance_available < spot_required:
             return False, f"资金风控(Binance可用{binance_available:.2f}<需{spot_required:.2f}USDT)"
         if gate_available < gate_required:
@@ -2290,35 +2207,23 @@ class TradingExecutor:
             return False, f"单标的资金风控(资金快照过期{age:.0f}s>{self.capital_max_age_sec}s)"
 
         binance = self._account_summary.get('binance') or {}
-        gate = self._account_summary.get('gate') or {}
         binance_total = float(binance.get('net_value') or binance.get('equity') or 0)
-        gate_total = float(gate.get('net_value') or gate.get('equity') or 0)
         if binance_total <= 0:
             return False, '单标的资金风控(Binance总资金无效)'
-        if gate_total <= 0:
-            return False, '单标的资金风控(Gate总资金无效)'
 
         ba = str(base_asset or '').upper()
         amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
         spot_after = self._holding_spot_amount_by_asset.get(ba, 0.0) + amount
-        future_margin_after = (
-            self._holding_future_margin_by_asset.get(ba, 0.0)
-            + amount / self._capital_gate_margin_divisor()
-        )
         spot_limit = binance_total * self.max_asset_exposure_ratio
-        future_limit = gate_total * self.max_asset_exposure_ratio
         spot_over = spot_after > spot_limit
-        future_over = future_margin_after > future_limit
-        if not spot_over and not future_over:
+        if not spot_over:
             return True, ''
 
         quality_ok, quality_reason = self._check_quality_scale_in(
             ba,
             row,
             spot_after,
-            future_margin_after,
             binance_total,
-            gate_total,
         )
         if quality_ok:
             if row is not None:
@@ -2331,13 +2236,6 @@ class TradingExecutor:
                 False,
                 f"单标的资金占用(Binance spot {spot_after:.2f}>"
                 f"总资金{self.max_asset_exposure_ratio:.0%}={spot_limit:.2f}USDT"
-                f"{self._format_quality_scale_in_fail(quality_reason)})"
-            )
-        if future_margin_after > future_limit:
-            return (
-                False,
-                f"单标的资金占用(Gate保证金 {future_margin_after:.2f}>"
-                f"总资金{self.max_asset_exposure_ratio:.0%}={future_limit:.2f}USDT"
                 f"{self._format_quality_scale_in_fail(quality_reason)})"
             )
         return True, ''
@@ -2354,9 +2252,7 @@ class TradingExecutor:
         base_asset: str,
         row: Optional[Dict],
         spot_after: float,
-        future_margin_after: float,
         binance_total: float,
-        gate_total: float,
     ) -> tuple:
         """普通单币 10% 额度用完后，允许极优机会进入增强额度。"""
         if not self.quality_scale_in_enabled:
@@ -2367,20 +2263,12 @@ class TradingExecutor:
             return False, '增强额度未高于普通额度'
 
         enhanced_spot_limit = binance_total * self.quality_scale_in_enhanced_ratio
-        enhanced_future_limit = gate_total * self.quality_scale_in_enhanced_ratio
         if spot_after > enhanced_spot_limit:
             return (
                 False,
                 f"Binance spot {spot_after:.2f}>"
                 f"增强{self.quality_scale_in_enhanced_ratio:.0%}={enhanced_spot_limit:.2f}"
             )
-        if future_margin_after > enhanced_future_limit:
-            return (
-                False,
-                f"Gate保证金 {future_margin_after:.2f}>"
-                f"增强{self.quality_scale_in_enhanced_ratio:.0%}={enhanced_future_limit:.2f}"
-            )
-
         now = datetime.now()
         last_time = self._quality_scale_in_last_time.get(base_asset)
         if last_time and self.quality_scale_in_cooldown_sec > 0:
@@ -2417,7 +2305,7 @@ class TradingExecutor:
         if self._holding_exchange_risk_by_asset.get(base_asset):
             return False, '存在交易所仓位风险'
 
-        margin_rate = self._effective_holding_margin_rate(base_asset)
+        margin_rate = self._gate_cross_account_mmr_pct()
         if margin_rate is not None and margin_rate < self.quality_scale_in_min_gate_margin_rate_pct:
             return (
                 False,
@@ -3026,12 +2914,11 @@ class TradingExecutor:
         if not delist_ok:
             return delist_reason
 
-        # 保证金风控检查：逐仓看单标的，Gate 全仓看账户级 MMR。
-        margin_rate = self._effective_holding_margin_rate(base_asset)
+        # Gate 正向仓位固定为全仓模式，开仓只看账户级 MMR。
+        margin_rate = self._gate_cross_account_mmr_pct()
         if margin_rate is not None and margin_rate < self.margin_warning_pct:
-            label = "Gate全仓MMR" if self._is_gate_cross_margin() else "保证金/维持保证金"
             return (
-                f"保证金风控({label}"
+                f"保证金风控(Gate全仓MMR"
                 f"{margin_rate:.1f}%<{self.margin_warning_pct:.1f}%)"
             )
 
@@ -3602,7 +3489,7 @@ class TradingExecutor:
             # 注入渠道和持仓关联
             order['channel'] = self.executor_client.channel
             order['position_id'] = position_id
-            order['leverage'] = self._order_leg_leverage(market_key)
+            order['leverage'] = 0.0 if market_key == 'future_order' else 1.0
             
             # 更新成交信息
             if exec_result['success']:
@@ -3645,19 +3532,6 @@ class TradingExecutor:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, order)
 
-    def _order_leg_leverage(self, market_key: str) -> float:
-        if market_key == 'future_order':
-            return self.capital_gate_leverage
-        return 1.0
-
-    def _capital_gate_margin_divisor(self) -> float:
-        """资金占用估算除数；Gate 全仓模式(leverage=0)按 1x 保守占用估算。"""
-        try:
-            leverage = float(self.capital_gate_leverage)
-        except (TypeError, ValueError):
-            leverage = 1.0
-        return max(leverage, 1.0)
-    
     def _create_position(self, order_group: Dict, exec_result: Dict) -> int:
         """创建持仓记录，返回 position_id"""
         spot_order = order_group['spot_order']

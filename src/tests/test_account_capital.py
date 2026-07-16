@@ -48,11 +48,10 @@ class FakeCapitalExecutor:
 
 
 class TestAccountCapitalSnapshotter(unittest.TestCase):
-    def test_default_snapshotter_uses_forward_gate_leverage(self):
+    def test_default_snapshotter_uses_cross_margin(self):
         with patch('calc.account_capital.fetch_contract_meta', return_value={}), \
                 patch('calc.account_capital.fetch_spot_meta', return_value={}), \
                 patch('calc.account_capital.build_exchange_config', return_value=object()), \
-                patch('calc.account_capital.get_forward_gate_leverage', return_value=0.0), \
                 patch('calc.account_capital.RealExecutor') as executor_cls:
             build_default_capital_snapshotter()
 

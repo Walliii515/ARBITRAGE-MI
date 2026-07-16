@@ -15,7 +15,7 @@ from calc.exchange_desync_remediator import (
     ExchangeDesyncRemediationConfig,
     ExchangeDesyncRemediator,
 )
-from calc.real_executor import ExchangeConfig, RealExecutor
+from calc.real_executor import ExchangeConfig, GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger
@@ -67,14 +67,6 @@ def get_ignored_binance_spot_assets() -> Set[str]:
     return normalize_asset_set(config.get('reconciliation.ignored_binance_spot_assets', ['BNB']))
 
 
-def get_forward_gate_leverage() -> float:
-    """Gate leverage for forward strategy futures; 0 means cross margin."""
-    return config.get_float(
-        'margin.forward_open_leverage',
-        0.0,
-    )
-
-
 def build_exchange_config() -> ExchangeConfig:
     """按当前 trade.mode 构建真实交易所只读配置。"""
     env = config.get_real_executor_env()
@@ -112,7 +104,7 @@ def build_default_reconciler() -> 'Reconciler':
         build_exchange_config(),
         contract_meta=contract_meta,
         spot_meta=spot_meta,
-        leverage=get_forward_gate_leverage(),
+        leverage=GATE_CROSS_MARGIN_LEVERAGE,
     )
     cfg = ReconciliationConfig(
         enabled=config.get_bool('reconciliation.enabled', True),

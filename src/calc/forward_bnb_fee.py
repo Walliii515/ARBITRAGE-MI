@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Dict
 from uuid import uuid4
 
-from calc.real_executor import RealExecutor
-from calc.reconciliation import build_exchange_config, get_forward_gate_leverage
+from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
+from calc.reconciliation import build_exchange_config
 from common.logger import get_logger
 
 
@@ -69,7 +69,7 @@ class ForwardBnbFeeBuyer:
 
 def build_default_forward_bnb_fee_buyer() -> ForwardBnbFeeBuyer:
     return ForwardBnbFeeBuyer(
-        RealExecutor(build_exchange_config(), leverage=get_forward_gate_leverage())
+        RealExecutor(build_exchange_config(), leverage=GATE_CROSS_MARGIN_LEVERAGE)
     )
 
 

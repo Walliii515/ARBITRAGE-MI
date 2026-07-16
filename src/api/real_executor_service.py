@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 # 加载 .env（从 src/ 目录向上查找项目根目录的 .env）
 load_dotenv()
 
-from calc.real_executor import RealExecutor, ExchangeConfig
+from calc.real_executor import ExchangeConfig, GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
 from common.config import config
 from common.logger import get_logger, setup_logging
@@ -99,17 +99,18 @@ def _load_meta_and_init():
 
     if _executor is None:
         _exchange_config = _build_exchange_config('forward')
-        leverage = config.get_int(
-            'margin.forward_open_leverage',
-            0,
+        _executor = RealExecutor(
+            _exchange_config,
+            _contract_meta,
+            spot_meta=_spot_meta,
+            leverage=GATE_CROSS_MARGIN_LEVERAGE,
         )
-        _executor = RealExecutor(_exchange_config, _contract_meta, spot_meta=_spot_meta, leverage=leverage)
     else:
         _executor.reload_meta(_contract_meta, _spot_meta)
 
     if _reverse_executor is None:
         _reverse_exchange_config = _build_exchange_config('reverse')
-        leverage = config.get_int('margin.leverage', 2)
+        leverage = config.get_int('reverse_arbitrage.execution.gate_leverage', 5)
         _reverse_executor = RealExecutor(
             _reverse_exchange_config,
             _contract_meta,

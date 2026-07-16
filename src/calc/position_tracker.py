@@ -173,15 +173,15 @@ class PositionTracker:
 
     def _get_real_executor(self):
         if self._real_executor is None:
-            from calc.reconciliation import build_exchange_config, get_forward_gate_leverage
-            from calc.real_executor import RealExecutor
+            from calc.reconciliation import build_exchange_config
+            from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
             from common.meta_loader import fetch_contract_meta, fetch_spot_meta
 
             self._real_executor = RealExecutor(
                 build_exchange_config(),
                 contract_meta=fetch_contract_meta(),
                 spot_meta=fetch_spot_meta(),
-                leverage=get_forward_gate_leverage(),
+                leverage=GATE_CROSS_MARGIN_LEVERAGE,
             )
         return self._real_executor
 

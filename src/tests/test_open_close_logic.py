@@ -103,7 +103,6 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           high_basis_min_entry_buffer_bps=25.0,
                           high_basis_min_net_edge_bps=20.0,
                           presignal_reject_log_cooldown_sec=300,
-                          capital_gate_leverage=2.0,
                           contract_meta=None,
                           spot_meta=None,
                           asset_profile_meta=None):
@@ -147,7 +146,6 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         high_basis_min_entry_buffer_bps=high_basis_min_entry_buffer_bps,
         high_basis_min_net_edge_bps=high_basis_min_net_edge_bps,
         presignal_reject_log_cooldown_sec=presignal_reject_log_cooldown_sec,
-        capital_gate_leverage=capital_gate_leverage,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
         funding_carry_basis_relax_bps=15.0,
@@ -1862,7 +1860,6 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 25.0, 'net_value': 100.0},
             'gate': {'available': 14.0, 'net_value': 100.0},
@@ -1881,10 +1878,9 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
-        te.capital_gate_leverage = 10.0
         te._account_summary = {
             'binance': {'available': 123.0, 'net_value': 1000.0},
-            'gate': {'available': 160.0, 'net_value': 1000.0},
+            'gate': {'available': 249.0, 'net_value': 1000.0},
         }
         te._account_summary_ts = time.time()
 
@@ -1900,10 +1896,9 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
-        te.capital_gate_leverage = 10.0
         te._account_summary = {
             'binance': {'available': 123.0, 'net_value': 1000.0},
-            'gate': {'available': 170.0, 'net_value': 1000.0},
+            'gate': {'available': 270.0, 'net_value': 1000.0},
         }
         te._account_summary_ts = time.time()
 
@@ -1917,7 +1912,6 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
-        te.capital_gate_leverage = 0.0
         te._account_summary = {
             'binance': {'available': 500.0, 'net_value': 1000.0},
             'gate': {
@@ -1946,7 +1940,6 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
-        te.capital_gate_leverage = 0.0
         te._account_summary = {
             'binance': {'available': 500.0, 'net_value': 1000.0},
             'gate': {
@@ -1971,7 +1964,6 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
-        te.capital_gate_leverage = 0.0
         te._account_summary = {
             'binance': {'available': 500.0, 'net_value': 1000.0},
             'gate': {
@@ -1992,16 +1984,8 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('Gate全仓风险预警', reason)
 
-    def test_cross_margin_leverage_zero_is_preserved_for_future_order_record(self):
-        te = make_trading_executor(capital_gate_leverage=0.0)
-
-        self.assertEqual(te.capital_gate_leverage, 0.0)
-        self.assertEqual(te._order_leg_leverage('future_order'), 0.0)
-        self.assertEqual(te._order_leg_leverage('spot_order'), 1.0)
-
-    def test_cross_margin_capital_check_uses_one_x_conservative_divisor(self):
+    def test_cross_margin_capital_check_reserves_full_order_notional(self):
         te = make_trading_executor(
-            capital_gate_leverage=0.0,
             min_binance_available_ratio=0,
             min_gate_available_ratio=0,
         )
@@ -2025,7 +2009,6 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
             'gate': {'available': 80.0, 'net_value': 100.0},
@@ -2039,26 +2022,55 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertFalse(te._pass_risk_check(row))
         self.assertIn('Binance spot', te._get_risk_fail_reason(row))
 
-    def test_asset_future_margin_exposure_ratio_blocks_new_open(self):
+    def test_asset_exposure_uses_spot_leg_for_concentration(self):
         te = make_trading_executor(
             max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
             vwap_threshold_meta={'ALLO': {'p20': 0.0}},
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
-            'binance': {'available': 80.0, 'net_value': 100.0},
-            'gate': {'available': 80.0, 'net_value': 100.0},
+            'binance': {'available': 1000.0, 'net_value': 5000.0},
+            'gate': {
+                'available': 4000.0,
+                'net_value': 4200.0,
+                'cross_risk': {'status': 'safe', 'account_mmr_pct': 3000.0},
+            },
         }
         te._account_summary_ts = time.time()
-        te._holding_future_margin_by_asset['ALLO'] = 8.0
+        te._holding_spot_amount_by_asset['ALLO'] = 275.0
 
         row = self._row('ALLO', 50.0, 0.008646)
-        row['open_amount_usdt'] = 10.0
+        row['open_amount_usdt'] = 160.0
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertNotIn('_quality_scale_in_used', row)
+
+    def test_asset_exposure_still_blocks_spot_concentration(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=False,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 1000.0, 'net_value': 4000.0},
+            'gate': {
+                'available': 4000.0,
+                'net_value': 4200.0,
+                'cross_risk': {'status': 'safe', 'account_mmr_pct': 3000.0},
+            },
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 275.0
+
+        row = self._row('ALLO', 50.0, 0.008646)
+        row['open_amount_usdt'] = 160.0
 
         self.assertFalse(te._pass_risk_check(row))
-        self.assertIn('Gate保证金', te._get_risk_fail_reason(row))
+        self.assertIn('Binance spot 435.00', te._get_risk_fail_reason(row))
 
     def test_asset_exposure_uses_normal_limit_when_quality_scale_in_disabled(self):
         te = make_trading_executor(
@@ -2068,16 +2080,13 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
             'gate': {'available': 80.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 20.0
-        te._holding_margin_rate['ALLO'] = 800.0
 
         row = self._row('ALLO', 50.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -2096,16 +2105,17 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
-            'gate': {'available': 80.0, 'net_value': 100.0},
+            'gate': {
+                'available': 80.0,
+                'net_value': 100.0,
+                'cross_risk': {'status': 'safe', 'account_mmr_pct': 800.0},
+            },
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 20.0
-        te._holding_margin_rate['ALLO'] = 800.0
 
         row = self._row('ALLO', 50.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -2123,16 +2133,13 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
             'gate': {'available': 80.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 43.0
-        te._holding_margin_rate['ALLO'] = 800.0
 
         row = self._row('ALLO', 50.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -2151,16 +2158,13 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
             'gate': {'available': 80.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 100.0
-        te._holding_margin_rate['ALLO'] = 800.0
 
         row = self._row('ALLO', 120.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -2177,15 +2181,12 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
             'gate': {'available': 80.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
-        te._holding_margin_rate['ALLO'] = 800.0
 
         row = self._row('ALLO', 50.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -2204,14 +2205,12 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
             'gate': {'available': 80.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 20.0
 
         row = self._row('ALLO', 50.0, 0.008646)
@@ -2230,16 +2229,17 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
             close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
         )
         te.capital_required = True
-        te.capital_gate_leverage = 2.0
         te._account_summary = {
             'binance': {'available': 80.0, 'net_value': 100.0},
-            'gate': {'available': 80.0, 'net_value': 100.0},
+            'gate': {
+                'available': 80.0,
+                'net_value': 100.0,
+                'cross_risk': {'status': 'safe', 'account_mmr_pct': 249.4},
+            },
         }
         te._account_summary_ts = time.time()
         te._holding_spot_amount_by_asset['ALLO'] = 9.0
-        te._holding_future_margin_by_asset['ALLO'] = 4.5
         te._holding_weighted_basis_by_asset['ALLO'] = 20.0
-        te._holding_margin_rate['ALLO'] = 249.4
 
         row = self._row('ALLO', 50.0, 0.008646)
         row['open_amount_usdt'] = 2.0
@@ -2445,7 +2445,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         te.open_amount_usdt = 100.0
         te._account_summary = {
             'binance': {'available': 25.0, 'net_value': 100.0},
-            'gate': {'available': 16.0, 'net_value': 100.0},
+            'gate': {'available': 25.0, 'net_value': 100.0},
         }
         te._account_summary_ts = time.time()
 
@@ -4271,6 +4271,10 @@ class TestMarginDangerPath(unittest.TestCase):
         ce = make_closing_executor()
         ce.margin_close_threshold_pct = 200.0
         ce.margin_danger_liq_distance_bps = 300.0
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': {'account_mmr_pct': 1000.0},
+        }
         ce._execute_close = MagicMock(return_value={
             'base_asset': 'TUT',
             'success': True,
@@ -4294,6 +4298,10 @@ class TestMarginDangerPath(unittest.TestCase):
     def test_danger_margin_close_uses_minimal_row_when_orderbook_missing(self):
         ce = make_closing_executor()
         ce.margin_danger_liq_distance_bps = 300.0
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': {'account_mmr_pct': 1000.0},
+        }
         ce._execute_close = MagicMock(return_value={
             'base_asset': 'TUT',
             'success': True,
@@ -4308,17 +4316,15 @@ class TestMarginDangerPath(unittest.TestCase):
 
     def test_needs_fresh_margin_risk_detects_mmr_and_liq_distance(self):
         ce = make_closing_executor()
-        ce.forward_gate_leverage = 10.0
         ce.margin_danger_mmr_pct = 300.0
         ce.margin_danger_liq_distance_bps = 300.0
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': {'account_mmr_pct': 450.0},
+        }
 
         safe = self._risk_position(
             gate_maintenance_margin_rate=450.0,
-            gate_liq_price=1.20,
-            gate_mark_price=1.00,
-        )
-        low_mmr = self._risk_position(
-            gate_maintenance_margin_rate=250.0,
             gate_liq_price=1.20,
             gate_mark_price=1.00,
         )
@@ -4333,11 +4339,16 @@ class TestMarginDangerPath(unittest.TestCase):
         )
 
         self.assertFalse(ce.needs_fresh_margin_risk([safe]))
-        self.assertTrue(ce.needs_fresh_margin_risk([low_mmr]))
         self.assertTrue(ce.needs_fresh_margin_risk([near_liq]))
         self.assertTrue(ce.needs_fresh_margin_risk([missing_risk]))
-        summary = ce.margin_risk_refresh_summary([safe, low_mmr, missing_risk])
+        summary = ce.margin_risk_refresh_summary([safe, near_liq, missing_risk])
         self.assertEqual(summary, {'danger': ['TUT'], 'missing': ['TUT']})
+
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': {'account_mmr_pct': 250.0},
+        }
+        self.assertTrue(ce.needs_fresh_margin_risk([safe]))
 
     def test_missing_gate_margin_risk_refresh_can_be_disabled(self):
         ce = make_closing_executor()
@@ -4354,6 +4365,10 @@ class TestMarginDangerPath(unittest.TestCase):
         ce = make_closing_executor()
         ce.margin_danger_mmr_pct = 300.0
         ce.margin_danger_liq_distance_bps = 192.0
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': {'account_mmr_pct': 450.0},
+        }
         pos = self._risk_position(
             gate_maintenance_margin_rate=450.0,
             gate_liq_price=1.05,
@@ -4367,7 +4382,6 @@ class TestMarginDangerPath(unittest.TestCase):
 
     def test_cross_margin_zero_position_margin_does_not_trigger_mmr_close(self):
         ce = make_closing_executor()
-        ce.forward_gate_leverage = 0.0
         ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': None}
         pos = self._risk_position(
             gate_maintenance_margin_rate=0.0,
@@ -4389,7 +4403,6 @@ class TestMarginDangerPath(unittest.TestCase):
 
     def test_cross_margin_uses_account_mmr_snapshot_for_danger_path(self):
         ce = make_closing_executor()
-        ce.forward_gate_leverage = 0.0
         ce.margin_danger_mmr_pct = 300.0
         ce._gate_cross_risk_cache = {
             'ts': time.time(),
@@ -4421,7 +4434,6 @@ class TestMarginDangerPath(unittest.TestCase):
         ce = make_closing_executor()
         pos = self._risk_position(future_open_leverage=0.0)
 
-        self.assertEqual(ce._position_future_leverage(pos), 0.0)
         self.assertEqual(ce._order_leg_leverage('future_order', pos), 0.0)
 
 

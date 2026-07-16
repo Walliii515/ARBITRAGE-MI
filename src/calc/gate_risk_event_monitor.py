@@ -21,8 +21,8 @@ from calc.exchange_desync_remediator import (
     ExchangeDesyncRemediationConfig,
     ExchangeDesyncRemediator,
 )
-from calc.real_executor import RealExecutor
-from calc.reconciliation import build_exchange_config, get_forward_gate_leverage
+from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
+from calc.reconciliation import build_exchange_config
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger, log_print
@@ -58,7 +58,7 @@ def build_default_gate_risk_event_monitor() -> 'GateRiskEventMonitor':
         build_exchange_config(),
         contract_meta=contract_meta,
         spot_meta=spot_meta,
-        leverage=get_forward_gate_leverage(),
+        leverage=GATE_CROSS_MARGIN_LEVERAGE,
     )
     remediation_cfg = ExchangeDesyncRemediationConfig(
         enabled=config.get_bool('exchange_risk_monitor.auto_remediate.enabled', True),

@@ -1037,7 +1037,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_refresh_meta_cache_loop())
     asyncio.create_task(_open_position_loop())
     asyncio.create_task(_reverse_signal_loop())
-    asyncio.create_task(_margin_status_loop())
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
     asyncio.create_task(_account_capital_snapshot_loop())
@@ -1960,10 +1959,6 @@ def _run_open_position_check_once():
                 ),
                 capital_required=config.get_trade_mode() != 'virtual',
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
-                capital_gate_leverage=config.get_float(
-                    'margin.forward_open_leverage',
-                    0.0,
-                ),
                 binance_margin_required=config.get_bool('account_capital.binance_margin.enabled', False),
                 binance_margin_min_open_level=config.get_float(
                     'account_capital.binance_margin.min_open_margin_level',
@@ -2140,52 +2135,6 @@ async def _reverse_signal_loop():
     while True:
         await asyncio.sleep(interval)
         await loop.run_in_executor(_critical_open_executor, _run_reverse_signal_check_once)
-
-
-def _run_margin_status_update_once():
-    """保证金开仓风控缓存刷新；与开仓检查共用同一个专用线程。"""
-    try:
-        if not svc or svc.state != SERVICE_RUNNING:
-            return
-
-        if _trading_executor is None:
-            return
-
-        if not (svc.gate_manager and svc.spot_manager):
-            return
-
-        _margin_tracker = PositionTracker(_contract_meta)
-        _margin_positions = _margin_tracker.get_holding_positions()
-        if not _margin_positions:
-            _trading_executor.update_holding_margin_status([])
-            return
-
-        merged_rows = _get_merged_rows()
-        _margin_close_vwaps: Dict[str, Dict] = {}
-        for _mr in merged_rows:
-            _mba = _mr.get('base_asset', '')
-            _spot_cv = _mr.get('spot_close_vwap')
-            _future_cv = _mr.get('future_close_vwap')
-            if _mba and _spot_cv is not None and _future_cv is not None:
-                _margin_close_vwaps[_mba] = {
-                    'spot_close_vwap': float(_spot_cv),
-                    'future_close_vwap': float(_future_cv),
-                }
-        calculate_realtime_pnl(_margin_positions, _margin_close_vwaps, _contract_meta, _pnl_cfg)
-        attach_gate_position_risk(_margin_positions, _get_gate_position_risk_snapshot())
-        _trading_executor.update_holding_margin_status(_margin_positions)
-    except Exception as e:
-        logger.warning(f"保证金状态更新失败(不影响开仓): {e}", exc_info=True)
-
-
-async def _margin_status_loop():
-    """低频更新保证金风控状态；与开仓关键路径串行执行，避免并发改风控缓存。"""
-    interval = 5
-    loop = asyncio.get_running_loop()
-
-    while True:
-        await asyncio.sleep(interval)
-        await loop.run_in_executor(_critical_open_executor, _run_margin_status_update_once)
 
 
 async def _position_funding_loop():

@@ -33,7 +33,7 @@ from calc.dynamic_take_profit import (
     evaluate_dynamic_take_profit,
     format_dynamic_take_profit,
 )
-from calc.reconciliation import get_forward_gate_leverage
+from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE
 
 logger = get_logger(__name__)
 
@@ -154,7 +154,6 @@ class ClosingExecutor:
         self.fee_future_close = config.get_float('trade.fee.future_close', 0.00075)
         self.fee_future_taker_open = config.get_float('trade.fee.future_taker_open', self.fee_future_open)
         self.fee_future_taker_close = config.get_float('trade.fee.future_taker_close', self.fee_future_close)
-        self.forward_gate_leverage = get_forward_gate_leverage()
         # 全部手续费 BPS（正数，用于止盈阈值累加）
         self.fee_full_bps = -calc_full_fee_bps(
             self.fee_spot_open, self.fee_spot_close,
@@ -902,7 +901,7 @@ class ClosingExecutor:
     def _check_margin_liquidation(self, pos: Dict) -> bool:
         """
         保证金爆仓风控（优先级 0）：
-        当 Gate 保证金/维持保证金低于平仓阈值时触发两端同时平仓。
+        当 Gate 全仓账户 MMR 低于平仓阈值时触发两端同时平仓。
         """
         margin_rate = self._maintenance_margin_rate(pos)
         if margin_rate is None:
@@ -910,36 +909,8 @@ class ClosingExecutor:
         return margin_rate < self.margin_close_threshold_pct
 
     def _maintenance_margin_rate(self, pos: Dict) -> Optional[float]:
-        """Gate 聚合仓位口径：仓位权益 / 维持保证金 * 100，越高越安全。"""
-        if self._is_forward_cross_margin():
-            return self._latest_gate_cross_account_mmr()
-
-        value = pos.get('gate_maintenance_margin_rate')
-        if value is not None:
-            try:
-                rate = float(value)
-            except (TypeError, ValueError):
-                return None
-            if self._is_forward_cross_margin() and rate <= 0:
-                return None
-            return rate
-        margin = _float_or_none(pos.get('gate_position_margin_equity'))
-        if margin is None:
-            raw_margin = _float_or_none(pos.get('gate_position_margin'))
-            unrealised_pnl = _float_or_none(pos.get('gate_unrealised_pnl')) or 0.0
-            margin = raw_margin + unrealised_pnl if raw_margin is not None else None
-        maintenance = _float_or_none(pos.get('gate_maintenance_margin'))
-        if self._is_forward_cross_margin() and (margin is None or margin <= 0):
-            return None
-        if margin is None or maintenance is None or maintenance <= 0:
-            return None
-        return margin / maintenance * 100
-
-    def _is_forward_cross_margin(self) -> bool:
-        try:
-            return abs(float(self.forward_gate_leverage)) < 1e-9
-        except (TypeError, ValueError):
-            return False
+        """Gate 正向仓位固定全仓，使用账户权益 / 总维持保证金。"""
+        return self._latest_gate_cross_account_mmr()
 
     def _latest_gate_cross_account_mmr(self) -> Optional[float]:
         risk = self._latest_gate_cross_risk()
@@ -1008,13 +979,8 @@ class ClosingExecutor:
         future_contract = str(pos.get('future_contract') or '').strip()
         if future_qty <= 0 or not future_contract:
             return False
-        if self._is_forward_cross_margin():
-            return (
-                self._latest_gate_cross_account_mmr() is None
-                or pos.get('gate_liq_price') is None
-            )
         return (
-            pos.get('gate_maintenance_margin_rate') is None
+            self._latest_gate_cross_account_mmr() is None
             or pos.get('gate_liq_price') is None
         )
 
@@ -1074,21 +1040,13 @@ class ClosingExecutor:
         margin_rate = self._maintenance_margin_rate(pos)
         if margin_rate is not None and '保证金/维持保证金' not in prefix:
             parts.append(f"保证金/维持保证金{margin_rate:.2f}%")
-        if self._is_forward_cross_margin():
-            cross_risk = self._latest_gate_cross_risk() or {}
-            account_equity = _float_or_none(cross_risk.get('account_equity_usdt'))
-            total_maintenance = _float_or_none(cross_risk.get('maintenance_margin_usdt'))
-            if account_equity is not None:
-                parts.append(f"全仓权益{account_equity:.4f}")
-            if total_maintenance is not None:
-                parts.append(f"全仓维持保证金{total_maintenance:.4f}")
-        else:
-            gate_margin = pos.get('gate_contract_position_margin', pos.get('gate_position_margin'))
-            gate_maintenance = pos.get('gate_contract_maintenance_margin', pos.get('gate_maintenance_margin'))
-            if gate_margin is not None:
-                parts.append(f"仓位保证金{float(gate_margin or 0):.4f}")
-            if gate_maintenance is not None:
-                parts.append(f"维持保证金{float(gate_maintenance or 0):.4f}")
+        cross_risk = self._latest_gate_cross_risk() or {}
+        account_equity = _float_or_none(cross_risk.get('account_equity_usdt'))
+        total_maintenance = _float_or_none(cross_risk.get('maintenance_margin_usdt'))
+        if account_equity is not None:
+            parts.append(f"全仓权益{account_equity:.4f}")
+        if total_maintenance is not None:
+            parts.append(f"全仓维持保证金{total_maintenance:.4f}")
 
         danger = danger or {}
         if danger.get('liq_price') is not None:
@@ -2216,34 +2174,7 @@ class ClosingExecutor:
         suffix = '|...(完整执行审计见mi_trade_order.reject_reason)'
         return text[: max_len - len(suffix)] + suffix
 
-    def _position_future_leverage(self, pos: Dict) -> float:
-        leverage = _float_or_none(pos.get('future_open_leverage'))
-        if leverage is None and pos.get('id') is not None:
-            leverage = self._load_position_future_open_leverage(int(pos.get('id')))
-        if leverage is None:
-            leverage = self.forward_gate_leverage
-        leverage = float(leverage)
-        if abs(leverage) < 1e-9:
-            return 0.0
-        return max(leverage, 1.0)
-
-    def _load_position_future_open_leverage(self, position_id: int) -> Optional[float]:
-        sql = """
-            SELECT leverage
-            FROM mi_trade_order
-            WHERE position_id = %s
-              AND order_side = 'open'
-              AND market_type = 'future'
-              AND status = 'executed'
-            ORDER BY id ASC
-            LIMIT 1
-        """
-        with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, (position_id,))
-            row = cursor.fetchone()
-        return _float_or_none(row.get('leverage')) if row else None
-
     def _order_leg_leverage(self, market_key: str, pos: Dict) -> float:
         if market_key == 'future_order':
-            return self._position_future_leverage(pos)
+            return GATE_CROSS_MARGIN_LEVERAGE
         return 1.0

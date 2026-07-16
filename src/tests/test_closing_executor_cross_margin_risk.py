@@ -37,7 +37,6 @@ def _risk_position(**overrides):
 class TestClosingExecutorGateCrossRisk(unittest.TestCase):
     def test_cross_margin_missing_refresh_uses_account_mmr_not_contract_mmr(self):
         ce = make_closing_executor()
-        ce.forward_gate_leverage = 0.0
         ce._gate_cross_risk_cache = {
             'ts': time.time(),
             'risk': {
@@ -51,7 +50,6 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
     def test_cross_margin_missing_refresh_requires_account_mmr_and_liq_price(self):
         ce = make_closing_executor()
-        ce.forward_gate_leverage = 0.0
         ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': None}
 
         self.assertTrue(ce.needs_fresh_margin_risk([_risk_position()]))
@@ -66,7 +64,6 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
     def test_cross_margin_does_not_fallback_to_stale_contract_mmr(self):
         ce = make_closing_executor()
-        ce.forward_gate_leverage = 0.0
         ce.margin_close_threshold_pct = 200.0
         ce.margin_danger_mmr_pct = 300.0
         ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': None}

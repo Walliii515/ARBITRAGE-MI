@@ -16,7 +16,6 @@ class TestForwardBinanceMarginGuard(unittest.TestCase):
                 open_amount_usdt=100.0,
                 min_available_ratio=0.0,
                 max_asset_exposure_ratio=0.0,
-                capital_gate_leverage=5.0,
                 binance_margin_required=True,
                 binance_margin_min_open_level=2.5,
             ),

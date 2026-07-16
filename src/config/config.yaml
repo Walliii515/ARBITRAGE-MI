@@ -60,10 +60,10 @@ trade:
     min_available_ratio: 0.10               # 兼容旧字段；未配置分交易所阈值时使用
     min_binance_available_ratio: 0.02       # Binance 下单后可用资金最低比例；主要预留手续费/现货兜底
     min_gate_available_ratio: 0.15          # Gate 下单后可用资金最低比例；预留给全仓风险处置
-    max_asset_exposure_ratio: 0.10          # 单标的 spot开仓额 / future当前保证金 均不得超过各自总资金比例
+    max_asset_exposure_ratio: 0.10          # 单币集中度：等额 Binance spot 名义金额 / Binance 总资金
     quality_scale_in:
       enabled: true                         # 普通单标的额度用完后，极优机会允许进入增强额度
-      enhanced_ratio: 0.20                  # 增强后单标的 spot/future 占用上限
+      enhanced_ratio: 0.20                  # 增强后单标的 Binance spot 集中度上限
       min_funding_24h_bps: 50               # 24h funding 足够厚才允许加仓
       min_basis_improvement_bps: 8          # 优质加仓最低基差改善要求
       basis_improvement_ratio: 0.25         # 相对已有加权入场基差的改善比例
@@ -329,15 +329,11 @@ trade:
 
 # 保证金风控配置（Gate 全仓模式）
 margin:
-  # 默认杠杆倍数（历史仓位/展示兜底；不要用来覆盖已有仓位）
-  leverage: 5
-  # 正向套利新开 Gate future 全仓模式；Gate API leverage=0 表示 cross margin
-  forward_open_leverage: 0
   # 默认维持保证金率（当合约表无数据时的回退值）
   default_maintenance_rate: 0.005
-  # 保证金/维持保证金预警阈值(%): 低于此值时禁止该标的新开仓
+  # Gate 全仓账户 MMR 开仓下限(%): 低于此值时禁止所有正向新开仓
   warning_pct: 300
-  # 保证金/维持保证金紧急平仓阈值(%): 低于此值时由系统主动市价平仓，避免等交易所强平
+  # Gate 全仓账户 MMR 紧急平仓阈值(%): 低于此值时由系统主动市价平仓
   close_threshold_pct: 200
   danger_path:
     enabled: true
@@ -423,6 +419,7 @@ reverse_arbitrage:
   execution:
     enabled: true                           # 反向执行器开关；下单链路仍走反向独立实现，不复用正向执行器
     dry_run: false                          # 反向开仓旁路通过后真实下单
+    gate_leverage: 5                        # 仅反向策略 Gate future 使用
     max_total_positions: 10                 # 反向最大持仓数，先限制不超过10个
     max_positions_per_asset: 2
     min_open_amount_usdt: 0                 # 0 表示第一版不做“有多少开多少”

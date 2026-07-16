@@ -27,6 +27,8 @@ from common.tools import truncate_to_precision
 
 logger = get_logger(__name__)
 
+GATE_CROSS_MARGIN_LEVERAGE = 0.0
+
 
 @dataclass
 class ExchangeConfig:
