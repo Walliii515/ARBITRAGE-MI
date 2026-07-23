@@ -22,6 +22,8 @@ interface CapitalRow {
   fee_cost_usdt: number | null
   total_pnl_usdt: number | null
   gross_total_pnl_usdt: number | null
+  gate_account_balance_usdt?: number | null
+  gate_account_unrealized_pnl_usdt?: number | null
   bnb_available?: number | null
   bnb_available_usdt?: number | null
   gate_cross_risk_status?: string | null
@@ -1027,6 +1029,22 @@ onBeforeUnmount(() => {
             <span v-if="hasAmount(latestByExchange[exchange]?.equity_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
+        <div v-if="exchange === 'gate'" class="gate-equity-breakdown">
+          <div class="gate-equity-item">
+            <span>账户余额</span>
+            <strong>
+              <span>{{ formatAmount(latestByExchange.gate?.gate_account_balance_usdt) }}</span>
+              <span v-if="hasAmount(latestByExchange.gate?.gate_account_balance_usdt)" class="metric-unit">USDT</span>
+            </strong>
+          </div>
+          <div class="gate-equity-item">
+            <span>未实现盈亏</span>
+            <strong :class="Number(latestByExchange.gate?.gate_account_unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+              <span>{{ formatAmount(latestByExchange.gate?.gate_account_unrealized_pnl_usdt) }}</span>
+              <span v-if="hasAmount(latestByExchange.gate?.gate_account_unrealized_pnl_usdt)" class="metric-unit">USDT</span>
+            </strong>
+          </div>
+        </div>
         <div class="metric-row available-row">
           <span class="metric-label-with-help">
             <span>可用资金</span>
@@ -1050,12 +1068,27 @@ onBeforeUnmount(() => {
             </span>
           </strong>
         </div>
-        <div class="metric-row">
+        <div v-if="exchange !== 'gate'" class="metric-row">
           <span>占用</span>
           <strong>
             <span>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</span>
             <span v-if="hasAmount(occupiedAmount(latestByExchange[exchange], exchange))" class="metric-unit">USDT</span>
           </strong>
+        </div>
+        <div v-else class="gate-summary-risk">
+          <div class="metric-row">
+            <span>维持保证金</span>
+            <strong>
+              <span>{{ formatAmount(gateCrossRisk.maintenance_margin_usdt) }}</span>
+              <span v-if="hasAmount(gateCrossRisk.maintenance_margin_usdt)" class="metric-unit">USDT</span>
+            </strong>
+          </div>
+          <div class="metric-row">
+            <span>全仓MMR</span>
+            <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
+              {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
+            </strong>
+          </div>
         </div>
         <div v-if="exchange === 'binance'" class="metric-row bnb-metric-row">
           <span>BNB可用</span>
@@ -1067,7 +1100,7 @@ onBeforeUnmount(() => {
             <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
-        <div v-if="showSummaryDetails" class="metric-row">
+        <div v-if="showSummaryDetails && exchange !== 'gate'" class="metric-row">
           <span>未实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
             <span>{{ formatAmount(latestByExchange[exchange]?.unrealized_pnl_usdt) }}</span>
@@ -1468,6 +1501,40 @@ onBeforeUnmount(() => {
   color: var(--app-text);
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+
+.gate-equity-breakdown {
+  display: grid;
+  gap: 3px;
+  margin: -1px 0 5px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--app-border);
+  color: var(--app-text-muted);
+  font-size: 11px;
+}
+
+.gate-equity-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.gate-equity-item strong {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 0;
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.gate-summary-risk {
+  border-top: 1px solid var(--app-border);
+  margin-top: 5px;
+  padding-top: 3px;
 }
 
 .metric-label-with-help {

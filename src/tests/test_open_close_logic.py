@@ -113,6 +113,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           high_basis_min_funding_24h_bps=3.0,
                           high_basis_min_entry_buffer_bps=25.0,
                           high_basis_min_net_edge_bps=20.0,
+                          high_basis_scale_in_min_basis_improvement_bps=20.0,
                           presignal_reject_log_cooldown_sec=300,
                           contract_meta=None,
                           spot_meta=None,
@@ -155,6 +156,9 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         high_basis_min_funding_24h_bps=high_basis_min_funding_24h_bps,
         high_basis_min_entry_buffer_bps=high_basis_min_entry_buffer_bps,
         high_basis_min_net_edge_bps=high_basis_min_net_edge_bps,
+        high_basis_scale_in_min_basis_improvement_bps=(
+            high_basis_scale_in_min_basis_improvement_bps
+        ),
         presignal_reject_log_cooldown_sec=presignal_reject_log_cooldown_sec,
         funding_carry_allowed_tiers=['A', 'B'],
         funding_carry_min_24h_bps=30.0,
@@ -2169,6 +2173,148 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertTrue(te._pass_risk_check(row))
         self.assertTrue(row.get('_quality_scale_in_used'))
         self.assertIn('10%->20%', row.get('_quality_scale_in_reason', ''))
+
+    def test_high_basis_quality_scale_in_allows_weak_funding_to_20_percent_limit(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            high_basis_enabled=True,
+            high_basis_scale_in_min_basis_improvement_bps=20.0,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': fresh_safe_gate_summary(80.0, 100.0),
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_weighted_basis_by_asset['ALLO'] = 40.0
+
+        row = self._row('ALLO', 70.0, 0.0006)
+        row.update({
+            'funding_rate_24h_avg_bps': 2.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertEqual(row.get('_open_channel'), 'high_basis')
+        self.assertTrue(row.get('_quality_scale_in_used'))
+        reason = row.get('_quality_scale_in_reason', '')
+        self.assertIn('高基差优质加仓额度', reason)
+        self.assertIn('10%->20%', reason)
+        self.assertIn('basis_improve=30.0/20.0bps', reason)
+
+    def test_high_basis_quality_scale_in_is_checked_after_stable_funding_admission(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            high_basis_enabled=True,
+            high_basis_scale_in_min_basis_improvement_bps=20.0,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': fresh_safe_gate_summary(80.0, 100.0),
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_weighted_basis_by_asset['ALLO'] = 40.0
+
+        row = self._row('ALLO', 70.0, 0.0009)
+        row.update({
+            'funding_rate_24h_avg_bps': 9.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertEqual(row.get('_open_channel'), 'funding')
+        self.assertTrue(row.get('_quality_scale_in_used'))
+        self.assertIn('高基差优质加仓额度', row.get('_quality_scale_in_reason', ''))
+
+    def test_quality_scale_in_reports_funding_and_high_basis_rejections(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            high_basis_enabled=True,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': fresh_safe_gate_summary(80.0, 100.0),
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_weighted_basis_by_asset['ALLO'] = 40.0
+
+        row = self._row('ALLO', 38.0, 0.0009)
+        row.update({
+            'funding_rate_24h_avg_bps': 9.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('funding24h 9.0<50.0bps', reason)
+        self.assertIn('高基差加仓不达标', reason)
+        self.assertIn('基差垫', reason)
+
+    def test_high_basis_quality_scale_in_requires_stricter_basis_improvement(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            max_asset_exposure_ratio=0.10,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.20,
+            high_basis_enabled=True,
+            high_basis_scale_in_min_basis_improvement_bps=20.0,
+            vwap_threshold_meta={'ALLO': {'p20': 10.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': 0.0}},
+            asset_tier_meta={'ALLO': 'A'},
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': fresh_safe_gate_summary(80.0, 100.0),
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 9.0
+        te._holding_weighted_basis_by_asset['ALLO'] = 55.0
+
+        row = self._row('ALLO', 70.0, 0.0006)
+        row.update({
+            'funding_rate_24h_avg_bps': 2.0,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('优质加仓拒绝', reason)
+        self.assertIn('基差改善15.0<20.0bps', reason)
 
     def test_quality_scale_in_rejects_when_basis_not_enough_better(self):
         te = make_trading_executor(

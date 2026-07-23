@@ -176,6 +176,7 @@ trade:
     min_funding_24h_bps: 3                  # funding 不要求很厚，但实时24h不能太差
     min_entry_buffer_bps: 25                # 当前基差至少高于 entry_floor 的额外安全垫
     min_net_edge_bps: 20                    # 当前基差 - 平仓p20 - 全部手续费 - 滑点缓冲后的最低净空间
+    scale_in_min_basis_improvement_bps: 20  # 使用20%增强额度时，相对已有加权入场基差的最低改善
     close_take_profit_bps: 30               # 高基差仓单独净止盈阈值，避免按普通carry仓长期占用资金
     close_positive_funding_hold_enabled: false # 高基差仓默认不因下一期小额正资金费暂缓止盈
 

@@ -147,6 +147,7 @@ class TradingExecutorConfig:
     high_basis_min_funding_24h_bps: float = 3.0
     high_basis_min_entry_buffer_bps: float = 25.0
     high_basis_min_net_edge_bps: float = 20.0
+    high_basis_scale_in_min_basis_improvement_bps: float = 20.0
 
     # ─── 行情画像参数覆盖 ───
     thin_bursty_enabled: bool = True
@@ -427,6 +428,10 @@ class TradingExecutor:
         self.high_basis_min_funding_24h_bps = float(cfg.high_basis_min_funding_24h_bps)
         self.high_basis_min_entry_buffer_bps = float(cfg.high_basis_min_entry_buffer_bps)
         self.high_basis_min_net_edge_bps = float(cfg.high_basis_min_net_edge_bps)
+        self.high_basis_scale_in_min_basis_improvement_bps = max(
+            float(cfg.high_basis_scale_in_min_basis_improvement_bps),
+            0.0,
+        )
 
         self.thin_bursty_enabled = bool(cfg.thin_bursty_enabled)
         self.thin_bursty_open_amount_multiplier = self.reduced_open_amount_multiplier
@@ -2271,21 +2276,37 @@ class TradingExecutor:
             if remain > 0:
                 return False, f"冷却{remain:.0f}s"
 
-        funding_bps = self._funding_24h_bps(base_asset, row)
-        if funding_bps < self.quality_scale_in_min_funding_24h_bps:
-            return (
-                False,
-                f"funding24h {funding_bps:.1f}<"
-                f"{self.quality_scale_in_min_funding_24h_bps:.1f}bps"
-            )
-
         current_basis = self._float_or_none(row.get('open_vwap_basis_bps'))
         if current_basis is None:
             return False, '缺少当前基差'
+
+        funding_bps = self._funding_24h_bps(base_asset, row)
+        funding_scale_in = funding_bps >= self.quality_scale_in_min_funding_24h_bps
+        high_basis_scale_in = False
+        high_basis_snapshot: Dict = {}
+        if not funding_scale_in:
+            high_ok, high_reason, high_basis_snapshot = self._high_basis_snapshot(
+                base_asset,
+                current_basis,
+                row,
+            )
+            if not high_ok:
+                return False, (
+                f"funding24h {funding_bps:.1f}<"
+                    f"{self.quality_scale_in_min_funding_24h_bps:.1f}bps;"
+                    f"高基差加仓不达标:{high_reason}"
+                )
+            high_basis_scale_in = True
+
         existing_basis = self._holding_weighted_basis_by_asset.get(base_asset)
         if existing_basis is None:
             return False, '缺少已有仓位均价'
         required_improvement = self._quality_scale_in_required_improvement_bps(existing_basis)
+        if high_basis_scale_in:
+            required_improvement = max(
+                required_improvement,
+                self.high_basis_scale_in_min_basis_improvement_bps,
+            )
         improvement = current_basis - float(existing_basis)
         if improvement < required_improvement:
             return (
@@ -2299,6 +2320,17 @@ class TradingExecutor:
 
         if self._holding_exchange_risk_by_asset.get(base_asset):
             return False, '存在交易所仓位风险'
+
+        if high_basis_scale_in:
+            return (
+                True,
+                f"高基差优质加仓额度("
+                f"{self.max_asset_exposure_ratio:.0%}->{self.quality_scale_in_enhanced_ratio:.0%},"
+                f"funding={funding_bps:.1f}bps,"
+                f"basis_improve={improvement:.1f}/{required_improvement:.1f}bps,"
+                f"entry_buffer={float(high_basis_snapshot.get('high_basis_entry_buffer_bps') or 0):.1f}bps,"
+                f"net={float(high_basis_snapshot.get('high_basis_net_edge_bps') or 0):.1f}bps)"
+            )
 
         return (
             True,

@@ -2006,6 +2006,9 @@ def _run_open_position_check_once():
                 high_basis_min_net_edge_bps=config.get_float(
                     'trade.high_basis_open.min_net_edge_bps', 20.0
                 ),
+                high_basis_scale_in_min_basis_improvement_bps=config.get_float(
+                    'trade.high_basis_open.scale_in_min_basis_improvement_bps', 20.0
+                ),
                 thin_bursty_enabled=config.get_bool('trade.market_profile.thin_bursty.enabled', True),
                 thin_bursty_max_orderbook_lag_ms=config.get_float(
                     'trade.market_profile.thin_bursty.max_orderbook_lag_ms', 1500.0
