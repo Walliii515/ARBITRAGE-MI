@@ -1257,8 +1257,21 @@ async def get_capital_latest():
             fee_cost_usdt,
             total_pnl_usdt,
             COALESCE(total_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.raw_total_usdt')), 'null') AS DECIMAL(28,12)) AS gate_account_balance_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.account_unrealized_pnl')), 'null') AS DECIMAL(28,12)) AS gate_account_unrealized_pnl_usdt,
+            CASE
+                WHEN exchange = 'gate' THEN COALESCE(
+                    CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.raw_total_usdt')), 'null') AS DECIMAL(28,12)),
+                    equity_usdt - COALESCE(unrealized_pnl_usdt, 0)
+                )
+                ELSE equity_usdt - COALESCE(unrealized_pnl_usdt, 0)
+            END AS account_balance_usdt,
+            CASE
+                WHEN exchange = 'gate' THEN COALESCE(
+                    CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.account_unrealized_pnl')), 'null') AS DECIMAL(28,12)),
+                    unrealized_pnl_usdt,
+                    0
+                )
+                ELSE COALESCE(unrealized_pnl_usdt, 0)
+            END AS account_unrealized_pnl_usdt,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.bnb_fee_asset.free')) AS DECIMAL(28,12)) AS bnb_available,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.bnb_fee_asset.free_value_usdt')) AS DECIMAL(28,12)) AS bnb_available_usdt,
             NULLIF(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.status')), 'null') AS gate_cross_risk_status,
@@ -1338,8 +1351,21 @@ async def get_capital_history(
             s.fee_cost_usdt,
             s.total_pnl_usdt,
             COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.raw_total_usdt')), 'null') AS DECIMAL(28,12)) AS gate_account_balance_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.account_unrealized_pnl')), 'null') AS DECIMAL(28,12)) AS gate_account_unrealized_pnl_usdt,
+            CASE
+                WHEN s.exchange = 'gate' THEN COALESCE(
+                    CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.raw_total_usdt')), 'null') AS DECIMAL(28,12)),
+                    s.equity_usdt - COALESCE(s.unrealized_pnl_usdt, 0)
+                )
+                ELSE s.equity_usdt - COALESCE(s.unrealized_pnl_usdt, 0)
+            END AS account_balance_usdt,
+            CASE
+                WHEN s.exchange = 'gate' THEN COALESCE(
+                    CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.account_unrealized_pnl')), 'null') AS DECIMAL(28,12)),
+                    s.unrealized_pnl_usdt,
+                    0
+                )
+                ELSE COALESCE(s.unrealized_pnl_usdt, 0)
+            END AS account_unrealized_pnl_usdt,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.bnb_fee_asset.free')) AS DECIMAL(28,12)) AS bnb_available,
             CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.bnb_fee_asset.free_value_usdt')) AS DECIMAL(28,12)) AS bnb_available_usdt,
             NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status')), 'null') AS gate_cross_risk_status,

@@ -22,13 +22,12 @@ interface CapitalRow {
   fee_cost_usdt: number | null
   total_pnl_usdt: number | null
   gross_total_pnl_usdt: number | null
-  gate_account_balance_usdt?: number | null
-  gate_account_unrealized_pnl_usdt?: number | null
+  account_balance_usdt?: number | null
+  account_unrealized_pnl_usdt?: number | null
   bnb_available?: number | null
   bnb_available_usdt?: number | null
   gate_cross_risk_status?: string | null
   gate_cross_risk_status_label?: string | null
-  gate_cross_position_count?: number | null
   gate_cross_mmr_pct?: number | null
   gate_cross_available_ratio_pct?: number | null
   gate_cross_margin_usage_pct?: number | null
@@ -36,23 +35,13 @@ interface CapitalRow {
   gate_cross_maintenance_margin_usdt?: number | null
   gate_cross_nearest_liq_contract?: string | null
   gate_cross_nearest_liq_distance_bps?: number | null
-  gate_cross_health_status?: string | null
-  gate_cross_health_label?: string | null
-  gate_cross_observed_status?: string | null
-  gate_cross_source?: string | null
   gate_cross_error?: string | null
   gate_cross_fetched_at?: string | null
-  gate_cross_account_age_sec?: number | null
-  gate_cross_positions_age_sec?: number | null
-  gate_cross_account_latency_ms?: number | null
-  gate_cross_positions_latency_ms?: number | null
-  gate_cross_latency_ms?: number | null
 }
 
 interface GateCrossRiskSnapshot {
   status?: string | null
   status_label?: string | null
-  position_count?: number | null
   account_mmr_pct?: number | null
   available_ratio_pct?: number | null
   margin_usage_pct?: number | null
@@ -60,18 +49,8 @@ interface GateCrossRiskSnapshot {
   maintenance_margin_usdt?: number | null
   nearest_liq_contract?: string | null
   nearest_liq_distance_bps?: number | null
-  health_status?: string | null
-  health_label?: string | null
-  observed_status?: string | null
-  source?: string | null
   error?: string | null
   fetched_at?: string | null
-  account_age_sec?: number | null
-  positions_age_sec?: number | null
-  max_age_sec?: number | null
-  account_latency_ms?: number | null
-  positions_latency_ms?: number | null
-  latency_ms?: number | null
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -208,7 +187,6 @@ const gateCrossRisk = computed<GateCrossRiskSnapshot>(() => {
   return {
     status: row?.gate_cross_risk_status,
     status_label: row?.gate_cross_risk_status_label,
-    position_count: row?.gate_cross_position_count,
     account_mmr_pct: row?.gate_cross_mmr_pct,
     available_ratio_pct: row?.gate_cross_available_ratio_pct,
     margin_usage_pct: row?.gate_cross_margin_usage_pct,
@@ -216,22 +194,10 @@ const gateCrossRisk = computed<GateCrossRiskSnapshot>(() => {
     maintenance_margin_usdt: row?.gate_cross_maintenance_margin_usdt,
     nearest_liq_contract: row?.gate_cross_nearest_liq_contract,
     nearest_liq_distance_bps: row?.gate_cross_nearest_liq_distance_bps,
-    health_status: row?.gate_cross_health_status,
-    health_label: row?.gate_cross_health_label,
-    observed_status: row?.gate_cross_observed_status,
-    source: row?.gate_cross_source,
     error: row?.gate_cross_error,
     fetched_at: row?.gate_cross_fetched_at,
-    account_age_sec: row?.gate_cross_account_age_sec,
-    positions_age_sec: row?.gate_cross_positions_age_sec,
-    account_latency_ms: row?.gate_cross_account_latency_ms,
-    positions_latency_ms: row?.gate_cross_positions_latency_ms,
-    latency_ms: row?.gate_cross_latency_ms,
   }
 })
-const gateRiskHealthStatus = computed(() => (
-  liveGateRiskRequestError.value ? 'unavailable' : gateCrossRisk.value.health_status
-))
 const gateRiskHealthError = computed(() => (
   liveGateRiskRequestError.value || gateCrossRisk.value.error || ''
 ))
@@ -534,42 +500,6 @@ function gateRiskStatusLabel(risk: GateCrossRiskSnapshot): string {
             : risk.status === 'unknown' ? '未知'
             : '未采集'
   )
-}
-
-function gateRiskHealthClass(status: string | null | undefined): string {
-  if (status === 'healthy') return 'risk-safe'
-  if (status === 'degraded' || status === 'stale') return 'risk-warning'
-  if (status === 'unavailable') return 'risk-danger'
-  return 'risk-idle'
-}
-
-function gateRiskHealthLabel(): string {
-  if (liveGateRiskRequestError.value) return '接口异常'
-  return gateCrossRisk.value.health_label || (
-    gateCrossRisk.value.health_status === 'healthy' ? '正常'
-      : gateCrossRisk.value.health_status === 'degraded' ? '部分异常'
-        : gateCrossRisk.value.health_status === 'stale' ? '数据陈旧'
-          : gateCrossRisk.value.health_status === 'unavailable' ? '不可用'
-            : '未采集'
-  )
-}
-
-function formatAge(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(Number(value))) return '-'
-  const seconds = Math.max(Number(value), 0)
-  return seconds < 10 ? `${seconds.toFixed(1)}s` : `${seconds.toFixed(0)}s`
-}
-
-function formatLatency(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(Number(value))) return '-'
-  return `${Number(value).toFixed(0)}ms`
-}
-
-function formatRiskSource(value: string | null | undefined): string {
-  if (value === 'gate_account_api') return 'Gate REST'
-  if (value === 'gate_cross_risk_loop') return '风险采集器'
-  if (value === 'gate_cross_risk_monitor') return '风险监控器'
-  return value || '-'
 }
 
 function formatRiskContract(contract: string | null | undefined, fallback = '-'): string {
@@ -1029,19 +959,19 @@ onBeforeUnmount(() => {
             <span v-if="hasAmount(latestByExchange[exchange]?.equity_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
-        <div v-if="exchange === 'gate'" class="gate-equity-breakdown">
-          <div class="gate-equity-item">
+        <div class="equity-breakdown">
+          <div class="equity-breakdown-item">
             <span>账户余额</span>
             <strong>
-              <span>{{ formatAmount(latestByExchange.gate?.gate_account_balance_usdt) }}</span>
-              <span v-if="hasAmount(latestByExchange.gate?.gate_account_balance_usdt)" class="metric-unit">USDT</span>
+              <span>{{ formatAmount(latestByExchange[exchange]?.account_balance_usdt) }}</span>
+              <span v-if="hasAmount(latestByExchange[exchange]?.account_balance_usdt)" class="metric-unit">USDT</span>
             </strong>
           </div>
-          <div class="gate-equity-item">
+          <div class="equity-breakdown-item">
             <span>未实现盈亏</span>
-            <strong :class="Number(latestByExchange.gate?.gate_account_unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-              <span>{{ formatAmount(latestByExchange.gate?.gate_account_unrealized_pnl_usdt) }}</span>
-              <span v-if="hasAmount(latestByExchange.gate?.gate_account_unrealized_pnl_usdt)" class="metric-unit">USDT</span>
+            <strong :class="Number(latestByExchange[exchange]?.account_unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+              <span>{{ formatAmount(latestByExchange[exchange]?.account_unrealized_pnl_usdt) }}</span>
+              <span v-if="hasAmount(latestByExchange[exchange]?.account_unrealized_pnl_usdt)" class="metric-unit">USDT</span>
             </strong>
           </div>
         </div>
@@ -1100,13 +1030,6 @@ onBeforeUnmount(() => {
             <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
-        <div v-if="showSummaryDetails && exchange !== 'gate'" class="metric-row">
-          <span>未实现盈亏</span>
-          <strong :class="Number(latestByExchange[exchange]?.unrealized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            <span>{{ formatAmount(latestByExchange[exchange]?.unrealized_pnl_usdt) }}</span>
-            <span v-if="hasAmount(latestByExchange[exchange]?.unrealized_pnl_usdt)" class="metric-unit">USDT</span>
-          </strong>
-        </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>已实现盈亏</span>
           <strong :class="Number(latestByExchange[exchange]?.realized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
@@ -1152,9 +1075,6 @@ onBeforeUnmount(() => {
           <span class="gate-risk-subtitle">{{ gateCrossRisk.fetched_at || '等待实时采集' }}</span>
         </div>
         <div class="gate-risk-badges">
-          <span class="risk-badge" :class="gateRiskHealthClass(gateRiskHealthStatus)">
-            {{ gateRiskHealthLabel() }}
-          </span>
           <span class="risk-badge" :class="gateRiskStatusClass(gateCrossRisk.status)">
             {{ gateRiskStatusLabel(gateCrossRisk) }}
           </span>
@@ -1176,6 +1096,13 @@ onBeforeUnmount(() => {
           <strong>{{ formatPercent(gateCrossRisk.margin_usage_pct) }}</strong>
         </div>
         <div class="risk-metric">
+          <span>初始保证金</span>
+          <strong>
+            {{ formatAmount(gateCrossRisk.initial_margin_usdt) }}
+            <small v-if="hasAmount(gateCrossRisk.initial_margin_usdt)">USDT</small>
+          </strong>
+        </div>
+        <div class="risk-metric risk-maintenance-metric">
           <span>维持保证金</span>
           <strong>
             {{ formatAmount(gateCrossRisk.maintenance_margin_usdt) }}
@@ -1183,42 +1110,9 @@ onBeforeUnmount(() => {
           </strong>
         </div>
         <div class="risk-metric">
-          <span>初始保证金</span>
-          <strong>
-            {{ formatAmount(gateCrossRisk.initial_margin_usdt) }}
-            <small v-if="hasAmount(gateCrossRisk.initial_margin_usdt)">USDT</small>
-          </strong>
-        </div>
-        <div class="risk-metric">
           <span>最近强平距离</span>
           <strong>{{ formatBps(gateCrossRisk.nearest_liq_distance_bps) }}</strong>
           <em>{{ formatRiskContract(gateCrossRisk.nearest_liq_contract) }}</em>
-        </div>
-        <div class="risk-metric">
-          <span>Gate持仓数</span>
-          <strong>{{ gateCrossRisk.position_count ?? '-' }}</strong>
-        </div>
-        <div class="risk-metric">
-          <span>数据健康</span>
-          <strong :class="gateRiskHealthClass(gateRiskHealthStatus)">{{ gateRiskHealthLabel() }}</strong>
-        </div>
-        <div class="risk-metric">
-          <span>账户数据年龄</span>
-          <strong>{{ formatAge(gateCrossRisk.account_age_sec) }}</strong>
-          <em>上限 {{ formatAge(gateCrossRisk.max_age_sec) }}</em>
-        </div>
-        <div class="risk-metric">
-          <span>持仓数据年龄</span>
-          <strong>{{ formatAge(gateCrossRisk.positions_age_sec) }}</strong>
-        </div>
-        <div class="risk-metric">
-          <span>采集耗时</span>
-          <strong>{{ formatLatency(gateCrossRisk.latency_ms) }}</strong>
-          <em>账户 {{ formatLatency(gateCrossRisk.account_latency_ms) }} / 持仓 {{ formatLatency(gateCrossRisk.positions_latency_ms) }}</em>
-        </div>
-        <div class="risk-metric">
-          <span>数据源</span>
-          <strong>{{ formatRiskSource(gateCrossRisk.source) }}</strong>
         </div>
       </div>
       <div v-if="gateRiskHealthError" class="risk-health-error">
@@ -1408,7 +1302,7 @@ onBeforeUnmount(() => {
 
 .gate-risk-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
   gap: 1px;
   overflow: hidden;
   border: 1px solid var(--app-border);
@@ -1454,6 +1348,14 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.risk-maintenance-metric strong {
+  color: #e6a23c;
+}
+
+.risk-maintenance-metric small {
+  color: color-mix(in srgb, #e6a23c 72%, var(--app-text-muted));
 }
 
 .risk-health-error {
@@ -1503,7 +1405,7 @@ onBeforeUnmount(() => {
   text-align: right;
 }
 
-.gate-equity-breakdown {
+.equity-breakdown {
   display: grid;
   gap: 3px;
   margin: -1px 0 5px;
@@ -1513,14 +1415,14 @@ onBeforeUnmount(() => {
   font-size: 11px;
 }
 
-.gate-equity-item {
+.equity-breakdown-item {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
 }
 
-.gate-equity-item strong {
+.equity-breakdown-item strong {
   display: inline-flex;
   align-items: baseline;
   justify-content: flex-end;
@@ -1681,8 +1583,38 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 900px) {
+  .capital-page {
+    padding: 10px;
+  }
+
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .summary-card {
+    min-width: 0;
+    padding: 10px;
+    overflow: hidden;
+  }
+
+  .card-header,
+  .metric-row,
+  .equity-breakdown-item {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .metric-row strong,
+  .equity-breakdown-item strong {
+    justify-content: flex-start;
+    max-width: 100%;
+    text-align: left;
+  }
+
+  .available-value,
+  .bnb-value {
+    max-width: 100%;
   }
 
   .gate-risk-header {
@@ -1697,7 +1629,23 @@ onBeforeUnmount(() => {
   }
 
   .gate-risk-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .risk-metric {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .risk-metric strong {
+    font-size: 13px;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .risk-metric em {
+    grid-column: 1;
+    text-align: left;
   }
 
   .chart-header,
