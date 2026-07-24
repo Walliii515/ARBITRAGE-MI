@@ -139,7 +139,7 @@ const clearDefaultTime = [
 ]
 const openRiskConfig = ref<OpenRiskConfig>({
   min_available_ratio: 0.10,
-  min_binance_available_ratio: 0.02,
+  min_binance_available_ratio: 0.08,
   min_gate_available_ratio: 0.15,
 })
 const chartRef = ref<HTMLDivElement | null>(null)

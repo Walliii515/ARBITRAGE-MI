@@ -58,7 +58,7 @@ trade:
     cooldown_sec: 60                        # 同标的开仓冷却（秒）
     reject_cooldown_sec: 60                 # 被交易所拒单后冷却（秒），避免重复提交失败订单
     min_available_ratio: 0.10               # 兼容旧字段；未配置分交易所阈值时使用
-    min_binance_available_ratio: 0.02       # Binance 下单后可用资金最低比例；主要预留手续费/现货兜底
+    min_binance_available_ratio: 0.08       # Binance 下单后可用资金最低比例；主要预留手续费/现货兜底
     min_gate_available_ratio: 0.15          # Gate 下单后可用资金最低比例；预留给全仓风险处置
     max_asset_exposure_ratio: 0.10          # 单币集中度：等额 Binance spot 名义金额 / Binance 总资金
     quality_scale_in:

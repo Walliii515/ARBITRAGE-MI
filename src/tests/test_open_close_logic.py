@@ -1909,12 +1909,12 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
     def test_exchange_available_ratio_uses_split_thresholds(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.02,
+            min_binance_available_ratio=0.08,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
         te._account_summary = {
-            'binance': {'available': 123.0, 'net_value': 1000.0},
+            'binance': {'available': 200.0, 'net_value': 1000.0},
             'gate': fresh_safe_gate_summary(249.0, 1000.0),
         }
         te._account_summary_ts = time.time()
@@ -1925,14 +1925,32 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertIn('Gate下单后可用', reason)
         self.assertIn('总资金15%', reason)
 
-    def test_binance_available_ratio_allows_lower_fee_buffer(self):
+    def test_binance_available_ratio_blocks_below_eight_percent_reserve(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.02,
+            min_binance_available_ratio=0.08,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
         te._account_summary = {
-            'binance': {'available': 123.0, 'net_value': 1000.0},
+            'binance': {'available': 179.0, 'net_value': 1000.0},
+            'gate': fresh_safe_gate_summary(270.0, 1000.0),
+        }
+        te._account_summary_ts = time.time()
+
+        ok, reason = te._check_account_capital(100.0)
+
+        self.assertFalse(ok)
+        self.assertIn('Binance下单后可用', reason)
+        self.assertIn('总资金8%', reason)
+
+    def test_binance_available_ratio_allows_above_eight_percent_reserve(self):
+        te = make_trading_executor(
+            min_binance_available_ratio=0.08,
+            min_gate_available_ratio=0.15,
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 181.0, 'net_value': 1000.0},
             'gate': fresh_safe_gate_summary(270.0, 1000.0),
         }
         te._account_summary_ts = time.time()
@@ -1943,7 +1961,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
     def test_gate_cross_risk_warning_blocks_new_open(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.02,
+            min_binance_available_ratio=0.08,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
@@ -1972,7 +1990,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
     def test_gate_cross_risk_safe_allows_new_open(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.02,
+            min_binance_available_ratio=0.08,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
@@ -1997,7 +2015,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
     def test_gate_cross_risk_warning_from_detail_blocks_new_open(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.02,
+            min_binance_available_ratio=0.08,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
