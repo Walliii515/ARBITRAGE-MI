@@ -26,6 +26,7 @@ from calc.reconciliation import build_default_reconciler, get_ignored_binance_sp
 from calc.account_capital import build_default_capital_snapshotter
 from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
+from calc.gate_cross_risk import gate_cross_risk_pressure
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.listing_event_monitor import (
     add_listing_asset_to_monitor,
@@ -821,6 +822,89 @@ def _filter_capital_transfer_transient_rows(rows: List[Dict[str, Any]]) -> List[
     return [row for idx, row in enumerate(rows) if idx not in remove_indexes]
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    if value in (None, ''):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gate_cross_primary_risk(risk: Dict[str, Any]) -> tuple[Optional[Dict], str]:
+    primary = risk.get('primary_risk')
+    if isinstance(primary, dict) and primary.get('contract'):
+        return primary, 'full_snapshot'
+
+    candidates = [
+        item
+        for item in (risk.get('top_risks') or [])
+        if isinstance(item, dict) and item.get('contract')
+    ]
+    if candidates:
+        return max(
+            candidates,
+            key=lambda item: (
+                gate_cross_risk_pressure(item),
+                _optional_float(item.get('maintenance_margin_usdt')) or 0.0,
+                str(item.get('contract') or ''),
+            ),
+        ), 'legacy_top_risks'
+
+    contract = risk.get('primary_risk_contract')
+    if contract:
+        return {
+            'contract': contract,
+            'risk_pressure_usdt': risk.get('primary_risk_pressure_usdt'),
+        }, 'snapshot_contract'
+    return None, 'unavailable'
+
+
+def _build_gate_cross_minimum_summary(row: Optional[Dict[str, Any]]) -> Optional[Dict]:
+    if not row:
+        return None
+
+    detail = row.get('detail')
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except (TypeError, ValueError):
+            detail = {}
+    detail = detail if isinstance(detail, dict) else {}
+    risk = detail.get('gate_cross_risk')
+    risk = risk if isinstance(risk, dict) else {}
+    primary, attribution = _gate_cross_primary_risk(risk)
+    primary = primary or {}
+    contract = str(primary.get('contract') or '').strip().upper() or None
+    base_asset = contract
+    if base_asset and base_asset.endswith('_USDT'):
+        base_asset = base_asset[:-5]
+
+    mmr_pct = _optional_float(row.get('gate_cross_mmr_pct'))
+    if mmr_pct is None:
+        mmr_pct = _optional_float(risk.get('account_mmr_pct'))
+    pressure = _optional_float(primary.get('risk_pressure_usdt'))
+    if primary and pressure is None:
+        pressure = gate_cross_risk_pressure(primary)
+
+    serialized = _serialize_row({'snapshot_at': row.get('snapshot_at')})
+    return {
+        'account_mmr_pct': mmr_pct,
+        'snapshot_at': serialized.get('snapshot_at'),
+        'primary_risk_contract': contract,
+        'primary_risk_asset': base_asset,
+        'primary_risk_pressure_usdt': pressure,
+        'maintenance_margin_usdt': _optional_float(
+            primary.get('maintenance_margin_usdt')
+        ),
+        'unrealized_pnl_usdt': _optional_float(
+            primary.get('unrealized_pnl_usdt')
+        ),
+        'liq_distance_bps': _optional_float(primary.get('liq_distance_bps')),
+        'attribution': attribution,
+    }
+
+
 def _reconciliation_ignore_clause(table_alias: str = '') -> tuple[str, List[Any]]:
     ignored = sorted(get_ignored_binance_spot_assets())
     if not ignored:
@@ -1236,6 +1320,63 @@ def _parse_capital_range_datetime(value: str, field_name: str) -> datetime:
         except ValueError:
             pass
     raise HTTPException(status_code=400, detail=f'{field_name} 格式必须为 YYYY-MM-DD HH:mm:ss')
+
+
+@router.get('/capital/gate-cross-risk/summary')
+async def get_gate_cross_risk_summary(
+    days: int = Query(7, ge=1, le=90, description="最近N天"),
+):
+    """Return the lowest valid Gate cross MMR and its main risk contributor."""
+    sql = """
+        SELECT
+            snapshot_at,
+            CAST(
+                NULLIF(
+                    JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_mmr_pct')),
+                    'null'
+                ) AS DECIMAL(28,12)
+            ) AS gate_cross_mmr_pct,
+            detail
+        FROM mi_capital_snapshot
+        WHERE exchange = 'gate'
+          AND snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
+          AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
+          AND CAST(
+                NULLIF(
+                    JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.position_count')),
+                    'null'
+                ) AS UNSIGNED
+              ) > 0
+          AND CAST(
+                NULLIF(
+                    JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.account_mmr_pct')),
+                    'null'
+                ) AS DECIMAL(28,12)
+              ) > 0
+          AND COALESCE(
+                NULLIF(
+                    JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.health_status')),
+                    'null'
+                ),
+                'healthy'
+              ) = 'healthy'
+          AND COALESCE(
+                NULLIF(
+                    JSON_UNQUOTE(JSON_EXTRACT(detail, '$.gate_cross_risk.source')),
+                    'null'
+                ),
+                'gate_account_api'
+              ) = 'gate_account_api'
+        ORDER BY gate_cross_mmr_pct ASC, snapshot_at ASC
+        LIMIT 1
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, [days])
+        row = cursor.fetchone()
+    return {
+        'period_days': days,
+        'minimum': _build_gate_cross_minimum_summary(row),
+    }
 
 
 @router.get('/capital/latest')

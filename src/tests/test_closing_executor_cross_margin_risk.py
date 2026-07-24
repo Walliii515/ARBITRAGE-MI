@@ -105,6 +105,46 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
         self.assertEqual(ce._execute_close.call_args_list[0].args[3], {'base_asset': 'TUT'})
         self.assertEqual(ce._execute_close.call_args_list[1].args[3], {'base_asset': 'AI'})
 
+    def test_account_mmr_danger_uses_gate_risk_close_priority(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(
+                status='danger',
+                account_mmr_pct=250.0,
+                close_priority=[
+                    {'contract': 'AI_USDT', 'reason': 'maintenance_margin'},
+                    {'contract': 'TUT_USDT', 'reason': 'maintenance_margin'},
+                ],
+            ),
+        }
+        positions = [
+            _risk_position(gate_liq_price=1.50),
+            _risk_position(
+                id=12,
+                base_asset='AI',
+                future_contract='AI_USDT',
+                spot_symbol='AIUSDT',
+                gate_liq_price=2.0,
+                gate_mark_price=1.0,
+            ),
+        ]
+        ce._execute_close = MagicMock(side_effect=[
+            {'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close'},
+            {'base_asset': 'TUT', 'success': True, 'close_reason': 'margin_close'},
+        ])
+
+        results = ce.check_and_close_margin_danger(positions, {})
+
+        self.assertEqual([item['position_id'] for item in results], [12, 11])
+        self.assertEqual(
+            [
+                call.args[0]['future_contract']
+                for call in ce._execute_close.call_args_list
+            ],
+            ['AI_USDT', 'TUT_USDT'],
+        )
+
     def test_liquidation_distance_danger_only_closes_affected_contract(self):
         ce = make_closing_executor()
         ce._gate_cross_risk_cache = {

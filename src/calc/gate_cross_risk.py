@@ -201,6 +201,65 @@ def gate_account_metrics(account: Dict) -> Dict[str, float]:
     }
 
 
+def gate_cross_risk_pressure(item: Dict) -> float:
+    """Estimate how strongly one contract is depressing account-level MMR."""
+    maintenance = max(_float(item.get('maintenance_margin_usdt')), 0.0)
+    unrealized = _float(item.get('unrealized_pnl_usdt'))
+    return maintenance + max(-unrealized, 0.0)
+
+
+def build_gate_cross_close_priority(
+    risk_items: List[Dict],
+    *,
+    danger_liq_distance_bps: float,
+) -> List[Dict]:
+    """Return the deterministic order used by the cross-margin emergency close."""
+
+    def priority_key(item: Dict):
+        liq_distance = _float_or_none(item.get('liq_distance_bps'))
+        maintenance = max(_float(item.get('maintenance_margin_usdt')), 0.0)
+        pressure = gate_cross_risk_pressure(item)
+        is_liq_danger = (
+            liq_distance is not None
+            and liq_distance <= danger_liq_distance_bps
+        )
+        if is_liq_danger:
+            return (
+                0,
+                liq_distance,
+                -maintenance,
+                -pressure,
+                str(item.get('contract') or ''),
+            )
+        return (
+            1,
+            -maintenance,
+            -pressure,
+            liq_distance if liq_distance is not None else float('inf'),
+            str(item.get('contract') or ''),
+        )
+
+    ordered = sorted(risk_items or [], key=priority_key)
+    result = []
+    for rank, item in enumerate(ordered, start=1):
+        liq_distance = _float_or_none(item.get('liq_distance_bps'))
+        is_liq_danger = (
+            liq_distance is not None
+            and liq_distance <= danger_liq_distance_bps
+        )
+        result.append({
+            'rank': rank,
+            'contract': item.get('contract'),
+            'reason': 'liquidation_distance' if is_liq_danger else 'maintenance_margin',
+            'liq_distance_bps': _round(liq_distance),
+            'maintenance_margin_usdt': _round(
+                _float(item.get('maintenance_margin_usdt'))
+            ),
+            'risk_pressure_usdt': _round(gate_cross_risk_pressure(item)),
+        })
+    return result
+
+
 def build_gate_cross_risk(
     account: Dict,
     positions: List[Dict],
@@ -231,6 +290,9 @@ def build_gate_cross_risk(
             'initial_margin_usdt': _round(initial_margin),
             'unrealized_pnl_usdt': _round(unrealized),
             'maintenance_margin_usdt': _round(maintenance),
+            'risk_pressure_usdt': _round(
+                max(maintenance, 0.0) + max(-unrealized, 0.0)
+            ),
             'liq_distance_bps': _round(liq_distance_bps),
             'mark_price': _round(_float_or_none(pos.get('mark_price')), 10),
             'liq_price': _round(_float_or_none(pos.get('liq_price')), 10),
@@ -254,6 +316,19 @@ def build_gate_cross_risk(
     available_ratio_pct = available / equity * 100 if equity > 0 else None
     margin_usage_pct = margin_used / equity * 100 if equity > 0 else None
     has_exposure = bool(active_positions) or total_maintenance > 0
+    primary_risk = max(
+        top_risks,
+        key=lambda item: (
+            gate_cross_risk_pressure(item),
+            _float(item.get('maintenance_margin_usdt')),
+            str(item.get('contract') or ''),
+        ),
+        default=None,
+    )
+    close_priority = build_gate_cross_close_priority(
+        top_risks,
+        danger_liq_distance_bps=thresholds.danger_liq_distance_bps,
+    )
 
     top_risks.sort(key=lambda item: (
         item['liq_distance_bps'] is None,
@@ -291,6 +366,18 @@ def build_gate_cross_risk(
         'account_mmr_difference_pct': _round(difference_pct),
         'nearest_liq_contract': nearest_liq.get('contract') if nearest_liq else None,
         'nearest_liq_distance_bps': nearest_liq.get('liq_distance_bps') if nearest_liq else None,
+        'primary_risk_contract': primary_risk.get('contract') if primary_risk else None,
+        'primary_risk_pressure_usdt': (
+            primary_risk.get('risk_pressure_usdt') if primary_risk else None
+        ),
+        'primary_risk': primary_risk,
+        'priority_close_contract': (
+            close_priority[0].get('contract') if close_priority else None
+        ),
+        'priority_close_reason': (
+            close_priority[0].get('reason') if close_priority else None
+        ),
+        'close_priority': close_priority,
         'thresholds': {
             'warning_mmr_pct': thresholds.warning_mmr_pct,
             'danger_mmr_pct': thresholds.danger_mmr_pct,

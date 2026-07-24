@@ -1,13 +1,18 @@
+import asyncio
+import json
 import unittest
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 from api.trading_api import (
     _append_unique_notification,
+    _build_gate_cross_minimum_summary,
     _build_forward_signal_filters,
     _filter_capital_transfer_transient_rows,
     _format_reconciliation_notification,
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
+    get_gate_cross_risk_summary,
 )
 
 
@@ -149,6 +154,84 @@ class CapitalHistoryFilterTests(unittest.TestCase):
         filtered = _filter_capital_transfer_transient_rows(rows)
 
         self.assertEqual(filtered, rows)
+
+
+class GateCrossRiskSummaryTests(unittest.TestCase):
+    def test_legacy_snapshot_rebuilds_primary_risk_from_pressure(self):
+        summary = _build_gate_cross_minimum_summary({
+            'snapshot_at': datetime(2026, 7, 24, 9, 26, 54),
+            'gate_cross_mmr_pct': '554.68',
+            'detail': json.dumps({
+                'gate_cross_risk': {
+                    'top_risks': [
+                        {
+                            'contract': 'BANK_USDT',
+                            'maintenance_margin_usdt': 297.18,
+                            'unrealized_pnl_usdt': -1418.75,
+                            'liq_distance_bps': 6235.74,
+                        },
+                        {
+                            'contract': 'AI_USDT',
+                            'maintenance_margin_usdt': 30,
+                            'unrealized_pnl_usdt': -20,
+                            'liq_distance_bps': 500,
+                        },
+                    ],
+                },
+            }),
+        })
+
+        self.assertEqual(summary['account_mmr_pct'], 554.68)
+        self.assertEqual(summary['snapshot_at'], '2026-07-24 09:26:54')
+        self.assertEqual(summary['primary_risk_contract'], 'BANK_USDT')
+        self.assertEqual(summary['primary_risk_asset'], 'BANK')
+        self.assertAlmostEqual(summary['primary_risk_pressure_usdt'], 1715.93)
+        self.assertEqual(summary['attribution'], 'legacy_top_risks')
+
+    def test_new_snapshot_prefers_explicit_primary_risk(self):
+        summary = _build_gate_cross_minimum_summary({
+            'snapshot_at': '2026-07-24 10:00:00',
+            'gate_cross_mmr_pct': 480,
+            'detail': {
+                'gate_cross_risk': {
+                    'primary_risk': {
+                        'contract': 'AI_USDT',
+                        'risk_pressure_usdt': 200,
+                        'maintenance_margin_usdt': 80,
+                        'unrealized_pnl_usdt': -120,
+                    },
+                    'top_risks': [{
+                        'contract': 'BANK_USDT',
+                        'maintenance_margin_usdt': 500,
+                        'unrealized_pnl_usdt': -500,
+                    }],
+                },
+            },
+        })
+
+        self.assertEqual(summary['primary_risk_asset'], 'AI')
+        self.assertEqual(summary['maintenance_margin_usdt'], 80.0)
+        self.assertEqual(summary['unrealized_pnl_usdt'], -120.0)
+        self.assertEqual(summary['attribution'], 'full_snapshot')
+
+    def test_summary_endpoint_returns_empty_minimum_when_no_valid_snapshot(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch(
+            'api.trading_api.db_manager.get_cursor',
+            return_value=context,
+        ):
+            result = asyncio.run(get_gate_cross_risk_summary(days=7))
+
+        self.assertEqual(result, {'period_days': 7, 'minimum': None})
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("health_status", sql)
+        self.assertIn("position_count", sql)
+        self.assertEqual(params, [7])
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from calc.gate_cross_risk import (
     GateCrossRiskMonitor,
     GateCrossRiskThresholds,
+    build_gate_cross_close_priority,
     build_gate_cross_risk,
     gate_account_metrics,
     gate_cross_risk_health,
@@ -248,6 +249,96 @@ class TestGateCrossRisk(unittest.TestCase):
 
         self.assertEqual(risk['status'], 'danger')
         self.assertAlmostEqual(risk['nearest_liq_distance_bps'], 200.0)
+
+    def test_close_priority_puts_liquidation_danger_before_larger_maintenance(self):
+        priority = build_gate_cross_close_priority(
+            [
+                {
+                    'contract': 'BANK_USDT',
+                    'maintenance_margin_usdt': 100,
+                    'unrealized_pnl_usdt': -20,
+                    'liq_distance_bps': 900,
+                },
+                {
+                    'contract': 'AI_USDT',
+                    'maintenance_margin_usdt': 10,
+                    'unrealized_pnl_usdt': -5,
+                    'liq_distance_bps': 250,
+                },
+            ],
+            danger_liq_distance_bps=300,
+        )
+
+        self.assertEqual(
+            [item['contract'] for item in priority],
+            ['AI_USDT', 'BANK_USDT'],
+        )
+        self.assertEqual(priority[0]['reason'], 'liquidation_distance')
+        self.assertEqual(priority[1]['reason'], 'maintenance_margin')
+
+    def test_close_priority_uses_maintenance_for_non_liquidation_positions(self):
+        priority = build_gate_cross_close_priority(
+            [
+                {
+                    'contract': 'AI_USDT',
+                    'maintenance_margin_usdt': 10,
+                    'unrealized_pnl_usdt': -500,
+                    'liq_distance_bps': 800,
+                },
+                {
+                    'contract': 'BANK_USDT',
+                    'maintenance_margin_usdt': 100,
+                    'unrealized_pnl_usdt': 0,
+                    'liq_distance_bps': 900,
+                },
+            ],
+            danger_liq_distance_bps=300,
+        )
+
+        self.assertEqual(
+            [item['contract'] for item in priority],
+            ['BANK_USDT', 'AI_USDT'],
+        )
+
+    def test_snapshot_separates_primary_risk_from_first_close_contract(self):
+        risk = build_gate_cross_risk(
+            {
+                'cross_mmr': '2.5',
+                'cross_margin_balance': '100',
+                'cross_maintenance_margin': '40',
+                'cross_available': '50',
+            },
+            [
+                {
+                    'contract': 'AI_USDT',
+                    'size': '-10',
+                    'maintenance_margin': '10',
+                    'unrealised_pnl': '-500',
+                    'mark_price': '1',
+                    'liq_price': '1.08',
+                },
+                {
+                    'contract': 'BANK_USDT',
+                    'size': '-10',
+                    'maintenance_margin': '20',
+                    'unrealised_pnl': '-10',
+                    'mark_price': '1',
+                    'liq_price': '1.025',
+                },
+            ],
+            equity=100,
+            available=50,
+            margin_used=20,
+        )
+
+        self.assertEqual(risk['primary_risk_contract'], 'AI_USDT')
+        self.assertEqual(risk['primary_risk_pressure_usdt'], 510.0)
+        self.assertEqual(risk['priority_close_contract'], 'BANK_USDT')
+        self.assertEqual(risk['priority_close_reason'], 'liquidation_distance')
+        self.assertEqual(
+            [item['contract'] for item in risk['close_priority']],
+            ['BANK_USDT', 'AI_USDT'],
+        )
 
 
 if __name__ == '__main__':

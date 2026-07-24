@@ -354,7 +354,8 @@ class ClosingExecutor:
 
         rows = orderbook_rows_by_asset or {}
         results = []
-        for pos in positions or []:
+        ordered_positions = self._sort_margin_danger_positions(positions, cross_risk)
+        for pos in ordered_positions:
             if pos.get('status') != 'holding':
                 continue
 
@@ -424,6 +425,33 @@ class ClosingExecutor:
                 self._release_margin_close(inflight_key)
 
         return results
+
+    @staticmethod
+    def _sort_margin_danger_positions(
+        positions: Optional[List[Dict]],
+        cross_risk: Optional[Dict],
+    ) -> List[Dict]:
+        """Match local holdings to the close priority published by Gate risk."""
+        priority_by_contract = {}
+        for index, item in enumerate((cross_risk or {}).get('close_priority') or []):
+            contract = item.get('contract') if isinstance(item, dict) else item
+            contract = str(contract or '').strip().upper()
+            if contract and contract not in priority_by_contract:
+                priority_by_contract[contract] = index
+
+        if not priority_by_contract:
+            return list(positions or [])
+
+        fallback_rank = len(priority_by_contract)
+        indexed_positions = list(enumerate(positions or []))
+        indexed_positions.sort(key=lambda indexed: (
+            priority_by_contract.get(
+                str(indexed[1].get('future_contract') or '').strip().upper(),
+                fallback_rank,
+            ),
+            indexed[0],
+        ))
+        return [pos for _, pos in indexed_positions]
 
     def check_and_close(
         self,

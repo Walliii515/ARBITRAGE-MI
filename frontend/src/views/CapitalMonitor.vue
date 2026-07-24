@@ -49,8 +49,27 @@ interface GateCrossRiskSnapshot {
   maintenance_margin_usdt?: number | null
   nearest_liq_contract?: string | null
   nearest_liq_distance_bps?: number | null
+  priority_close_contract?: string | null
+  priority_close_reason?: string | null
   error?: string | null
   fetched_at?: string | null
+}
+
+interface GateCrossRiskMinimum {
+  account_mmr_pct?: number | null
+  snapshot_at?: string | null
+  primary_risk_contract?: string | null
+  primary_risk_asset?: string | null
+  primary_risk_pressure_usdt?: number | null
+  maintenance_margin_usdt?: number | null
+  unrealized_pnl_usdt?: number | null
+  liq_distance_bps?: number | null
+  attribution?: string | null
+}
+
+interface GateCrossRiskSummary {
+  period_days: number
+  minimum?: GateCrossRiskMinimum | null
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -101,6 +120,8 @@ const latestRows = ref<CapitalRow[]>([])
 const historyRows = ref<CapitalRow[]>([])
 const liveGateRisk = ref<GateCrossRiskSnapshot | null>(null)
 const liveGateRiskRequestError = ref('')
+const gateRiskSummary = ref<GateCrossRiskSummary | null>(null)
+const gateRiskSummaryRequestError = ref('')
 const loading = ref(false)
 const running = ref(false)
 const selectedWindow = ref<TimeWindowKey>('7d')
@@ -200,6 +221,13 @@ const gateCrossRisk = computed<GateCrossRiskSnapshot>(() => {
 })
 const gateRiskHealthError = computed(() => (
   liveGateRiskRequestError.value || gateCrossRisk.value.error || ''
+))
+const recentMinimumGateRisk = computed(() => gateRiskSummary.value?.minimum || null)
+const gatePriorityAsset = computed(() => (
+  formatRiskContract(gateCrossRisk.value.priority_close_contract)
+))
+const gateRiskPanelError = computed(() => (
+  gateRiskSummaryRequestError.value || gateRiskHealthError.value
 ))
 const chartExchange = computed<ExchangeKey>(() => (
   selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
@@ -472,8 +500,8 @@ function availableHelpText(exchange: string): string {
   if (exchange === 'gate') {
     return [
       `开仓预留: Gate 每笔正向开仓前都会检查“本次下单后可用资金 / Gate净值”是否仍 >= ${formatPercent(minAvailableRatio(exchange))}。低于该值时只拦截新的正向开仓，不会自动切换左侧“暂停正向开仓”，已有持仓和平仓逻辑不受影响。`,
-      '系统主动平仓: 持仓监控会刷新 Gate 全仓 MMR 和强平价。MMR <= 300% 或正向空头距强平价 <= 300bps 时进入危险路径，系统按保证金风控全量市价平仓；若已低于 200% 也会作为兜底保证金风控触发。',
-      '交易所强平/ADL: 以 Gate 返回的 liq_price 和交易所风控为准。页面在“Gate 全仓风险”里看全仓MMR和最近强平距离；发生交易所强平/ADL 后，Gate风险WS/持仓对账会写入铃铛和交易所风险。'
+      '已有持仓仍会执行普通止盈、负资金费、下架风险和对账兜底平仓。全仓MMR的停开、主动平仓与交易所强平规则，请查看“全仓MMR”后的问号。',
+      '发生交易所强平或 ADL 后，Gate 风险WS与持仓对账会写入铃铛和交易所风险。'
     ].join('\n\n')
   }
   return '合计可用资金仅用于观察，不参与单交易所开仓预留风控。'
@@ -491,20 +519,29 @@ function gateRiskStatusClass(status: string | null | undefined): string {
   return 'risk-idle'
 }
 
-function gateRiskStatusLabel(risk: GateCrossRiskSnapshot): string {
-  return risk.status_label || (
-    risk.status === 'danger' ? '危险'
-      : risk.status === 'warning' ? '预警'
-        : risk.status === 'safe' ? '安全'
-          : risk.status === 'idle' ? '无持仓'
-            : risk.status === 'unknown' ? '未知'
-            : '未采集'
-  )
+function gateMmrValueClass(value: number | null | undefined): string {
+  const mmr = Number(value)
+  if (!Number.isFinite(mmr)) return 'risk-idle'
+  if (mmr <= 300) return 'risk-danger'
+  if (mmr <= 500) return 'risk-warning'
+  return 'risk-safe'
 }
 
 function formatRiskContract(contract: string | null | undefined, fallback = '-'): string {
   if (!contract || contract === 'null') return fallback
   return contract.replace(/_USDT$/i, '')
+}
+
+function gatePriorityReasonText(): string {
+  if (!gateCrossRisk.value.priority_close_contract) return '当前没有可排序的 Gate 正向持仓'
+  const reason = gateCrossRisk.value.priority_close_reason === 'liquidation_distance'
+    ? '距强平价已进入 300bps 危险区，优先级最高'
+    : '按维持保证金占用从高到低排序'
+  const mmr = Number(gateCrossRisk.value.account_mmr_pct)
+  if (Number.isFinite(mmr) && mmr <= 500) {
+    return `${reason}；当前已停开，MMR降至300%时执行`
+  }
+  return `${reason}；500%停开，MMR降至300%时执行`
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -673,6 +710,18 @@ async function fetchLiveGateRisk() {
   }
 }
 
+async function fetchGateRiskSummary() {
+  try {
+    const res = await get('/api/trading/capital/gate-cross-risk/summary?days=7', { silent: true })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    gateRiskSummary.value = data
+    gateRiskSummaryRequestError.value = ''
+  } catch (e: any) {
+    gateRiskSummaryRequestError.value = e?.message || 'Gate风险历史摘要不可用'
+  }
+}
+
 async function fetchCapital() {
   loading.value = true
   try {
@@ -680,6 +729,7 @@ async function fetchCapital() {
     const latest = await latestRes.json()
     latestRows.value = latest.rows || []
 
+    await fetchGateRiskSummary()
     await fetchHistory()
   } catch (e: any) {
     showError(e?.message || '获取资金数据失败')
@@ -1014,7 +1064,43 @@ onBeforeUnmount(() => {
             </strong>
           </div>
           <div class="metric-row">
-            <span>全仓MMR</span>
+            <span class="metric-label-with-help">
+              <span>全仓MMR</span>
+              <el-popover
+                trigger="click"
+                placement="top"
+                width="min(560px, calc(100vw - 24px))"
+              >
+                <template #reference>
+                  <el-button
+                    class="help-icon-button"
+                    text
+                    circle
+                    size="small"
+                    aria-label="全仓MMR风控说明"
+                  >
+                    <el-icon><QuestionFilled /></el-icon>
+                  </el-button>
+                </template>
+                <div class="mmr-help">
+                  <div class="mmr-help-row">
+                    <strong class="risk-warning">500%</strong>
+                    <span>停止新的正向开仓并写入铃铛告警。已有持仓不会因为 500% 被强平，仍会执行普通止盈、负资金费、下架风险和对账兜底平仓。</span>
+                  </div>
+                  <div class="mmr-help-row">
+                    <strong class="risk-danger">300%</strong>
+                    <span>使用 5 秒内的 Gate 官方账户 MMR，按风险顺序全量退出全部正向持仓：先平距强平价不超过 300bps 的合约，再按维持保证金从高到低处理；每笔先以 reduce-only 市价买回 Gate 空头，再市价卖出 Binance 现货。该路径不依赖盘口、WS 或普通平仓冷却，失败会在下一轮立即重试。</span>
+                  </div>
+                  <div class="mmr-help-row">
+                    <strong>100%</strong>
+                    <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在 300% 完成主动退出。</span>
+                  </div>
+                  <div class="mmr-help-note">
+                    独立危险条件：任一正向空头距强平价不超过 300bps 时，不等待账户 MMR 降至 300%，立即市价平掉该合约对应的完整套利仓位。
+                  </div>
+                </div>
+              </el-popover>
+            </span>
             <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
               {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
             </strong>
@@ -1069,54 +1155,35 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="gate-risk-panel">
-      <div class="gate-risk-header">
-        <div class="gate-risk-heading">
-          <span class="gate-risk-title">Gate 全仓风险</span>
-          <span class="gate-risk-subtitle">{{ gateCrossRisk.fetched_at || '等待实时采集' }}</span>
+      <div class="gate-risk-review-header">
+        <span>Gate 风险重点</span>
+        <span>历史仅统计有效官方快照</span>
+      </div>
+      <div class="gate-risk-review-grid">
+        <div class="gate-risk-review-item">
+          <span class="gate-risk-review-label">近7天最低全仓MMR</span>
+          <strong :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
+            {{ formatPercent(recentMinimumGateRisk?.account_mmr_pct) }}
+          </strong>
+          <div class="gate-risk-review-meta">
+            <span>{{ recentMinimumGateRisk?.snapshot_at || '暂无有效历史快照' }}</span>
+            <span v-if="recentMinimumGateRisk?.primary_risk_asset">
+              主要风险币 {{ recentMinimumGateRisk.primary_risk_asset }}
+            </span>
+          </div>
         </div>
-        <div class="gate-risk-badges">
-          <span class="risk-badge" :class="gateRiskStatusClass(gateCrossRisk.status)">
-            {{ gateRiskStatusLabel(gateCrossRisk) }}
-          </span>
+        <div class="gate-risk-review-item">
+          <span class="gate-risk-review-label">低于500%首平候选</span>
+          <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
+            {{ gatePriorityAsset }}
+          </strong>
+          <div class="gate-risk-review-meta">
+            <span>{{ gatePriorityReasonText() }}</span>
+          </div>
         </div>
       </div>
-      <div class="gate-risk-grid">
-        <div class="risk-metric">
-          <span>全仓MMR</span>
-          <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
-            {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
-          </strong>
-        </div>
-        <div class="risk-metric">
-          <span>可用率</span>
-          <strong>{{ formatPercent(gateCrossRisk.available_ratio_pct) }}</strong>
-        </div>
-        <div class="risk-metric">
-          <span>占用率</span>
-          <strong>{{ formatPercent(gateCrossRisk.margin_usage_pct) }}</strong>
-        </div>
-        <div class="risk-metric">
-          <span>初始保证金</span>
-          <strong>
-            {{ formatAmount(gateCrossRisk.initial_margin_usdt) }}
-            <small v-if="hasAmount(gateCrossRisk.initial_margin_usdt)">USDT</small>
-          </strong>
-        </div>
-        <div class="risk-metric risk-maintenance-metric">
-          <span>维持保证金</span>
-          <strong>
-            {{ formatAmount(gateCrossRisk.maintenance_margin_usdt) }}
-            <small v-if="hasAmount(gateCrossRisk.maintenance_margin_usdt)">USDT</small>
-          </strong>
-        </div>
-        <div class="risk-metric">
-          <span>最近强平距离</span>
-          <strong>{{ formatBps(gateCrossRisk.nearest_liq_distance_bps) }}</strong>
-          <em>{{ formatRiskContract(gateCrossRisk.nearest_liq_contract) }}</em>
-        </div>
-      </div>
-      <div v-if="gateRiskHealthError" class="risk-health-error">
-        {{ gateRiskHealthError }}
+      <div v-if="gateRiskPanelError" class="risk-health-error">
+        {{ gateRiskPanelError }}
       </div>
     </div>
 
@@ -1234,128 +1301,84 @@ onBeforeUnmount(() => {
   padding: 12px 14px;
 }
 
-.gate-risk-header {
+.gate-risk-review-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 10px;
-}
-
-.gate-risk-title {
   color: var(--app-text);
   font-size: 15px;
   font-weight: 700;
 }
 
-.gate-risk-heading {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}
-
-.gate-risk-subtitle {
+.gate-risk-review-header span:last-child {
   color: var(--app-text-muted);
   font-size: 11px;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-.gate-risk-badges {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.risk-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 58px;
-  height: 24px;
-  padding: 0 10px;
-  border: 1px solid var(--app-border);
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .risk-safe {
   color: #67c23a !important;
-  border-color: color-mix(in srgb, #67c23a 45%, var(--app-border));
 }
 
 .risk-warning {
   color: #e6a23c !important;
-  border-color: color-mix(in srgb, #e6a23c 50%, var(--app-border));
 }
 
 .risk-danger {
   color: #f56c6c !important;
-  border-color: color-mix(in srgb, #f56c6c 55%, var(--app-border));
 }
 
 .risk-idle {
   color: var(--app-text-muted) !important;
 }
 
-.gate-risk-grid {
+.gate-risk-review-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(180px, 1fr));
-  gap: 1px;
-  overflow: hidden;
-  border: 1px solid var(--app-border);
-  border-radius: 4px;
-  background: var(--app-border);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.risk-metric {
+.gate-risk-review-item {
   display: grid;
-  grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
-  align-items: baseline;
-  column-gap: 10px;
-  row-gap: 2px;
-  min-height: 44px;
-  padding: 8px 10px;
-  background: var(--app-surface);
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
+  align-items: center;
+  column-gap: 14px;
+  row-gap: 4px;
+  min-height: 58px;
+  padding: 8px 12px;
+  border-left: 1px solid var(--app-border);
+}
+
+.gate-risk-review-item:first-child {
+  border-left: 0;
+}
+
+.gate-risk-review-label {
   color: var(--app-text-muted);
   font-size: 12px;
+  white-space: nowrap;
 }
 
-.risk-metric strong {
+.gate-risk-review-item strong {
   min-width: 0;
   color: var(--app-text);
-  font-size: 15px;
+  font-size: 18px;
   font-variant-numeric: tabular-nums;
   text-align: right;
   white-space: nowrap;
 }
 
-.risk-metric small {
-  margin-left: 2px;
-  color: var(--app-text-muted);
-  font-size: 10px;
-  font-weight: 500;
-}
-
-.risk-metric em {
-  grid-column: 2;
+.gate-risk-review-meta {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
   color: var(--app-text-muted);
   font-size: 11px;
-  font-style: normal;
-  text-align: right;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.risk-maintenance-metric strong {
-  color: #e6a23c;
-}
-
-.risk-maintenance-metric small {
-  color: color-mix(in srgb, #e6a23c 72%, var(--app-text-muted));
+  line-height: 1.5;
 }
 
 .risk-health-error {
@@ -1459,6 +1482,32 @@ onBeforeUnmount(() => {
   font-size: 12px;
   line-height: 1.6;
   white-space: pre-line;
+}
+
+.mmr-help {
+  display: grid;
+  gap: 10px;
+  color: var(--app-text);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.mmr-help-row {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.mmr-help-row strong {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mmr-help-note {
+  border-top: 1px solid var(--app-border);
+  padding-top: 8px;
+  color: var(--app-text-muted);
 }
 
 .metric-unit,
@@ -1617,35 +1666,45 @@ onBeforeUnmount(() => {
     max-width: 100%;
   }
 
-  .gate-risk-header {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .gate-risk-heading {
+  .gate-risk-review-header {
     align-items: flex-start;
     flex-direction: column;
     gap: 3px;
   }
 
-  .gate-risk-grid {
+  .gate-risk-review-header span:last-child,
+  .gate-risk-review-label {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .gate-risk-review-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .risk-metric {
+  .gate-risk-review-item {
     grid-template-columns: minmax(0, 1fr);
+    border-top: 1px solid var(--app-border);
+    border-left: 0;
   }
 
-  .risk-metric strong {
+  .gate-risk-review-item:first-child {
+    border-top: 0;
+  }
+
+  .gate-risk-review-item strong {
     font-size: 13px;
     text-align: left;
     white-space: normal;
     overflow-wrap: anywhere;
   }
 
-  .risk-metric em {
+  .gate-risk-review-meta {
     grid-column: 1;
-    text-align: left;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .chart-header,

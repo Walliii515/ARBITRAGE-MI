@@ -26,6 +26,22 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
         self.assertEqual(payload['account_age_sec'], 6.0)
         self.assertTrue(payload['stale'])
 
+    def test_live_gate_cross_risk_payload_keeps_close_priority_contract(self):
+        payload = orderbook_server._build_live_gate_cross_risk_payload(
+            {
+                'status': 'warning',
+                'priority_close_contract': 'BANK_USDT',
+                'priority_close_reason': 'maintenance_margin',
+                'account_fetched_at_ts': 100.0,
+                'positions_fetched_at_ts': 100.0,
+            },
+            now_ts=101.0,
+        )
+
+        self.assertEqual(payload['priority_close_contract'], 'BANK_USDT')
+        self.assertEqual(payload['priority_close_reason'], 'maintenance_margin')
+        self.assertEqual(payload['health_status'], 'healthy')
+
     def test_live_gate_cross_risk_payload_is_unknown_before_first_snapshot(self):
         payload = orderbook_server._build_live_gate_cross_risk_payload(None, now_ts=100.0)
 
