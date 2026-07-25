@@ -105,6 +105,19 @@ interface FundTransferPreview {
   received_amount: number
   minimum_received_amount: number
   binance_forward_free: number
+  minimum_transfer_amount: number
+  maximum_transfer_amount: number
+}
+
+interface FundTransferLimits {
+  coin: string
+  network: string
+  destination_masked: string
+  fee: number
+  minimum_received_amount: number
+  binance_forward_free: number
+  minimum_transfer_amount: number
+  maximum_transfer_amount: number
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
@@ -172,6 +185,9 @@ const fundTransferDialogVisible = ref(false)
 const fundTransferAmount = ref<string>('10')
 const fundTransferPassword = ref('')
 const fundTransferPreflight = ref<FundTransferPreview | null>(null)
+const fundTransferLimits = ref<FundTransferLimits | null>(null)
+const fundTransferLimitsLoading = ref(false)
+const fundTransferLimitsError = ref('')
 const fundTransferPreflighting = ref(false)
 const fundTransferCreating = ref(false)
 const fundTransferRetrying = ref(false)
@@ -935,14 +951,46 @@ async function fetchFundTransfers(silent = true) {
 async function openFundTransferDialog() {
   fundTransferPreflight.value = null
   fundTransferPassword.value = ''
+  fundTransferLimitsError.value = ''
   fundTransferDialogVisible.value = true
-  await fetchFundTransfers(false)
+  await Promise.all([
+    fetchFundTransfers(false),
+    fetchFundTransferLimits(false),
+  ])
+}
+
+async function fetchFundTransferLimits(silent = true): Promise<FundTransferLimits | null> {
+  fundTransferLimitsLoading.value = true
+  fundTransferLimitsError.value = ''
+  try {
+    const res = await get('/api/trading/capital/fund-transfer/limits', { silent })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    fundTransferLimits.value = data.limits
+    return data.limits
+  } catch (e: any) {
+    fundTransferLimits.value = null
+    fundTransferLimitsError.value = e?.message || '读取实时划转额度失败'
+    if (!silent) showError(fundTransferLimitsError.value)
+    return null
+  } finally {
+    fundTransferLimitsLoading.value = false
+  }
 }
 
 async function preflightFundTransfer(): Promise<FundTransferPreview | null> {
   const amount = Number(fundTransferAmount.value)
   if (!Number.isFinite(amount) || amount <= 0) {
     showError('请输入有效的划转金额')
+    return null
+  }
+  const limits = fundTransferLimits.value
+  if (limits && amount < Number(limits.minimum_transfer_amount)) {
+    showError(`当前最小可划转 ${formatAmount(limits.minimum_transfer_amount)} USDT`)
+    return null
+  }
+  if (limits && amount > Number(limits.maximum_transfer_amount)) {
+    showError(`当前最大可划转 ${formatAmount(limits.maximum_transfer_amount)} USDT`)
     return null
   }
   fundTransferPreflighting.value = true
@@ -954,6 +1002,16 @@ async function preflightFundTransfer(): Promise<FundTransferPreview | null> {
     const data = await res.json()
     if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
     fundTransferPreflight.value = data.preview
+    fundTransferLimits.value = {
+      coin: data.preview.coin,
+      network: data.preview.network,
+      destination_masked: data.preview.destination_masked,
+      fee: data.preview.fee,
+      minimum_received_amount: data.preview.minimum_received_amount,
+      binance_forward_free: data.preview.binance_forward_free,
+      minimum_transfer_amount: data.preview.minimum_transfer_amount,
+      maximum_transfer_amount: data.preview.maximum_transfer_amount,
+    }
     return data.preview
   } catch (e: any) {
     fundTransferPreflight.value = null
@@ -1570,6 +1628,25 @@ onBeforeUnmount(() => {
             :closable="false"
             show-icon
           />
+          <div class="fund-transfer-limits" :class="{ loading: fundTransferLimitsLoading }">
+            <div>
+              <span>当前最小可划转</span>
+              <strong>
+                {{ fundTransferLimits ? formatAmount(fundTransferLimits.minimum_transfer_amount) : '--' }}
+                USDT
+              </strong>
+            </div>
+            <div>
+              <span>当前最大可划转</span>
+              <strong>
+                {{ fundTransferLimits ? formatAmount(fundTransferLimits.maximum_transfer_amount) : '--' }}
+                USDT
+              </strong>
+            </div>
+          </div>
+          <div v-if="fundTransferLimitsError" class="fund-transfer-limits-error">
+            {{ fundTransferLimitsError }}
+          </div>
           <el-form label-position="top" @submit.prevent>
             <el-form-item label="划转金额 (USDT)">
               <el-input
@@ -2125,6 +2202,46 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid var(--app-border);
 }
 
+.fund-transfer-limits {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid var(--app-border);
+  border-bottom: 1px solid var(--app-border);
+  opacity: 1;
+}
+
+.fund-transfer-limits.loading {
+  opacity: 0.62;
+}
+
+.fund-transfer-limits > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+}
+
+.fund-transfer-limits > div:first-child {
+  border-right: 1px solid var(--app-border);
+}
+
+.fund-transfer-limits span {
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.fund-transfer-limits strong {
+  color: #409eff;
+  font-size: 14px;
+  text-align: right;
+}
+
+.fund-transfer-limits-error {
+  color: #f56c6c;
+  font-size: 12px;
+}
+
 .fund-transfer-preview > div {
   display: flex;
   justify-content: space-between;
@@ -2275,6 +2392,15 @@ onBeforeUnmount(() => {
 
   .fund-transfer-preview {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fund-transfer-limits {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fund-transfer-limits > div:first-child {
+    border-right: 0;
+    border-bottom: 1px solid var(--app-border);
   }
 
   .fund-transfer-preview > div:nth-child(odd) {

@@ -188,10 +188,38 @@ def test_preview_is_read_only_and_exposes_live_confirmation_values():
         'received_amount': Decimal('9.99000000'),
         'minimum_received_amount': Decimal('5'),
         'binance_forward_free': Decimal('100'),
+        'minimum_transfer_amount': Decimal('5.01000000'),
+        'maximum_transfer_amount': Decimal('100.00000000'),
     }
     assert store.get_active() is None
     assert not binance.calls
     assert not gate.calls
+
+
+def test_limits_expose_live_minimum_and_maximum_without_creating_task():
+    service, store, binance, gate, _ = make_service()
+    binance.forward_free = Decimal('123.456789019')
+
+    limits = service.limits()
+
+    assert limits['minimum_transfer_amount'] == Decimal('5.01000000')
+    assert limits['maximum_transfer_amount'] == Decimal('123.45678901')
+    assert limits['fee'] == Decimal('0.01')
+    assert limits['binance_forward_free'] == Decimal('123.456789019')
+    assert store.get_active() is None
+    assert not binance.calls
+    assert not gate.calls
+
+
+def test_preview_rejects_amount_outside_the_displayed_live_limits():
+    service, _, binance, _, _ = make_service()
+
+    with pytest.raises(ValueError, match='至少为 5.01000000'):
+        service.preview(Decimal('5'))
+
+    binance.forward_free = Decimal('9.99')
+    with pytest.raises(ValueError, match='可用余额不足: 9.99000000'):
+        service.preview(Decimal('10'))
 
 
 def test_create_task_checks_live_forward_balance_without_fixed_cap():

@@ -7,7 +7,7 @@ import secrets
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, Optional
 
 from calc.fund_transfer_store import FundTransferStore, TERMINAL_STATUSES
@@ -173,6 +173,33 @@ class FundTransferService:
         requested = _decimal(amount).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
         if requested <= 0:
             raise ValueError('划转金额必须大于 0')
+        limits = self.limits()
+        minimum_amount = _decimal(limits['minimum_transfer_amount'])
+        maximum_amount = _decimal(limits['maximum_transfer_amount'])
+        if requested < minimum_amount:
+            raise ValueError(
+                f'划转金额至少为 {minimum_amount:f} {self.settings.coin}'
+            )
+        if requested > maximum_amount:
+            raise ValueError(
+                f'Binance 子账户可用余额不足: {maximum_amount:f} {self.settings.coin}'
+            )
+        network = limits['_network_info']
+        net_amount = (requested - network.fee).quantize(
+            network.precision_step, rounding=ROUND_DOWN
+        )
+        return {
+            key: value
+            for key, value in {
+                **limits,
+                'requested_amount': requested,
+                'received_amount': net_amount,
+            }.items()
+            if key != '_network_info'
+        }
+
+    def limits(self) -> Dict[str, Any]:
+        """Return live transfer bounds and fixed-route details without moving money."""
         network = self.binance.get_network_info(
             self.settings.coin, self.settings.network
         )
@@ -184,28 +211,25 @@ class FundTransferService:
         )
         if gate_address.lower() != self.settings.destination.lower():
             raise ValueError('Gate API 返回的充值地址与固定配置不一致')
-        net_amount = (requested - network.fee).quantize(
-            network.precision_step, rounding=ROUND_DOWN
+        minimum_amount = (network.minimum + network.fee).quantize(
+            Decimal('0.00000001'), rounding=ROUND_UP
         )
-        if net_amount < network.minimum:
-            minimum_gross = network.minimum + network.fee
-            raise ValueError(f'划转金额至少为 {minimum_gross:f} {self.settings.coin}')
         forward_free = self.binance.get_subaccount_free(
             self.settings.binance_forward_email, self.settings.coin
         )
-        if forward_free < requested:
-            raise ValueError(
-                f'Binance 子账户可用余额不足: {forward_free:f} {self.settings.coin}'
-            )
+        maximum_amount = forward_free.quantize(
+            Decimal('0.00000001'), rounding=ROUND_DOWN
+        )
         return {
             'coin': self.settings.coin,
             'network': self.settings.network,
             'destination_masked': _mask_address(self.settings.destination),
-            'requested_amount': requested,
             'fee': network.fee,
-            'received_amount': net_amount,
             'minimum_received_amount': network.minimum,
             'binance_forward_free': forward_free,
+            'minimum_transfer_amount': minimum_amount,
+            'maximum_transfer_amount': maximum_amount,
+            '_network_info': network,
         }
 
     def run_once(self, task_id: Optional[int] = None) -> Optional[Dict[str, Any]]:

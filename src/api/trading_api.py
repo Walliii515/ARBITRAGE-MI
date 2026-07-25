@@ -1631,6 +1631,25 @@ async def get_fund_transfer_tasks(limit: int = Query(30, ge=1, le=200)):
 
 
 @router.get(
+    '/capital/fund-transfer/limits',
+    dependencies=[Depends(verify_token_dependency)],
+)
+async def get_fund_transfer_limits():
+    """Return current live minimum and maximum transferable amounts."""
+    try:
+        result = await asyncio.to_thread(
+            get_fund_transfer_service().limits
+        )
+        result.pop('_network_info', None)
+        return {'success': True, 'limits': _serialize_row(result)}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        logger.error('读取资金划转额度失败: %s', exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'读取资金划转额度失败: {exc}')
+
+
+@router.get(
     '/capital/fund-transfer/preflight',
     dependencies=[Depends(verify_token_dependency)],
 )

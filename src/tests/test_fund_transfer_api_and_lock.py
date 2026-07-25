@@ -10,6 +10,7 @@ from api.auth import verify_user_password
 from api.trading_api import (
     FundTransferCreateRequest,
     create_fund_transfer,
+    get_fund_transfer_limits,
 )
 from calc.fund_transfer_service import FundTransferService
 
@@ -52,6 +53,27 @@ def test_create_api_rejects_wrong_current_password_before_service_call():
 
     assert exc.value.status_code == 403
     get_service.assert_not_called()
+
+
+def test_limits_api_serializes_current_live_bounds():
+    service = MagicMock()
+    service.limits.return_value = {
+        'coin': 'USDT',
+        'minimum_transfer_amount': Decimal('5.01'),
+        'maximum_transfer_amount': Decimal('123.45'),
+        '_network_info': object(),
+    }
+    with patch('api.trading_api.get_fund_transfer_service', return_value=service):
+        result = asyncio.run(get_fund_transfer_limits())
+
+    assert result == {
+        'success': True,
+        'limits': {
+            'coin': 'USDT',
+            'minimum_transfer_amount': 5.01,
+            'maximum_transfer_amount': 123.45,
+        },
+    }
 
 
 def test_forward_open_loop_checks_independent_fund_transfer_lock():

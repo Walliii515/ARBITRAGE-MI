@@ -22,6 +22,7 @@ const notificationHistory = ref<PopupNotification[]>([])
 const notificationUnreadCount = ref(0)
 const notificationFilter = ref<'unread' | 'read' | 'all'>('unread')
 const notificationLoading = ref(false)
+const notificationRefreshing = ref(false)
 const notificationLoadingMore = ref(false)
 const notificationPagination = ref({ page: 1, page_size: 50, total: 0, total_pages: 0 })
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
@@ -64,9 +65,11 @@ const tradingModeColor = computed(() => {
 const notificationCount = computed(() => notificationUnreadCount.value)
 const notificationHasMore = computed(() => notificationPagination.value.page < notificationPagination.value.total_pages)
 
-async function refreshNotificationHistory(syncRecent = true) {
-  if (isLoginPage.value) return
-  notificationLoading.value = true
+async function refreshNotificationHistory(syncRecent = true, showLoading = false) {
+  if (isLoginPage.value || notificationRefreshing.value) return
+  notificationRefreshing.value = true
+  const useLoadingState = showLoading && notificationHistory.value.length === 0
+  if (useLoadingState) notificationLoading.value = true
   try {
     const data = await listPopupNotifications({
       readStatus: notificationFilter.value,
@@ -80,7 +83,8 @@ async function refreshNotificationHistory(syncRecent = true) {
   } catch {
     // request.ts 会提示错误；这里避免影响主界面。
   } finally {
-    notificationLoading.value = false
+    if (useLoadingState) notificationLoading.value = false
+    notificationRefreshing.value = false
   }
 }
 
@@ -146,7 +150,15 @@ async function markNotificationRead(id: number) {
 }
 
 function handleNotificationFilterChange() {
-  void refreshNotificationHistory(false)
+  void refreshNotificationHistory(false, true)
+}
+
+function handleNotificationPopoverShow() {
+  void refreshNotificationHistory(true, false)
+}
+
+function notificationTypeClass(type: PopupNotification['type']) {
+  return `notification-${type || 'info'}`
 }
 
 function formatNotificationTime(value: string) {
@@ -391,7 +403,7 @@ function stopRiskAlertTimer() {
 const notificationHistoryChangeHandler = () => void refreshNotificationHistory(false)
 
 onMounted(() => {
-  void refreshNotificationHistory()
+  void refreshNotificationHistory(true, true)
   window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, notificationHistoryChangeHandler)
   if (!isLoginPage.value) {
     startOpenPauseStatusTimer()
@@ -454,7 +466,7 @@ function toggleMenu() {
           :width="380"
           trigger="click"
           popper-class="notification-history-popper"
-          @show="() => refreshNotificationHistory()"
+          @show="handleNotificationPopoverShow"
         >
           <template #reference>
             <button class="notification-bell" title="弹窗消息">
@@ -500,7 +512,7 @@ function toggleMenu() {
                 v-for="item in notificationHistory"
                 :key="item.id"
                 class="notification-item"
-                :class="{ unread: !item.read_at }"
+                :class="[notificationTypeClass(item.type), { unread: !item.read_at }]"
               >
                 <div class="notification-item-top">
                   <span class="notification-title">
@@ -819,15 +831,32 @@ function toggleMenu() {
 }
 
 .notification-item {
+  --notification-color: #409eff;
   padding: 8px 10px;
   border: 1px solid var(--app-border, #2d2d3d);
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.03);
 }
 
+.notification-item.notification-success {
+  --notification-color: #67c23a;
+}
+
+.notification-item.notification-warning {
+  --notification-color: #e6a23c;
+}
+
+.notification-item.notification-error {
+  --notification-color: #f56c6c;
+}
+
 .notification-item.unread {
-  border-color: rgba(245, 108, 108, 0.45);
-  background: rgba(245, 108, 108, 0.08);
+  border-color: color-mix(in srgb, var(--notification-color) 48%, transparent);
+  background: color-mix(in srgb, var(--notification-color) 9%, transparent);
+}
+
+.notification-item.unread .notification-title {
+  color: var(--notification-color);
 }
 
 .notification-item-top {
@@ -859,7 +888,7 @@ function toggleMenu() {
   height: 6px;
   flex: 0 0 6px;
   border-radius: 50%;
-  background: #f56c6c;
+  background: var(--notification-color);
 }
 
 .notification-message {
