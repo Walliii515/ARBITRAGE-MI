@@ -769,6 +769,7 @@ function toggleMenu() {
 }
 
 .notification-history {
+  min-height: 160px;
   max-height: 420px;
   display: flex;
   flex-direction: column;
@@ -840,6 +841,12 @@ function toggleMenu() {
 
 .notification-item.notification-success {
   --notification-color: #67c23a;
+  border-color: rgba(103, 194, 58, 0.32);
+  background: rgba(103, 194, 58, 0.05);
+}
+
+.notification-item.notification-success .notification-title {
+  color: #67c23a;
 }
 
 .notification-item.notification-warning {
