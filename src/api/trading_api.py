@@ -13,7 +13,7 @@ import threading
 import time
 from decimal import Decimal
 from datetime import datetime, date, timedelta
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, Callable, List, Dict
 from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -737,6 +737,15 @@ _recon_running = False
 _recon_lock = threading.Lock()
 _capital_running = False
 _capital_lock = threading.Lock()
+_capital_strategy_pnl_provider: Optional[Callable[[], Dict[str, Any]]] = None
+
+
+def register_capital_strategy_pnl_provider(
+    provider: Optional[Callable[[], Dict[str, Any]]],
+) -> None:
+    """Register the live strategy PnL source used by manual capital snapshots."""
+    global _capital_strategy_pnl_provider
+    _capital_strategy_pnl_provider = provider
 
 
 class BinanceBnbBuyRequest(BaseModel):
@@ -1583,7 +1592,18 @@ async def run_capital_snapshot_now():
         _capital_running = True
 
     try:
-        result = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
+        provider = _capital_strategy_pnl_provider
+        if provider is None:
+            return {
+                'success': False,
+                'message': '实时策略盈亏尚未就绪，本次未写入资金快照',
+            }
+        strategy_pnl = await asyncio.to_thread(provider)
+        if not isinstance(strategy_pnl, dict):
+            raise RuntimeError('实时策略盈亏返回格式无效')
+        result = await asyncio.to_thread(
+            lambda: build_default_capital_snapshotter().run_once(strategy_pnl)
+        )
         return {'success': True, 'message': '资金采集完成', **result}
     except Exception as e:
         logger.error(f'手动资金采集失败: {e}', exc_info=True)

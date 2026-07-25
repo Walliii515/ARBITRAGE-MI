@@ -40,7 +40,10 @@ from common.meta_loader import (
 )
 from common.strategy_accounts import get_binance_credentials
 
-from api.trading_api import router as trading_router
+from api.trading_api import (
+    register_capital_strategy_pnl_provider,
+    router as trading_router,
+)
 from api.auth import router as auth_router, verify_token_dependency, verify_ws_token
 from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 from calc.position_tracker import PositionTracker
@@ -1065,6 +1068,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_reverse_signal_loop())
     asyncio.create_task(_close_position_loop())
     asyncio.create_task(_position_funding_loop())
+    register_capital_strategy_pnl_provider(_build_strategy_position_pnl_summary)
     asyncio.create_task(_account_capital_snapshot_loop())
     asyncio.create_task(_position_realtime_push())
     asyncio.create_task(_reverse_position_realtime_push())

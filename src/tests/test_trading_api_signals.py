@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+from api import trading_api
 from api.trading_api import (
     _append_unique_notification,
     _build_gate_cross_minimum_summary,
@@ -13,6 +14,8 @@ from api.trading_api import (
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
     get_gate_cross_risk_summary,
+    register_capital_strategy_pnl_provider,
+    run_capital_snapshot_now,
 )
 
 
@@ -45,6 +48,46 @@ class ForwardSignalFilterTests(unittest.TestCase):
         self.assertIn('s.exit_reason LIKE %s', where_sql)
         self.assertIn('s.base_asset LIKE %s', where_sql)
         self.assertEqual(params, [7, 'opened', '%旁路%', '%AI%'])
+
+
+class ManualCapitalSnapshotTests(unittest.TestCase):
+    def tearDown(self):
+        register_capital_strategy_pnl_provider(None)
+        trading_api._capital_running = False
+
+    def test_manual_snapshot_uses_registered_realtime_strategy_pnl(self):
+        strategy_pnl = {
+            'binance_spot_floating_pnl': 123.45,
+            'gate_future_floating_pnl': -120.0,
+            'floating_pnl': 3.45,
+            'position_count': 2,
+        }
+        captured = {}
+
+        class FakeSnapshotter:
+            def run_once(self, value):
+                captured['strategy_pnl'] = value
+                return {'success': True, 'snapshot_at': '2026-07-25 12:00:00'}
+
+        register_capital_strategy_pnl_provider(lambda: strategy_pnl)
+        with patch(
+            'api.trading_api.build_default_capital_snapshotter',
+            return_value=FakeSnapshotter(),
+        ):
+            result = asyncio.run(run_capital_snapshot_now())
+
+        self.assertTrue(result['success'])
+        self.assertIs(captured['strategy_pnl'], strategy_pnl)
+
+    def test_manual_snapshot_without_realtime_provider_does_not_write(self):
+        register_capital_strategy_pnl_provider(None)
+
+        with patch('api.trading_api.build_default_capital_snapshotter') as builder:
+            result = asyncio.run(run_capital_snapshot_now())
+
+        self.assertFalse(result['success'])
+        self.assertIn('本次未写入', result['message'])
+        builder.assert_not_called()
 
 
 class ReconciliationNotificationTests(unittest.TestCase):
