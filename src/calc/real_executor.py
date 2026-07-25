@@ -178,9 +178,9 @@ class RealExecutor:
         return result
 
     def _execute_future_then_spot(self, order_group: Dict, orderbook_row: Dict) -> Dict:
-        """紧急平仓：先用 Gate reduce-only 市价平期货腿，再卖 Binance 现货。"""
+        """先用 Gate reduce-only 市价平期货腿，再按实际成交量卖 Binance 现货。"""
         result = {'success': False, 'spot_order': None, 'future_order': None, 'message': ''}
-        spot_order = order_group.get('spot_order', {})
+        spot_order = dict(order_group.get('spot_order', {}) or {})
         future_order = dict(order_group.get('future_order', {}) or {})
         future_order.pop('protective_price', None)
         future_order.pop('execution_style', None)
@@ -191,12 +191,18 @@ class RealExecutor:
                 f"期货拒单(未执行现货): {future_result.get('reason')}"
             )
             logger.critical(
-                "⚠️ 紧急平仓期货腿失败，已跳过现货腿 | %s | reason=%s",
+                "⚠️ 平仓期货腿失败，已跳过现货腿 | %s | reason=%s",
                 future_order.get('base_asset'), future_result.get('reason'),
             )
             return result
 
         result['future_order'] = future_result
+        future_target_qty = float(future_order.get('target_qty') or 0)
+        spot_target_qty = float(spot_order.get('target_qty') or 0)
+        hedge_ratio = spot_target_qty / future_target_qty if future_target_qty > 0 else 1.0
+        spot_order['target_qty'] = float(future_result.get('exec_qty') or 0) * hedge_ratio
+        spot_order['target_amount'] = future_result.get('exec_amount')
+        spot_order['quantity_mode'] = 'base'
         spot_result = self._place_binance_spot_order(spot_order)
         if spot_result.get('success'):
             target_qty = float(spot_order.get('target_qty') or 0)
@@ -210,7 +216,7 @@ class RealExecutor:
                     f"qty={future_result.get('exec_qty')}"
                 )
                 logger.critical(
-                    "⚠️ 紧急平仓现货腿部分成交 | %s | Gate风险已解除但Binance现货剩余需处理: "
+                    "⚠️ 平仓现货腿部分成交 | %s | Gate期货已减仓但Binance现货剩余需处理: "
                     "filled=%s target=%s",
                     future_order.get('base_asset'), exec_qty, target_qty,
                 )
@@ -219,7 +225,7 @@ class RealExecutor:
             result['success'] = True
             result['message'] = '成交成功'
             logger.warning(
-                "紧急平仓成功(Gate优先) | %s | future: price=%s, qty=%s | "
+                "平仓成功(Gate市价优先) | %s | future: price=%s, qty=%s | "
                 "spot: price=%s, qty=%s",
                 future_order.get('base_asset'),
                 future_result.get('exec_price'), future_result.get('exec_qty'),
@@ -233,7 +239,7 @@ class RealExecutor:
             f"qty={future_result.get('exec_qty')}"
         )
         logger.critical(
-            "⚠️ 紧急平仓现货腿失败 | %s | Gate风险已解除但Binance现货仍需处理: %s",
+            "⚠️ 平仓现货腿失败 | %s | Gate期货已减仓但Binance现货仍需处理: %s",
             future_order.get('base_asset'), spot_result.get('reason'),
         )
         return result

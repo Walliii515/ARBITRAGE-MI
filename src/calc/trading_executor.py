@@ -248,7 +248,7 @@ class TradingExecutor:
         # 手续费率（用于 entry_floor / 旧盈利性守卫计算）
         self.fee_cost_bps = -calc_full_fee_bps(
             cfg.fee_spot_open, cfg.fee_spot_close,
-            cfg.fee_future_open, cfg.fee_future_close
+            cfg.fee_future_open, cfg.fee_future_taker_close
         )
         # 单纯开仓费率（用于持久化计算边际基差）
         self._fee_spot_open = cfg.fee_spot_open

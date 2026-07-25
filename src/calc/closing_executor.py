@@ -118,36 +118,6 @@ class ClosingExecutor:
             config.get_float('trade.close.delist_risk_exit_days', 2.0),
             0.0,
         )
-        self.protective_ioc_enabled = config.get_bool('trade.close.protective_ioc_enabled', True)
-        self.protective_ioc_take_profit_slippage_bps = config.get_float(
-            'trade.close.protective_ioc_take_profit_slippage_bps', 5.0
-        )
-        self.protective_ioc_risk_slippage_bps = config.get_float(
-            'trade.close.protective_ioc_risk_slippage_bps', 12.0
-        )
-        self.future_maker_close_enabled = config.get_bool(
-            'trade.execution.future_maker_close.enabled', False
-        )
-        self.future_maker_close_allowed_tiers = {
-            str(t).strip().upper()
-            for t in config.get('trade.execution.future_maker_close.allowed_tiers', ['A', 'B'])
-            if str(t).strip().upper() in ('A', 'B', 'C')
-        }
-        self.future_maker_close_ttl_ms = max(
-            config.get_int('trade.execution.future_maker_close.ttl_ms', 1000), 0
-        )
-        self.future_maker_close_price_offset_bps = config.get_float(
-            'trade.execution.future_maker_close.price_offset_bps', 0.0
-        )
-        self.future_maker_close_fallback_ioc_enabled = config.get_bool(
-            'trade.execution.future_maker_close.fallback_ioc_enabled', True
-        )
-        self.future_maker_close_fallback_allowed_tiers = {
-            str(t).strip().upper()
-            for t in config.get('trade.execution.future_maker_close.fallback_allowed_tiers', ['A', 'B'])
-            if str(t).strip().upper() in ('A', 'B', 'C')
-        }
-
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
         self.fee_spot_close = config.get_float('trade.fee.spot_close', 0.00075)
@@ -158,7 +128,7 @@ class ClosingExecutor:
         # 全部手续费 BPS（正数，用于止盈阈值累加）
         self.fee_full_bps = -calc_full_fee_bps(
             self.fee_spot_open, self.fee_spot_close,
-            self.fee_future_open, self.fee_future_close
+            self.fee_future_open, self.fee_future_taker_close
         )
 
         # 谷底反弹止盈策略
@@ -388,7 +358,6 @@ class ClosingExecutor:
                     detail,
                     orderbook_row,
                     pre_gate_basis_bps=None,
-                    future_protective_price=None,
                 )
                 result.setdefault('position_id', pos.get('id'))
                 results.append(result)
@@ -495,7 +464,6 @@ class ClosingExecutor:
             close_reason = None
             close_reason_detail = None
             pre_gate_basis_bps = None
-            future_protective_price = None
 
             if self._check_delist_risk_exit(pos):
                 close_reason = 'delist_risk_exit'
@@ -598,23 +566,6 @@ class ClosingExecutor:
                         'message': notional_reason,
                     })
                     continue
-            if (
-                close_reason not in FAST_RISK_CLOSE_REASONS
-                and close_reason != 'manual'
-                and self.protective_ioc_enabled
-                and not self.future_maker_close_enabled
-            ):
-                slippage_bps = (
-                    self.protective_ioc_take_profit_slippage_bps
-                    if close_reason == 'take_profit'
-                    else self.protective_ioc_risk_slippage_bps
-                )
-                future_protective_price = self._future_close_protective_price(orderbook_row, slippage_bps)
-                if future_protective_price is not None:
-                    close_reason_detail = (
-                        f"{close_reason_detail}|保护IOC(future_buy≤{future_protective_price})"
-                    )
-
             try:
                 result = self._execute_close(
                     pos,
@@ -622,7 +573,6 @@ class ClosingExecutor:
                     close_reason_detail,
                     orderbook_row,
                     pre_gate_basis_bps=pre_gate_basis_bps,
-                    future_protective_price=future_protective_price,
                 )
                 results.append(result)
                 if result.get('success'):
@@ -1736,16 +1686,6 @@ class ClosingExecutor:
 
         return f"{detail}|鲜度(gate={_fmt(gate_lag_ms)},spot={_fmt(spot_lag_ms)})"
 
-    def _future_close_protective_price(self, row: Dict, slippage_bps: float) -> Optional[float]:
-        """期货空头平仓是 buy，用旁路 close VWAP 加保护垫作为 IOC 最高成交价。"""
-        price = row.get('future_close_vwap') or row.get('future_ask_price_1') or row.get('future_ask_1')
-        if price is None:
-            return None
-        price = float(price)
-        if price <= 0:
-            return None
-        return round(price * (1 + max(float(slippage_bps), 0.0) / 10000.0), 10)
-
     def _append_close_basis_compare(
         self,
         detail: str,
@@ -1810,7 +1750,6 @@ class ClosingExecutor:
             close_reason,
             close_reason_detail,
             orderbook_row,
-            future_protective_price=None,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -1824,23 +1763,13 @@ class ClosingExecutor:
         close_reason_detail: str,
         orderbook_row: Dict,
         pre_gate_basis_bps: Optional[float] = None,
-        future_protective_price: Optional[float] = None,
     ) -> Dict:
         """构建平仓订单组 → 调用成交引擎 → 持久化"""
         ba = pos.get('base_asset', '')
         order_group = self._build_close_order_group(
             pos,
-            future_protective_price=future_protective_price,
-            orderbook_row=orderbook_row,
             close_reason=close_reason,
         )
-        future_order = order_group.get('future_order') or {}
-        if future_order.get('execution_style') == 'maker':
-            close_reason_detail = (
-                f"{close_reason_detail}|future maker("
-                f"future_buy@{future_order.get('maker_price')},"
-                f"ttl={future_order.get('maker_ttl_ms')}ms)"
-            )
         exec_result = self.executor_client.execute(order_group, orderbook_row)
         actual_close_basis_bps = self._save_close(
             pos,
@@ -1868,8 +1797,6 @@ class ClosingExecutor:
     def _build_close_order_group(
         self,
         pos: Dict,
-        future_protective_price: Optional[float] = None,
-        orderbook_row: Optional[Dict] = None,
         close_reason: Optional[str] = None,
     ) -> Dict:
         """
@@ -1907,11 +1834,6 @@ class ClosingExecutor:
             'target_qty': float(pos.get('future_open_qty') or 0),
             'target_amount': target_amount,
         }
-        if future_protective_price is not None and close_reason != 'manual':
-            future_order['protective_price'] = future_protective_price
-        if close_reason not in FAST_RISK_CLOSE_REASONS and close_reason != 'manual':
-            self._apply_future_maker_close(pos, orderbook_row or {}, future_order, close_reason)
-
         order_group = {
             'order_uuid': order_uuid,
             'base_asset': ba,
@@ -1919,71 +1841,10 @@ class ClosingExecutor:
             'future_contract': future_contract,
             'spot_order': spot_order,
             'future_order': future_order,
+            'execution_sequence': 'future_then_spot',
+            'execution_reason': close_reason,
         }
-        if close_reason in FAST_RISK_CLOSE_REASONS:
-            future_order.pop('protective_price', None)
-            order_group['execution_sequence'] = 'future_then_spot'
-            order_group['execution_reason'] = close_reason
         return order_group
-
-    def _apply_future_maker_close(
-        self,
-        pos: Dict,
-        row: Dict,
-        future_order: Dict,
-        close_reason: Optional[str] = None,
-    ) -> None:
-        """给实盘平仓期货腿附加 maker 执行参数；空头买回挂在 future bid1。"""
-        if not self.future_maker_close_enabled:
-            return
-        if self.executor_client.channel != 'Live':
-            return
-
-        base_asset = str(pos.get('base_asset') or future_order.get('base_asset') or '').upper()
-        tier = str(pos.get('strategy_tier') or '').strip().upper()
-        if not tier:
-            # close path 没有注入 asset_tier_meta，未知时按 A/B 池处理，避免已有持仓不能平。
-            tier = 'B'
-        if tier not in self.future_maker_close_allowed_tiers:
-            return
-
-        maker_price = row.get('future_price_bid_1') or row.get('future_bid_price_1') or row.get('future_bid_1')
-        if maker_price is None:
-            return
-
-        maker_price = float(maker_price)
-        if maker_price <= 0:
-            return
-        if self.future_maker_close_price_offset_bps:
-            maker_price *= 1 - self.future_maker_close_price_offset_bps / 10000.0
-
-        fallback_allowed = (
-            self.future_maker_close_fallback_ioc_enabled
-            and tier in self.future_maker_close_fallback_allowed_tiers
-        )
-        fallback_price = None
-        if fallback_allowed:
-            slippage_bps = (
-                self.protective_ioc_take_profit_slippage_bps
-                if close_reason == 'take_profit'
-                else self.protective_ioc_risk_slippage_bps
-            )
-            fallback_price = self._future_close_protective_price(row, slippage_bps)
-
-        future_order.pop('protective_price', None)
-        future_order.update({
-            'execution_style': 'maker',
-            'maker_ttl_ms': self.future_maker_close_ttl_ms,
-            'maker_price': maker_price,
-            'maker_price_source': 'future_bid1',
-            'maker_strategy_tier': tier,
-            'maker_taker_reference_price': row.get('future_close_vwap'),
-            'maker_spot_reference_price': row.get('spot_close_vwap'),
-            'maker_fallback_ioc_enabled': fallback_allowed,
-            'maker_fallback_protective_price': fallback_price,
-            'maker_fallback_slippage_bps': slippage_bps
-            if fallback_price is not None else None,
-        })
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         if base_asset in self.contract_meta:
@@ -2113,8 +1974,8 @@ class ClosingExecutor:
             with db_manager.get_cursor() as cursor:
                 cursor.execute(insert_sql, order)
 
-        if self._mark_partial_risk_close_desync(pos, exec_result, close_reason, close_reason_detail):
-            self._trigger_reconciliation('risk_close_partial_desync', str(pos.get('base_asset') or ''))
+        if self._mark_future_only_close_desync(pos, exec_result, close_reason, close_reason_detail):
+            self._trigger_reconciliation('close_future_only_desync', str(pos.get('base_asset') or ''))
 
         partial_state = self._close_partial_fill_state(pos, order_group, exec_result)
         if partial_state.get('partial'):
@@ -2269,15 +2130,15 @@ class ClosingExecutor:
             logger.warning("普通平仓部分成交断腿标记 | position_id=%s | %s", pos.get('id'), detail)
         return bool(updated)
 
-    def _mark_partial_risk_close_desync(
+    def _mark_future_only_close_desync(
         self,
         pos: Dict,
         exec_result: Dict,
         close_reason: str,
         close_reason_detail: str,
     ) -> bool:
-        """风险平仓 Gate 腿已成交但 spot 未成交时，标记断腿并交给对账兜底。"""
-        if close_reason not in FAST_RISK_CLOSE_REASONS or exec_result.get('success'):
+        """Gate 腿已成交但 spot 未成交时，标记断腿并交给对账兜底。"""
+        if exec_result.get('success'):
             return False
         future_exec = exec_result.get('future_order') or {}
         spot_exec = exec_result.get('spot_order') or {}
@@ -2297,7 +2158,8 @@ class ClosingExecutor:
         message = str(exec_result.get('message') or '')
         exchange_order_id = future_exec.get('exchange_order_id')
         detail = (
-            f"系统风险平仓Gate期货已成交但Binance现货失败|asset={base_asset}|"
+            f"系统平仓Gate期货已成交但Binance现货失败|asset={base_asset}|"
+            f"close_reason={close_reason}|"
             f"future_price={future_price}|future_qty={future_qty}|"
             f"future_order_id={exchange_order_id or ''}|spot_reason={message[:180]}"
         )
@@ -2322,15 +2184,15 @@ class ClosingExecutor:
                 'risk_at': datetime.now(),
                 'detail': detail,
                 'reason': reason,
-                'reason_like': '%系统风险平仓Gate期货已成交但Binance现货失败%',
+                'reason_like': '%系统平仓Gate期货已成交但Binance现货失败%',
                 'position_id': position_id,
             })
             updated = int(getattr(cursor, 'rowcount', 0) or 0)
 
         logger.critical(
-            "风险平仓出现待处置断腿 | %s | position_id=%s | risk_type=%s | "
+            "平仓出现待处置断腿 | %s | position_id=%s | close_reason=%s | risk_type=%s | "
             "future_price=%s | future_qty=%s | spot_reason=%s",
-            base_asset, position_id, risk_type, future_price, future_qty, message,
+            base_asset, position_id, close_reason, risk_type, future_price, future_qty, message,
         )
         return updated > 0
 

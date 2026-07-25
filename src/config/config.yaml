@@ -26,7 +26,7 @@ trade:
     spot_open: 0.00075
     spot_close: 0.00075
     future_open: 0.0002                  # Gate future maker 开仓账户费率
-    future_close: 0.0002                 # Gate future maker 平仓账户费率
+    future_close: 0.0002                 # 历史 Gate future maker 平仓费率（订单角色解析）
     future_taker_open: 0.0005            # Gate future taker/IOC 开仓账户费率
     future_taker_close: 0.0005           # Gate future taker/IOC 平仓账户费率
 
@@ -42,13 +42,6 @@ trade:
       fallback_min_buffer_bps: 8            # fallback 时 pre_gate 至少高于 entry_floor 的额外安全垫
       fallback_slippage_bps: 5              # 开仓future卖出IOC保护价低于旁路VWAP的最大bps
       spot_hedge_protective_ioc_enabled: true # future maker/fallback 成交后，spot 买入改用保护性IOC
-    future_maker_close:
-      enabled: true                         # 平仓先尝试 Gate future reduce-only post-only maker
-      allowed_tiers: [A, B]                 # A/B 档参与；未知历史持仓按 B 档处理
-      ttl_ms: 1000                          # maker 单最多挂单等待时间
-      price_offset_bps: 0                   # 买回挂 future bid1；正数表示更靠后排队
-      fallback_ioc_enabled: true            # maker未成交后，转reduce-only保护IOC兜底
-      fallback_allowed_tiers: [A, B]        # 允许平仓 maker->IOC 兜底的分层
 
   # ─── 开仓策略 ───
   open:
@@ -283,9 +276,6 @@ trade:
     delist_risk_exit_enabled: true          # 标的临近下架窗口时走风险平仓，不等待止盈/正资金费
     delist_risk_exit_days: 2                # 距下架时间小于等于该天数时触发下架风险平仓
     delist_risk_refresh_interval_sec: 900   # 后台刷新下架风险报告间隔；平仓关键路径只读内存缓存
-    protective_ioc_enabled: true            # 平仓Gate期货腿使用 reduce_only 保护限价 IOC
-    protective_ioc_take_profit_slippage_bps: 5 # 止盈平仓期货买回保护价允许高于旁路VWAP的bps
-    protective_ioc_risk_slippage_bps: 12    # 风险平仓期货买回保护价允许高于旁路VWAP的bps
     take_profit_days_multiplier: 10         # legacy_p40模式止盈倍数
     # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
     max_funding_payments: 30                # 已废弃：资金费次数不再强制平仓，改由 dynamic_take_profit aging_*_funding_count 接管
