@@ -49,7 +49,7 @@ let resizeObserver: ResizeObserver | null = null
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const hasRows = computed(() => rows.value.length > 0)
-const lastUpdatedAt = computed(() => latest.value?.snapshot_at || '-')
+const lastUpdatedAt = computed(() => formatDateTime(latest.value?.snapshot_at))
 const hostLabel = computed(() => latest.value?.hostname || '-')
 const sampleCount = computed(() => rows.value.length)
 const diskFilesystems = computed<DiskFilesystem[]>(() => {
@@ -143,15 +143,28 @@ function formatUptime(value: number | null | undefined): string {
   return `${hours}小时`
 }
 
-function formatTooltipTime(value: unknown): string {
-  const date = new Date(String(value))
-  if (!Number.isFinite(date.getTime())) return String(value ?? '-')
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
+function padDatePart(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+function parseMetricTime(value: unknown): Date | null {
+  if (value == null || value === '') return null
+  const raw = typeof value === 'number' ? value : String(value)
+  const date = new Date(raw)
+  if (!Number.isFinite(date.getTime())) return null
+  return date
+}
+
+function formatDateTime(value: unknown): string {
+  const date = parseMetricTime(value)
+  if (!date) return String(value ?? '-')
+  const year = date.getFullYear()
+  const month = padDatePart(date.getMonth() + 1)
+  const day = padDatePart(date.getDate())
+  const hour = padDatePart(date.getHours())
+  const minute = padDatePart(date.getMinutes())
+  const second = padDatePart(date.getSeconds())
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`
 }
 
 function usageTone(value: number | null | undefined): string {
@@ -193,7 +206,7 @@ function buildUsageChartOption(): EChartsOption {
       textStyle: { color: colors.text },
       formatter: (params) => {
         const items: any[] = Array.isArray(params) ? params : [params]
-        const title = formatTooltipTime(items[0]?.axisValue)
+        const title = formatDateTime(items[0]?.axisValue)
         const lines = items.map((item) => {
           const value = Array.isArray(item.value) ? item.value[1] : item.value
           return `${item.marker}${item.seriesName}: ${formatPercent(Number(value))}`
@@ -205,7 +218,7 @@ function buildUsageChartOption(): EChartsOption {
       type: 'time',
       axisLine: { lineStyle: { color: colors.border } },
       axisTick: { show: false },
-      axisLabel: { color: colors.muted },
+      axisLabel: { color: colors.muted, formatter: (value: number) => formatDateTime(value) },
       splitLine: { show: false },
     },
     yAxis: {
@@ -248,7 +261,7 @@ function buildLoadChartOption(): EChartsOption {
       textStyle: { color: colors.text },
       formatter: (params) => {
         const items: any[] = Array.isArray(params) ? params : [params]
-        const title = formatTooltipTime(items[0]?.axisValue)
+        const title = formatDateTime(items[0]?.axisValue)
         const lines = items.map((item) => {
           const value = Array.isArray(item.value) ? item.value[1] : item.value
           return `${item.marker}${item.seriesName}: ${formatNumber(Number(value), 2)}`
@@ -260,7 +273,7 @@ function buildLoadChartOption(): EChartsOption {
       type: 'time',
       axisLine: { lineStyle: { color: colors.border } },
       axisTick: { show: false },
-      axisLabel: { color: colors.muted },
+      axisLabel: { color: colors.muted, formatter: (value: number) => formatDateTime(value) },
       splitLine: { show: false },
     },
     yAxis: {
