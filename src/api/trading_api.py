@@ -150,6 +150,44 @@ def _serialize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [_serialize_row(row) for row in rows]
 
 
+def _aggregate_capital_latest_account_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the total account card on the same exchange-account basis as its components."""
+    serialized = _serialize_rows(rows)
+    by_exchange = {str(row.get('exchange') or ''): row for row in serialized}
+    binance = by_exchange.get('binance')
+    gate = by_exchange.get('gate')
+    total = by_exchange.get('total')
+    if not binance or not gate or not total:
+        return serialized
+
+    for key in (
+        'equity_usdt',
+        'available_usdt',
+        'locked_usdt',
+        'position_value_usdt',
+        'margin_used_usdt',
+    ):
+        if binance.get(key) is None or gate.get(key) is None:
+            continue
+        total[key] = float(binance[key]) + float(gate[key])
+
+    account_balance_values = (
+        binance.get('account_balance_usdt'),
+        gate.get('account_balance_usdt'),
+    )
+    account_unrealized_values = (
+        binance.get('account_unrealized_pnl_usdt'),
+        gate.get('account_unrealized_pnl_usdt'),
+    )
+    if all(value is not None for value in account_balance_values):
+        total['account_balance_usdt'] = sum(float(value) for value in account_balance_values)
+    if all(value is not None for value in account_unrealized_values):
+        total['account_unrealized_pnl_usdt'] = sum(
+            float(value) for value in account_unrealized_values
+        )
+    return serialized
+
+
 def _risk_notification_key(prefix: str, *parts: Any) -> str:
     values = [str(part if part is not None else '').strip() for part in parts]
     return f"{prefix}:{':'.join(values)}"[:220]
@@ -1591,7 +1629,7 @@ async def get_capital_latest():
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql)
         rows = cursor.fetchall()
-    return {'rows': _serialize_rows(rows)}
+    return {'rows': _aggregate_capital_latest_account_rows(rows)}
 
 
 @router.get('/capital/annualized-return')

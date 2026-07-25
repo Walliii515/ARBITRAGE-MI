@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from api import trading_api
 from api.trading_api import (
     _append_unique_notification,
+    _aggregate_capital_latest_account_rows,
     _build_gate_cross_minimum_summary,
     _calculate_capital_annualized_return,
     _capital_history_interval,
@@ -95,6 +96,60 @@ class ManualCapitalSnapshotTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertIn('本次未写入', result['message'])
         builder.assert_not_called()
+
+
+class CapitalLatestAccountAggregationTests(unittest.TestCase):
+    def test_total_account_breakdown_sums_exchange_account_values(self):
+        rows = [
+            {
+                'exchange': 'binance',
+                'equity_usdt': Decimal('10854.8283015280'),
+                'available_usdt': Decimal('1852.6505021100'),
+                'locked_usdt': Decimal('0'),
+                'position_value_usdt': Decimal('9002.1777994180'),
+                'margin_used_usdt': Decimal('0'),
+                'unrealized_pnl_usdt': Decimal('54.0580'),
+                'account_balance_usdt': Decimal('10800.7703015280'),
+                'account_unrealized_pnl_usdt': Decimal('54.0580'),
+            },
+            {
+                'exchange': 'gate',
+                'equity_usdt': Decimal('4224.7719069583'),
+                'available_usdt': Decimal('3788.1067827441'),
+                'locked_usdt': Decimal('0'),
+                'position_value_usdt': Decimal('432.4346142142'),
+                'margin_used_usdt': Decimal('432.4346142142'),
+                'unrealized_pnl_usdt': Decimal('-73.4507'),
+                'account_balance_usdt': Decimal('4283.342997206459'),
+                'account_unrealized_pnl_usdt': Decimal('-58.57109024817'),
+            },
+            {
+                'exchange': 'total',
+                'equity_usdt': Decimal('15079.6002084863'),
+                'available_usdt': Decimal('5640.7572848541'),
+                'locked_usdt': Decimal('0'),
+                'position_value_usdt': Decimal('9434.6124136321'),
+                'margin_used_usdt': Decimal('432.4346142142'),
+                'unrealized_pnl_usdt': Decimal('-19.3930'),
+                'account_balance_usdt': Decimal('15098.9932084863'),
+                'account_unrealized_pnl_usdt': Decimal('-19.3930'),
+            },
+        ]
+
+        result = _aggregate_capital_latest_account_rows(rows)
+        by_exchange = {row['exchange']: row for row in result}
+        total = by_exchange['total']
+
+        self.assertAlmostEqual(total['equity_usdt'], 15079.6002084863)
+        self.assertAlmostEqual(total['available_usdt'], 5640.7572848541)
+        self.assertAlmostEqual(total['position_value_usdt'], 9434.6124136321)
+        self.assertAlmostEqual(total['account_balance_usdt'], 15084.113298734459)
+        self.assertAlmostEqual(total['account_unrealized_pnl_usdt'], -4.51309024817)
+        self.assertAlmostEqual(
+            total['account_balance_usdt'] + total['account_unrealized_pnl_usdt'],
+            total['equity_usdt'],
+        )
+        self.assertAlmostEqual(total['unrealized_pnl_usdt'], -19.3930)
 
 
 class ReconciliationNotificationTests(unittest.TestCase):
