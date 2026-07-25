@@ -2,21 +2,26 @@ import asyncio
 import json
 import unittest
 from datetime import datetime
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from api import trading_api
 from api.trading_api import (
     _append_unique_notification,
     _build_gate_cross_minimum_summary,
+    _capital_history_interval,
+    _capital_history_select_columns,
     _build_forward_signal_filters,
     _filter_capital_transfer_transient_rows,
     _format_reconciliation_notification,
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
+    get_capital_history,
     get_gate_cross_risk_summary,
     register_capital_strategy_pnl_provider,
     run_capital_snapshot_now,
 )
+from fastapi import HTTPException
 
 
 class ForwardSignalFilterTests(unittest.TestCase):
@@ -197,6 +202,82 @@ class CapitalHistoryFilterTests(unittest.TestCase):
         filtered = _filter_capital_transfer_transient_rows(rows)
 
         self.assertEqual(filtered, rows)
+
+
+class CapitalHistoryQueryTests(unittest.TestCase):
+    def test_interval_is_selected_from_requested_window(self):
+        self.assertEqual(_capital_history_interval(6, 7), ('1m', 60))
+        self.assertEqual(_capital_history_interval(None, 1), ('1m', 60))
+        self.assertEqual(_capital_history_interval(None, 7), ('10m', 600))
+        self.assertEqual(_capital_history_interval(None, 30), ('1h', 3600))
+        self.assertEqual(_capital_history_interval(None, 90), ('1h', 3600))
+
+    def test_metric_columns_only_include_fields_used_by_chart(self):
+        equity_columns = _capital_history_select_columns('equity_usdt')
+        self.assertIn('s.equity_usdt', equity_columns)
+        self.assertNotIn('unrealized_pnl_usdt', equity_columns)
+        self.assertNotIn('gate_cross_risk', equity_columns)
+
+        realized_columns = _capital_history_select_columns('realized_breakdown')
+        self.assertIn('s.realized_pnl_usdt', realized_columns)
+        self.assertIn('s.funding_pnl_usdt', realized_columns)
+        self.assertIn('s.total_pnl_usdt', realized_columns)
+        self.assertNotIn('bnb_fee_asset', realized_columns)
+
+    def test_unknown_metric_is_rejected(self):
+        with self.assertRaises(HTTPException) as raised:
+            _capital_history_select_columns('everything')
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_history_endpoint_uses_auto_interval_and_narrow_query(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{
+            'snapshot_at': datetime(2026, 7, 25, 12, 0, 0),
+            'exchange': 'total',
+            'equity_usdt': Decimal('15000.25'),
+        }]
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('api.trading_api.db_manager.get_cursor', return_value=context):
+            result = asyncio.run(get_capital_history(
+                days=7,
+                hours=None,
+                exchange='total',
+                metric='equity_usdt',
+            ))
+
+        self.assertEqual(result['interval'], '10m')
+        self.assertEqual(result['metric'], 'equity_usdt')
+        self.assertEqual(result['rows'][0]['equity_usdt'], 15000.25)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('FORCE INDEX (idx_exchange_snapshot)', sql)
+        self.assertNotIn('bnb_fee_asset', sql)
+        self.assertNotIn('account_latency_ms', sql)
+        self.assertEqual(params, [600, 600, 7, 'total'])
+
+    def test_gate_risk_metric_forces_gate_exchange(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('api.trading_api.db_manager.get_cursor', return_value=context):
+            result = asyncio.run(get_capital_history(
+                days=30,
+                hours=None,
+                exchange='total',
+                metric='gate_cross_risk',
+            ))
+
+        self.assertEqual(result['interval'], '1h')
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('gate_cross_mmr_pct', sql)
+        self.assertIn('gate_cross_nearest_liq_distance_bps', sql)
+        self.assertEqual(params, [3600, 3600, 30, 'gate'])
 
 
 class GateCrossRiskSummaryTests(unittest.TestCase):

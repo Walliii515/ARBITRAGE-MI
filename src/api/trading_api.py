@@ -757,9 +757,72 @@ _CAPITAL_HISTORY_INTERVALS = {
     '10m': 600,
     '1h': 3600,
 }
+_CAPITAL_HISTORY_METRIC_COLUMNS = {
+    'equity_usdt': (),
+    'unrealized_pnl_usdt': (
+        's.unrealized_pnl_usdt',
+    ),
+    'realized_breakdown': (
+        's.realized_pnl_usdt',
+        's.funding_pnl_usdt',
+        's.total_pnl_usdt',
+    ),
+    'gross_total_pnl_usdt': (
+        (
+            'COALESCE(s.total_pnl_usdt, 0) + '
+            'COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt'
+        ),
+    ),
+    'daily_return': (
+        's.total_pnl_usdt',
+    ),
+    'gate_cross_risk': (
+        (
+            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
+            "s.detail, '$.gate_cross_risk.account_mmr_pct')), 'null') "
+            "AS DECIMAL(28,12)) AS gate_cross_mmr_pct"
+        ),
+        (
+            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
+            "s.detail, '$.gate_cross_risk.available_ratio_pct')), 'null') "
+            "AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct"
+        ),
+        (
+            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
+            "s.detail, '$.gate_cross_risk.margin_usage_pct')), 'null') "
+            "AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct"
+        ),
+        (
+            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
+            "s.detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') "
+            "AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps"
+        ),
+    ),
+}
 _CAPITAL_TRANSFER_OUTLIER_RELATIVE_CHANGE = 0.05
 _CAPITAL_TRANSFER_RECOVERY_TOLERANCE = 0.015
 _CAPITAL_TRANSFER_MAX_RECOVERY_SECONDS = 30 * 60
+
+
+def _capital_history_interval(hours: Optional[int], days: int) -> tuple[str, int]:
+    if hours is not None or days <= 1:
+        return '1m', _CAPITAL_HISTORY_INTERVALS['1m']
+    if days <= 7:
+        return '10m', _CAPITAL_HISTORY_INTERVALS['10m']
+    return '1h', _CAPITAL_HISTORY_INTERVALS['1h']
+
+
+def _capital_history_select_columns(metric: str) -> str:
+    metric_columns = _CAPITAL_HISTORY_METRIC_COLUMNS.get(metric)
+    if metric_columns is None:
+        raise HTTPException(status_code=400, detail='不支持的资金趋势指标')
+    columns = [
+        's.snapshot_at',
+        's.exchange',
+        's.equity_usdt',
+        *metric_columns,
+    ]
+    return ',\n            '.join(columns)
 
 
 def _capital_row_time(row: Dict[str, Any]) -> Optional[datetime]:
@@ -1475,10 +1538,13 @@ async def get_capital_history(
     days: int = Query(7, ge=1, le=90, description="最近N天"),
     hours: Optional[int] = Query(None, ge=1, le=24, description="最近N小时，优先于days"),
     exchange: Optional[str] = Query(None, description="交易所过滤(binance/gate/total)"),
-    interval: str = Query('10m', description="采样间隔(1m/10m/1h)"),
+    metric: str = Query('equity_usdt', description="资金趋势指标"),
 ):
-    """返回资金历史曲线数据。"""
-    bucket_sec = _CAPITAL_HISTORY_INTERVALS.get(interval, _CAPITAL_HISTORY_INTERVALS['10m'])
+    """按时间范围自动采样，并只返回当前资金趋势需要的字段。"""
+    interval, bucket_sec = _capital_history_interval(hours, days)
+    select_columns = _capital_history_select_columns(metric)
+    if metric == 'gate_cross_risk':
+        exchange = 'gate'
     if hours is not None:
         window_clause = "snapshot_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)"
         window_value = hours
@@ -1494,68 +1560,18 @@ async def get_capital_history(
         where.append("exchange = %s")
         params.append(exchange)
     where_sql = " AND ".join(where)
+    force_index = 'FORCE INDEX (idx_exchange_snapshot)' if exchange else ''
 
     sql = f"""
         SELECT
-            s.id,
-            s.snapshot_at,
-            s.exchange,
-            s.equity_usdt,
-            s.available_usdt,
-            s.locked_usdt,
-            s.position_value_usdt,
-            s.margin_used_usdt,
-            s.unrealized_pnl_usdt,
-            s.realized_pnl_usdt,
-            s.funding_pnl_usdt,
-            s.fee_cost_usdt,
-            s.total_pnl_usdt,
-            COALESCE(s.total_pnl_usdt, 0) + COALESCE(s.unrealized_pnl_usdt, 0) AS gross_total_pnl_usdt,
-            CASE
-                WHEN s.exchange = 'gate' THEN COALESCE(
-                    CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.raw_total_usdt')), 'null') AS DECIMAL(28,12)),
-                    s.equity_usdt - COALESCE(s.unrealized_pnl_usdt, 0)
-                )
-                ELSE s.equity_usdt - COALESCE(s.unrealized_pnl_usdt, 0)
-            END AS account_balance_usdt,
-            CASE
-                WHEN s.exchange = 'gate' THEN COALESCE(
-                    CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.account_unrealized_pnl')), 'null') AS DECIMAL(28,12)),
-                    s.unrealized_pnl_usdt,
-                    0
-                )
-                ELSE COALESCE(s.unrealized_pnl_usdt, 0)
-            END AS account_unrealized_pnl_usdt,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.bnb_fee_asset.free')) AS DECIMAL(28,12)) AS bnb_available,
-            CAST(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.bnb_fee_asset.free_value_usdt')) AS DECIMAL(28,12)) AS bnb_available_usdt,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status')), 'null') AS gate_cross_risk_status,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.status_label')), 'null') AS gate_cross_risk_status_label,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.position_count')), 'null') AS UNSIGNED) AS gate_cross_position_count,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_mmr_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_mmr_pct,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.available_ratio_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.margin_usage_pct')), 'null') AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.initial_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_initial_margin_usdt,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.maintenance_margin_usdt')), 'null') AS DECIMAL(28,12)) AS gate_cross_maintenance_margin_usdt,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_contract')), 'null') AS gate_cross_nearest_liq_contract,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.health_status')), 'null') AS gate_cross_health_status,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.health_label')), 'null') AS gate_cross_health_label,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.observed_status')), 'null') AS gate_cross_observed_status,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.source')), 'null') AS gate_cross_source,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.error')), 'null') AS gate_cross_error,
-            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.fetched_at')), 'null') AS gate_cross_fetched_at,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_age_sec')), 'null') AS DECIMAL(28,12)) AS gate_cross_account_age_sec,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.positions_age_sec')), 'null') AS DECIMAL(28,12)) AS gate_cross_positions_age_sec,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.account_latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_account_latency_ms,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.positions_latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_positions_latency_ms,
-            CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.detail, '$.gate_cross_risk.latency_ms')), 'null') AS DECIMAL(28,12)) AS gate_cross_latency_ms
+            {select_columns}
         FROM mi_capital_snapshot s
         INNER JOIN (
             SELECT
                 exchange,
                 FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(snapshot_at) / %s) * %s) AS bucket_at,
                 MAX(snapshot_at) AS snapshot_at
-            FROM mi_capital_snapshot
+            FROM mi_capital_snapshot {force_index}
             WHERE {where_sql}
             GROUP BY exchange, bucket_at
         ) latest
@@ -1572,7 +1588,8 @@ async def get_capital_history(
     serialized_rows = _filter_capital_transfer_transient_rows(serialized_rows)
     return {
         'rows': serialized_rows,
-        'interval': interval if interval in _CAPITAL_HISTORY_INTERVALS else '10m',
+        'metric': metric,
+        'interval': interval,
         'window': {'hours': hours} if hours is not None else {'days': days},
     }
 

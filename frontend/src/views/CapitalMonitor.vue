@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
 import { ElMessageBox } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
@@ -121,7 +120,6 @@ interface FundTransferLimits {
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
-type HistoryInterval = '1m' | '10m' | '1h'
 type TimeWindowKey = '1h' | '3h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
 type ChartMetric =
   | 'equity_usdt'
@@ -171,11 +169,12 @@ const liveGateRiskRequestError = ref('')
 const gateRiskSummary = ref<GateCrossRiskSummary | null>(null)
 const gateRiskSummaryRequestError = ref('')
 const loading = ref(false)
+const historyLoading = ref(false)
+const chartActivated = ref(false)
 const running = ref(false)
 const selectedWindow = ref<TimeWindowKey>('7d')
 const selectedChartMode = ref<ChartModeKey>('equity_usdt')
 const selectedExchange = ref<ExchangeKey>('total')
-const selectedInterval = ref<HistoryInterval>('10m')
 const showSummaryDetails = ref(false)
 const bnbBuying = ref(false)
 const clearDialogVisible = ref(false)
@@ -203,10 +202,16 @@ const openRiskConfig = ref<OpenRiskConfig>({
   min_gate_available_ratio: 0.15,
 })
 const chartRef = ref<HTMLDivElement | null>(null)
+const chartPanelRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
+let chartIntersectionObserver: IntersectionObserver | null = null
+let historyAbortController: AbortController | null = null
+let historyRequestId = 0
 let gateRiskTimer: ReturnType<typeof setInterval> | null = null
 let fundTransferTimer: ReturnType<typeof setInterval> | null = null
+const historyCache = new Map<string, { rows: CapitalRow[]; cachedAt: number }>()
+const HISTORY_CACHE_TTL_MS = 60_000
 
 const metricOptions: ChartMetricOption[] = [
   { key: 'equity_usdt', label: '总资产', group: 'asset', color: '#67c23a' },
@@ -793,11 +798,39 @@ function updateChart() {
 
 async function initChart() {
   await nextTick()
+  if (!chartRef.value || chart) return
+  const { init } = await import('../utils/capitalChart')
   if (!chartRef.value) return
-  chart = echarts.init(chartRef.value)
+  chart = init(chartRef.value)
   updateChart()
   resizeObserver = new ResizeObserver(() => chart?.resize())
   resizeObserver.observe(chartRef.value)
+}
+
+async function activateChart() {
+  if (chartActivated.value) return
+  chartActivated.value = true
+  chartIntersectionObserver?.disconnect()
+  chartIntersectionObserver = null
+  await Promise.all([
+    initChart(),
+    fetchHistory(),
+  ])
+}
+
+async function observeChartVisibility() {
+  await nextTick()
+  if (!chartPanelRef.value) return
+  if (typeof IntersectionObserver === 'undefined') {
+    await activateChart()
+    return
+  }
+  chartIntersectionObserver = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) {
+      void activateChart()
+    }
+  }, { rootMargin: '160px 0px' })
+  chartIntersectionObserver.observe(chartPanelRef.value)
 }
 
 async function fetchLiveGateRisk() {
@@ -827,15 +860,18 @@ async function fetchGateRiskSummary() {
   }
 }
 
-async function fetchCapital() {
+async function fetchCapital(forceHistory = true) {
   loading.value = true
   try {
-    const latestRes = await get('/api/trading/capital/latest')
-    const latest = await latestRes.json()
-    latestRows.value = latest.rows || []
-
-    await fetchGateRiskSummary()
-    await fetchHistory()
+    await Promise.all([
+      (async () => {
+        const latestRes = await get('/api/trading/capital/latest')
+        const latest = await latestRes.json()
+        latestRows.value = latest.rows || []
+      })(),
+      fetchGateRiskSummary(),
+      chartActivated.value ? fetchHistory(forceHistory) : Promise.resolve(),
+    ])
   } catch (e: any) {
     showError(e?.message || '获取资金数据失败')
   } finally {
@@ -861,30 +897,53 @@ async function fetchOpenRiskConfig() {
   }
 }
 
-async function fetchHistory() {
-  loading.value = true
-  try {
-    const params = new URLSearchParams()
-    const window = timeWindowOptions.find((item) => item.key === selectedWindow.value)
-      || timeWindowOptions.find((item) => item.key === '7d')!
-    if (selectedChartMode.value === 'daily_return' && window.hours != null) params.set('days', '1')
-    else if (window.hours != null) params.set('hours', String(window.hours))
-    else params.set('days', String(window.days || 7))
-    params.set('exchange', chartExchange.value)
-    params.set('interval', dailyHistoryInterval())
-    const historyRes = await get(`/api/trading/capital/history?${params.toString()}`)
-    const history = await historyRes.json()
-    historyRows.value = history.rows || []
-  } catch (e: any) {
-    showError(e?.message || '获取资金曲线失败')
-  } finally {
-    loading.value = false
-  }
+function historyRequestParams(): URLSearchParams {
+  const params = new URLSearchParams()
+  const window = timeWindowOptions.find((item) => item.key === selectedWindow.value)
+    || timeWindowOptions.find((item) => item.key === '7d')!
+  if (selectedChartMode.value === 'daily_return' && window.hours != null) params.set('days', '1')
+  else if (window.hours != null) params.set('hours', String(window.hours))
+  else params.set('days', String(window.days || 7))
+  params.set('exchange', chartExchange.value)
+  params.set('metric', selectedChartMode.value)
+  return params
 }
 
-function dailyHistoryInterval(): HistoryInterval {
-  if (selectedChartMode.value !== 'daily_return') return selectedInterval.value
-  return selectedWindow.value === '30d' || selectedWindow.value === '90d' ? '1h' : '10m'
+async function fetchHistory(force = false) {
+  if (!chartActivated.value) return
+  const params = historyRequestParams()
+  const cacheKey = params.toString()
+  const requestId = ++historyRequestId
+  historyAbortController?.abort()
+  historyAbortController = null
+  const cached = historyCache.get(cacheKey)
+  if (!force && cached && Date.now() - cached.cachedAt < HISTORY_CACHE_TTL_MS) {
+    historyLoading.value = false
+    historyRows.value = cached.rows
+    return
+  }
+
+  const controller = new AbortController()
+  historyAbortController = controller
+  historyRows.value = []
+  historyLoading.value = true
+  try {
+    const historyRes = await get(
+      `/api/trading/capital/history?${params.toString()}`,
+      { signal: controller.signal, silent: true },
+    )
+    const history = await historyRes.json()
+    if (!historyRes.ok) throw new Error(history?.detail || `HTTP ${historyRes.status}`)
+    if (requestId !== historyRequestId) return
+    const rows = history.rows || []
+    historyCache.set(cacheKey, { rows, cachedAt: Date.now() })
+    historyRows.value = rows
+  } catch (e: any) {
+    if (e?.name === 'AbortError') return
+    showError(e?.message || '获取资金曲线失败')
+  } finally {
+    if (requestId === historyRequestId) historyLoading.value = false
+  }
 }
 
 async function runSnapshot() {
@@ -1234,15 +1293,21 @@ async function buyBnbFeeAsset() {
 
 function setWindow(window: TimeWindowKey) {
   selectedWindow.value = window
-  fetchCapital()
+  void fetchHistory()
+}
+
+async function refreshCapital() {
+  await fetchCapital(true)
 }
 
 onMounted(async () => {
-  await fetchOpenRiskConfig()
-  await fetchLiveGateRisk()
-  await fetchCapital()
-  await fetchFundTransfers()
-  await initChart()
+  await Promise.all([
+    fetchOpenRiskConfig(),
+    fetchLiveGateRisk(),
+    fetchCapital(false),
+    fetchFundTransfers(),
+  ])
+  await observeChartVisibility()
   gateRiskTimer = setInterval(fetchLiveGateRisk, 2000)
   fundTransferTimer = setInterval(() => {
     if (fundTransferDialogVisible.value || activeFundTransfer.value) {
@@ -1251,19 +1316,19 @@ onMounted(async () => {
   }, 3000)
 })
 
-watch([historyRows, selectedChartMode, selectedExchange], () => {
+watch(historyRows, () => {
   updateChart()
 })
 
-watch([selectedExchange, selectedInterval], () => {
-  fetchHistory()
-})
-
-watch(selectedChartMode, () => {
-  fetchHistory()
+watch([selectedExchange, selectedChartMode], () => {
+  void fetchHistory()
 })
 
 onBeforeUnmount(() => {
+  historyAbortController?.abort()
+  historyAbortController = null
+  chartIntersectionObserver?.disconnect()
+  chartIntersectionObserver = null
   if (gateRiskTimer) clearInterval(gateRiskTimer)
   gateRiskTimer = null
   if (fundTransferTimer) clearInterval(fundTransferTimer)
@@ -1299,7 +1364,7 @@ onBeforeUnmount(() => {
           {{ window.label }}
         </el-button>
       </el-button-group>
-      <el-button size="small" :loading="loading" @click="fetchCapital">刷新</el-button>
+      <el-button size="small" :loading="loading" @click="refreshCapital">刷新</el-button>
       <el-button size="small" type="danger" plain @click="openClearDialog">清理时间段</el-button>
       <el-button size="small" @click="showSummaryDetails = !showSummaryDetails">
         {{ showSummaryDetails ? '收起详情' : '详细' }}
@@ -1509,7 +1574,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div class="chart-panel">
+    <div ref="chartPanelRef" class="chart-panel">
       <div class="chart-header">
         <span>{{ selectedChartMode === 'gate_cross_risk' ? 'Gate 全仓风险趋势' : '资金趋势' }}</span>
         <el-radio-group
@@ -1525,16 +1590,6 @@ onBeforeUnmount(() => {
       </div>
       <div class="metric-selector-row">
         <el-radio-group
-          v-if="selectedChartMode !== 'daily_return'"
-          v-model="selectedInterval"
-          size="small"
-          class="interval-selector"
-        >
-          <el-radio-button label="1m">1分钟</el-radio-button>
-          <el-radio-button label="10m">10分钟</el-radio-button>
-          <el-radio-button label="1h">1小时</el-radio-button>
-        </el-radio-group>
-        <el-radio-group
           v-model="selectedChartMode"
           size="small"
           class="metric-selector"
@@ -1548,9 +1603,14 @@ onBeforeUnmount(() => {
           </el-radio-button>
         </el-radio-group>
       </div>
-      <div class="chart-wrap">
+      <div v-loading="historyLoading" class="chart-wrap">
         <div ref="chartRef" class="echarts-chart"></div>
-        <div v-if="!historyRows.length" class="empty-text">暂无资金快照</div>
+        <div
+          v-if="chartActivated && !historyLoading && !historyRows.length"
+          class="empty-text"
+        >
+          暂无资金快照
+        </div>
       </div>
     </div>
 
@@ -2091,7 +2151,6 @@ onBeforeUnmount(() => {
 }
 
 .exchange-selector,
-.interval-selector,
 .metric-selector {
   display: flex;
   flex-wrap: wrap;
@@ -2423,7 +2482,6 @@ onBeforeUnmount(() => {
   }
 
   .exchange-selector,
-  .interval-selector,
   .metric-selector {
     justify-content: flex-start;
   }
