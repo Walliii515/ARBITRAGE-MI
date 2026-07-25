@@ -20,12 +20,13 @@ from pydantic import BaseModel
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
-from api.auth import verify_token_dependency
+from api.auth import verify_token_dependency, verify_user_password
 from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
 from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
+from calc.fund_transfer_service import get_fund_transfer_service
 from calc.gate_cross_risk import gate_cross_risk_pressure
 from calc.gate_position_risk import attach_gate_position_risk
 from calc.listing_event_monitor import (
@@ -100,6 +101,15 @@ class PopupNotificationMarkReadRequest(BaseModel):
 class CapitalClearRangeRequest(BaseModel):
     start_at: str
     end_at: str
+
+
+class FundTransferCreateRequest(BaseModel):
+    amount: Decimal
+    password: str
+
+
+class FundTransferRetryRequest(BaseModel):
+    password: str
 
 
 def _subscribe_listing_asset_orderbook(base_asset: str) -> Dict[str, Any]:
@@ -1581,6 +1591,89 @@ async def run_capital_snapshot_now():
     finally:
         with _capital_lock:
             _capital_running = False
+
+
+@router.get('/capital/fund-transfer', dependencies=[Depends(verify_token_dependency)])
+async def get_fund_transfer_tasks(limit: int = Query(30, ge=1, le=200)):
+    """Return the active transfer and durable transfer history."""
+    try:
+        service = get_fund_transfer_service()
+        active = service.store.get_active()
+        history = service.store.list(limit=limit)
+        return {
+            'active': _serialize_row(active) if active else None,
+            'history': _serialize_rows(history),
+            'open_locked': service.open_locked,
+        }
+    except Exception as exc:
+        logger.error('读取资金划转任务失败: %s', exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'读取资金划转任务失败: {exc}')
+
+
+@router.get(
+    '/capital/fund-transfer/preflight',
+    dependencies=[Depends(verify_token_dependency)],
+)
+async def preflight_fund_transfer(amount: Decimal = Query(..., gt=0)):
+    """Read live balances, fee, network and fixed destination without moving money."""
+    try:
+        result = await asyncio.to_thread(
+            lambda: get_fund_transfer_service().preview(amount)
+        )
+        return {'success': True, 'preview': _serialize_row(result)}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        logger.error('资金划转预检失败: %s', exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'资金划转预检失败: {exc}')
+
+
+@router.post('/capital/fund-transfer', status_code=201)
+async def create_fund_transfer(
+    req: FundTransferCreateRequest,
+    user: Dict[str, Any] = Depends(verify_token_dependency),
+):
+    """Create one real transfer after current-password re-authentication."""
+    if config.get_trade_mode() == 'virtual':
+        raise HTTPException(status_code=409, detail='virtual 模式不执行真实资金划转')
+    if not verify_user_password(user_id=user.get('user_id'), password=req.password):
+        raise HTTPException(status_code=403, detail='当前登录密码校验失败')
+    try:
+        service = get_fund_transfer_service()
+        task = await asyncio.to_thread(
+            lambda: service.create_task(
+                amount=req.amount,
+                user_id=str(user.get('user_id') or 'default'),
+                username=str(user.get('username') or ''),
+            )
+        )
+        return {'success': True, 'task': _serialize_row(task)}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        logger.error('创建资金划转任务失败: %s', exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'创建资金划转任务失败: {exc}')
+
+
+@router.post('/capital/fund-transfer/{task_id}/retry')
+async def retry_fund_transfer(
+    task_id: int,
+    req: FundTransferRetryRequest,
+    user: Dict[str, Any] = Depends(verify_token_dependency),
+):
+    """Recheck an ambiguous task or retry only its location-safe recovery step."""
+    if not verify_user_password(user_id=user.get('user_id'), password=req.password):
+        raise HTTPException(status_code=403, detail='当前登录密码校验失败')
+    try:
+        task = await asyncio.to_thread(
+            lambda: get_fund_transfer_service().request_retry(task_id)
+        )
+        return {'success': True, 'task': _serialize_row(task)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error('资金划转恢复失败: task=%s error=%s', task_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'资金划转恢复失败: {exc}')
 
 
 @router.post('/capital/clear-range', dependencies=[Depends(verify_token_dependency)])

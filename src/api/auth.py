@@ -35,6 +35,18 @@ class LoginResponse(BaseModel):
     expires_at: str
 
 
+def verify_user_password(*, user_id: object, password: str) -> bool:
+    """Re-authenticate a logged-in user before a sensitive money operation."""
+    if user_id is None or not password:
+        return False
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(
+            "SELECT 1 AS ok FROM mi_users WHERE id = %s AND password = %s LIMIT 1",
+            (user_id, password),
+        )
+        return bool(cursor.fetchone())
+
+
 @router.post('/login', response_model=LoginResponse)
 async def login(req: LoginRequest):
     """用户登录,验证用户名密码,返回 token"""

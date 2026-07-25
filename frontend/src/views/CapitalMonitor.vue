@@ -72,6 +72,41 @@ interface GateCrossRiskSummary {
   minimum?: GateCrossRiskMinimum | null
 }
 
+interface FundTransferTask {
+  id: number
+  status: string
+  step: string
+  status_message?: string | null
+  coin: string
+  network: string
+  destination_masked: string
+  requested_amount: number
+  expected_fee: number
+  withdraw_amount: number
+  received_amount?: number | null
+  binance_transfer_id?: string | null
+  binance_withdraw_id?: string | null
+  binance_tx_id?: string | null
+  gate_deposit_id?: string | null
+  gate_transfer_id?: string | null
+  attention_required?: boolean | number
+  last_error?: string | null
+  created_at: string
+  updated_at?: string | null
+  completed_at?: string | null
+}
+
+interface FundTransferPreview {
+  coin: string
+  network: string
+  destination_masked: string
+  requested_amount: number
+  fee: number
+  received_amount: number
+  minimum_received_amount: number
+  binance_forward_free: number
+}
+
 type ExchangeKey = 'binance' | 'gate' | 'total'
 type HistoryInterval = '1m' | '10m' | '1h'
 type TimeWindowKey = '1h' | '3h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
@@ -133,6 +168,15 @@ const bnbBuying = ref(false)
 const clearDialogVisible = ref(false)
 const clearingRange = ref(false)
 const clearRange = ref<[string, string] | null>(null)
+const fundTransferDialogVisible = ref(false)
+const fundTransferAmount = ref<string>('10')
+const fundTransferPassword = ref('')
+const fundTransferPreflight = ref<FundTransferPreview | null>(null)
+const fundTransferPreflighting = ref(false)
+const fundTransferCreating = ref(false)
+const fundTransferRetrying = ref(false)
+const activeFundTransfer = ref<FundTransferTask | null>(null)
+const fundTransferHistory = ref<FundTransferTask[]>([])
 const clearDefaultTime = [
   new Date(2000, 0, 1, 0, 0, 0),
   new Date(2000, 0, 1, 23, 59, 59),
@@ -146,6 +190,7 @@ const chartRef = ref<HTMLDivElement | null>(null)
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
 let gateRiskTimer: ReturnType<typeof setInterval> | null = null
+let fundTransferTimer: ReturnType<typeof setInterval> | null = null
 
 const metricOptions: ChartMetricOption[] = [
   { key: 'equity_usdt', label: '总资产', group: 'asset', color: '#67c23a' },
@@ -195,6 +240,32 @@ const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: numb
   { key: '90d', label: '90天', days: 90 },
 ]
 
+const fundTransferStatusLabels: Record<string, string> = {
+  queued: '等待划到 Binance 主账户',
+  binance_transfer_submitted: '核验 Binance 内部划转',
+  binance_master_funded: 'Binance 主账户已到账',
+  binance_withdraw_submitted: '核验 Binance 提现',
+  binance_withdrawing: 'Binance 提现处理中',
+  binance_withdraw_completed: '等待 Gate 入账',
+  gate_deposit_confirmed: 'Gate 主账户已到账',
+  gate_transfer_submitted: '核验 Gate 内部划转',
+  gate_transfer_retry_required: 'Gate 内部划转待重试',
+  rollback_pending: '准备退回 Binance 子账户',
+  rollback_submitted: '核验 Binance 回滚',
+  rollback_retry_required: 'Binance 回滚待重试',
+  completed: '划转完成',
+  rolled_back: '已退回 Binance',
+  failed_before_transfer: '未发生资金动作',
+  manually_reconciled: '已人工核对',
+}
+
+const fundTransferTerminalStatuses = new Set([
+  'completed',
+  'rolled_back',
+  'failed_before_transfer',
+  'manually_reconciled',
+])
+
 const latestByExchange = computed(() => {
   const result: Record<string, CapitalRow | undefined> = {}
   for (const row of latestRows.value) result[row.exchange] = row
@@ -232,6 +303,24 @@ const gateRiskPanelError = computed(() => (
 const chartExchange = computed<ExchangeKey>(() => (
   selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
 ))
+const displayedFundTransfer = computed<FundTransferTask | null>(() => (
+  activeFundTransfer.value || fundTransferHistory.value[0] || null
+))
+const fundTransferProgress = computed(() => {
+  const status = displayedFundTransfer.value?.status || ''
+  if (fundTransferTerminalStatuses.has(status)) return status === 'completed' ? 4 : 0
+  if (['gate_deposit_confirmed', 'gate_transfer_submitted', 'gate_transfer_retry_required'].includes(status)) return 3
+  if (status === 'binance_withdraw_completed') return 2
+  if ([
+    'binance_master_funded',
+    'binance_withdraw_submitted',
+    'binance_withdrawing',
+    'rollback_pending',
+    'rollback_submitted',
+    'rollback_retry_required',
+  ].includes(status)) return 1
+  return 0
+})
 
 const chartSeries = computed<ChartSeries[]>(() => {
   const rows = historyRows.value
@@ -800,6 +889,165 @@ async function runSnapshot() {
   }
 }
 
+function fundTransferStatusLabel(status: string | null | undefined): string {
+  if (!status) return '-'
+  return fundTransferStatusLabels[status] || status
+}
+
+function fundTransferStatusType(status: string | null | undefined): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'completed') return 'success'
+  if (status === 'failed_before_transfer' || status === 'rolled_back') return 'info'
+  if (status?.includes('retry_required')) return 'danger'
+  return 'warning'
+}
+
+function canRetryFundTransfer(task: FundTransferTask | null): boolean {
+  if (!task || fundTransferTerminalStatuses.has(task.status)) return false
+  return Boolean(task.attention_required)
+    || ['gate_transfer_retry_required', 'rollback_retry_required'].includes(task.status)
+}
+
+function fundTransferTxUrl(txId: string | null | undefined): string {
+  return txId ? `https://bscscan.com/tx/${encodeURIComponent(txId)}` : ''
+}
+
+async function fetchFundTransfers(silent = true) {
+  const previousActiveId = activeFundTransfer.value?.id
+  try {
+    const res = await get('/api/trading/capital/fund-transfer?limit=30', { silent })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    activeFundTransfer.value = data.active || null
+    fundTransferHistory.value = data.history || []
+    if (previousActiveId && !activeFundTransfer.value) {
+      try {
+        await post('/api/trading/capital/run', undefined, { silent: true })
+      } catch {
+        // 任务终态不受快照刷新失败影响，随后仍读取已有资金快照。
+      }
+      await fetchCapital()
+    }
+  } catch (e: any) {
+    if (!silent) showError(e?.message || '读取资金划转状态失败')
+  }
+}
+
+async function openFundTransferDialog() {
+  fundTransferPreflight.value = null
+  fundTransferPassword.value = ''
+  fundTransferDialogVisible.value = true
+  await fetchFundTransfers(false)
+}
+
+async function preflightFundTransfer(): Promise<FundTransferPreview | null> {
+  const amount = Number(fundTransferAmount.value)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    showError('请输入有效的划转金额')
+    return null
+  }
+  fundTransferPreflighting.value = true
+  try {
+    const res = await get(
+      `/api/trading/capital/fund-transfer/preflight?amount=${encodeURIComponent(String(amount))}`,
+      { silent: true },
+    )
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    fundTransferPreflight.value = data.preview
+    return data.preview
+  } catch (e: any) {
+    fundTransferPreflight.value = null
+    showError(e?.message || '资金划转预检失败')
+    return null
+  } finally {
+    fundTransferPreflighting.value = false
+  }
+}
+
+async function submitFundTransfer() {
+  if (activeFundTransfer.value) {
+    showError('已有资金划转任务正在处理')
+    return
+  }
+  if (!fundTransferPassword.value) {
+    showError('请输入当前登录密码')
+    return
+  }
+  const preview = await preflightFundTransfer()
+  if (!preview) return
+  try {
+    await ElMessageBox.confirm(
+      `Binance forward 子账户将减少 ${formatAmount(preview.requested_amount)} ${preview.coin}。\n`
+      + `网络 ${preview.network}，手续费 ${formatAmount(preview.fee)} ${preview.coin}，`
+      + `预计 Gate 到账 ${formatAmount(preview.received_amount)} ${preview.coin}。\n`
+      + `到账地址 ${preview.destination_masked}。确认后任务将自动执行，不能重复发起。`,
+      '确认真实资金划转',
+      {
+        confirmButtonText: '确认划转',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
+
+  fundTransferCreating.value = true
+  try {
+    const res = await post('/api/trading/capital/fund-transfer', {
+      amount: preview.requested_amount,
+      password: fundTransferPassword.value,
+    }, { silent: true })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    activeFundTransfer.value = data.task
+    fundTransferPassword.value = ''
+    fundTransferPreflight.value = null
+    showSuccess('资金划转任务已创建，正向开仓已独立暂停')
+    await fetchFundTransfers()
+  } catch (e: any) {
+    showError(e?.message || '创建资金划转任务失败')
+  } finally {
+    fundTransferCreating.value = false
+  }
+}
+
+async function retryFundTransfer(task: FundTransferTask) {
+  let password = ''
+  try {
+    const result = await ElMessageBox.prompt(
+      '系统只会重新核验，或重试已经确认资金位置的安全步骤。',
+      `恢复资金划转 #${task.id}`,
+      {
+        confirmButtonText: '确认恢复',
+        cancelButtonText: '取消',
+        inputType: 'password',
+        inputPlaceholder: '输入当前登录密码',
+        inputValidator: (value: string) => Boolean(value) || '请输入当前登录密码',
+      },
+    )
+    password = result.value
+  } catch {
+    return
+  }
+  fundTransferRetrying.value = true
+  try {
+    const res = await post(
+      `/api/trading/capital/fund-transfer/${task.id}/retry`,
+      { password },
+      { silent: true },
+    )
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    showSuccess('恢复请求已提交，系统将继续按资金位置核验')
+    await fetchFundTransfers(false)
+  } catch (e: any) {
+    showError(e?.message || '资金划转恢复失败')
+  } finally {
+    fundTransferRetrying.value = false
+  }
+}
+
 function formatLocalDateTime(date: Date): string {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
@@ -935,8 +1183,14 @@ onMounted(async () => {
   await fetchOpenRiskConfig()
   await fetchLiveGateRisk()
   await fetchCapital()
+  await fetchFundTransfers()
   await initChart()
   gateRiskTimer = setInterval(fetchLiveGateRisk, 2000)
+  fundTransferTimer = setInterval(() => {
+    if (fundTransferDialogVisible.value || activeFundTransfer.value) {
+      fetchFundTransfers()
+    }
+  }, 3000)
 })
 
 watch([historyRows, selectedChartMode, selectedExchange], () => {
@@ -954,6 +1208,8 @@ watch(selectedChartMode, () => {
 onBeforeUnmount(() => {
   if (gateRiskTimer) clearInterval(gateRiskTimer)
   gateRiskTimer = null
+  if (fundTransferTimer) clearInterval(fundTransferTimer)
+  fundTransferTimer = null
   resizeObserver?.disconnect()
   resizeObserver = null
   chart?.dispose()
@@ -966,6 +1222,14 @@ onBeforeUnmount(() => {
     <div class="toolbar">
       <el-button size="small" type="primary" :loading="running" @click="runSnapshot">
         立即采集
+      </el-button>
+      <el-button
+        size="small"
+        :type="activeFundTransfer ? 'warning' : 'primary'"
+        plain
+        @click="openFundTransferDialog"
+      >
+        {{ activeFundTransfer ? `划转中 #${activeFundTransfer.id}` : '资金划转' }}
       </el-button>
       <el-button-group size="small">
         <el-button
@@ -1231,6 +1495,164 @@ onBeforeUnmount(() => {
         <div v-if="!historyRows.length" class="empty-text">暂无资金快照</div>
       </div>
     </div>
+
+    <el-dialog
+      v-model="fundTransferDialogVisible"
+      title="Binance → Gate 资金划转"
+      width="min(820px, 96vw)"
+      class="fund-transfer-dialog"
+      append-to-body
+      destroy-on-close
+    >
+      <div class="fund-transfer-content">
+        <div v-if="activeFundTransfer" class="fund-transfer-active">
+          <div class="fund-transfer-status-line">
+            <div>
+              <strong>任务 #{{ activeFundTransfer.id }}</strong>
+              <span>{{ formatAmount(activeFundTransfer.requested_amount) }} {{ activeFundTransfer.coin }}</span>
+            </div>
+            <el-tag :type="fundTransferStatusType(activeFundTransfer.status)" effect="dark">
+              {{ fundTransferStatusLabel(activeFundTransfer.status) }}
+            </el-tag>
+          </div>
+          <el-steps
+            :active="fundTransferProgress"
+            finish-status="success"
+            process-status="process"
+            align-center
+            class="fund-transfer-steps"
+          >
+            <el-step title="主账户" />
+            <el-step title="提现" />
+            <el-step title="Gate入账" />
+            <el-step title="合约账户" />
+          </el-steps>
+          <div class="fund-transfer-message">
+            {{ activeFundTransfer.status_message || fundTransferStatusLabel(activeFundTransfer.status) }}
+          </div>
+          <div class="fund-transfer-detail-grid">
+            <span>预计手续费</span>
+            <strong>{{ formatAmount(activeFundTransfer.expected_fee) }} {{ activeFundTransfer.coin }}</strong>
+            <span>预计到账</span>
+            <strong>{{ formatAmount(activeFundTransfer.withdraw_amount) }} {{ activeFundTransfer.coin }}</strong>
+            <span>网络 / 地址</span>
+            <strong>{{ activeFundTransfer.network }} / {{ activeFundTransfer.destination_masked }}</strong>
+            <span>开始时间</span>
+            <strong>{{ activeFundTransfer.created_at }}</strong>
+          </div>
+          <a
+            v-if="activeFundTransfer.binance_tx_id"
+            class="fund-transfer-tx-link"
+            :href="fundTransferTxUrl(activeFundTransfer.binance_tx_id)"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            在 BscScan 查看链上交易
+          </a>
+          <div v-if="activeFundTransfer.last_error" class="fund-transfer-error">
+            {{ activeFundTransfer.last_error }}
+          </div>
+          <el-button
+            v-if="canRetryFundTransfer(activeFundTransfer)"
+            size="small"
+            type="warning"
+            :loading="fundTransferRetrying"
+            @click="retryFundTransfer(activeFundTransfer)"
+          >
+            重新核验并恢复
+          </el-button>
+        </div>
+
+        <div v-else class="fund-transfer-form">
+          <el-alert
+            title="输入金额是 Binance forward 子账户的总减少额，网络手续费包含在该金额内。任务执行期间只暂停正向开仓，平仓和风控不受影响。"
+            type="warning"
+            :closable="false"
+            show-icon
+          />
+          <el-form label-position="top" @submit.prevent>
+            <el-form-item label="划转金额 (USDT)">
+              <el-input
+                v-model="fundTransferAmount"
+                inputmode="decimal"
+                placeholder="例如 100"
+                @input="fundTransferPreflight = null"
+              />
+            </el-form-item>
+            <el-form-item label="当前登录密码">
+              <el-input
+                v-model="fundTransferPassword"
+                type="password"
+                show-password
+                autocomplete="current-password"
+                placeholder="每次真实划转都需要重新验证"
+              />
+            </el-form-item>
+          </el-form>
+          <div v-if="fundTransferPreflight" class="fund-transfer-preview">
+            <div><span>Binance forward 可用</span><strong>{{ formatAmount(fundTransferPreflight.binance_forward_free) }} USDT</strong></div>
+            <div><span>总扣除</span><strong>{{ formatAmount(fundTransferPreflight.requested_amount) }} USDT</strong></div>
+            <div><span>网络手续费</span><strong>{{ formatAmount(fundTransferPreflight.fee) }} USDT</strong></div>
+            <div><span>预计 Gate 到账</span><strong>{{ formatAmount(fundTransferPreflight.received_amount) }} USDT</strong></div>
+            <div><span>网络 / 地址</span><strong>{{ fundTransferPreflight.network }} / {{ fundTransferPreflight.destination_masked }}</strong></div>
+          </div>
+          <div class="fund-transfer-actions">
+            <el-button
+              size="small"
+              :loading="fundTransferPreflighting"
+              @click="preflightFundTransfer"
+            >
+              检查金额
+            </el-button>
+            <el-button
+              size="small"
+              type="primary"
+              :loading="fundTransferCreating"
+              @click="submitFundTransfer"
+            >
+              确认划转
+            </el-button>
+          </div>
+        </div>
+
+        <div class="fund-transfer-history">
+          <div class="fund-transfer-section-title">划转记录</div>
+          <el-table :data="fundTransferHistory" size="small" max-height="240">
+            <el-table-column prop="id" label="任务" width="68">
+              <template #default="{ row }">#{{ row.id }}</template>
+            </el-table-column>
+            <el-table-column prop="created_at" label="时间" min-width="150" />
+            <el-table-column label="金额" width="110" align="right">
+              <template #default="{ row }">{{ formatAmount(row.requested_amount) }} {{ row.coin }}</template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="150">
+              <template #default="{ row }">
+                <el-tag :type="fundTransferStatusType(row.status)" size="small">
+                  {{ fundTransferStatusLabel(row.status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="链上" width="72" align="center">
+              <template #default="{ row }">
+                <a
+                  v-if="row.binance_tx_id"
+                  :href="fundTransferTxUrl(row.binance_tx_id)"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="fund-transfer-tx-link"
+                >
+                  查看
+                </a>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </div>
+      <template #footer>
+        <el-button size="small" @click="fundTransferDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog
       v-model="clearDialogVisible"
@@ -1622,6 +2044,144 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+:deep(.fund-transfer-dialog .el-dialog__body) {
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+}
+
+.fund-transfer-content {
+  display: grid;
+  gap: 18px;
+}
+
+.fund-transfer-active,
+.fund-transfer-form {
+  display: grid;
+  gap: 14px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.fund-transfer-status-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.fund-transfer-status-line > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.fund-transfer-status-line strong {
+  color: var(--app-text);
+  font-size: 15px;
+}
+
+.fund-transfer-status-line span {
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.fund-transfer-steps {
+  margin: 4px 0;
+}
+
+.fund-transfer-message {
+  border-left: 3px solid #e6a23c;
+  padding: 7px 10px;
+  background: color-mix(in srgb, #e6a23c 8%, transparent);
+  color: var(--app-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.fund-transfer-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) minmax(0, 1fr);
+  gap: 7px 14px;
+  font-size: 12px;
+}
+
+.fund-transfer-detail-grid span {
+  color: var(--app-text-muted);
+}
+
+.fund-transfer-detail-grid strong {
+  min-width: 0;
+  color: var(--app-text);
+  font-weight: 600;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.fund-transfer-preview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid var(--app-border);
+  border-bottom: 1px solid var(--app-border);
+}
+
+.fund-transfer-preview > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--app-border);
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.fund-transfer-preview > div:nth-child(odd) {
+  border-right: 1px solid var(--app-border);
+}
+
+.fund-transfer-preview strong {
+  color: var(--app-text);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.fund-transfer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.fund-transfer-error {
+  border-left: 3px solid #f56c6c;
+  padding: 7px 10px;
+  color: #f56c6c;
+  background: color-mix(in srgb, #f56c6c 8%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.fund-transfer-tx-link {
+  color: #409eff;
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.fund-transfer-tx-link:hover {
+  text-decoration: underline;
+}
+
+.fund-transfer-history {
+  min-width: 0;
+}
+
+.fund-transfer-section-title {
+  margin-bottom: 8px;
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .clear-range-dialog {
   display: flex;
   width: 100%;
@@ -1707,6 +2267,28 @@ onBeforeUnmount(() => {
     overflow-wrap: anywhere;
   }
 
+  .fund-transfer-status-line,
+  .fund-transfer-status-line > div {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .fund-transfer-preview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fund-transfer-preview > div:nth-child(odd) {
+    border-right: 0;
+  }
+
+  .fund-transfer-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fund-transfer-detail-grid strong {
+    text-align: left;
+  }
+
   .chart-header,
   .metric-selector-row {
     align-items: flex-start;
@@ -1718,6 +2300,35 @@ onBeforeUnmount(() => {
   .interval-selector,
   .metric-selector {
     justify-content: flex-start;
+  }
+}
+</style>
+
+<style>
+.fund-transfer-dialog.el-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: 96vh;
+  margin-top: 2vh;
+  margin-bottom: 2vh;
+}
+
+.fund-transfer-dialog.el-dialog .el-dialog__body {
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+}
+
+@media (max-width: 520px) {
+  .fund-transfer-dialog.el-dialog .el-dialog__header,
+  .fund-transfer-dialog.el-dialog .el-dialog__body,
+  .fund-transfer-dialog.el-dialog .el-dialog__footer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .fund-transfer-dialog.el-dialog .el-step__title {
+    font-size: 11px;
   }
 }
 </style>

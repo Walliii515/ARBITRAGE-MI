@@ -80,6 +80,10 @@ from calc.service_lifecycle import SERVICE_IDLE, SERVICE_STARTING, SERVICE_RUNNI
 from calc.orderbook_data_client import OrderBookDataClient
 from calc.server_metrics import get_latest_server_metrics, list_server_metrics, record_server_metrics
 from calc.popup_notification_store import upsert_popup_notification
+from calc.fund_transfer_service import (
+    fund_transfer_open_locked,
+    get_fund_transfer_service,
+)
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
 
 setup_logging()
@@ -966,6 +970,16 @@ async def lifespan(app: FastAPI):
     broadcast_queue = asyncio.Queue()
     worker_task = asyncio.create_task(broadcast_worker())
 
+    async def _fund_transfer_loop():
+        while True:
+            try:
+                await asyncio.to_thread(get_fund_transfer_service().run_once)
+            except Exception as exc:
+                logger.error('资金划转后台核验失败: %s', exc, exc_info=True)
+            await asyncio.sleep(3)
+
+    fund_transfer_task = asyncio.create_task(_fund_transfer_loop())
+
     global _contract_meta, _spot_meta, _threshold_meta, _vwap_threshold_meta
     global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
     global _funding_support_meta
@@ -1081,8 +1095,13 @@ async def lifespan(app: FastAPI):
     _critical_open_executor.shutdown(wait=False, cancel_futures=True)
     _critical_close_executor.shutdown(wait=False, cancel_futures=True)
     worker_task.cancel()
+    fund_transfer_task.cancel()
     try:
         await worker_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await fund_transfer_task
     except asyncio.CancelledError:
         pass
 
@@ -1400,6 +1419,7 @@ async def open_status():
     """查询正向开仓暂停状态（无需认证）"""
     return {
         'open_paused': _open_paused,
+        'fund_transfer_locked': fund_transfer_open_locked(),
         'reverse_open_paused': _reverse_open_paused,
         'min_available_ratio': config.get_float('trade.open.min_available_ratio', 0.10),
         'min_binance_available_ratio': config.get_float(
@@ -1851,6 +1871,9 @@ def _run_open_position_check_once():
             return
 
         if _open_paused:
+            return
+
+        if fund_transfer_open_locked():
             return
 
         if _is_real_executor and not _exchange_connectivity_ok:
