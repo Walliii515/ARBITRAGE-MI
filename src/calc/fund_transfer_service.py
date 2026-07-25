@@ -442,7 +442,9 @@ class FundTransferService:
                 coin=task['coin'],
                 network=task['network'],
                 address=self.settings.destination,
-                amount=_decimal(task['withdraw_amount']),
+                # Binance deducts the fee from this gross amount. Passing the
+                # expected net amount would leave one fee unit in master SPOT.
+                amount=_decimal(task['requested_amount']),
                 order_id=task['binance_withdraw_order_id'],
             )
         except FundApiError as exc:

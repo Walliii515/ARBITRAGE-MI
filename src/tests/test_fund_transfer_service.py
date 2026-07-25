@@ -293,10 +293,23 @@ def test_withdrawal_rechecks_live_fee_and_preserves_total_debit_semantics():
     result = service.run_once(task['id'])
 
     withdraw = [call for call in binance.calls if call[0] == 'withdraw'][0][1]
-    assert withdraw['amount'] == Decimal('9.98000000')
+    assert withdraw['amount'] == Decimal('10.00000000')
     assert result['expected_fee'] == Decimal('0.02')
     assert result['withdraw_amount'] == Decimal('9.98000000')
     assert result['requested_amount'] == Decimal('10.00000000')
+
+
+def test_withdrawal_submits_gross_amount_and_keeps_net_amount_for_display():
+    service, store, binance, _, _ = make_service()
+    task = create_task(service)
+    store.update(task['id'], status='binance_master_funded')
+
+    result = service.run_once(task['id'])
+
+    withdraw = [call for call in binance.calls if call[0] == 'withdraw'][0][1]
+    assert withdraw['amount'] == Decimal('10.00000000')
+    assert result['withdraw_amount'] == Decimal('9.99000000')
+    assert result['expected_fee'] == Decimal('0.01')
 
 
 def test_ambiguous_withdrawal_is_queried_without_duplicate_submission():
