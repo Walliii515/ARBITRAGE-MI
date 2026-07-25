@@ -167,6 +167,10 @@ function formatDateTime(value: unknown): string {
   return `${year}-${month}-${day} ${hour}:${minute}:${second}`
 }
 
+function formatAxisDateTime(value: unknown): string {
+  return formatDateTime(value).replace(' ', '\n')
+}
+
 function usageTone(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return 'neutral'
   if (Number(value) >= 90) return 'danger'
@@ -196,7 +200,7 @@ function buildUsageChartOption(): EChartsOption {
   return {
     color: series.map((item) => item.color),
     animation: false,
-    grid: { top: 42, right: 34, bottom: 42, left: 54 },
+    grid: { top: 42, right: 34, bottom: 64, left: 54 },
     legend: { top: 0, textStyle: { color: colors.muted } },
     tooltip: {
       trigger: 'axis',
@@ -216,9 +220,16 @@ function buildUsageChartOption(): EChartsOption {
     },
     xAxis: {
       type: 'time',
+      splitNumber: 4,
+      minInterval: 12 * 60 * 60 * 1000,
       axisLine: { lineStyle: { color: colors.border } },
       axisTick: { show: false },
-      axisLabel: { color: colors.muted, formatter: (value: number) => formatDateTime(value) },
+      axisLabel: {
+        color: colors.muted,
+        hideOverlap: true,
+        margin: 12,
+        formatter: (value: number) => formatAxisDateTime(value),
+      },
       splitLine: { show: false },
     },
     yAxis: {
@@ -251,7 +262,7 @@ function buildLoadChartOption(): EChartsOption {
   return {
     color: series.map((item) => item.color),
     animation: false,
-    grid: { top: 42, right: 34, bottom: 42, left: 54 },
+    grid: { top: 42, right: 34, bottom: 64, left: 54 },
     legend: { top: 0, textStyle: { color: colors.muted } },
     tooltip: {
       trigger: 'axis',
@@ -271,9 +282,16 @@ function buildLoadChartOption(): EChartsOption {
     },
     xAxis: {
       type: 'time',
+      splitNumber: 4,
+      minInterval: 12 * 60 * 60 * 1000,
       axisLine: { lineStyle: { color: colors.border } },
       axisTick: { show: false },
-      axisLabel: { color: colors.muted, formatter: (value: number) => formatDateTime(value) },
+      axisLabel: {
+        color: colors.muted,
+        hideOverlap: true,
+        margin: 12,
+        formatter: (value: number) => formatAxisDateTime(value),
+      },
       splitLine: { show: false },
     },
     yAxis: {
