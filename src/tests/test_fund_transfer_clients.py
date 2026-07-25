@@ -72,10 +72,11 @@ def test_binance_universal_transfer_uses_stable_client_id_and_subaccount_email()
         from_email='forward@example.com',
     )
 
-    body = session.calls[0][2]['data']
-    assert 'clientTranId=ft_1_bin' in body
-    assert 'fromEmail=forward%40example.com' in body
-    assert 'toEmail=' not in body
+    query = session.calls[0][2]['params']
+    assert 'clientTranId=ft_1_bin' in query
+    assert 'fromEmail=forward%40example.com' in query
+    assert 'toEmail=' not in query
+    assert 'data' not in session.calls[0][2]
 
 
 def test_binance_transfer_history_queries_the_correct_direction():
@@ -112,11 +113,12 @@ def test_binance_withdraw_always_sends_network_address_and_order_id():
         order_id='ft_1_withdraw',
     )
 
-    body = session.calls[0][2]['data']
-    assert 'network=BSC' in body
-    assert 'address=0xabc' in body
-    assert 'amount=9.99' in body
-    assert 'withdrawOrderId=ft_1_withdraw' in body
+    query = session.calls[0][2]['params']
+    assert 'network=BSC' in query
+    assert 'address=0xabc' in query
+    assert 'amount=9.99' in query
+    assert 'withdrawOrderId=ft_1_withdraw' in query
+    assert 'data' not in session.calls[0][2]
 
 
 def test_transport_error_is_marked_ambiguous():

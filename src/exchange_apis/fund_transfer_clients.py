@@ -76,12 +76,8 @@ class BinanceFundClient:
         kwargs = {
             'headers': {'X-MBX-APIKEY': self.api_key},
             'timeout': self.timeout_sec,
+            'params': encoded,
         }
-        if method.upper() == 'GET':
-            kwargs['params'] = encoded
-        else:
-            kwargs['data'] = encoded
-            kwargs['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
         try:
             response = self.session.request(
                 method.upper(), f'{self.base_url}{path}', **kwargs
