@@ -1630,6 +1630,30 @@ onBeforeUnmount(() => {
         </strong>
       </div>
       <div class="gate-risk-review-grid">
+        <div class="gate-risk-review-item annualized-summary">
+          <div class="annualized-summary-heading">
+            <span class="gate-risk-review-label">策略年化收益率</span>
+            <el-radio-group
+              v-model="selectedAnnualizedPeriod"
+              size="small"
+              class="annualized-period-selector"
+            >
+              <el-radio-button
+                v-for="option in annualizedPeriodOptions"
+                :key="option.value"
+                :label="option.value"
+              >
+                {{ option.label }}
+              </el-radio-button>
+            </el-radio-group>
+          </div>
+          <strong :class="annualizedReturnValueClass">
+            {{ formatAnnualizedReturn() }}
+          </strong>
+          <div class="gate-risk-review-meta annualized-summary-meta">
+            <span>{{ annualizedReturnMeta() }}</span>
+          </div>
+        </div>
         <div class="gate-risk-review-item">
           <span class="gate-risk-review-label">近7天最低全仓MMR</span>
           <strong :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
@@ -1650,30 +1674,6 @@ onBeforeUnmount(() => {
           <div class="gate-risk-review-meta">
             <span>{{ gatePriorityReasonText() }}</span>
           </div>
-        </div>
-      </div>
-      <div class="annualized-summary">
-        <div class="annualized-summary-heading">
-          <span>策略年化收益率</span>
-          <el-radio-group
-            v-model="selectedAnnualizedPeriod"
-            size="small"
-            class="annualized-period-selector"
-          >
-            <el-radio-button
-              v-for="option in annualizedPeriodOptions"
-              :key="option.value"
-              :label="option.value"
-            >
-              {{ option.label }}
-            </el-radio-button>
-          </el-radio-group>
-        </div>
-        <div class="annualized-summary-value">
-          <strong :class="annualizedReturnValueClass">
-            {{ formatAnnualizedReturn() }}
-          </strong>
-          <span>{{ annualizedReturnMeta() }}</span>
         </div>
       </div>
       <div v-if="gateRiskPanelError" class="risk-health-error">
@@ -2035,7 +2035,8 @@ onBeforeUnmount(() => {
 
 .gate-risk-review-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--app-border);
 }
 
 .gate-risk-review-item {
@@ -2079,24 +2080,17 @@ onBeforeUnmount(() => {
 }
 
 .annualized-summary {
-  display: grid;
-  gap: 10px;
-  padding: 14px 12px 8px;
-  border-top: 1px solid var(--app-border);
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 8px;
 }
 
-.annualized-summary-heading,
-.annualized-summary-value {
+.annualized-summary-heading {
+  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-}
-
-.annualized-summary-heading > span {
-  color: var(--app-text);
-  font-size: 13px;
-  font-weight: 650;
+  gap: 8px;
 }
 
 .annualized-period-selector {
@@ -2105,17 +2099,12 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
 }
 
-.annualized-summary-value strong {
-  font-size: 22px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+.annualized-summary > strong {
+  text-align: left;
 }
 
-.annualized-summary-value > span {
-  color: var(--app-text-muted);
-  font-size: 11px;
-  line-height: 1.5;
-  text-align: right;
+.annualized-summary-meta {
+  grid-column: 1;
 }
 
 .risk-health-error {
@@ -2629,8 +2618,7 @@ onBeforeUnmount(() => {
     font-size: 24px;
   }
 
-  .annualized-summary-heading,
-  .annualized-summary-value {
+  .annualized-summary-heading {
     align-items: flex-start;
     flex-direction: column;
     gap: 8px;
@@ -2638,10 +2626,6 @@ onBeforeUnmount(() => {
 
   .annualized-period-selector {
     justify-content: flex-start;
-  }
-
-  .annualized-summary-value > span {
-    text-align: left;
   }
 
   .fund-transfer-status-line,

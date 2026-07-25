@@ -60,3 +60,18 @@ def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
     for label in ('7天', '1个月', '3个月', '半年', '1年'):
         assert f"label: '{label}'" in CAPITAL_MONITOR_SOURCE
     assert '已有 ${summary.available_days} / ${summary.period_days} 天有效数据' in CAPITAL_MONITOR_SOURCE
+
+
+def test_annualized_return_and_gate_risk_details_share_one_three_column_row():
+    grid_start = CAPITAL_MONITOR_SOURCE.index('<div class="gate-risk-review-grid">')
+    grid_end = CAPITAL_MONITOR_SOURCE.index(
+        '<div v-if="gateRiskPanelError"',
+        grid_start,
+    )
+    summary_grid = CAPITAL_MONITOR_SOURCE[grid_start:grid_end]
+
+    annualized = summary_grid.index('策略年化收益率')
+    minimum_mmr = summary_grid.index('近7天最低全仓MMR')
+    priority_asset = summary_grid.index('低于500%首平候选')
+    assert annualized < minimum_mmr < priority_asset
+    assert 'grid-template-columns: repeat(3, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
