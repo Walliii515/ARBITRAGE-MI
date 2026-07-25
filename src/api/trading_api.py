@@ -799,6 +799,7 @@ _CAPITAL_HISTORY_METRIC_COLUMNS = {
         ),
     ),
 }
+_CAPITAL_ANNUALIZED_PERIODS = {7, 30, 90, 180, 365}
 _CAPITAL_TRANSFER_OUTLIER_RELATIVE_CHANGE = 0.05
 _CAPITAL_TRANSFER_RECOVERY_TOLERANCE = 0.015
 _CAPITAL_TRANSFER_MAX_RECOVERY_SECONDS = 30 * 60
@@ -823,6 +824,66 @@ def _capital_history_select_columns(metric: str) -> str:
         *metric_columns,
     ]
     return ',\n            '.join(columns)
+
+
+def _calculate_capital_annualized_return(
+    rows: List[Dict[str, Any]],
+    period_days: int,
+) -> Dict[str, Any]:
+    valid_rows = []
+    for row in rows:
+        sample_count = int(row.get('sample_count') or 0)
+        equity_sum = float(row.get('equity_sum_usdt') or 0)
+        first_pnl = row.get('first_gross_pnl_usdt')
+        last_pnl = row.get('last_gross_pnl_usdt')
+        if sample_count <= 0 or equity_sum <= 0 or first_pnl is None or last_pnl is None:
+            continue
+        valid_rows.append({
+            **row,
+            'average_equity_usdt': equity_sum / sample_count,
+            'gross_pnl_delta_usdt': float(last_pnl) - float(first_pnl),
+        })
+
+    available_days = len(valid_rows)
+    sufficient = available_days >= period_days
+    total_samples = sum(int(row.get('sample_count') or 0) for row in valid_rows)
+    total_equity = sum(float(row.get('equity_sum_usdt') or 0) for row in valid_rows)
+    average_equity = total_equity / total_samples if total_samples > 0 else None
+    period_pnl = sum(row['gross_pnl_delta_usdt'] for row in valid_rows)
+
+    compound_factor = 1.0
+    factor_valid = bool(valid_rows)
+    for row in valid_rows:
+        daily_factor = 1.0 + (
+            row['gross_pnl_delta_usdt'] / row['average_equity_usdt']
+        )
+        if daily_factor <= 0:
+            factor_valid = False
+            break
+        compound_factor *= daily_factor
+
+    period_return_pct = (
+        (compound_factor - 1.0) * 100.0
+        if factor_valid
+        else None
+    )
+    annualized_return_pct = (
+        (compound_factor ** (365.0 / period_days) - 1.0) * 100.0
+        if sufficient and factor_valid
+        else None
+    )
+    return {
+        'period_days': period_days,
+        'available_days': available_days,
+        'sufficient_data': sufficient,
+        'annualized_return_pct': annualized_return_pct,
+        'period_return_pct': period_return_pct,
+        'period_pnl_usdt': period_pnl if valid_rows else None,
+        'average_equity_usdt': average_equity,
+        'start_date': str(valid_rows[0].get('summary_date')) if valid_rows else None,
+        'end_date': str(valid_rows[-1].get('summary_date')) if valid_rows else None,
+        'formula': 'daily_gross_pnl_delta_over_daily_average_equity_compounded',
+    }
 
 
 def _capital_row_time(row: Dict[str, Any]) -> Optional[datetime]:
@@ -1531,6 +1592,32 @@ async def get_capital_latest():
         cursor.execute(sql)
         rows = cursor.fetchall()
     return {'rows': _serialize_rows(rows)}
+
+
+@router.get('/capital/annualized-return')
+async def get_capital_annualized_return(
+    days: int = Query(7, description="统计周期(7/30/90/180/365天)"),
+):
+    """Return compounded annualized strategy return from daily capital summaries."""
+    if days not in _CAPITAL_ANNUALIZED_PERIODS:
+        raise HTTPException(status_code=400, detail='不支持的年化收益统计周期')
+    sql = """
+        SELECT
+            summary_date,
+            first_snapshot_at,
+            last_snapshot_at,
+            equity_sum_usdt,
+            sample_count,
+            first_gross_pnl_usdt,
+            last_gross_pnl_usdt
+        FROM mi_capital_daily_summary
+        WHERE summary_date >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+        ORDER BY summary_date ASC
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, (days - 1,))
+        rows = cursor.fetchall()
+    return _calculate_capital_annualized_return(rows, days)
 
 
 @router.get('/capital/history')

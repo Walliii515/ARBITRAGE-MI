@@ -34,3 +34,29 @@ def test_chart_selection_changes_do_not_reload_capital_overview():
     watcher = "watch([selectedExchange, selectedChartMode], () => {\n  void fetchHistory()\n})"
     assert watcher in CAPITAL_MONITOR_SOURCE
     assert 'selectedWindow.value = window\n  void fetchHistory()' in CAPITAL_MONITOR_SOURCE
+
+
+def test_gate_summary_prioritizes_current_mmr_outside_exchange_card():
+    assert '<span>重点摘要</span>' in CAPITAL_MONITOR_SOURCE
+    assert 'Gate 风险重点' not in CAPITAL_MONITOR_SOURCE
+    assert '<span>当前全仓MMR</span>' in CAPITAL_MONITOR_SOURCE
+    current_mmr = CAPITAL_MONITOR_SOURCE.index('<span>当前全仓MMR</span>')
+    minimum_mmr = CAPITAL_MONITOR_SOURCE.index('近7天最低全仓MMR')
+    assert current_mmr < minimum_mmr
+
+    gate_card_start = CAPITAL_MONITOR_SOURCE.index('<div v-else class="gate-summary-risk">')
+    gate_card_end = CAPITAL_MONITOR_SOURCE.index(
+        '<div v-if="exchange === \'binance\'"',
+        gate_card_start,
+    )
+    gate_card = CAPITAL_MONITOR_SOURCE[gate_card_start:gate_card_end]
+    assert '维持保证金' in gate_card
+    assert '全仓MMR' not in gate_card
+
+
+def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
+    assert 'selectedAnnualizedPeriod = ref<AnnualizedPeriod>(7)' in CAPITAL_MONITOR_SOURCE
+    assert '/api/trading/capital/annualized-return?days=${period}' in CAPITAL_MONITOR_SOURCE
+    for label in ('7天', '1个月', '3个月', '半年', '1年'):
+        assert f"label: '{label}'" in CAPITAL_MONITOR_SOURCE
+    assert '已有 ${summary.available_days} / ${summary.period_days} 天有效数据' in CAPITAL_MONITOR_SOURCE

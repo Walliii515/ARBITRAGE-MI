@@ -30,7 +30,8 @@ logger = get_logger(__name__)
 @dataclass
 class AccountCapitalConfig:
     retention_days: int = 30
-    pnl_lookback_days: int = 90
+    annualized_retention_days: int = 400
+    pnl_lookback_days: int = 400
     binance_margin_enabled: bool = True
     binance_margin_warning_level: float = 3.0
     binance_margin_min_open_level: float = 2.5
@@ -170,7 +171,11 @@ def build_default_capital_snapshotter(
         executor,
         AccountCapitalConfig(
             retention_days=config.get_int('account_capital.retention_days', 30),
-            pnl_lookback_days=config.get_int('account_capital.pnl_lookback_days', 90),
+            annualized_retention_days=config.get_int(
+                'account_capital.annualized_retention_days',
+                400,
+            ),
+            pnl_lookback_days=config.get_int('account_capital.pnl_lookback_days', 400),
             binance_margin_enabled=config.get_bool('account_capital.binance_margin.enabled', True),
             binance_margin_warning_level=config.get_float(
                 'account_capital.binance_margin.warning_margin_level',
@@ -309,10 +314,20 @@ class AccountCapitalSnapshotter:
 
     def cleanup_old_snapshots(self):
         if self.cfg.retention_days <= 0:
-            return
-        cutoff = datetime.now() - timedelta(days=self.cfg.retention_days)
+            cutoff = None
+        else:
+            cutoff = datetime.now() - timedelta(days=self.cfg.retention_days)
         with db_manager.get_cursor() as cursor:
-            cursor.execute("DELETE FROM mi_capital_snapshot WHERE snapshot_at < %s", (cutoff,))
+            if cutoff is not None:
+                cursor.execute("DELETE FROM mi_capital_snapshot WHERE snapshot_at < %s", (cutoff,))
+            if self.cfg.annualized_retention_days > 0:
+                cursor.execute(
+                    """
+                    DELETE FROM mi_capital_daily_summary
+                    WHERE summary_date < DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                    """,
+                    (self.cfg.annualized_retention_days,),
+                )
 
     def _build_binance_row(self, snapshot_at: datetime, pnl: Dict) -> Dict:
         balances = self.executor.fetch_binance_account_balances()
@@ -728,8 +743,128 @@ class AccountCapitalSnapshotter:
             cursor = conn.cursor()
             try:
                 cursor.executemany(sql, payload)
+                total_row = next(
+                    (row for row in payload if row.get('exchange') == 'total'),
+                    None,
+                )
+                if total_row is not None:
+                    gross_pnl = (
+                        _float(total_row.get('total_pnl_usdt'))
+                        + _float(total_row.get('unrealized_pnl_usdt'))
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO mi_capital_daily_summary (
+                            summary_date,
+                            first_snapshot_at,
+                            last_snapshot_at,
+                            first_equity_usdt,
+                            last_equity_usdt,
+                            equity_sum_usdt,
+                            sample_count,
+                            first_gross_pnl_usdt,
+                            last_gross_pnl_usdt
+                        ) VALUES (
+                            DATE(%(snapshot_at)s),
+                            %(snapshot_at)s,
+                            %(snapshot_at)s,
+                            %(equity_usdt)s,
+                            %(equity_usdt)s,
+                            %(equity_usdt)s,
+                            1,
+                            %(gross_pnl_usdt)s,
+                            %(gross_pnl_usdt)s
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            first_equity_usdt = IF(
+                                VALUES(first_snapshot_at) < first_snapshot_at,
+                                VALUES(first_equity_usdt),
+                                first_equity_usdt
+                            ),
+                            first_gross_pnl_usdt = IF(
+                                VALUES(first_snapshot_at) < first_snapshot_at,
+                                VALUES(first_gross_pnl_usdt),
+                                first_gross_pnl_usdt
+                            ),
+                            first_snapshot_at = LEAST(first_snapshot_at, VALUES(first_snapshot_at)),
+                            last_equity_usdt = IF(
+                                VALUES(last_snapshot_at) >= last_snapshot_at,
+                                VALUES(last_equity_usdt),
+                                last_equity_usdt
+                            ),
+                            last_gross_pnl_usdt = IF(
+                                VALUES(last_snapshot_at) >= last_snapshot_at,
+                                VALUES(last_gross_pnl_usdt),
+                                last_gross_pnl_usdt
+                            ),
+                            last_snapshot_at = GREATEST(last_snapshot_at, VALUES(last_snapshot_at)),
+                            equity_sum_usdt = equity_sum_usdt + VALUES(equity_sum_usdt),
+                            sample_count = sample_count + 1
+                        """,
+                        {
+                            **total_row,
+                            'gross_pnl_usdt': gross_pnl,
+                        },
+                    )
             finally:
                 cursor.close()
+
+
+def rebuild_capital_daily_summaries(days: int = 400) -> int:
+    """Rebuild daily summaries from retained total-account snapshots."""
+    lookback_days = max(int(days), 1)
+    sql = """
+        INSERT INTO mi_capital_daily_summary (
+            summary_date,
+            first_snapshot_at,
+            last_snapshot_at,
+            first_equity_usdt,
+            last_equity_usdt,
+            equity_sum_usdt,
+            sample_count,
+            first_gross_pnl_usdt,
+            last_gross_pnl_usdt
+        )
+        SELECT
+            grouped.summary_date,
+            first_row.snapshot_at,
+            last_row.snapshot_at,
+            first_row.equity_usdt,
+            last_row.equity_usdt,
+            grouped.equity_sum_usdt,
+            grouped.sample_count,
+            COALESCE(first_row.total_pnl_usdt, 0)
+                + COALESCE(first_row.unrealized_pnl_usdt, 0),
+            COALESCE(last_row.total_pnl_usdt, 0)
+                + COALESCE(last_row.unrealized_pnl_usdt, 0)
+        FROM (
+            SELECT
+                DATE(snapshot_at) AS summary_date,
+                MIN(id) AS first_id,
+                MAX(id) AS last_id,
+                SUM(COALESCE(equity_usdt, 0)) AS equity_sum_usdt,
+                COUNT(*) AS sample_count
+            FROM mi_capital_snapshot
+            WHERE exchange = 'total'
+              AND snapshot_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+              AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
+            GROUP BY DATE(snapshot_at)
+        ) grouped
+        INNER JOIN mi_capital_snapshot first_row ON first_row.id = grouped.first_id
+        INNER JOIN mi_capital_snapshot last_row ON last_row.id = grouped.last_id
+        ON DUPLICATE KEY UPDATE
+            first_snapshot_at = VALUES(first_snapshot_at),
+            last_snapshot_at = VALUES(last_snapshot_at),
+            first_equity_usdt = VALUES(first_equity_usdt),
+            last_equity_usdt = VALUES(last_equity_usdt),
+            equity_sum_usdt = VALUES(equity_sum_usdt),
+            sample_count = VALUES(sample_count),
+            first_gross_pnl_usdt = VALUES(first_gross_pnl_usdt),
+            last_gross_pnl_usdt = VALUES(last_gross_pnl_usdt)
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, (lookback_days,))
+        return int(cursor.rowcount or 0)
 
 
 def _float(value) -> float:

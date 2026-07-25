@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +9,7 @@ from api import trading_api
 from api.trading_api import (
     _append_unique_notification,
     _build_gate_cross_minimum_summary,
+    _calculate_capital_annualized_return,
     _capital_history_interval,
     _capital_history_select_columns,
     _build_forward_signal_filters,
@@ -16,6 +17,7 @@ from api.trading_api import (
     _format_reconciliation_notification,
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
+    get_capital_annualized_return,
     get_capital_history,
     get_gate_cross_risk_summary,
     register_capital_strategy_pnl_provider,
@@ -278,6 +280,62 @@ class CapitalHistoryQueryTests(unittest.TestCase):
         self.assertIn('gate_cross_mmr_pct', sql)
         self.assertIn('gate_cross_nearest_liq_distance_bps', sql)
         self.assertEqual(params, [3600, 3600, 30, 'gate'])
+
+
+class CapitalAnnualizedReturnTests(unittest.TestCase):
+    @staticmethod
+    def _daily_rows(count: int, daily_pnl: Decimal = Decimal('10')):
+        return [
+            {
+                'summary_date': date(2026, 7, day + 1),
+                'equity_sum_usdt': Decimal('100000'),
+                'sample_count': 100,
+                'first_gross_pnl_usdt': Decimal('100') + daily_pnl * day,
+                'last_gross_pnl_usdt': Decimal('100') + daily_pnl * (day + 1),
+            }
+            for day in range(count)
+        ]
+
+    def test_compounds_daily_return_and_annualizes_complete_period(self):
+        result = _calculate_capital_annualized_return(self._daily_rows(7), 7)
+
+        expected_period = ((1.01 ** 7) - 1) * 100
+        expected_annualized = ((1.01 ** 365) - 1) * 100
+        self.assertTrue(result['sufficient_data'])
+        self.assertEqual(result['available_days'], 7)
+        self.assertAlmostEqual(result['period_return_pct'], expected_period)
+        self.assertAlmostEqual(result['annualized_return_pct'], expected_annualized)
+        self.assertAlmostEqual(result['period_pnl_usdt'], 70)
+        self.assertAlmostEqual(result['average_equity_usdt'], 1000)
+
+    def test_incomplete_period_reports_coverage_without_annualizing(self):
+        result = _calculate_capital_annualized_return(self._daily_rows(15), 30)
+
+        self.assertFalse(result['sufficient_data'])
+        self.assertEqual(result['available_days'], 15)
+        self.assertIsNone(result['annualized_return_pct'])
+        self.assertIsNotNone(result['period_return_pct'])
+
+    def test_endpoint_rejects_unknown_period(self):
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(get_capital_annualized_return(days=14))
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_endpoint_loads_requested_daily_window(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = self._daily_rows(7)
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('api.trading_api.db_manager.get_cursor', return_value=context):
+            result = asyncio.run(get_capital_annualized_return(days=7))
+
+        self.assertTrue(result['sufficient_data'])
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('mi_capital_daily_summary', sql)
+        self.assertEqual(params, (6,))
 
 
 class GateCrossRiskSummaryTests(unittest.TestCase):

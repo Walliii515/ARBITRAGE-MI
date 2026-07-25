@@ -71,6 +71,18 @@ interface GateCrossRiskSummary {
   minimum?: GateCrossRiskMinimum | null
 }
 
+interface AnnualizedReturnSummary {
+  period_days: number
+  available_days: number
+  sufficient_data: boolean
+  annualized_return_pct?: number | null
+  period_return_pct?: number | null
+  period_pnl_usdt?: number | null
+  average_equity_usdt?: number | null
+  start_date?: string | null
+  end_date?: string | null
+}
+
 interface FundTransferTask {
   id: number
   status: string
@@ -121,6 +133,7 @@ interface FundTransferLimits {
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
 type TimeWindowKey = '1h' | '3h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
+type AnnualizedPeriod = 7 | 30 | 90 | 180 | 365
 type ChartMetric =
   | 'equity_usdt'
   | 'unrealized_pnl_usdt'
@@ -168,6 +181,10 @@ const liveGateRisk = ref<GateCrossRiskSnapshot | null>(null)
 const liveGateRiskRequestError = ref('')
 const gateRiskSummary = ref<GateCrossRiskSummary | null>(null)
 const gateRiskSummaryRequestError = ref('')
+const annualizedReturn = ref<AnnualizedReturnSummary | null>(null)
+const annualizedReturnRequestError = ref('')
+const annualizedReturnLoading = ref(false)
+const selectedAnnualizedPeriod = ref<AnnualizedPeriod>(7)
 const loading = ref(false)
 const historyLoading = ref(false)
 const chartActivated = ref(false)
@@ -208,10 +225,18 @@ let resizeObserver: ResizeObserver | null = null
 let chartIntersectionObserver: IntersectionObserver | null = null
 let historyAbortController: AbortController | null = null
 let historyRequestId = 0
+let annualizedReturnRequestId = 0
 let gateRiskTimer: ReturnType<typeof setInterval> | null = null
 let fundTransferTimer: ReturnType<typeof setInterval> | null = null
 const historyCache = new Map<string, { rows: CapitalRow[]; cachedAt: number }>()
 const HISTORY_CACHE_TTL_MS = 60_000
+const annualizedPeriodOptions: Array<{ value: AnnualizedPeriod; label: string }> = [
+  { value: 7, label: '7天' },
+  { value: 30, label: '1个月' },
+  { value: 90, label: '3个月' },
+  { value: 180, label: '半年' },
+  { value: 365, label: '1年' },
+]
 
 const metricOptions: ChartMetricOption[] = [
   { key: 'equity_usdt', label: '总资产', group: 'asset', color: '#67c23a' },
@@ -321,6 +346,11 @@ const gatePriorityAsset = computed(() => (
 const gateRiskPanelError = computed(() => (
   gateRiskSummaryRequestError.value || gateRiskHealthError.value
 ))
+const annualizedReturnValueClass = computed(() => {
+  const value = Number(annualizedReturn.value?.annualized_return_pct)
+  if (!Number.isFinite(value)) return 'risk-idle'
+  return value >= 0 ? 'pnl-positive' : 'pnl-negative'
+})
 const chartExchange = computed<ExchangeKey>(() => (
   selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
 ))
@@ -513,6 +543,25 @@ function formatAmount(value: number | null | undefined): string {
 function formatPercent(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
+}
+
+function formatAnnualizedReturn(): string {
+  if (annualizedReturnLoading.value && !annualizedReturn.value) return '-'
+  if (!annualizedReturn.value?.sufficient_data) return '数据不足'
+  return formatPercent(annualizedReturn.value.annualized_return_pct)
+}
+
+function annualizedReturnMeta(): string {
+  const summary = annualizedReturn.value
+  if (!summary) return annualizedReturnRequestError.value || '暂无收益汇总'
+  if (!summary.sufficient_data) {
+    return `已有 ${summary.available_days} / ${summary.period_days} 天有效数据`
+  }
+  return [
+    `区间收益 ${formatPercent(summary.period_return_pct)}`,
+    `总盈亏 ${formatAmount(summary.period_pnl_usdt)} USDT`,
+    `日均总资产 ${formatAmount(summary.average_equity_usdt)} USDT`,
+  ].join(' · ')
 }
 
 function formatBps(value: number | null | undefined): string {
@@ -860,6 +909,32 @@ async function fetchGateRiskSummary() {
   }
 }
 
+async function fetchAnnualizedReturn() {
+  const period = selectedAnnualizedPeriod.value
+  const requestId = ++annualizedReturnRequestId
+  annualizedReturn.value = null
+  annualizedReturnLoading.value = true
+  annualizedReturnRequestError.value = ''
+  try {
+    const res = await get(
+      `/api/trading/capital/annualized-return?days=${period}`,
+      { silent: true },
+    )
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+    if (requestId !== annualizedReturnRequestId) return
+    annualizedReturn.value = data
+  } catch (e: any) {
+    if (requestId !== annualizedReturnRequestId) return
+    annualizedReturn.value = null
+    annualizedReturnRequestError.value = e?.message || '年化收益统计不可用'
+  } finally {
+    if (requestId === annualizedReturnRequestId) {
+      annualizedReturnLoading.value = false
+    }
+  }
+}
+
 async function fetchCapital(forceHistory = true) {
   loading.value = true
   try {
@@ -870,6 +945,7 @@ async function fetchCapital(forceHistory = true) {
         latestRows.value = latest.rows || []
       })(),
       fetchGateRiskSummary(),
+      fetchAnnualizedReturn(),
       chartActivated.value ? fetchHistory(forceHistory) : Promise.resolve(),
     ])
   } catch (e: any) {
@@ -1324,6 +1400,10 @@ watch([selectedExchange, selectedChartMode], () => {
   void fetchHistory()
 })
 
+watch(selectedAnnualizedPeriod, () => {
+  void fetchAnnualizedReturn()
+})
+
 onBeforeUnmount(() => {
   historyAbortController?.abort()
   historyAbortController = null
@@ -1450,48 +1530,6 @@ onBeforeUnmount(() => {
               <span v-if="hasAmount(gateCrossRisk.maintenance_margin_usdt)" class="metric-unit">USDT</span>
             </strong>
           </div>
-          <div class="metric-row">
-            <span class="metric-label-with-help">
-              <span>全仓MMR</span>
-              <el-popover
-                trigger="click"
-                placement="top"
-                width="min(560px, calc(100vw - 24px))"
-              >
-                <template #reference>
-                  <el-button
-                    class="help-icon-button"
-                    text
-                    circle
-                    size="small"
-                    aria-label="全仓MMR风控说明"
-                  >
-                    <el-icon><QuestionFilled /></el-icon>
-                  </el-button>
-                </template>
-                <div class="mmr-help">
-                  <div class="mmr-help-row">
-                    <strong class="risk-warning">500%</strong>
-                    <span>停止新的正向开仓并写入铃铛告警。已有持仓不会因为 500% 被强平，仍会执行普通止盈、负资金费、下架风险和对账兜底平仓。</span>
-                  </div>
-                  <div class="mmr-help-row">
-                    <strong class="risk-danger">300%</strong>
-                    <span>使用 5 秒内的 Gate 官方账户 MMR，按风险顺序全量退出全部正向持仓：先平距强平价不超过 300bps 的合约，再按维持保证金从高到低处理；每笔先以 reduce-only 市价买回 Gate 空头，再市价卖出 Binance 现货。该路径不依赖盘口、WS 或普通平仓冷却，失败会在下一轮立即重试。</span>
-                  </div>
-                  <div class="mmr-help-row">
-                    <strong>100%</strong>
-                    <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在 300% 完成主动退出。</span>
-                  </div>
-                  <div class="mmr-help-note">
-                    独立危险条件：任一正向空头距强平价不超过 300bps 时，不等待账户 MMR 降至 300%，立即市价平掉该合约对应的完整套利仓位。
-                  </div>
-                </div>
-              </el-popover>
-            </span>
-            <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
-              {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
-            </strong>
-          </div>
         </div>
         <div v-if="exchange === 'binance'" class="metric-row bnb-metric-row">
           <span>BNB可用</span>
@@ -1543,8 +1581,53 @@ onBeforeUnmount(() => {
 
     <div class="gate-risk-panel">
       <div class="gate-risk-review-header">
-        <span>Gate 风险重点</span>
-        <span>历史仅统计有效官方快照</span>
+        <span>重点摘要</span>
+        <span>MMR历史仅统计有效官方快照</span>
+      </div>
+      <div class="gate-current-mmr">
+        <div class="gate-current-mmr-copy">
+          <span class="metric-label-with-help">
+            <span>当前全仓MMR</span>
+            <el-popover
+              trigger="click"
+              placement="top"
+              width="min(560px, calc(100vw - 24px))"
+            >
+              <template #reference>
+                <el-button
+                  class="help-icon-button"
+                  text
+                  circle
+                  size="small"
+                  aria-label="全仓MMR风控说明"
+                >
+                  <el-icon><QuestionFilled /></el-icon>
+                </el-button>
+              </template>
+              <div class="mmr-help">
+                <div class="mmr-help-row">
+                  <strong class="risk-warning">500%</strong>
+                  <span>停止新的正向开仓并写入铃铛告警。已有持仓不会因为 500% 被强平，仍会执行普通止盈、负资金费、下架风险和对账兜底平仓。</span>
+                </div>
+                <div class="mmr-help-row">
+                  <strong class="risk-danger">300%</strong>
+                  <span>使用 5 秒内的 Gate 官方账户 MMR，按风险顺序全量退出全部正向持仓：先平距强平价不超过 300bps 的合约，再按维持保证金从高到低处理；每笔先以 reduce-only 市价买回 Gate 空头，再市价卖出 Binance 现货。该路径不依赖盘口、WS 或普通平仓冷却，失败会在下一轮立即重试。</span>
+                </div>
+                <div class="mmr-help-row">
+                  <strong>100%</strong>
+                  <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在 300% 完成主动退出。</span>
+                </div>
+                <div class="mmr-help-note">
+                  独立危险条件：任一正向空头距强平价不超过 300bps 时，不等待账户 MMR 降至 300%，立即市价平掉该合约对应的完整套利仓位。
+                </div>
+              </div>
+            </el-popover>
+          </span>
+          <span>{{ gateCrossRisk.status_label || '实时官方账户风险' }}</span>
+        </div>
+        <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
+          {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
+        </strong>
       </div>
       <div class="gate-risk-review-grid">
         <div class="gate-risk-review-item">
@@ -1567,6 +1650,30 @@ onBeforeUnmount(() => {
           <div class="gate-risk-review-meta">
             <span>{{ gatePriorityReasonText() }}</span>
           </div>
+        </div>
+      </div>
+      <div class="annualized-summary">
+        <div class="annualized-summary-heading">
+          <span>策略年化收益率</span>
+          <el-radio-group
+            v-model="selectedAnnualizedPeriod"
+            size="small"
+            class="annualized-period-selector"
+          >
+            <el-radio-button
+              v-for="option in annualizedPeriodOptions"
+              :key="option.value"
+              :label="option.value"
+            >
+              {{ option.label }}
+            </el-radio-button>
+          </el-radio-group>
+        </div>
+        <div class="annualized-summary-value">
+          <strong :class="annualizedReturnValueClass">
+            {{ formatAnnualizedReturn() }}
+          </strong>
+          <span>{{ annualizedReturnMeta() }}</span>
         </div>
       </div>
       <div v-if="gateRiskPanelError" class="risk-health-error">
@@ -1879,6 +1986,37 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.gate-current-mmr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 70px;
+  padding: 8px 12px 14px;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.gate-current-mmr-copy {
+  display: grid;
+  gap: 5px;
+  color: var(--app-text);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.gate-current-mmr-copy > span:last-child {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.gate-current-mmr > strong {
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+}
+
 .risk-safe {
   color: #67c23a !important;
 }
@@ -1938,6 +2076,46 @@ onBeforeUnmount(() => {
   color: var(--app-text-muted);
   font-size: 11px;
   line-height: 1.5;
+}
+
+.annualized-summary {
+  display: grid;
+  gap: 10px;
+  padding: 14px 12px 8px;
+  border-top: 1px solid var(--app-border);
+}
+
+.annualized-summary-heading,
+.annualized-summary-value {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.annualized-summary-heading > span {
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.annualized-period-selector {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.annualized-summary-value strong {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.annualized-summary-value > span {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: right;
 }
 
 .risk-health-error {
@@ -2441,6 +2619,29 @@ onBeforeUnmount(() => {
     gap: 2px;
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+
+  .gate-current-mmr {
+    align-items: flex-start;
+  }
+
+  .gate-current-mmr > strong {
+    font-size: 24px;
+  }
+
+  .annualized-summary-heading,
+  .annualized-summary-value {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .annualized-period-selector {
+    justify-content: flex-start;
+  }
+
+  .annualized-summary-value > span {
+    text-align: left;
   }
 
   .fund-transfer-status-line,

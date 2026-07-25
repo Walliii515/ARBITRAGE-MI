@@ -3,7 +3,7 @@ import os
 import sys
 import unittest
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -12,6 +12,7 @@ from calc.account_capital import (
     AccountCapitalSnapshotter,
     GateCrossRiskNotifier,
     build_default_capital_snapshotter,
+    rebuild_capital_daily_summaries,
 )
 
 
@@ -49,6 +50,61 @@ class FakeCapitalExecutor:
 
 
 class TestAccountCapitalSnapshotter(unittest.TestCase):
+    def test_insert_rows_updates_daily_return_summary_with_total_row(self):
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(),
+            AccountCapitalConfig(),
+        )
+        rows = [
+            {
+                'snapshot_at': datetime(2026, 7, 25, 12, 0, 0),
+                'exchange': exchange,
+                'equity_usdt': 1000 if exchange == 'total' else 500,
+                'available_usdt': 100,
+                'locked_usdt': 0,
+                'position_value_usdt': 900,
+                'margin_used_usdt': 0,
+                'unrealized_pnl_usdt': 5 if exchange == 'total' else 0,
+                'realized_pnl_usdt': 0,
+                'funding_pnl_usdt': 0,
+                'fee_cost_usdt': 0,
+                'total_pnl_usdt': 20 if exchange == 'total' else 0,
+                'detail': {'source': 'exchange_api'},
+            }
+            for exchange in ('binance', 'gate', 'total')
+        ]
+
+        with patch('calc.account_capital.db_manager.get_connection', return_value=context):
+            snapshotter._insert_rows(rows)
+
+        cursor.executemany.assert_called_once()
+        daily_sql, daily_params = cursor.execute.call_args.args
+        self.assertIn('mi_capital_daily_summary', daily_sql)
+        self.assertEqual(daily_params['gross_pnl_usdt'], 25)
+        self.assertEqual(daily_params['equity_usdt'], 1000)
+
+    def test_rebuild_daily_summaries_uses_retained_total_snapshots(self):
+        cursor = MagicMock()
+        cursor.rowcount = 12
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('calc.account_capital.db_manager.get_cursor', return_value=context):
+            affected = rebuild_capital_daily_summaries(400)
+
+        self.assertEqual(affected, 12)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("exchange = 'total'", sql)
+        self.assertIn('ON DUPLICATE KEY UPDATE', sql)
+        self.assertEqual(params, (400,))
+
     def test_default_snapshotter_uses_cross_margin(self):
         with patch('calc.account_capital.fetch_contract_meta', return_value={}), \
                 patch('calc.account_capital.fetch_spot_meta', return_value={}), \

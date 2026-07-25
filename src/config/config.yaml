@@ -344,7 +344,8 @@ account_capital:
   enabled: true
   snapshot_interval_sec: 60
   retention_days: 30
-  pnl_lookback_days: 90
+  annualized_retention_days: 400
+  pnl_lookback_days: 400
   max_age_sec: 180
   binance_margin:
     enabled: false
