@@ -2,7 +2,7 @@
 """Strategy-scoped exchange API credential helpers."""
 import os
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Literal
 
 
 StrategyName = Literal['forward', 'reverse']
@@ -14,12 +14,30 @@ class ApiCredentials:
     api_secret: str = ''
 
 
-def _first_env(names: Iterable[str]) -> str:
-    for name in names:
-        value = os.getenv(name, '')
-        if value:
-            return value
-    return ''
+def _required_credentials(
+    api_key_name: str,
+    api_secret_name: str,
+    *,
+    account_label: str,
+) -> ApiCredentials:
+    credentials = ApiCredentials(
+        api_key=os.getenv(api_key_name, ''),
+        api_secret=os.getenv(api_secret_name, ''),
+    )
+    missing = [
+        name
+        for name, value in (
+            (api_key_name, credentials.api_key),
+            (api_secret_name, credentials.api_secret),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            f'{account_label}凭据缺失: {", ".join(missing)}；'
+            '系统不会回退到旧账户变量'
+        )
+    return credentials
 
 
 def _normalize_strategy(strategy: str) -> StrategyName:
@@ -30,11 +48,7 @@ def _normalize_strategy(strategy: str) -> StrategyName:
 
 
 def get_binance_credentials(strategy: str, *, mainnet: bool = True) -> ApiCredentials:
-    """Return Binance credentials for the requested strategy.
-
-    Forward mainnet keeps legacy fallback for rollout compatibility. Reverse mainnet
-    intentionally has no legacy fallback to avoid accidentally using forward funds.
-    """
+    """Return Binance credentials for the requested strategy."""
     normalized = _normalize_strategy(strategy)
     if not mainnet:
         return ApiCredentials(
@@ -43,9 +57,10 @@ def get_binance_credentials(strategy: str, *, mainnet: bool = True) -> ApiCreden
         )
 
     if normalized == 'forward':
-        return ApiCredentials(
-            api_key=_first_env(('FORWARD_BINANCE_API_KEY', 'BINANCE_API_KEY')),
-            api_secret=_first_env(('FORWARD_BINANCE_API_SECRET', 'BINANCE_API_SECRET')),
+        return _required_credentials(
+            'FORWARD_BINANCE_API_KEY',
+            'FORWARD_BINANCE_API_SECRET',
+            account_label='正向 Binance',
         )
     return ApiCredentials(
         api_key=os.getenv('REVERSE_BINANCE_API_KEY', ''),
@@ -63,9 +78,10 @@ def get_gate_futures_credentials(strategy: str, *, mainnet: bool = True) -> ApiC
         )
 
     if normalized == 'forward':
-        return ApiCredentials(
-            api_key=_first_env(('FORWARD_GATE_FUTURES_API_KEY', 'GATE_FUTURES_API_KEY')),
-            api_secret=_first_env(('FORWARD_GATE_FUTURES_API_SECRET', 'GATE_FUTURES_API_SECRET')),
+        return _required_credentials(
+            'FORWARD_GATE_FUTURES_API_KEY',
+            'FORWARD_GATE_FUTURES_API_SECRET',
+            account_label='正向 Gate futures',
         )
     return ApiCredentials(
         api_key=os.getenv('REVERSE_GATE_FUTURES_API_KEY', ''),
