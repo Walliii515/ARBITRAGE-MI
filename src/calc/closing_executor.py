@@ -111,6 +111,9 @@ class ClosingExecutor:
         self.negative_funding_exit_paid_bps = config.get_float(
             'trade.close.negative_funding_exit_paid_bps', 7.0
         )
+        self.negative_funding_exit_max_projected_loss_bps = config.get_float(
+            'trade.close.negative_funding_exit_max_projected_loss_bps', 40.0
+        )
         self.delist_risk_exit_enabled = config.get_bool(
             'trade.close.delist_risk_exit_enabled', True
         )
@@ -475,38 +478,48 @@ class ClosingExecutor:
             close_reason = None
             close_reason_detail = None
             pre_gate_basis_bps = None
+            negative_funding_exit_mode = None
 
             if self._check_delist_risk_exit(pos):
                 close_reason = 'delist_risk_exit'
                 close_reason_detail = self._build_delist_risk_exit_detail(pos)
                 self._clear_position_close_state(ba, pos)
-            elif self._check_negative_funding_exit(pos):
-                close_reason = 'negative_funding_exit'
-                close_reason_detail = self._build_negative_funding_exit_detail(pos)
-                self._clear_position_close_state(ba, pos)
-            elif self._check_take_profit(
-                pos,
-                current_spread_bps,
-                close_vwap_threshold_meta.get(ba, {}),
-            ):
-                # 止盈条件满足，进入谷底反弹确认
-                orderbook_row = orderbook_rows_by_asset.get(ba)
-                if orderbook_row is not None:
-                    self._annotate_resiliency_row(orderbook_row, ba)
-                    close_basis_for_resiliency = orderbook_row.get('close_vwap_basis_bps')
-                    if close_basis_for_resiliency is None:
-                        close_basis_for_resiliency = current_spread_bps
-                    self._close_resiliency.observe_shock(ba, orderbook_row)
-                if self._pass_valley_check(ba, current_spread_bps, pos):
-                    if orderbook_row is not None and not self._pass_close_resiliency_check(
-                        ba, orderbook_row, float(close_basis_for_resiliency), pos
-                    ):
-                        continue
-                    close_reason = 'take_profit'
-                # else: 谷底监控中，不平仓
             else:
-                # 止盈不再满足，清除谷底监控状态
-                self._clear_position_close_state(ba, pos)
+                negative_funding_exit_mode = self._negative_funding_exit_mode(
+                    pos,
+                    current_spread_bps,
+                )
+                if negative_funding_exit_mode:
+                    close_reason = 'negative_funding_exit'
+                    close_reason_detail = self._build_negative_funding_exit_detail(
+                        pos,
+                        current_spread_bps,
+                        negative_funding_exit_mode,
+                    )
+                    self._clear_position_close_state(ba, pos)
+                elif self._check_take_profit(
+                    pos,
+                    current_spread_bps,
+                    close_vwap_threshold_meta.get(ba, {}),
+                ):
+                    # 止盈条件满足，进入谷底反弹确认
+                    orderbook_row = orderbook_rows_by_asset.get(ba)
+                    if orderbook_row is not None:
+                        self._annotate_resiliency_row(orderbook_row, ba)
+                        close_basis_for_resiliency = orderbook_row.get('close_vwap_basis_bps')
+                        if close_basis_for_resiliency is None:
+                            close_basis_for_resiliency = current_spread_bps
+                        self._close_resiliency.observe_shock(ba, orderbook_row)
+                    if self._pass_valley_check(ba, current_spread_bps, pos):
+                        if orderbook_row is not None and not self._pass_close_resiliency_check(
+                            ba, orderbook_row, float(close_basis_for_resiliency), pos
+                        ):
+                            continue
+                        close_reason = 'take_profit'
+                    # else: 谷底监控中，不平仓
+                else:
+                    # 止盈不再满足，清除谷底监控状态
+                    self._clear_position_close_state(ba, pos)
 
             if not close_reason:
                 continue
@@ -538,6 +551,33 @@ class ClosingExecutor:
                 if close_reason == 'take_profit':
                     # 旁路通过后再构建详情，才能把本次旁路写入的 lag 拼入“鲜度”字段
                     close_reason_detail = self._build_take_profit_detail(pos, current_spread_bps)
+                elif close_reason == 'negative_funding_exit':
+                    if negative_funding_exit_mode == 'projected_loss':
+                        if gate_basis is None:
+                            logger.info(
+                                f"负资金费预计损失平仓复核取消 | {ba} | "
+                                "旁路未返回仓位级VWAP基差"
+                            )
+                            self._valley_state.pop(valley_key, None)
+                            continue
+                        refreshed_mode = self._negative_funding_exit_mode(pos, gate_basis)
+                        if refreshed_mode is None:
+                            refreshed_loss = self._projected_exit_loss_bps(pos, gate_basis)
+                            logger.info(
+                                f"负资金费预计损失平仓复核取消 | {ba} | "
+                                f"预计损失{refreshed_loss:.1f}bps<"
+                                f"{self.negative_funding_exit_max_projected_loss_bps:.1f}bps | "
+                                f"gate_basis={gate_basis:.1f}bps"
+                            )
+                            self._valley_state.pop(valley_key, None)
+                            continue
+                        negative_funding_exit_mode = refreshed_mode
+                    close_reason_detail = self._build_negative_funding_exit_detail(
+                        pos,
+                        gate_basis if gate_basis is not None else current_spread_bps,
+                        negative_funding_exit_mode,
+                    )
+                    close_reason_detail = self._append_lag_detail(ba, close_reason_detail)
                 else:
                     close_reason_detail = self._append_lag_detail(ba, close_reason_detail)
                 # 补充旁路判定信息到原因详情（供复盘）
@@ -836,14 +876,15 @@ class ClosingExecutor:
         funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
         spread_profit_bps = open_spread_bps - float(close_basis_bps)
         gross_profit_bps = spread_profit_bps + funding_earned_bps
-        net_profit_bps = gross_profit_bps - self.fee_full_bps
+        fee_full_bps = self._estimated_full_fee_bps(pos)
+        net_profit_bps = gross_profit_bps - fee_full_bps
         return {
             'open_spread_bps': open_spread_bps,
             'close_basis_bps': float(close_basis_bps),
             'spread_profit_bps': spread_profit_bps,
             'funding_earned_bps': funding_earned_bps,
             'gross_profit_bps': gross_profit_bps,
-            'fee_full_bps': self.fee_full_bps,
+            'fee_full_bps': fee_full_bps,
             'net_profit_bps': net_profit_bps,
         }
 
@@ -894,9 +935,13 @@ class ClosingExecutor:
     def _negative_paid_bps(self, pos: Dict) -> float:
         return max(0.0, float(pos.get('funding_rate_sum_bps') or 0.0))
 
-    def _check_negative_funding_exit(self, pos: Dict) -> bool:
-        """负 funding 强制退出：临近结算且下一期仍明显为负才触发。"""
-        return self._negative_funding_state(pos) == 'force_exit'
+    def _check_negative_funding_exit(
+        self,
+        pos: Dict,
+        close_basis_bps: Optional[float] = None,
+    ) -> bool:
+        """负 funding 强制退出：严重临近结算，或监控仓预计退出损失超限。"""
+        return self._negative_funding_exit_mode(pos, close_basis_bps) is not None
 
     def _delist_exit_risks(self, pos: Dict) -> List[Dict]:
         if not self.delist_risk_exit_enabled:
@@ -950,17 +995,27 @@ class ClosingExecutor:
         except ValueError:
             return None
 
-    def _negative_funding_state(self, pos: Dict) -> str:
-        """返回负 funding 状态：none / watch / force_exit。"""
+    def _negative_funding_watch_active(self, pos: Dict) -> bool:
         if not self.negative_funding_exit_enabled:
-            return 'none'
+            return False
         current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
-        current_window_min = abs(float(self.negative_funding_exit_current_window_min or 0.0))
         extreme_threshold = abs(float(self.negative_funding_exit_extreme_24h_bps or 0.0))
-        next_threshold = abs(float(self.negative_funding_exit_next_bps or 0.0))
         paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         current_neg = self._negative_current_24h_bps(pos)
         paid_neg = self._negative_paid_bps(pos)
+        return (
+            (paid_threshold > 0 and paid_neg >= paid_threshold)
+            or (extreme_threshold > 0 and current_neg >= extreme_threshold)
+            or (current_threshold > 0 and current_neg >= current_threshold)
+        )
+
+    def _negative_funding_settlement_force(self, pos: Dict) -> bool:
+        if not self.negative_funding_exit_enabled:
+            return False
+        current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
+        current_window_min = abs(float(self.negative_funding_exit_current_window_min or 0.0))
+        next_threshold = abs(float(self.negative_funding_exit_next_bps or 0.0))
+        current_neg = self._negative_current_24h_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
         next_bps = self._next_funding_bps(pos)
         near_next_funding = next_min is not None and 0 <= next_min <= current_window_min
@@ -968,19 +1023,48 @@ class ClosingExecutor:
             next_bps is not None
             and (next_threshold <= 0 or next_bps <= -next_threshold)
         )
-        if (
+        return (
             current_threshold > 0
             and current_neg >= current_threshold
             and near_next_funding
             and next_still_negative
-        ):
-            return 'force_exit'
+        )
 
-        if paid_threshold > 0 and paid_neg >= paid_threshold:
-            return 'watch'
-        if extreme_threshold > 0 and current_neg >= extreme_threshold:
-            return 'watch'
-        if current_threshold > 0 and current_neg >= current_threshold:
+    def _projected_exit_loss_bps(self, pos: Dict, close_basis_bps: float) -> float:
+        comps = self._profit_components(pos, close_basis_bps)
+        return max(0.0, -comps['net_profit_bps'])
+
+    def _negative_funding_exit_mode(
+        self,
+        pos: Dict,
+        close_basis_bps: Optional[float] = None,
+    ) -> Optional[str]:
+        if self._negative_funding_settlement_force(pos):
+            return 'settlement'
+        if not self._negative_funding_watch_active(pos):
+            return None
+        if self._negative_current_24h_bps(pos) <= 0:
+            return None
+        threshold = abs(float(self.negative_funding_exit_max_projected_loss_bps or 0.0))
+        if threshold <= 0:
+            return None
+        if close_basis_bps is None:
+            close_basis_bps = _float_or_none(pos.get('current_spread_bps'))
+        if close_basis_bps is None:
+            return None
+        if self._projected_exit_loss_bps(pos, close_basis_bps) >= threshold:
+            return 'projected_loss'
+        return None
+
+    def _negative_funding_state(
+        self,
+        pos: Dict,
+        close_basis_bps: Optional[float] = None,
+    ) -> str:
+        """返回负 funding 状态：none / watch / force_exit。"""
+        if self._negative_funding_exit_mode(pos, close_basis_bps) is not None:
+            return 'force_exit'
+        if self._negative_funding_watch_active(pos):
             return 'watch'
         return 'none'
 
@@ -1680,9 +1764,17 @@ class ClosingExecutor:
 
         return detail
 
-    def _build_negative_funding_exit_detail(self, pos: Dict) -> str:
+    def _build_negative_funding_exit_detail(
+        self,
+        pos: Dict,
+        close_basis_bps: Optional[float] = None,
+        exit_mode: Optional[str] = None,
+    ) -> str:
         """构建负资金费风险平仓原因。"""
-        state = self._negative_funding_state(pos)
+        if close_basis_bps is None:
+            close_basis_bps = _float_or_none(pos.get('current_spread_bps'))
+        exit_mode = exit_mode or self._negative_funding_exit_mode(pos, close_basis_bps)
+        state = 'force_exit' if exit_mode else self._negative_funding_state(pos, close_basis_bps)
         current_neg = self._negative_current_24h_bps(pos)
         paid_neg = self._negative_paid_bps(pos)
         current_threshold = abs(float(self.negative_funding_exit_current_24h_bps or 0.0))
@@ -1694,9 +1786,30 @@ class ClosingExecutor:
         next_min = self._time_to_next_funding_min(pos)
         next_text = 'NA' if next_bps is None else f'{next_bps:+.1f}bps'
         next_min_text = 'NA' if next_min is None else f'{next_min:.1f}min'
+        projected_text = '预计退出损失NA'
+        composition_text = '组成(NA)'
+        if close_basis_bps is not None:
+            comps = self._profit_components(pos, close_basis_bps)
+            projected_loss = max(0.0, -comps['net_profit_bps'])
+            comparison = (
+                '>='
+                if projected_loss >= self.negative_funding_exit_max_projected_loss_bps
+                else '<'
+            )
+            projected_text = (
+                f"预计退出损失{projected_loss:.1f}{comparison}"
+                f"{self.negative_funding_exit_max_projected_loss_bps:.1f}bps"
+            )
+            composition_text = (
+                f"组成(价差{comps['spread_profit_bps']:+.1f}"
+                f"+净资金费{comps['funding_earned_bps']:+.1f}"
+                f"-{comps['fee_full_bps']:.1f}费)"
+            )
         return (
-            f"负资金费风险|state={state}|当前24h负费{current_neg:.1f}bps"
+            f"负资金费风险|state={state}|mode={exit_mode or 'watch'}"
+            f"|当前24h负费{current_neg:.1f}bps"
             f"|已付负费{paid_neg:.1f}bps"
+            f"|{projected_text}|{composition_text}"
             f"|阈值(当前{current_threshold:.1f}@{current_window_min:.0f}min,"
             f"next≤-{next_threshold:.1f},极端监控{extreme_threshold:.1f},"
             f"已付监控{paid_threshold:.1f})"
