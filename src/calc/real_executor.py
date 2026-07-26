@@ -178,11 +178,13 @@ class RealExecutor:
         return result
 
     def _execute_future_then_spot(self, order_group: Dict, orderbook_row: Dict) -> Dict:
-        """先用 Gate reduce-only 市价平期货腿，再按实际成交量卖 Binance 现货。"""
+        """先平 Gate 期货腿，再按实际成交量卖 Binance 现货。"""
         result = {'success': False, 'spot_order': None, 'future_order': None, 'message': ''}
         spot_order = dict(order_group.get('spot_order', {}) or {})
         future_order = dict(order_group.get('future_order', {}) or {})
-        future_order.pop('protective_price', None)
+        close_reason = str(order_group.get('execution_reason') or '')
+        if close_reason != 'take_profit':
+            future_order.pop('protective_price', None)
         future_order.pop('execution_style', None)
 
         future_result = self._place_gate_futures_order(future_order)
@@ -207,7 +209,10 @@ class RealExecutor:
         if spot_result.get('success'):
             target_qty = float(spot_order.get('target_qty') or 0)
             exec_qty = float(spot_result.get('exec_qty') or 0)
-            if target_qty > 0 and exec_qty + 1e-12 < target_qty:
+            qty_tolerance = self._spot_close_qty_tolerance(
+                spot_order.get('base_asset'),
+            )
+            if target_qty > 0 and exec_qty + qty_tolerance < target_qty:
                 result['spot_order'] = spot_result
                 result['message'] = (
                     f"现货部分成交(期货已成交,需人工处理): "
@@ -224,9 +229,13 @@ class RealExecutor:
             result['spot_order'] = spot_result
             result['success'] = True
             result['message'] = '成交成功'
+            execution_style = (
+                '保护IOC' if future_order.get('protective_price') is not None else '市价'
+            )
             logger.warning(
-                "平仓成功(Gate市价优先) | %s | future: price=%s, qty=%s | "
+                "平仓成功(Gate%s优先) | %s | future: price=%s, qty=%s | "
                 "spot: price=%s, qty=%s",
+                execution_style,
                 future_order.get('base_asset'),
                 future_result.get('exec_price'), future_result.get('exec_qty'),
                 spot_result.get('exec_price'), spot_result.get('exec_qty'),
@@ -243,6 +252,11 @@ class RealExecutor:
             future_order.get('base_asset'), spot_result.get('reason'),
         )
         return result
+
+    def _spot_close_qty_tolerance(self, base_asset: str) -> float:
+        """允许 Binance 按 step_size 向下截断，不把不可成交尘埃误判为断腿。"""
+        step_size = float((self.spot_meta.get(base_asset) or {}).get('step_size') or 0)
+        return max(step_size, 1e-12)
 
     def execute_reverse_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:
         """

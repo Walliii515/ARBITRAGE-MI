@@ -118,6 +118,17 @@ class ClosingExecutor:
             config.get_float('trade.close.delist_risk_exit_days', 2.0),
             0.0,
         )
+        self.take_profit_protective_ioc_enabled = config.get_bool(
+            'trade.close.take_profit_protective_ioc_enabled',
+            True,
+        )
+        self.take_profit_protective_ioc_slippage_bps = max(
+            config.get_float(
+                'trade.close.take_profit_protective_ioc_slippage_bps',
+                5.0,
+            ),
+            0.0,
+        )
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
         self.fee_spot_close = config.get_float('trade.fee.spot_close', 0.00075)
@@ -566,6 +577,21 @@ class ClosingExecutor:
                         'message': notional_reason,
                     })
                     continue
+            future_protective_price = None
+            if close_reason == 'take_profit' and self.take_profit_protective_ioc_enabled:
+                future_protective_price = self._future_close_protective_price(
+                    orderbook_row,
+                    self.take_profit_protective_ioc_slippage_bps,
+                )
+                if future_protective_price is None:
+                    logger.info(f"止盈保护IOC缺少有效价格，跳过本轮 | {ba}")
+                    self._close_cooldown[ba] = datetime.now()
+                    continue
+                close_reason_detail = (
+                    f"{close_reason_detail}|保护IOC("
+                    f"future_buy≤{future_protective_price},"
+                    f"slip≤{self.take_profit_protective_ioc_slippage_bps:.1f}bps)"
+                )
             try:
                 result = self._execute_close(
                     pos,
@@ -573,6 +599,7 @@ class ClosingExecutor:
                     close_reason_detail,
                     orderbook_row,
                     pre_gate_basis_bps=pre_gate_basis_bps,
+                    future_protective_price=future_protective_price,
                 )
                 results.append(result)
                 if result.get('success'):
@@ -1258,9 +1285,46 @@ class ClosingExecutor:
             close_threshold_meta=threshold_meta,
             close_threshold_col=self.close_threshold_col,
             fixed_take_profit_bps=self._effective_take_profit_bps(pos),
-            fee_full_bps=self.fee_full_bps,
+            fee_full_bps=self._estimated_full_fee_bps(pos),
             cfg=self.dynamic_take_profit_cfg,
         )
+
+    def _estimated_full_fee_bps(self, pos: Dict) -> float:
+        """按实际开仓费和当前待平名义金额估算完整往返手续费。"""
+        open_notional = _float_or_none(pos.get('spot_open_amount'))
+        if open_notional is None or open_notional <= 0:
+            return self.fee_full_bps
+
+        recorded_open_fee = _float_or_none(pos.get('fee_cost'))
+        if recorded_open_fee is not None:
+            open_fee_cost = abs(recorded_open_fee)
+        else:
+            future_open_notional = (
+                (_float_or_none(pos.get('future_open_qty')) or 0.0)
+                * (_float_or_none(pos.get('future_open_price')) or 0.0)
+            )
+            open_fee_cost = (
+                open_notional * self.fee_spot_open
+                + future_open_notional * self.fee_future_taker_open
+            )
+
+        spot_close_notional = (
+            (_float_or_none(pos.get('spot_open_qty')) or 0.0)
+            * (_float_or_none(pos.get('current_spot_price')) or 0.0)
+        )
+        future_close_notional = (
+            (_float_or_none(pos.get('future_open_qty')) or 0.0)
+            * (_float_or_none(pos.get('current_future_price')) or 0.0)
+        )
+        if spot_close_notional <= 0 or future_close_notional <= 0:
+            return self.fee_full_bps
+
+        total_fee_cost = (
+            open_fee_cost
+            + spot_close_notional * self.fee_spot_close
+            + future_close_notional * self.fee_future_taker_close
+        )
+        return total_fee_cost / open_notional * 10000.0
 
     def _pre_execution_gate(
         self,
@@ -1355,15 +1419,16 @@ class ClosingExecutor:
             from calc.merge_cross_exchange_orderbook import merge_orderbook_records
             from calc.calculate_hedge_metrics import calculate_hedge_metrics
 
-            open_amount_usdt = config.get_float('trade.open.amount_usdt', 5)
             merged = merge_orderbook_records([gate_row], [spot_row])
             if not merged:
                 return False, None, None, '盘口合并失败'
 
+            close_amount_usdt = self._position_close_vwap_amount(pos, spot_row)
             merged = calculate_hedge_metrics(
-                merged, self.contract_meta, self.spot_meta, open_amount_usdt
+                merged, self.contract_meta, self.spot_meta, close_amount_usdt
             )
             row = merged[0]
+            row['close_target_amount_usdt'] = close_amount_usdt
 
             # ── 4. 计算平仓VWAP基差 ──
             gate_basis_bps = calc_vwap_basis_bps(
@@ -1686,6 +1751,34 @@ class ClosingExecutor:
 
         return f"{detail}|鲜度(gate={_fmt(gate_lag_ms)},spot={_fmt(spot_lag_ms)})"
 
+    @staticmethod
+    def _position_close_vwap_amount(pos: Dict, spot_row: Dict) -> float:
+        """把实际待平数量换算为 VWAP 计算金额；两腿不等时取较大腿，保持保守。"""
+        spot_qty = max(_float_or_none(pos.get('spot_open_qty')) or 0.0, 0.0)
+        future_qty = max(_float_or_none(pos.get('future_open_qty')) or 0.0, 0.0)
+        target_qty = max(spot_qty, future_qty)
+        reference_price = (
+            _float_or_none(spot_row.get('spot_price_ask_1'))
+            or _float_or_none(spot_row.get('spot_price_bid_1'))
+        )
+        if target_qty > 0 and reference_price is not None and reference_price > 0:
+            return target_qty * reference_price
+        return config.get_float('trade.open.amount_usdt', 5.0)
+
+    @staticmethod
+    def _future_close_protective_price(row: Dict, slippage_bps: float) -> Optional[float]:
+        """Gate 空头平仓是买入，以足量 VWAP 加保护垫作为 IOC 最高成交价。"""
+        price = (
+            row.get('future_close_vwap')
+            or row.get('future_price_ask_1')
+            or row.get('future_ask_price_1')
+            or row.get('future_ask_1')
+        )
+        price = _float_or_none(price)
+        if price is None or price <= 0:
+            return None
+        return round(price * (1 + max(float(slippage_bps), 0.0) / 10000.0), 10)
+
     def _append_close_basis_compare(
         self,
         detail: str,
@@ -1763,12 +1856,14 @@ class ClosingExecutor:
         close_reason_detail: str,
         orderbook_row: Dict,
         pre_gate_basis_bps: Optional[float] = None,
+        future_protective_price: Optional[float] = None,
     ) -> Dict:
         """构建平仓订单组 → 调用成交引擎 → 持久化"""
         ba = pos.get('base_asset', '')
         order_group = self._build_close_order_group(
             pos,
             close_reason=close_reason,
+            future_protective_price=future_protective_price,
         )
         exec_result = self.executor_client.execute(order_group, orderbook_row)
         actual_close_basis_bps = self._save_close(
@@ -1798,6 +1893,7 @@ class ClosingExecutor:
         self,
         pos: Dict,
         close_reason: Optional[str] = None,
+        future_protective_price: Optional[float] = None,
     ) -> Dict:
         """
         生成平仓订单组：
@@ -1834,6 +1930,8 @@ class ClosingExecutor:
             'target_qty': float(pos.get('future_open_qty') or 0),
             'target_amount': target_amount,
         }
+        if close_reason == 'take_profit' and future_protective_price is not None:
+            future_order['protective_price'] = future_protective_price
         order_group = {
             'order_uuid': order_uuid,
             'base_asset': ba,
@@ -2036,10 +2134,17 @@ class ClosingExecutor:
             return {'partial': False}
 
         remaining_contracts = self._remaining_future_contracts(pos, future_target, future_shortfall)
+        spot_fill_ratio = spot_exec / spot_target
+        future_fill_ratio = future_exec / future_target
+        expected_spot_exec = spot_target * future_fill_ratio
+        spot_step = _float_or_none(
+            (self.spot_meta.get(str(pos.get('base_asset') or '').upper()) or {}).get('step_size')
+        ) or 0.0
+        balance_tolerance = max(CLOSE_QTY_TOLERANCE, spot_step + 1e-12)
         balanced = (
             spot_exec > CLOSE_QTY_TOLERANCE
             and future_exec > CLOSE_QTY_TOLERANCE
-            and abs(spot_shortfall - future_shortfall) <= max(CLOSE_QTY_TOLERANCE, min(spot_target, future_target) * 1e-8)
+            and abs(spot_exec - expected_spot_exec) <= balance_tolerance
         )
         return {
             'partial': True,
@@ -2051,6 +2156,10 @@ class ClosingExecutor:
             'spot_remaining': spot_shortfall,
             'future_remaining': future_shortfall,
             'future_contracts_remaining': remaining_contracts,
+            'spot_fill_ratio': spot_fill_ratio,
+            'future_fill_ratio': future_fill_ratio,
+            'expected_spot_exec': expected_spot_exec,
+            'balance_tolerance': balance_tolerance,
         }
 
     def _remaining_future_contracts(self, pos: Dict, future_target: float, future_remaining: float) -> float:

@@ -26,6 +26,7 @@
 import os
 import sys
 import time
+import json
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
@@ -453,7 +454,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         executor._place_binance_spot_order.assert_not_called()
         executor._place_gate_futures_order.assert_not_called()
 
-    def test_close_future_then_spot_uses_gate_first_and_actual_fill_ratio(self):
+    def test_take_profit_protective_ioc_hedges_gate_partial_fill_by_position_ratio(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
         calls = []
@@ -461,7 +462,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
 
         def gate_order(order):
             calls.append('future')
-            self.assertNotIn('protective_price', order)
+            self.assertEqual(order['protective_price'], 0.119)
             return {
                 'success': True,
                 'exec_price': 0.12092,
@@ -488,6 +489,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
 
         result = executor.execute({
             'execution_sequence': 'future_then_spot',
+            'execution_reason': 'take_profit',
             'spot_order': {
                 'base_asset': 'BEL',
                 'order_side': 'close',
@@ -506,6 +508,87 @@ class TestRealExecutorGateParsing(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(calls, ['future', 'spot'])
+
+    def test_take_profit_protective_ioc_zero_fill_does_not_touch_spot(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'IOC未成交(fill=0, finish_as=ioc)',
+        })
+        executor._place_binance_spot_order = MagicMock()
+
+        result = executor.execute({
+            'execution_sequence': 'future_then_spot',
+            'execution_reason': 'take_profit',
+            'spot_order': {
+                'base_asset': 'EPIC',
+                'order_side': 'close',
+                'trade_direction': 'sell',
+                'target_qty': 297.0,
+            },
+            'future_order': {
+                'base_asset': 'EPIC',
+                'future_contract': 'EPIC_USDT',
+                'order_side': 'close',
+                'trade_direction': 'buy',
+                'target_qty': 297.0,
+                'protective_price': 0.69195,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIn('未执行现货', result['message'])
+        executor._place_binance_spot_order.assert_not_called()
+
+    def test_take_profit_partial_fill_allows_one_spot_step_truncation(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(),
+            contract_meta={},
+            spot_meta={'BEL': {'step_size': 0.1}},
+        )
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.12092,
+            'exec_qty': 400.0,
+            'exec_amount': 48.368,
+            'coverage_ratio': 0,
+        })
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.1196,
+            'exec_qty': 395.9,
+            'exec_amount': 47.34964,
+            'coverage_ratio': 0,
+        })
+
+        result = executor.execute({
+            'execution_sequence': 'future_then_spot',
+            'execution_reason': 'take_profit',
+            'spot_order': {
+                'base_asset': 'BEL',
+                'order_side': 'close',
+                'trade_direction': 'sell',
+                'target_qty': 488.0,
+            },
+            'future_order': {
+                'base_asset': 'BEL',
+                'future_contract': 'BEL_USDT',
+                'order_side': 'close',
+                'trade_direction': 'buy',
+                'target_qty': 493.0,
+                'protective_price': 0.119,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        requested_spot_qty = (
+            executor._place_binance_spot_order.call_args.args[0]['target_qty']
+        )
+        self.assertAlmostEqual(requested_spot_qty, 488.0 * 400.0 / 493.0)
 
     def test_margin_close_strips_maker_and_protective_fields_before_gate(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
@@ -528,6 +611,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
 
         result = executor.execute({
             'execution_sequence': 'future_then_spot',
+            'execution_reason': 'margin_close',
             'spot_order': {
                 'base_asset': 'BEL',
                 'order_side': 'close',
@@ -549,6 +633,91 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         gate_order = executor._place_gate_futures_order.call_args.args[0]
         self.assertNotIn('execution_style', gate_order)
         self.assertNotIn('protective_price', gate_order)
+
+    def test_gate_take_profit_protective_ioc_uses_nonzero_limit_and_reduce_only(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        class FakeResponse:
+            status_code = 200
+            text = '{}'
+
+            @staticmethod
+            def json():
+                return {
+                    'id': 'gate-close-1',
+                    'status': 'finished',
+                    'size': '297',
+                    'left': '0',
+                    'fill_price': '0.6919',
+                    'finish_as': 'filled',
+                }
+
+        executor = RealExecutor(
+            ExchangeConfig(gate_base_url='https://gate.test'),
+            contract_meta={'EPIC': {'quanto_multiplier': 1.0}},
+            spot_meta={},
+        )
+        executor._gate_sign = MagicMock(return_value={})
+        executor._session = MagicMock()
+        executor._session.post.return_value = FakeResponse()
+
+        result = executor._place_gate_futures_order({
+            'order_uuid': 'abcdef123456',
+            'base_asset': 'EPIC',
+            'future_contract': 'EPIC_USDT',
+            'order_side': 'close',
+            'trade_direction': 'buy',
+            'target_qty': 297.0,
+            'protective_price': 0.69195,
+        })
+
+        self.assertTrue(result['success'])
+        body = json.loads(executor._session.post.call_args.kwargs['data'])
+        self.assertNotEqual(body['price'], '0')
+        self.assertEqual(body['tif'], 'ioc')
+        self.assertTrue(body['reduce_only'])
+
+    def test_gate_risk_close_uses_market_ioc_and_reduce_only(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        class FakeResponse:
+            status_code = 200
+            text = '{}'
+
+            @staticmethod
+            def json():
+                return {
+                    'id': 'gate-risk-close-1',
+                    'status': 'finished',
+                    'size': '297',
+                    'left': '0',
+                    'fill_price': '0.6949',
+                    'finish_as': 'filled',
+                }
+
+        executor = RealExecutor(
+            ExchangeConfig(gate_base_url='https://gate.test'),
+            contract_meta={'EPIC': {'quanto_multiplier': 1.0}},
+            spot_meta={},
+        )
+        executor._gate_sign = MagicMock(return_value={})
+        executor._session = MagicMock()
+        executor._session.post.return_value = FakeResponse()
+
+        result = executor._place_gate_futures_order({
+            'order_uuid': 'abcdef123456',
+            'base_asset': 'EPIC',
+            'future_contract': 'EPIC_USDT',
+            'order_side': 'close',
+            'trade_direction': 'buy',
+            'target_qty': 297.0,
+        })
+
+        self.assertTrue(result['success'])
+        body = json.loads(executor._session.post.call_args.kwargs['data'])
+        self.assertEqual(body['price'], '0')
+        self.assertEqual(body['tif'], 'ioc')
+        self.assertTrue(body['reduce_only'])
 
     def test_margin_close_skips_spot_when_gate_market_close_fails(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
@@ -3214,7 +3383,11 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         spot_book = FakeOrderBook(
             last_update_time=now - spot_lag_sec,
             update_count=spot_uc,
-            row={'symbol': 'BTCUSDT'},
+            row={
+                'symbol': 'BTCUSDT',
+                'spot_price_ask_1': 2.0,
+                'spot_price_bid_1': 1.99,
+            },
         )
         self.ce.set_orderbook_managers(
             FakeManager({'BTC_USDT': gate_book}),
@@ -3375,6 +3548,38 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertAlmostEqual(gate_lag, 50, delta=30)
         self.assertAlmostEqual(spot_lag, 60, delta=30)
 
+    def test_pre_execution_vwap_uses_actual_position_quantity(self):
+        """旁路按真实待平数量计算深度，不再固定使用普通开仓金额。"""
+        self._setup_books()
+        pos = dict(self.pos)
+        pos.update({
+            'spot_open_qty': 297.0,
+            'future_open_qty': 297.0,
+        })
+        merge_mock = MagicMock(return_value=[{'_': 'merged'}])
+        hedge_mock = MagicMock(return_value=[{
+            'spot_close_vwap': 1.99,
+            'future_close_vwap': 1.98,
+        }])
+        with (
+            patch(
+                'calc.merge_cross_exchange_orderbook.merge_orderbook_records',
+                merge_mock,
+            ),
+            patch(
+                'calc.calculate_hedge_metrics.calculate_hedge_metrics',
+                hedge_mock,
+            ),
+            patch('calc.closing_executor.calc_vwap_basis_bps', return_value=35.0),
+        ):
+            passed, row, _, _ = self.ce._pre_execution_gate(
+                'BTC', 'BTC_USDT', 'BTCUSDT', pos
+            )
+
+        self.assertTrue(passed)
+        self.assertAlmostEqual(hedge_mock.call_args.args[3], 594.0)
+        self.assertAlmostEqual(row['close_target_amount_usdt'], 594.0)
+
     def test_full_pass_then_build_take_profit_detail_consumes_lag(self):
         """端到端验证：通过路径写 lag → _build_take_profit_detail 弹出并拼接到原因"""
         self._setup_books()
@@ -3434,6 +3639,11 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertIn('鲜度(gate=', detail)
         self.assertNotIn('鲜度(NA)', detail)
         self.assertIn('旁路✓', detail)
+        self.assertIn('保护IOC', detail)
+        self.assertAlmostEqual(
+            execute_mock.call_args.kwargs['future_protective_price'],
+            100.05,
+        )
 
     def test_take_profit_batch_guard_stops_same_asset_after_bad_probe(self):
         """同标的多笔止盈时，首笔成交质量差则本轮不继续批量平仓。"""
@@ -3465,7 +3675,12 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
             'message': None,
             'close_basis_slip_bps': 12.0,
         })
-        gate_mock = MagicMock(return_value=(True, {'fresh': 'row'}, 10.0, ''))
+        gate_mock = MagicMock(return_value=(
+            True,
+            {'fresh': 'row', 'future_close_vwap': 100.0},
+            10.0,
+            '',
+        ))
 
         with (
             patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
@@ -3527,7 +3742,12 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
                 'close_basis_slip_bps': 2.0,
             },
         ])
-        gate_mock = MagicMock(return_value=(True, {'fresh': 'row'}, 10.0, ''))
+        gate_mock = MagicMock(return_value=(
+            True,
+            {'fresh': 'row', 'future_close_vwap': 100.0},
+            10.0,
+            '',
+        ))
 
         with (
             patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
@@ -3798,6 +4018,64 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
         self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
 
+    def test_take_profit_partial_ioc_keeps_unequal_legs_at_same_hedge_ratio(self):
+        """历史两腿数量略有差异时，按相同成交比例保留仍属于平衡持仓。"""
+        pos = self._bel_close_position(qty=493.0)
+        pos.update({
+            'spot_open_qty': 488.07,
+            'spot_open_amount': 488.07 * 0.12,
+        })
+        order_group = self._bel_close_order_group(qty=493.0)
+        order_group['spot_order']['target_qty'] = 488.07
+
+        cursor, triggered = self._record_save_close(
+            pos,
+            order_group,
+            self._close_exec_result(396.0, 400.0),
+        )
+
+        update_calls = [
+            params for sql, params in cursor.calls
+            if 'spot_open_qty = %(spot_open_qty)s' in sql
+        ]
+        self.assertEqual(len(update_calls), 1)
+        self.assertAlmostEqual(update_calls[0]['spot_open_qty'], 92.07)
+        self.assertAlmostEqual(update_calls[0]['future_open_qty'], 93.0)
+        self.assertEqual(update_calls[0]['future_open_contracts'], 93.0)
+        self.assertFalse(any(
+            "exchange_risk_status = 'desynced'" in sql for sql, _ in cursor.calls
+        ))
+        self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
+
+    def test_take_profit_partial_ioc_accepts_spot_step_size_rounding(self):
+        """同比例现货数量不足一个 step 的截断不应把平衡余仓标记为断腿。"""
+        self.ce.spot_meta = {'BEL': {'step_size': 0.1}}
+        pos = self._bel_close_position(qty=493.0)
+        pos.update({
+            'spot_open_qty': 488.0,
+            'spot_open_amount': 488.0 * 0.12,
+        })
+        order_group = self._bel_close_order_group(qty=493.0)
+        order_group['spot_order']['target_qty'] = 488.0
+
+        cursor, triggered = self._record_save_close(
+            pos,
+            order_group,
+            self._close_exec_result(395.9, 400.0),
+        )
+
+        update_calls = [
+            params for sql, params in cursor.calls
+            if 'spot_open_qty = %(spot_open_qty)s' in sql
+        ]
+        self.assertEqual(len(update_calls), 1)
+        self.assertAlmostEqual(update_calls[0]['spot_open_qty'], 92.1)
+        self.assertAlmostEqual(update_calls[0]['future_open_qty'], 93.0)
+        self.assertFalse(any(
+            "exchange_risk_status = 'desynced'" in sql for sql, _ in cursor.calls
+        ))
+        self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
+
     def test_take_profit_full_fill_marks_position_closed(self):
         cursor, triggered = self._record_save_close(
             self._bel_close_position(qty=410.0),
@@ -4033,7 +4311,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         })
         self.assertTrue(self.ce._check_delist_risk_exit(self.pos))
 
-    def test_take_profit_close_order_group_uses_gate_market_first(self):
+    def test_take_profit_close_order_group_uses_gate_first(self):
         group = self.ce._build_close_order_group({
             'base_asset': 'BTC',
             'spot_open_qty': 1.0,
@@ -4049,6 +4327,22 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 
     def test_take_profit_threshold_includes_gate_taker_close_fee(self):
         self.assertEqual(self.ce.fee_full_bps, 22.0)
+
+    def test_take_profit_fee_estimate_scales_with_current_close_notional(self):
+        pos = {
+            'spot_open_amount': 160.08,
+            'spot_open_qty': 297.0,
+            'future_open_qty': 297.0,
+            'fee_cost': -0.2003329,
+            'current_spot_price': 0.69443993,
+            'current_future_price': 0.6949,
+        }
+
+        self.assertAlmostEqual(
+            self.ce._estimated_full_fee_bps(pos),
+            28.62,
+            places=2,
+        )
 
     def test_dynamic_take_profit_uses_asset_funding_history_when_current_drops(self):
         self.ce.fixed_take_profit_bps = 200.0
@@ -4204,16 +4498,16 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertTrue(eval_.aging_blocked_by_funding)
         self.assertEqual(eval_.threshold_bps, 200.0)
 
-    def test_take_profit_close_never_adds_maker_or_protective_params(self):
+    def test_take_profit_close_adds_protective_ioc_without_maker(self):
         group = self.ce._build_close_order_group({
             'base_asset': 'BTC',
             'spot_open_qty': 0.99,
             'future_open_qty': 1.0,
             'future_contract': 'BTC_USDT',
-        }, close_reason='take_profit')
+        }, close_reason='take_profit', future_protective_price=100.05)
 
         future_order = group['future_order']
-        self.assertNotIn('protective_price', future_order)
+        self.assertEqual(future_order['protective_price'], 100.05)
         self.assertNotIn('execution_style', future_order)
         self.assertFalse(any(str(key).startswith('maker_') for key in future_order))
         self.assertEqual(group['execution_sequence'], 'future_then_spot')

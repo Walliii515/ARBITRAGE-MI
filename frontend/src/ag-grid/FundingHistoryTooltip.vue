@@ -24,10 +24,11 @@ const totalRate = computed(() => {
   return history.reduce((sum: number, item: any) => sum + (item.rate || 0), 0)
 })
 
-function formatAbsBps(value: unknown): string {
+function formatSignedBps(value: unknown): string {
   const rate = Number(value)
   if (!Number.isFinite(rate)) return '—'
-  return (Math.abs(rate) * 10000).toFixed(2)
+  const bps = rate * 10000
+  return `${bps > 0 ? '+' : ''}${bps.toFixed(2)}`
 }
 
 function formatPnl(value: unknown): string {
@@ -54,7 +55,7 @@ function formatPnl(value: unknown): string {
           <tr v-for="item in params.value" :key="item.seq">
             <td class="fh-seq">{{ item.seq }}</td>
             <td class="fh-rate" :class="{ positive: item.rate > 0, negative: item.rate < 0 }">
-              {{ formatAbsBps(item.rate) }}
+              {{ formatSignedBps(item.rate) }}
             </td>
             <td class="fh-pnl" :class="{ positive: item.pnl > 0, negative: item.pnl < 0 }">
               {{ formatPnl(item.pnl) }}
@@ -66,7 +67,7 @@ function formatPnl(value: unknown): string {
           <tr class="fh-summary">
             <td class="fh-summary-label">合计 ({{ params.value.length }}次)</td>
             <td class="fh-rate" :class="{ positive: totalRate > 0, negative: totalRate < 0 }">
-              {{ formatAbsBps(totalRate) }}
+              {{ formatSignedBps(totalRate) }}
             </td>
             <td class="fh-pnl" :class="{ positive: totalPnl > 0, negative: totalPnl < 0 }">
               {{ formatPnl(totalPnl) }}
@@ -177,8 +178,8 @@ function formatPnl(value: unknown): string {
 .fh-rate.positive { color: #67c23a; }
 .fh-rate.negative { color: #f56c6c; }
 
-.fh-pnl.positive { color: #f56c6c; }
-.fh-pnl.negative { color: #67c23a; }
+.fh-pnl.positive { color: #67c23a; }
+.fh-pnl.negative { color: #f56c6c; }
 
 .fh-time {
   color: #8b949e;
