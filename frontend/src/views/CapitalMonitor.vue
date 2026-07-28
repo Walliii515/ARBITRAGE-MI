@@ -1676,22 +1676,56 @@ onBeforeUnmount(() => {
           </div>
           <div class="annualized-values">
             <div class="annualized-value-block">
-              <span class="annualized-value-label">策略年化</span>
+              <span class="annualized-value-label annualized-label-with-help">
+                <span>策略年化</span>
+                <el-popover
+                  trigger="click"
+                  placement="top"
+                  width="min(360px, calc(100vw - 24px))"
+                >
+                  <template #reference>
+                    <el-button
+                      class="help-icon-button"
+                      text
+                      circle
+                      size="small"
+                      aria-label="策略年化收益说明"
+                    >
+                      <el-icon><QuestionFilled /></el-icon>
+                    </el-button>
+                  </template>
+                  <div class="annualized-help">{{ annualizedReturnMeta() }}</div>
+                </el-popover>
+              </span>
               <strong :class="annualizedValueClass(annualizedReturn?.annualized_return_pct)">
                 {{ formatAnnualizedReturnValue(annualizedReturn?.annualized_return_pct, annualizedReturn?.sufficient_data) }}
               </strong>
-              <div class="gate-risk-review-meta annualized-summary-meta">
-                <span>{{ annualizedReturnMeta() }}</span>
-              </div>
             </div>
             <div class="annualized-value-block">
-              <span class="annualized-value-label">已实现年化</span>
+              <span class="annualized-value-label annualized-label-with-help">
+                <span>已实现年化</span>
+                <el-popover
+                  trigger="click"
+                  placement="top"
+                  width="min(360px, calc(100vw - 24px))"
+                >
+                  <template #reference>
+                    <el-button
+                      class="help-icon-button"
+                      text
+                      circle
+                      size="small"
+                      aria-label="已实现年化收益说明"
+                    >
+                      <el-icon><QuestionFilled /></el-icon>
+                    </el-button>
+                  </template>
+                  <div class="annualized-help">{{ realizedAnnualizedReturnMeta() }}</div>
+                </el-popover>
+              </span>
               <strong :class="annualizedValueClass(annualizedReturn?.realized_annualized_return_pct)">
                 {{ formatAnnualizedReturnValue(annualizedReturn?.realized_annualized_return_pct, annualizedReturn?.realized_sufficient_data) }}
               </strong>
-              <div class="gate-risk-review-meta annualized-summary-meta">
-                <span>{{ realizedAnnualizedReturnMeta() }}</span>
-              </div>
             </div>
           </div>
         </div>
@@ -2155,20 +2189,28 @@ onBeforeUnmount(() => {
 }
 
 .annualized-value-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   color: var(--app-text-muted);
   font-size: 12px;
   font-weight: 600;
   line-height: 1.3;
 }
 
+.annualized-label-with-help {
+  min-width: 0;
+}
+
 .annualized-value-block > strong {
   text-align: left;
 }
 
-.annualized-summary-meta {
-  grid-column: 1;
-  min-width: 0;
-  justify-content: flex-start;
+.annualized-help {
+  color: var(--app-text);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 .risk-health-error {
