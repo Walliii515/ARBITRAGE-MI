@@ -78,9 +78,16 @@ interface AnnualizedReturnSummary {
   annualized_return_pct?: number | null
   period_return_pct?: number | null
   period_pnl_usdt?: number | null
+  realized_available_days?: number | null
+  realized_sufficient_data?: boolean | null
+  realized_data_available?: boolean | null
+  realized_annualized_return_pct?: number | null
+  realized_period_return_pct?: number | null
+  realized_period_pnl_usdt?: number | null
   average_equity_usdt?: number | null
   start_date?: string | null
   end_date?: string | null
+  window_end_policy?: string | null
 }
 
 interface FundTransferTask {
@@ -346,11 +353,6 @@ const gatePriorityAsset = computed(() => (
 const gateRiskPanelError = computed(() => (
   gateRiskSummaryRequestError.value || gateRiskHealthError.value
 ))
-const annualizedReturnValueClass = computed(() => {
-  const value = Number(annualizedReturn.value?.annualized_return_pct)
-  if (!Number.isFinite(value)) return 'risk-idle'
-  return value >= 0 ? 'pnl-positive' : 'pnl-negative'
-})
 const chartExchange = computed<ExchangeKey>(() => (
   selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
 ))
@@ -545,10 +547,19 @@ function formatPercent(value: number | null | undefined): string {
   return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
 }
 
-function formatAnnualizedReturn(): string {
+function annualizedValueClass(value: number | null | undefined): string {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 'risk-idle'
+  return numeric >= 0 ? 'pnl-positive' : 'pnl-negative'
+}
+
+function formatAnnualizedReturnValue(
+  value: number | null | undefined,
+  sufficient: boolean | null | undefined,
+): string {
   if (annualizedReturnLoading.value && !annualizedReturn.value) return '-'
-  if (!annualizedReturn.value?.sufficient_data) return '数据不足'
-  return formatPercent(annualizedReturn.value.annualized_return_pct)
+  if (!sufficient) return '数据不足'
+  return formatPercent(value)
 }
 
 function annualizedReturnMeta(): string {
@@ -558,8 +569,24 @@ function annualizedReturnMeta(): string {
     return `已有 ${summary.available_days} / ${summary.period_days} 天有效数据`
   }
   return [
+    `截至 ${summary.end_date || '昨日'}`,
     `区间收益 ${formatPercent(summary.period_return_pct)}`,
     `总盈亏 ${formatAmount(summary.period_pnl_usdt)} USDT`,
+    `日均总资产 ${formatAmount(summary.average_equity_usdt)} USDT`,
+  ].join(' · ')
+}
+
+function realizedAnnualizedReturnMeta(): string {
+  const summary = annualizedReturn.value
+  if (!summary) return annualizedReturnRequestError.value || '暂无收益汇总'
+  if (!summary.realized_data_available) return '暂无已实现收益数据'
+  if (!summary.realized_sufficient_data) {
+    return `已有 ${summary.realized_available_days || 0} / ${summary.period_days} 天有效数据`
+  }
+  return [
+    `截至 ${summary.end_date || '昨日'}`,
+    `区间收益 ${formatPercent(summary.realized_period_return_pct)}`,
+    `净已实现收益 ${formatAmount(summary.realized_period_pnl_usdt)} USDT`,
     `日均总资产 ${formatAmount(summary.average_equity_usdt)} USDT`,
   ].join(' · ')
 }
@@ -1647,11 +1674,25 @@ onBeforeUnmount(() => {
               </el-radio-button>
             </el-radio-group>
           </div>
-          <strong :class="annualizedReturnValueClass">
-            {{ formatAnnualizedReturn() }}
-          </strong>
-          <div class="gate-risk-review-meta annualized-summary-meta">
-            <span>{{ annualizedReturnMeta() }}</span>
+          <div class="annualized-values">
+            <div class="annualized-value-block">
+              <span class="annualized-value-label">策略年化</span>
+              <strong :class="annualizedValueClass(annualizedReturn?.annualized_return_pct)">
+                {{ formatAnnualizedReturnValue(annualizedReturn?.annualized_return_pct, annualizedReturn?.sufficient_data) }}
+              </strong>
+              <div class="gate-risk-review-meta annualized-summary-meta">
+                <span>{{ annualizedReturnMeta() }}</span>
+              </div>
+            </div>
+            <div class="annualized-value-block">
+              <span class="annualized-value-label">已实现年化</span>
+              <strong :class="annualizedValueClass(annualizedReturn?.realized_annualized_return_pct)">
+                {{ formatAnnualizedReturnValue(annualizedReturn?.realized_annualized_return_pct, annualizedReturn?.realized_sufficient_data) }}
+              </strong>
+              <div class="gate-risk-review-meta annualized-summary-meta">
+                <span>{{ realizedAnnualizedReturnMeta() }}</span>
+              </div>
+            </div>
           </div>
         </div>
         <div class="gate-risk-review-item">
@@ -2099,12 +2140,35 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
 }
 
-.annualized-summary > strong {
+.annualized-values {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.annualized-value-block {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  min-width: 0;
+}
+
+.annualized-value-label {
+  color: var(--app-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.annualized-value-block > strong {
   text-align: left;
 }
 
 .annualized-summary-meta {
   grid-column: 1;
+  min-width: 0;
+  justify-content: flex-start;
 }
 
 .risk-health-error {
@@ -2626,6 +2690,10 @@ onBeforeUnmount(() => {
 
   .annualized-period-selector {
     justify-content: flex-start;
+  }
+
+  .annualized-values {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .fund-transfer-status-line,

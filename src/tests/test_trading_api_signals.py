@@ -339,7 +339,11 @@ class CapitalHistoryQueryTests(unittest.TestCase):
 
 class CapitalAnnualizedReturnTests(unittest.TestCase):
     @staticmethod
-    def _daily_rows(count: int, daily_pnl: Decimal = Decimal('10')):
+    def _daily_rows(
+        count: int,
+        daily_pnl: Decimal = Decimal('10'),
+        daily_realized_pnl: Decimal = Decimal('5'),
+    ):
         return [
             {
                 'summary_date': date(2026, 7, day + 1),
@@ -347,6 +351,8 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
                 'sample_count': 100,
                 'first_gross_pnl_usdt': Decimal('100') + daily_pnl * day,
                 'last_gross_pnl_usdt': Decimal('100') + daily_pnl * (day + 1),
+                'first_realized_pnl_usdt': Decimal('50') + daily_realized_pnl * day,
+                'last_realized_pnl_usdt': Decimal('50') + daily_realized_pnl * (day + 1),
             }
             for day in range(count)
         ]
@@ -356,12 +362,20 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
 
         expected_period = ((1.01 ** 7) - 1) * 100
         expected_annualized = ((1.01 ** 365) - 1) * 100
+        expected_realized_period = ((1.005 ** 7) - 1) * 100
+        expected_realized_annualized = ((1.005 ** 365) - 1) * 100
         self.assertTrue(result['sufficient_data'])
         self.assertEqual(result['available_days'], 7)
         self.assertAlmostEqual(result['period_return_pct'], expected_period)
         self.assertAlmostEqual(result['annualized_return_pct'], expected_annualized)
         self.assertAlmostEqual(result['period_pnl_usdt'], 70)
+        self.assertTrue(result['realized_sufficient_data'])
+        self.assertEqual(result['realized_available_days'], 7)
+        self.assertAlmostEqual(result['realized_period_return_pct'], expected_realized_period)
+        self.assertAlmostEqual(result['realized_annualized_return_pct'], expected_realized_annualized)
+        self.assertAlmostEqual(result['realized_period_pnl_usdt'], 35)
         self.assertAlmostEqual(result['average_equity_usdt'], 1000)
+        self.assertEqual(result['window_end_policy'], 'previous_calendar_day')
 
     def test_incomplete_period_reports_coverage_without_annualizing(self):
         result = _calculate_capital_annualized_return(self._daily_rows(15), 30)
@@ -370,6 +384,24 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
         self.assertEqual(result['available_days'], 15)
         self.assertIsNone(result['annualized_return_pct'])
         self.assertIsNotNone(result['period_return_pct'])
+        self.assertFalse(result['realized_sufficient_data'])
+        self.assertEqual(result['realized_available_days'], 15)
+        self.assertIsNone(result['realized_annualized_return_pct'])
+        self.assertIsNotNone(result['realized_period_return_pct'])
+
+    def test_realized_metric_is_optional_for_legacy_rows(self):
+        rows = self._daily_rows(7)
+        for row in rows:
+            row.pop('first_realized_pnl_usdt')
+            row.pop('last_realized_pnl_usdt')
+
+        result = _calculate_capital_annualized_return(rows, 7)
+
+        self.assertTrue(result['sufficient_data'])
+        self.assertIsNotNone(result['annualized_return_pct'])
+        self.assertFalse(result['realized_data_available'])
+        self.assertFalse(result['realized_sufficient_data'])
+        self.assertIsNone(result['realized_annualized_return_pct'])
 
     def test_endpoint_rejects_unknown_period(self):
         with self.assertRaises(HTTPException) as raised:
@@ -390,7 +422,9 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
         self.assertTrue(result['sufficient_data'])
         sql, params = cursor.execute.call_args.args
         self.assertIn('mi_capital_daily_summary', sql)
-        self.assertEqual(params, (6,))
+        self.assertIn('mi_capital_snapshot', sql)
+        self.assertIn('d.summary_date < CURDATE()', sql)
+        self.assertEqual(params, (7,))
 
 
 class GateCrossRiskSummaryTests(unittest.TestCase):
