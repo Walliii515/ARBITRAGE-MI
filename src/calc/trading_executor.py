@@ -49,9 +49,9 @@ class TradingExecutorConfig:
     min_available_ratio: float = 0.10
     min_binance_available_ratio: Optional[float] = None
     min_gate_available_ratio: Optional[float] = None
-    max_asset_exposure_ratio: float = 0.10
+    max_asset_exposure_ratio: float = 0.20
     quality_scale_in_enabled: bool = False
-    quality_scale_in_enhanced_ratio: float = 0.20
+    quality_scale_in_enhanced_ratio: float = 0.30
     quality_scale_in_min_funding_24h_bps: float = 50.0
     quality_scale_in_min_basis_improvement_bps: float = 8.0
     quality_scale_in_basis_improvement_ratio: float = 0.25
@@ -2254,7 +2254,7 @@ class TradingExecutor:
         spot_after: float,
         binance_total: float,
     ) -> tuple:
-        """普通单币 10% 额度用完后，允许极优机会进入增强额度。"""
+        """普通单币额度用完后，允许极优机会进入配置的增强额度。"""
         if not self.quality_scale_in_enabled:
             return False, '未启用'
         if row is None:
