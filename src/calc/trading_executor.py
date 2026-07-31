@@ -918,12 +918,14 @@ class TradingExecutor:
             exchange = item.get('exchange') or 'unknown'
             market_type = item.get('market_type') or ''
             status = item.get('status') or item.get('risk_type') or ''
+            reduce_only_at = item.get('reduce_only_at')
             delist_at = item.get('delist_at') or 'NA'
             days_left = item.get('days_left')
             message = item.get('message') or ''
             days_text = 'NA' if days_left is None else str(days_left)
+            reduce_only_text = f"|reduce_only_at={reduce_only_at}" if reduce_only_at else ''
             fragments.append(
-                f"{exchange}/{market_type}:{status}|delist_at={delist_at}|"
+                f"{exchange}/{market_type}:{status}{reduce_only_text}|delist_at={delist_at}|"
                 f"days_left={days_text}|{message}"
             )
         return '下架风险禁止开仓|' + ' || '.join(fragments)

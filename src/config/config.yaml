@@ -276,7 +276,7 @@ trade:
     negative_funding_exit_max_projected_loss_bps: 40 # 监控仓按最新仓位VWAP估算的净退出损失达到该值时风险平仓
     delist_risk_exit_enabled: true          # 标的临近下架窗口时走风险平仓，不等待止盈/正资金费
     delist_risk_exit_days: 2                # 距下架时间小于等于该天数时触发下架风险平仓
-    delist_risk_refresh_interval_sec: 900   # 后台刷新下架风险报告间隔；平仓关键路径只读内存缓存
+    delist_risk_refresh_interval_sec: 60    # 每分钟刷新Gate/Binance下架计划；平仓关键路径只读内存缓存
     take_profit_protective_ioc_enabled: true # 普通止盈使用Gate非零保护价IOC；风险/手动平仓仍用市价语义
     take_profit_protective_ioc_slippage_bps: 5 # 保护价相对该笔真实待平数量VWAP允许的最大不利滑点
     take_profit_days_multiplier: 10         # legacy_p40模式止盈倍数

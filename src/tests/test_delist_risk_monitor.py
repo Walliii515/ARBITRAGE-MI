@@ -11,6 +11,77 @@ from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 
 
 class TestDelistRiskMonitor(unittest.TestCase):
+    def test_gate_upcoming_delist_is_reported_before_status_changes(self):
+        monitor = DelistRiskMonitor(DelistRiskConfig(lookahead_days=30))
+        now = datetime(2026, 7, 29, 18, 6, 15)
+        reduce_only_at = now + timedelta(hours=45, minutes=24)
+        delisted_at = now + timedelta(hours=45, minutes=54)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = [{
+            'name': 'VIC_USDT',
+            'status': 'trading',
+            'in_delisting': False,
+            'delisting_time': int(reduce_only_at.timestamp()),
+            'delisted_time': int(delisted_at.timestamp()),
+        }]
+
+        with patch('calc.delist_risk_monitor._now', return_value=now), \
+             patch('calc.delist_risk_monitor.requests.get', return_value=resp):
+            risks = monitor._gate_risks({'VIC'})
+
+        self.assertEqual(len(risks), 1)
+        risk = risks[0]
+        self.assertEqual(risk['risk_type'], 'delist_schedule')
+        self.assertEqual(risk['status'], 'scheduled')
+        self.assertEqual(risk['contract_status'], 'trading')
+        self.assertEqual(risk['risk_level'], 'critical')
+        self.assertEqual(risk['reduce_only_at'], reduce_only_at.strftime('%Y-%m-%d %H:%M:%S'))
+        self.assertEqual(risk['delist_at'], delisted_at.strftime('%Y-%m-%d %H:%M:%S'))
+        self.assertEqual(risk['days_left'], 1.91)
+
+    def test_gate_schedule_outside_lookahead_is_not_reported(self):
+        monitor = DelistRiskMonitor(DelistRiskConfig(lookahead_days=30))
+        now = datetime(2026, 7, 1, 12, 0, 0)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = [{
+            'name': 'FAR_USDT',
+            'status': 'trading',
+            'in_delisting': False,
+            'delisting_time': int((now + timedelta(days=31)).timestamp()),
+            'delisted_time': int((now + timedelta(days=31, minutes=30)).timestamp()),
+        }]
+
+        with patch('calc.delist_risk_monitor._now', return_value=now), \
+             patch('calc.delist_risk_monitor.requests.get', return_value=resp):
+            risks = monitor._gate_risks({'FAR'})
+
+        self.assertEqual(risks, [])
+
+    def test_gate_schedule_uses_reduce_only_time_when_delisted_time_missing(self):
+        monitor = DelistRiskMonitor(DelistRiskConfig(lookahead_days=30))
+        now = datetime(2026, 7, 1, 12, 0, 0)
+        reduce_only_at = now + timedelta(days=10)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = [{
+            'name': 'ONLY_USDT',
+            'status': 'trading',
+            'in_delisting': False,
+            'delisting_time': int(reduce_only_at.timestamp() * 1000),
+            'delisted_time': None,
+        }]
+
+        with patch('calc.delist_risk_monitor._now', return_value=now), \
+             patch('calc.delist_risk_monitor.requests.get', return_value=resp):
+            risks = monitor._gate_risks({'ONLY'})
+
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]['delist_at'], reduce_only_at.strftime('%Y-%m-%d %H:%M:%S'))
+        self.assertEqual(risks[0]['days_left'], 10.0)
+        self.assertEqual(risks[0]['risk_level'], 'warning')
+
     def test_gate_in_delisting_contract_is_reported(self):
         monitor = DelistRiskMonitor(DelistRiskConfig(lookahead_days=30))
         resp = MagicMock()
@@ -26,6 +97,7 @@ class TestDelistRiskMonitor(unittest.TestCase):
         self.assertEqual(len(risks), 1)
         self.assertEqual(risks[0]['base_asset'], 'BANK')
         self.assertEqual(risks[0]['exchange'], 'gate')
+        self.assertEqual(risks[0]['risk_type'], 'contract_status')
         self.assertEqual(risks[0]['risk_level'], 'critical')
 
     def test_binance_schedule_respects_lookahead_window(self):

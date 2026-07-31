@@ -135,7 +135,10 @@ class DelistRiskMonitor:
             timeout=self.cfg.timeout_sec,
         )
         resp.raise_for_status()
-        rows = resp.json() if isinstance(resp.json(), list) else []
+        payload = resp.json()
+        rows = payload if isinstance(payload, list) else []
+        now = _now()
+        cutoff = now + timedelta(days=max(int(self.cfg.lookahead_days or 30), 1))
         risks: List[Dict] = []
         for contract in rows:
             name = str(contract.get('name') or '').upper()
@@ -144,21 +147,49 @@ class DelistRiskMonitor:
                 continue
             status = str(contract.get('status') or '').lower()
             in_delisting = bool(contract.get('in_delisting'))
-            if status == 'trading' and not in_delisting:
+            reduce_only_at = _dt_from_ms(contract.get('delisting_time'))
+            delisted_at = _dt_from_ms(contract.get('delisted_time'))
+            schedule_at = reduce_only_at or delisted_at
+            is_active_delist = status in {'delisting', 'delisted'} or in_delisting
+            is_upcoming_delist = bool(schedule_at and schedule_at <= cutoff)
+            if status == 'trading' and not is_active_delist and not is_upcoming_delist:
                 continue
-            level = 'critical' if status in {'delisted', 'delisting'} or in_delisting else 'warning'
+
+            effective_delist_at = delisted_at or reduce_only_at
+            days_left = None
+            if effective_delist_at is not None:
+                days_left = round((effective_delist_at - now).total_seconds() / 86400, 2)
+
+            if is_active_delist:
+                risk_type = 'contract_status'
+                risk_status = status or 'in_delisting'
+                level = 'critical'
+                message = f"Gate合约状态={status or 'unknown'}，已进入下架流程"
+            elif is_upcoming_delist:
+                risk_type = 'delist_schedule'
+                risk_status = 'scheduled'
+                level = 'critical' if days_left is not None and days_left <= 7 else 'warning'
+                message = f"Gate合约已计划下架，当前状态={status or 'unknown'}"
+            else:
+                risk_type = 'contract_status'
+                risk_status = status or 'unknown'
+                level = 'warning'
+                message = f"Gate合约状态={status or 'unknown'}"
+
             risks.append({
-                'risk_key': _risk_key('gate', base, status or 'in_delisting'),
+                'risk_key': _risk_key('gate', base, risk_type),
                 'base_asset': base,
                 'exchange': 'gate',
                 'market_type': 'future',
                 'symbol': name,
-                'risk_type': 'contract_status',
+                'risk_type': risk_type,
                 'risk_level': level,
-                'status': status or None,
-                'delist_at': None,
-                'days_left': None,
-                'message': f"Gate合约状态={status or 'unknown'}" + ('，已进入下架流程' if in_delisting else ''),
+                'status': risk_status,
+                'contract_status': status or None,
+                'reduce_only_at': reduce_only_at.strftime('%Y-%m-%d %H:%M:%S') if reduce_only_at else None,
+                'delist_at': effective_delist_at.strftime('%Y-%m-%d %H:%M:%S') if effective_delist_at else None,
+                'days_left': days_left,
+                'message': message,
             })
         return risks
 

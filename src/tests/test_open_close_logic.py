@@ -1839,6 +1839,31 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertIn('下架风险禁止开仓', reason)
         self.assertIn('binance/spot:scheduled', reason)
 
+    def test_gate_scheduled_delist_blocks_new_open_before_reduce_only(self):
+        te = make_trading_executor()
+        te.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'VIC',
+                'exchange': 'gate',
+                'market_type': 'future',
+                'risk_type': 'delist_schedule',
+                'risk_level': 'critical',
+                'status': 'scheduled',
+                'contract_status': 'trading',
+                'reduce_only_at': (datetime.now() + timedelta(hours=45)).strftime('%Y-%m-%d %H:%M:%S'),
+                'delist_at': (datetime.now() + timedelta(hours=46)).strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 1.92,
+                'message': 'Gate合约已计划下架，当前状态=trading',
+            }],
+        })
+
+        allowed, reason = te._check_delist_open_block('VIC')
+
+        self.assertFalse(allowed)
+        self.assertIn('gate/future:scheduled', reason)
+        self.assertIn('reduce_only_at=', reason)
+        self.assertIn('Gate合约已计划下架', reason)
+
     def test_check_and_open_skips_delist_risk_before_executor_call(self):
         te = make_trading_executor()
         te.set_delist_risk_report({
@@ -4571,6 +4596,29 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         })
         self.assertTrue(self.ce._check_delist_risk_exit(self.pos))
         self.assertIn('下架风险退出', self.ce._build_delist_risk_exit_detail(self.pos))
+
+    def test_gate_scheduled_delist_triggers_exit_before_reduce_only(self):
+        reduce_only_at = datetime.now() + timedelta(hours=45)
+        delist_at = datetime.now() + timedelta(hours=46)
+        self.ce.set_delist_risk_report({
+            'items': [{
+                'base_asset': 'BTC',
+                'exchange': 'gate',
+                'market_type': 'future',
+                'risk_type': 'delist_schedule',
+                'status': 'scheduled',
+                'risk_level': 'critical',
+                'reduce_only_at': reduce_only_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'delist_at': delist_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'days_left': 1.92,
+                'message': 'Gate合约已计划下架，当前状态=trading',
+            }],
+        })
+
+        self.assertTrue(self.ce._check_delist_risk_exit(self.pos))
+        detail = self.ce._build_delist_risk_exit_detail(self.pos)
+        self.assertIn('gate/future:scheduled', detail)
+        self.assertIn(f'reduce_only_at={reduce_only_at:%Y-%m-%d %H:%M:%S}', detail)
 
     def test_delist_risk_exit_ignores_schedule_outside_window(self):
         self.ce.set_delist_risk_report({
