@@ -395,6 +395,197 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertIn('IOC未成交', parsed['reason'])
         self.assertNotIn('成交数据异常', parsed['reason'])
 
+    def test_maker_cancel_not_found_reconciles_full_fill(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._cancel_gate_futures_order = MagicMock(return_value=None)
+        executor._reconcile_gate_maker_terminal_state = MagicMock(return_value=(
+            {
+                'id': 'maker-26',
+                'status': 'finished',
+                'size': '-26',
+                'left': '0',
+                'fill_price': '0.018692',
+            },
+            True,
+        ))
+
+        result = executor._wait_gate_maker_fill(
+            order={
+                'base_asset': 'TUT',
+                'future_contract': 'TUT_USDT',
+                'trade_direction': 'sell',
+                'order_side': 'open',
+                'maker_ttl_ms': 0,
+            },
+            initial_order={
+                'id': 'maker-26',
+                'status': 'open',
+                'size': '-26',
+                'left': '-26',
+                'fill_price': '0',
+            },
+            quanto_multiplier=1,
+            requested_contracts=26,
+            maker_price=0.018692,
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['exec_qty'], 26)
+        maker = result['execution_stats']['future_maker']
+        self.assertEqual(maker['filled_contracts'], 26)
+        self.assertTrue(maker['terminal_confirmed'])
+        self.assertFalse(maker['fill_state_uncertain'])
+
+    def test_maker_terminal_recheck_reconstructs_matching_trades(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._get_gate_futures_order = MagicMock(return_value=None)
+        executor.fetch_gate_futures_my_trades = MagicMock(return_value=[
+            {'order_id': 'maker-26', 'size': '-13', 'price': '0.018692'},
+            {'order_id': 'other', 'size': '-99', 'price': '0.02'},
+            {'order_id': 'maker-26', 'size': '-13', 'price': '0.018694'},
+        ])
+
+        reconciled, terminal = executor._reconcile_gate_maker_terminal_state(
+            contract='TUT_USDT',
+            order_id='maker-26',
+            initial_order={
+                'id': 'maker-26',
+                'status': 'open',
+                'size': '-26',
+                'left': '-26',
+            },
+            requested_contracts=26,
+        )
+
+        self.assertTrue(terminal)
+        self.assertEqual(reconciled['status'], 'finished')
+        self.assertEqual(reconciled['left'], 0)
+        self.assertAlmostEqual(float(reconciled['fill_price']), 0.018693)
+
+    def test_maker_unknown_terminal_state_blocks_duplicate_fallback(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'future maker未成交(fill=0%,终态未确认)',
+            'execution_stats': {
+                'future_maker': {
+                    'attempted': True,
+                    'filled': False,
+                    'fill_state_uncertain': True,
+                }
+            },
+        })
+        executor._place_binance_spot_order = MagicMock()
+
+        result = executor.execute({
+            'spot_order': {
+                'base_asset': 'TUT',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 2600,
+                'target_amount': 50,
+            },
+            'future_order': {
+                'base_asset': 'TUT',
+                'future_contract': 'TUT_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_fallback_ioc_enabled': True,
+                'maker_fallback_protective_price': 0.01869,
+                'target_qty': 2600,
+                'target_amount': 50,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertEqual(executor._place_gate_futures_order.call_count, 1)
+        executor._place_binance_spot_order.assert_not_called()
+        self.assertIn('禁止fallback', result['message'])
+
+    def test_maker_partial_fill_fallback_only_submits_remaining_contracts(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_gate_futures_order = MagicMock(side_effect=[
+            {
+                'success': True,
+                'exec_price': 0.018692,
+                'exec_qty': 1000.0,
+                'exec_amount': 18.692,
+                'coverage_ratio': 0,
+                'exchange_order_id': 'maker-10',
+                'execution_stats': {
+                    'future_maker': {
+                        'attempted': True,
+                        'filled': True,
+                        'fill_ratio': 10 / 26,
+                        'requested_contracts': 26,
+                        'filled_contracts': 10,
+                        'terminal_confirmed': True,
+                        'fill_state_uncertain': False,
+                    }
+                },
+            },
+            {
+                'success': True,
+                'exec_price': 0.018700,
+                'exec_qty': 1600.0,
+                'exec_amount': 29.92,
+                'coverage_ratio': 0,
+                'exchange_order_id': 'fallback-16',
+            },
+        ])
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.0185,
+            'exec_qty': 2600.0,
+            'exec_amount': 48.1,
+            'coverage_ratio': 0,
+        })
+
+        result = executor.execute({
+            'spot_order': {
+                'base_asset': 'TUT',
+                'market_type': 'spot',
+                'trade_direction': 'buy',
+                'target_qty': 2600,
+                'target_amount': 48.1,
+            },
+            'future_order': {
+                'base_asset': 'TUT',
+                'future_contract': 'TUT_USDT',
+                'order_side': 'open',
+                'market_type': 'future',
+                'trade_direction': 'sell',
+                'execution_style': 'maker',
+                'maker_fallback_ioc_enabled': True,
+                'maker_fallback_protective_price': 0.01869,
+                'target_qty': 2600,
+                'target_amount': 48.612,
+            },
+        }, {})
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor._place_gate_futures_order.call_count, 2)
+        fallback_order = executor._place_gate_futures_order.call_args_list[1].args[0]
+        self.assertEqual(fallback_order['target_qty'], 1600)
+        self.assertAlmostEqual(fallback_order['target_amount'], 48.612 * 16 / 26)
+        hedge_order = executor._place_binance_spot_order.call_args.args[0]
+        self.assertEqual(hedge_order['target_qty'], 2600)
+        self.assertEqual(result['future_order']['exec_qty'], 2600)
+        self.assertEqual(
+            result['execution_stats']['future_maker']['fallback_remaining_contracts'],
+            16,
+        )
+
     def test_gate_open_sets_leverage_when_contract_has_no_position(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 

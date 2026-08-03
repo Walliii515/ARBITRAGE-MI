@@ -17,7 +17,7 @@ import hmac
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -390,6 +390,26 @@ class RealExecutor:
                 logger.info(f"future maker 放弃{order_side} | {base_asset} | {result['message']}")
                 return result
             future_result = fallback_result
+        else:
+            maker_stats = stats.setdefault('future_maker', {})
+            requested_contracts = int(maker_stats.get('requested_contracts') or 0)
+            filled_contracts = int(maker_stats.get('filled_contracts') or 0)
+            remaining_contracts = max(requested_contracts - filled_contracts, 0)
+            terminal_confirmed = maker_stats.get('terminal_confirmed', True)
+            if remaining_contracts > 0 and terminal_confirmed:
+                remaining_order = self._build_future_maker_remaining_order(
+                    future_order,
+                    requested_contracts=requested_contracts,
+                    remaining_contracts=remaining_contracts,
+                )
+                maker_stats['fallback_remaining_contracts'] = remaining_contracts
+                fallback_result = self._try_future_maker_fallback_ioc(
+                    remaining_order, future_result, stats
+                )
+                if fallback_result.get('success'):
+                    future_result = self._merge_future_execution_results(
+                        future_result, fallback_result
+                    )
 
         maker_stats = stats.setdefault('future_maker', {})
         hedge_order = dict(spot_order)
@@ -657,6 +677,52 @@ class RealExecutor:
             merged['fee_amount_usdt'] = float(fee1) + float(fee2)
         return merged
 
+    @staticmethod
+    def _merge_future_execution_results(first: Dict, second: Dict) -> Dict:
+        """Merge a confirmed maker fill and its residual fallback fill."""
+        qty1 = float(first.get('exec_qty') or 0)
+        qty2 = float(second.get('exec_qty') or 0)
+        amount1 = float(first.get('exec_amount') or 0)
+        amount2 = float(second.get('exec_amount') or 0)
+        total_qty = qty1 + qty2
+        total_amount = amount1 + amount2
+        merged = dict(second)
+        merged['success'] = True
+        merged['exec_qty'] = total_qty
+        merged['exec_amount'] = total_amount
+        merged['exec_price'] = total_amount / total_qty if total_qty > 0 else 0
+        ids = [
+            str(value)
+            for value in (first.get('exchange_order_id'), second.get('exchange_order_id'))
+            if value
+        ]
+        if ids:
+            merged['exchange_order_ids'] = ids
+        stats = first.get('execution_stats') or second.get('execution_stats') or {}
+        maker_stats = stats.setdefault('future_maker', {})
+        maker_stats['fallback_exchange_order_id'] = second.get('exchange_order_id')
+        merged['execution_stats'] = stats
+        fees = [
+            float(value)
+            for value in (first.get('fee_amount_usdt'), second.get('fee_amount_usdt'))
+            if value is not None
+        ]
+        if fees:
+            merged['fee_amount_usdt'] = sum(fees)
+        return merged
+
+    @staticmethod
+    def _build_future_maker_remaining_order(
+        maker_order: Dict,
+        requested_contracts: int,
+        remaining_contracts: int,
+    ) -> Dict:
+        remaining_order = dict(maker_order)
+        ratio = remaining_contracts / requested_contracts if requested_contracts > 0 else 0
+        remaining_order['target_qty'] = float(maker_order.get('target_qty') or 0) * ratio
+        remaining_order['target_amount'] = float(maker_order.get('target_amount') or 0) * ratio
+        return remaining_order
+
     def _unwind_filled_future_leg(self, future_order: Dict, future_result: Dict) -> Dict:
         """反向 IOC 撤回已成交的 future 腿，避免留下裸仓。"""
         exec_qty = float(future_result.get('exec_qty') or 0)
@@ -739,6 +805,16 @@ class RealExecutor:
         )
         maker_stats['fallback_attempted'] = False
         maker_stats['fallback_filled'] = False
+
+        if maker_stats.get('fill_state_uncertain'):
+            maker_stats['fallback_reason'] = 'maker_fill_state_uncertain'
+            return {
+                'success': False,
+                'reason': (
+                    f"{maker_result.get('reason', 'future maker状态未知')}; "
+                    '为防止重复成交，已禁止fallback'
+                ),
+            }
 
         use_market_fallback = maker_order.get('order_side') == 'close'
         maker_stats['fallback_market'] = bool(use_market_fallback)
@@ -1502,11 +1578,29 @@ class RealExecutor:
                 latest = fresh
 
         filled_contracts = self._gate_filled_contracts(latest)
+        terminal_confirmed = (
+            filled_contracts >= requested_contracts
+            or str(latest.get('status') or '').lower() == 'finished'
+        )
         if order_id and filled_contracts < requested_contracts:
             cancelled = self._cancel_gate_futures_order(contract, order_id)
             if cancelled:
                 latest = cancelled
                 filled_contracts = self._gate_filled_contracts(latest)
+                terminal_confirmed = (
+                    filled_contracts >= requested_contracts
+                    or str(latest.get('status') or '').lower() == 'finished'
+                )
+            else:
+                reconciled, terminal_confirmed = self._reconcile_gate_maker_terminal_state(
+                    contract=contract,
+                    order_id=order_id,
+                    initial_order=latest,
+                    requested_contracts=requested_contracts,
+                )
+                if reconciled:
+                    latest = reconciled
+                    filled_contracts = self._gate_filled_contracts(latest)
 
         elapsed_ms = (ttl_ms / 1000.0 - max(deadline - time.monotonic(), 0)) * 1000.0
         result = self._parse_gate_response(latest, quanto_multiplier, allow_partial=True)
@@ -1532,17 +1626,95 @@ class RealExecutor:
                 'future_exec_price': exec_price,
                 'requested_contracts': requested_contracts,
                 'filled_contracts': filled_contracts,
+                'remaining_contracts': max(requested_contracts - filled_contracts, 0),
+                'terminal_confirmed': terminal_confirmed,
+                'fill_state_uncertain': not terminal_confirmed,
                 'exchange_order_id': order_id,
                 'improvement_bps': round(improvement_bps, 2) if improvement_bps is not None else None,
             }
         }
         result['execution_stats'] = stats
         if not result.get('success'):
+            state_suffix = ',终态未确认' if not terminal_confirmed else ''
             result['reason'] = (
                 f"future maker未成交(fill={fill_ratio:.0%},wait={elapsed_ms:.0f}ms,"
-                f"ttl={ttl_ms}ms,id={order_id})"
+                f"ttl={ttl_ms}ms,id={order_id}{state_suffix})"
             )
         return result
+
+    def _reconcile_gate_maker_terminal_state(
+        self,
+        contract: str,
+        order_id: str,
+        initial_order: Dict,
+        requested_contracts: int,
+    ) -> Tuple[Optional[Dict], bool]:
+        """Recheck a maker order after an ambiguous cancel response.
+
+        A terminal order snapshot is authoritative. Trades can prove how much was
+        filled, but a partial trade alone cannot prove that the resting remainder
+        is gone, so residual fallback stays disabled in that case.
+        """
+        latest = self._get_gate_futures_order(contract, order_id)
+        if latest:
+            filled_contracts = self._gate_filled_contracts(latest)
+            terminal = (
+                filled_contracts >= requested_contracts
+                or str(latest.get('status') or '').lower() == 'finished'
+            )
+            if terminal:
+                return latest, True
+
+        try:
+            trades = self.fetch_gate_futures_my_trades(
+                contract=contract,
+                start_time=int(time.time()) - 60,
+                end_time=int(time.time()) + 1,
+                limit=1000,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Gate maker终态复核成交查询失败 | {contract} | {order_id} | {exc}"
+            )
+            return latest, False
+
+        matched = [
+            trade for trade in trades
+            if str(trade.get('order_id') or trade.get('order') or '') == str(order_id)
+        ]
+        if not matched:
+            return latest, False
+
+        filled_contracts = sum(
+            abs(float(trade.get('size') or 0)) for trade in matched
+        )
+        if filled_contracts <= 0:
+            return latest, False
+        weighted_amount = sum(
+            abs(float(trade.get('size') or 0)) * float(trade.get('price') or 0)
+            for trade in matched
+        )
+        fill_price = weighted_amount / filled_contracts if filled_contracts > 0 else 0
+        signed_size = self._gate_int(initial_order.get('size'))
+        if signed_size == 0:
+            signed_size = requested_contracts
+        sign = -1 if signed_size < 0 else 1
+        bounded_filled = min(int(round(filled_contracts)), requested_contracts)
+        terminal = bounded_filled >= requested_contracts
+        synthetic = dict(initial_order)
+        synthetic.update({
+            'id': order_id,
+            'size': sign * requested_contracts,
+            'left': sign * max(requested_contracts - bounded_filled, 0),
+            'fill_price': str(fill_price),
+            'status': 'finished' if terminal else synthetic.get('status', 'open'),
+            'finish_as': 'filled' if terminal else synthetic.get('finish_as', 'unknown'),
+        })
+        logger.warning(
+            f"Gate maker撤单状态不明，已按成交明细复核 | {contract} | {order_id} | "
+            f"filled={bounded_filled}/{requested_contracts} | terminal={terminal}"
+        )
+        return synthetic, terminal
 
     def _get_gate_futures_order(self, contract: str, order_id: str) -> Optional[Dict]:
         method = 'GET'
