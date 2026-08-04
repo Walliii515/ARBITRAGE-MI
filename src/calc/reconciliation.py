@@ -7,6 +7,7 @@
 """
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
@@ -39,7 +40,8 @@ class ReconciliationConfig:
     adl_lookback_sec: int = 24 * 3600
     auto_remediate_enabled: bool = True
     auto_remediate_confirm_runs: int = 2
-    auto_remediate_confirm_window_sec: int = 900
+    auto_remediate_confirm_window_sec: int = 15
+    auto_remediate_fast_confirm_delay_sec: float = 3.0
     auto_remediate_max_positions_per_run: int = 20
     auto_remediate_min_spot_qty: float = 0.0
     auto_remediate_close_extra_gate_position: bool = True
@@ -114,7 +116,10 @@ def build_default_reconciler() -> 'Reconciler':
         adl_lookback_sec=config.get_int('reconciliation.adl_lookback_sec', 24 * 3600),
         auto_remediate_enabled=config.get_bool('reconciliation.auto_remediate.enabled', True),
         auto_remediate_confirm_runs=config.get_int('reconciliation.auto_remediate.confirm_runs', 2),
-        auto_remediate_confirm_window_sec=config.get_int('reconciliation.auto_remediate.confirm_window_sec', 900),
+        auto_remediate_confirm_window_sec=config.get_int('reconciliation.auto_remediate.confirm_window_sec', 15),
+        auto_remediate_fast_confirm_delay_sec=config.get_float(
+            'reconciliation.auto_remediate.fast_confirm_delay_sec', 3.0
+        ),
         auto_remediate_max_positions_per_run=config.get_int('reconciliation.auto_remediate.max_positions_per_run', 20),
         auto_remediate_min_spot_qty=config.get_float('reconciliation.auto_remediate.min_spot_qty', 0.0),
         auto_remediate_close_extra_gate_position=config.get_bool(
@@ -199,7 +204,33 @@ class Reconciler:
             'error_count': error_count,
             'remediation_count': sum(1 for r in remediation_results if r.get('attempted')),
             'remediation_success_count': sum(1 for r in remediation_results if r.get('success')),
+            'confirmation_pending_count': sum(
+                1
+                for result in remediation_results
+                if result.get('reason') == 'waiting_for_reconciliation_confirmation'
+            ),
         }
+
+    def run_with_fast_confirmation(self) -> Dict:
+        """Run a second fresh reconciliation shortly after an unconfirmed mismatch."""
+        first = self.run_once()
+        pending = int(first.get('confirmation_pending_count') or 0)
+        delay_sec = max(float(self.cfg.auto_remediate_fast_confirm_delay_sec or 0.0), 0.0)
+        if pending <= 0 or delay_sec <= 0:
+            return first
+
+        logger.warning(
+            "对账发现待确认差异，%.1f秒后快速复核 | pending=%s | snapshot_at=%s",
+            delay_sec,
+            pending,
+            first.get('snapshot_at'),
+        )
+        time.sleep(delay_sec)
+        second = self.run_once()
+        second['fast_confirmation'] = True
+        second['fast_confirmation_delay_sec'] = delay_sec
+        second['initial_snapshot_at'] = first.get('snapshot_at')
+        return second
 
     def cleanup_old_snapshots(self):
         """按配置清理历史快照；历史不一致记录保留用于风险追溯。"""
@@ -448,7 +479,9 @@ class Reconciler:
         if self._has_self_reported_gate_desync(base_asset, risk_type, snapshot_at):
             return True
 
-        cutoff = snapshot_at - timedelta(seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 60), 60))
+        cutoff = snapshot_at - timedelta(
+            seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 1), 1)
+        )
         with db_manager.get_cursor() as cursor:
             cursor.execute(
                 """
@@ -481,7 +514,9 @@ class Reconciler:
         """系统平仓已确认 Gate 腿成交时，允许即时对账直接进入兜底处置。"""
         if risk_type not in {'missing_gate_position', 'qty_mismatch'}:
             return False
-        cutoff = snapshot_at - timedelta(seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 60), 60))
+        cutoff = snapshot_at - timedelta(
+            seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 1), 1)
+        )
         with db_manager.get_cursor() as cursor:
             cursor.execute(
                 """

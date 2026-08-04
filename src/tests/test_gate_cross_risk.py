@@ -34,6 +34,31 @@ class FakeRiskExecutor:
 
 
 class TestGateCrossRisk(unittest.TestCase):
+    def test_mmr_recovery_latch_stays_active_until_warning_threshold(self):
+        monitor = GateCrossRiskMonitor(
+            executor=object(),
+            thresholds=GateCrossRiskThresholds(
+                danger_mmr_pct=300.0,
+                warning_mmr_pct=500.0,
+            ),
+        )
+
+        danger = {'status': 'danger', 'account_mmr_pct': 250.0}
+        monitor._apply_mmr_recovery_state(danger)
+        self.assertTrue(danger['mmr_recovery_active'])
+
+        warning = {'status': 'warning', 'account_mmr_pct': 420.0}
+        monitor._apply_mmr_recovery_state(warning)
+        self.assertTrue(warning['mmr_recovery_active'])
+
+        unknown = {'status': 'unknown', 'account_mmr_pct': None}
+        monitor._apply_mmr_recovery_state(unknown)
+        self.assertTrue(unknown['mmr_recovery_active'])
+
+        recovered = {'status': 'safe', 'account_mmr_pct': 510.0}
+        monitor._apply_mmr_recovery_state(recovered)
+        self.assertFalse(recovered['mmr_recovery_active'])
+
     def test_gate_cross_mmr_is_authoritative_over_local_formula(self):
         account = {
             'cross_mmr': '3.2',

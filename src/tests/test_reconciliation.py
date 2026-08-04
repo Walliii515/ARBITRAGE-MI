@@ -88,6 +88,86 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(risk['future_close_size'], 12)
         self.assertEqual(risk['mark_price'], 0.1234)
 
+    def test_fast_confirmation_rechecks_pending_mismatch_after_configured_delay(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_fast_confirm_delay_sec=3.0),
+        )
+        first = {
+            'success': True,
+            'snapshot_at': '2026-08-04 10:00:00',
+            'confirmation_pending_count': 1,
+        }
+        second = {
+            'success': True,
+            'snapshot_at': '2026-08-04 10:00:03',
+            'confirmation_pending_count': 0,
+            'remediation_count': 1,
+            'remediation_success_count': 1,
+        }
+
+        with (
+            patch.object(reconciler, 'run_once', side_effect=[first, second]) as run_once,
+            patch('calc.reconciliation.time.sleep') as sleep,
+        ):
+            result = reconciler.run_with_fast_confirmation()
+
+        self.assertEqual(run_once.call_count, 2)
+        sleep.assert_called_once_with(3.0)
+        self.assertTrue(result['fast_confirmation'])
+        self.assertEqual(result['initial_snapshot_at'], first['snapshot_at'])
+        self.assertEqual(result['remediation_success_count'], 1)
+
+    def test_fast_confirmation_does_not_wait_when_first_snapshot_is_clean(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_fast_confirm_delay_sec=3.0),
+        )
+        clean = {
+            'success': True,
+            'snapshot_at': '2026-08-04 10:00:00',
+            'confirmation_pending_count': 0,
+        }
+
+        with (
+            patch.object(reconciler, 'run_once', return_value=clean) as run_once,
+            patch('calc.reconciliation.time.sleep') as sleep,
+        ):
+            result = reconciler.run_with_fast_confirmation()
+
+        self.assertIs(result, clean)
+        run_once.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_fast_confirmation_cancels_remediation_when_mismatch_disappears(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_fast_confirm_delay_sec=3.0),
+        )
+        first = {
+            'success': True,
+            'snapshot_at': '2026-08-04 10:00:00',
+            'confirmation_pending_count': 1,
+        }
+        clean_second = {
+            'success': True,
+            'snapshot_at': '2026-08-04 10:00:03',
+            'confirmation_pending_count': 0,
+            'mismatch_count': 0,
+            'remediation_count': 0,
+            'remediation_success_count': 0,
+        }
+
+        with (
+            patch.object(reconciler, 'run_once', side_effect=[first, clean_second]),
+            patch('calc.reconciliation.time.sleep'),
+        ):
+            result = reconciler.run_with_fast_confirmation()
+
+        self.assertEqual(result['mismatch_count'], 0)
+        self.assertEqual(result['remediation_count'], 0)
+        self.assertTrue(result['fast_confirmation'])
+
     def test_unconfirmed_gate_qty_mismatch_does_not_mark_position_risk(self):
         class TrackingReconciler(Reconciler):
             def __init__(self):

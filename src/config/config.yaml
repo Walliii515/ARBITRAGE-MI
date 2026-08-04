@@ -369,7 +369,8 @@ reconciliation:
   auto_remediate:
     enabled: true                           # 对账连续确认断腿后自动 reduce-only 处置裸腿
     confirm_runs: 2                         # 当前快照 + 上一轮同方向异常才允许实盘动作，避免单次 API 抖动
-    confirm_window_sec: 900                 # 上一轮确认快照最大年龄
+    fast_confirm_delay_sec: 3               # 首次异常后等待3秒立即复核，不等下一次定时对账
+    confirm_window_sec: 15                  # 快速复核只接受15秒内的同方向异常快照
     max_positions_per_run: 20               # Gate 缺腿时最多自动卖出多少个本地 holding spot
     min_spot_qty: 0.0
     close_extra_gate_position: true         # Gate 多出 forward 空头时，自动 reduce-only 买回多余合约

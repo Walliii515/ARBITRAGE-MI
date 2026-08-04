@@ -1512,7 +1512,9 @@ async def run_reconciliation_now():
         _recon_running = True
 
     try:
-        result = await asyncio.to_thread(lambda: build_default_reconciler().run_once())
+        result = await asyncio.to_thread(
+            lambda: build_default_reconciler().run_with_fast_confirmation()
+        )
         return {'success': True, 'message': '对账完成', **result}
     except Exception as e:
         logger.error(f'手动对账失败: {e}', exc_info=True)

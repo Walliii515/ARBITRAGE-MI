@@ -1637,7 +1637,7 @@ def _trigger_reconciliation_once(reason: str, base_asset: str = ''):
     def _worker():
         global _reconciliation_trigger_running
         try:
-            result = build_default_reconciler().run_once()
+            result = build_default_reconciler().run_with_fast_confirmation()
             logger.warning(
                 "风险平仓后即时对账完成 | asset=%s | reason=%s | result=%s",
                 base_asset, reason, result,
@@ -2810,7 +2810,9 @@ async def _reconciliation_loop():
                 logger.info('交易所对账循环跳过：已有对账任务正在执行')
             else:
                 try:
-                    result = await asyncio.to_thread(lambda: build_default_reconciler().run_once())
+                    result = await asyncio.to_thread(
+                        lambda: build_default_reconciler().run_with_fast_confirmation()
+                    )
                     logger.info(f"交易所对账循环完成: {result}")
                 finally:
                     with _reconciliation_trigger_lock:

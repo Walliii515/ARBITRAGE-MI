@@ -74,7 +74,7 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
         self.assertFalse(state['active'])
         self.assertNotIn('MMR0.60%', ';'.join(state['reasons']))
 
-    def test_account_mmr_danger_closes_every_holding_without_books_or_spread(self):
+    def test_account_mmr_danger_closes_only_one_holding_per_risk_snapshot(self):
         ce = make_closing_executor()
         ce._gate_cross_risk_cache = {
             'ts': time.time(),
@@ -93,17 +93,20 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
                 gate_mark_price=1.0,
             ),
         ]
-        ce._execute_close = MagicMock(side_effect=[
-            {'base_asset': 'TUT', 'success': True, 'close_reason': 'margin_close'},
-            {'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close'},
-        ])
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT', 'success': True, 'close_reason': 'margin_close',
+        })
 
         results = ce.check_and_close_margin_danger(positions, {})
 
-        self.assertEqual([item['position_id'] for item in results], [11, 12])
-        self.assertEqual(ce._execute_close.call_count, 2)
+        self.assertEqual([item['position_id'] for item in results], [11])
+        self.assertEqual(ce._execute_close.call_count, 1)
         self.assertEqual(ce._execute_close.call_args_list[0].args[3], {'base_asset': 'TUT'})
-        self.assertEqual(ce._execute_close.call_args_list[1].args[3], {'base_asset': 'AI'})
+
+        second = ce.check_and_close_margin_danger(positions, {})
+
+        self.assertEqual(second, [])
+        self.assertEqual(ce._execute_close.call_count, 1)
 
     def test_account_mmr_danger_uses_gate_risk_close_priority(self):
         ce = make_closing_executor()
@@ -129,21 +132,99 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
                 gate_mark_price=1.0,
             ),
         ]
-        ce._execute_close = MagicMock(side_effect=[
-            {'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close'},
-            {'base_asset': 'TUT', 'success': True, 'close_reason': 'margin_close'},
-        ])
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close',
+        })
 
         results = ce.check_and_close_margin_danger(positions, {})
 
-        self.assertEqual([item['position_id'] for item in results], [12, 11])
+        self.assertEqual([item['position_id'] for item in results], [12])
         self.assertEqual(
             [
                 call.args[0]['future_contract']
                 for call in ce._execute_close.call_args_list
             ],
-            ['AI_USDT', 'TUT_USDT'],
+            ['AI_USDT'],
         )
+
+    def test_account_mmr_recovery_continues_until_fresh_snapshot_reaches_target(self):
+        ce = make_closing_executor()
+        ce.margin_danger_mmr_pct = 300.0
+        ce.margin_recovery_target_mmr_pct = 500.0
+        first_risk = make_gate_cross_risk(
+            status='danger',
+            account_mmr_pct=250.0,
+            close_priority=[
+                {'contract': 'AI_USDT', 'reason': 'maintenance_margin'},
+                {'contract': 'TUT_USDT', 'reason': 'maintenance_margin'},
+            ],
+        )
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': first_risk}
+        ai = _risk_position(
+            id=12,
+            base_asset='AI',
+            future_contract='AI_USDT',
+            spot_symbol='AIUSDT',
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        tut = _risk_position(gate_liq_price=2.0, gate_mark_price=1.0)
+        ce._execute_close = MagicMock(side_effect=[
+            {'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close'},
+            {'base_asset': 'TUT', 'success': True, 'close_reason': 'margin_close'},
+        ])
+
+        first = ce.check_and_close_margin_danger([tut, ai], {})
+        same_snapshot = ce.check_and_close_margin_danger([tut], {})
+
+        self.assertEqual([item['position_id'] for item in first], [12])
+        self.assertEqual(same_snapshot, [])
+        self.assertTrue(ce._margin_recovery_active)
+        self.assertEqual(ce._execute_close.call_count, 1)
+
+        second_risk = make_gate_cross_risk(
+            status='warning',
+            account_mmr_pct=420.0,
+            close_priority=[{'contract': 'TUT_USDT', 'reason': 'maintenance_margin'}],
+        )
+        second_risk['account_fetched_at_ts'] = first_risk['account_fetched_at_ts'] + 1.0
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': second_risk}
+        second = ce.check_and_close_margin_danger([tut], {})
+
+        self.assertEqual([item['position_id'] for item in second], [11])
+        self.assertEqual(ce._execute_close.call_count, 2)
+
+        recovered_risk = make_gate_cross_risk(status='safe', account_mmr_pct=510.0)
+        recovered_risk['account_fetched_at_ts'] = second_risk['account_fetched_at_ts'] + 1.0
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': recovered_risk}
+        recovered = ce.check_and_close_margin_danger([tut], {})
+
+        self.assertEqual(recovered, [])
+        self.assertFalse(ce._margin_recovery_active)
+        self.assertEqual(ce._execute_close.call_count, 2)
+
+    def test_recreated_executor_resumes_published_mmr_recovery_episode(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(
+            status='warning',
+            account_mmr_pct=420.0,
+            mmr_recovery_active=True,
+            close_priority=[{'contract': 'TUT_USDT', 'reason': 'maintenance_margin'}],
+        )
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': True,
+            'close_reason': 'margin_close',
+        })
+
+        results = ce.check_and_close_margin_danger([
+            _risk_position(gate_liq_price=2.0, gate_mark_price=1.0),
+        ], {})
+
+        self.assertEqual([item['position_id'] for item in results], [11])
+        self.assertTrue(ce._margin_recovery_active)
+        ce._execute_close.assert_called_once()
 
     def test_liquidation_distance_danger_only_closes_affected_contract(self):
         ce = make_closing_executor()

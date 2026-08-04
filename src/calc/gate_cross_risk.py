@@ -74,6 +74,7 @@ class GateCrossRiskMonitor:
         self._snapshot: Optional[Dict] = None
         self._positions: List[Dict] = []
         self._positions_fetched_at_ts = 0.0
+        self._mmr_recovery_active = False
 
     def refresh(self) -> Dict:
         with self._refresh_lock:
@@ -101,6 +102,7 @@ class GateCrossRiskMonitor:
                 'account_latency_ms': round(account_latency_ms, 3),
                 'positions_latency_ms': None,
                 'latency_ms': round((time.monotonic() - started) * 1000.0, 3),
+                'mmr_recovery_active': self._mmr_recovery_active,
             }
             snapshot.update(gate_cross_risk_health(
                 snapshot,
@@ -135,6 +137,7 @@ class GateCrossRiskMonitor:
             margin_used=metrics['margin_used'],
             thresholds=self.thresholds,
         )
+        self._apply_mmr_recovery_state(snapshot)
         if positions_error and snapshot.get('status') != 'danger':
             snapshot['observed_status'] = snapshot.get('status')
             snapshot['status'] = 'unknown'
@@ -157,6 +160,23 @@ class GateCrossRiskMonitor:
         ))
         self._store_snapshot(snapshot)
         return copy.deepcopy(snapshot)
+
+    def _apply_mmr_recovery_state(self, snapshot: Dict) -> None:
+        """Latch a danger episode until fresh account MMR recovers to warning threshold."""
+        status = str(snapshot.get('status') or '').strip().lower()
+        account_mmr = _float_or_none(snapshot.get('account_mmr_pct'))
+        if (
+            status == 'danger'
+            and account_mmr is not None
+            and account_mmr <= self.thresholds.danger_mmr_pct
+        ):
+            self._mmr_recovery_active = True
+        elif status == 'idle' or (
+            account_mmr is not None
+            and account_mmr >= self.thresholds.warning_mmr_pct
+        ):
+            self._mmr_recovery_active = False
+        snapshot['mmr_recovery_active'] = self._mmr_recovery_active
 
     def get_snapshot(self) -> Optional[Dict]:
         with self._state_lock:

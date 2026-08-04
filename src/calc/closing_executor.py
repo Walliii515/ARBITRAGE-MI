@@ -176,6 +176,10 @@ class ClosingExecutor:
             'account_capital.gate_cross_risk.danger_mmr_pct',
             300.0,
         )
+        self.margin_recovery_target_mmr_pct = config.get_float(
+            'account_capital.gate_cross_risk.warning_mmr_pct',
+            500.0,
+        )
         self.margin_danger_liq_distance_bps = max(
             config.get_float('account_capital.gate_cross_risk.danger_liq_distance_bps', 300.0),
             0.0,
@@ -188,6 +192,8 @@ class ClosingExecutor:
         self._gate_cross_risk_cache: Dict[str, object] = {'ts': 0.0, 'risk': None}
         self._margin_close_inflight = set()
         self._margin_close_inflight_lock = threading.Lock()
+        self._margin_recovery_active = False
+        self._margin_recovery_last_close_snapshot_ts = 0.0
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -325,9 +331,10 @@ class ClosingExecutor:
         """Execute the Gate cross-margin emergency path without market-data gates.
 
         Only a fresh shared Gate risk snapshot may trigger this path. Account MMR
-        danger applies to every forward holding; liquidation-distance danger only
-        applies to the affected contract. Failed attempts are retried on the next
-        risk loop and never enter the ordinary close cooldown.
+        danger starts a staged recovery episode: close one priority holding, wait
+        for a newer account snapshot, and stop after MMR recovers to the warning
+        threshold. Liquidation-distance danger only applies to the affected
+        contract. Failed attempts never enter the ordinary close cooldown.
         """
         if not self.margin_danger_path_enabled:
             return []
@@ -335,6 +342,51 @@ class ClosingExecutor:
         cross_risk = self._latest_gate_cross_risk()
         if not self._is_gate_cross_risk_fresh(cross_risk):
             return []
+
+        account_mmr = self._latest_gate_cross_account_mmr(cross_risk)
+        risk_status = str(cross_risk.get('status') or '').strip().lower()
+        if risk_status in {'unknown', 'idle', ''}:
+            return []
+        if cross_risk.get('mmr_recovery_active') is True:
+            self._margin_recovery_active = True
+        snapshot_ts = float(cross_risk.get('account_fetched_at_ts') or 0.0)
+        if (
+            risk_status == 'danger'
+            and account_mmr is not None
+            and account_mmr <= self.margin_danger_mmr_pct
+        ):
+            if not self._margin_recovery_active:
+                logger.critical(
+                    "Gate全仓MMR进入分步恢复模式 | mmr=%.2f%% | trigger=%.2f%% | target=%.2f%%",
+                    account_mmr,
+                    self.margin_danger_mmr_pct,
+                    self.margin_recovery_target_mmr_pct,
+                )
+            self._margin_recovery_active = True
+        elif (
+            self._margin_recovery_active
+            and account_mmr is not None
+            and account_mmr >= self.margin_recovery_target_mmr_pct
+        ):
+            logger.warning(
+                "Gate全仓MMR恢复完成，停止风险减仓 | mmr=%.2f%% | target=%.2f%%",
+                account_mmr,
+                self.margin_recovery_target_mmr_pct,
+            )
+            self._margin_recovery_active = False
+            self._margin_recovery_last_close_snapshot_ts = 0.0
+
+        account_recovery_active = (
+            self._margin_recovery_active
+            and risk_status in {'danger', 'warning'}
+            and account_mmr is not None
+            and account_mmr < self.margin_recovery_target_mmr_pct
+        )
+        account_snapshot_already_used = (
+            account_recovery_active
+            and snapshot_ts > 0
+            and snapshot_ts <= self._margin_recovery_last_close_snapshot_ts
+        )
 
         rows = orderbook_rows_by_asset or {}
         results = []
@@ -344,8 +396,25 @@ class ClosingExecutor:
                 continue
 
             danger = self._margin_danger_state(pos, cross_risk=cross_risk)
-            if not danger.get('active'):
+            liq_danger = (
+                danger.get('liq_distance_bps') is not None
+                and float(danger['liq_distance_bps']) <= self.margin_danger_liq_distance_bps
+            )
+            if not liq_danger and not account_recovery_active:
                 continue
+            if account_snapshot_already_used and not liq_danger:
+                continue
+            if account_recovery_active:
+                danger = dict(danger)
+                reasons = list(danger.get('reasons') or [])
+                recovery_reason = (
+                    f"MMR恢复{account_mmr:.2f}%<"
+                    f"{self.margin_recovery_target_mmr_pct:.1f}%"
+                )
+                if recovery_reason not in reasons:
+                    reasons.append(recovery_reason)
+                danger['active'] = True
+                danger['reasons'] = reasons
 
             base_asset = str(pos.get('base_asset') or '').upper()
             inflight_key = self._margin_close_key(pos)
@@ -376,12 +445,15 @@ class ClosingExecutor:
                 result.setdefault('position_id', pos.get('id'))
                 results.append(result)
                 if result.get('success'):
+                    if account_recovery_active:
+                        self._margin_recovery_last_close_snapshot_ts = snapshot_ts
                     logger.critical(
                         "Gate全仓危险平仓成功 | %s | position_id=%s | %s",
                         base_asset,
                         pos.get('id'),
                         ';'.join(danger.get('reasons') or []),
                     )
+                    return results
                 else:
                     logger.critical(
                         "Gate全仓危险平仓失败，将在下一轮立即重试 | %s | position_id=%s | msg=%s",
