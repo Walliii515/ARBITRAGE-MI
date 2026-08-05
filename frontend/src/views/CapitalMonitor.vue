@@ -5,6 +5,7 @@ import { ElMessageBox } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
 import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
+import { POPUP_NOTIFICATION_HISTORY_EVENT } from '../utils/notificationHistory'
 
 interface CapitalRow {
   id?: number
@@ -1126,6 +1127,7 @@ async function fetchFundTransfers(silent = true) {
     activeFundTransfer.value = data.active || null
     fundTransferHistory.value = data.history || []
     if (previousActiveId && !activeFundTransfer.value) {
+      window.dispatchEvent(new CustomEvent(POPUP_NOTIFICATION_HISTORY_EVENT))
       try {
         await post('/api/trading/capital/run', undefined, { silent: true })
       } catch {

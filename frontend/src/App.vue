@@ -8,6 +8,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { post, get } from './utils/request'
 import {
   addPopupNotification,
+  getPopupNotificationUnreadCount,
   listPopupNotifications,
   markAllPopupNotificationsRead,
   markPopupNotificationRead,
@@ -28,6 +29,7 @@ const notificationPagination = ref({ page: 1, page_size: 50, total: 0, total_pag
 let openPauseStatusTimer: ReturnType<typeof setInterval> | null = null
 let listingAlertTimer: ReturnType<typeof setInterval> | null = null
 let riskAlertTimer: ReturnType<typeof setInterval> | null = null
+let notificationSyncTimer: ReturnType<typeof setInterval> | null = null
 const LISTING_ALERT_STORAGE_KEY = 'listing_event_alert'
 const LISTING_ALERT_SNOOZE_MS = 6 * 60 * 60 * 1000
 const LISTING_ALERT_INTERVAL_MS = 15 * 60 * 1000
@@ -36,6 +38,7 @@ const RISK_ALERT_INTERVAL_MS = 60 * 1000
 const RISK_ALERT_LOOKBACK_HOURS = 24
 const RISK_ALERT_MAX_SEEN = 500
 const NOTIFICATION_PAGE_SIZE = 50
+const NOTIFICATION_SYNC_INTERVAL_MS = 10 * 1000
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
@@ -155,6 +158,33 @@ function handleNotificationFilterChange() {
 
 function handleNotificationPopoverShow() {
   void refreshNotificationHistory(true, false)
+}
+
+async function syncNotificationHistoryIfChanged() {
+  if (isLoginPage.value || notificationRefreshing.value) return
+  try {
+    const unreadCount = await getPopupNotificationUnreadCount()
+    if (unreadCount !== notificationUnreadCount.value) {
+      notificationUnreadCount.value = unreadCount
+      await refreshNotificationHistory(false, false)
+    }
+  } catch {
+    // 铃铛轮询失败不影响主界面。
+  }
+}
+
+function startNotificationSyncTimer() {
+  void syncNotificationHistoryIfChanged()
+  if (!notificationSyncTimer) {
+    notificationSyncTimer = setInterval(syncNotificationHistoryIfChanged, NOTIFICATION_SYNC_INTERVAL_MS)
+  }
+}
+
+function stopNotificationSyncTimer() {
+  if (notificationSyncTimer) {
+    clearInterval(notificationSyncTimer)
+    notificationSyncTimer = null
+  }
 }
 
 function notificationTypeClass(type: PopupNotification['type']) {
@@ -401,14 +431,21 @@ function stopRiskAlertTimer() {
 }
 
 const notificationHistoryChangeHandler = () => void refreshNotificationHistory(false)
+const notificationVisibilityChangeHandler = () => {
+  if (document.visibilityState === 'visible') {
+    void syncNotificationHistoryIfChanged()
+  }
+}
 
 onMounted(() => {
   void refreshNotificationHistory(true, true)
   window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, notificationHistoryChangeHandler)
+  document.addEventListener('visibilitychange', notificationVisibilityChangeHandler)
   if (!isLoginPage.value) {
     startOpenPauseStatusTimer()
     startListingAlertTimer()
     startRiskAlertTimer()
+    startNotificationSyncTimer()
   }
 })
 
@@ -417,10 +454,13 @@ watch(isLoginPage, (loginPage) => {
     stopOpenPauseStatusTimer()
     stopListingAlertTimer()
     stopRiskAlertTimer()
+    stopNotificationSyncTimer()
   } else {
+    void refreshNotificationHistory(true, false)
     startOpenPauseStatusTimer()
     startListingAlertTimer()
     startRiskAlertTimer()
+    startNotificationSyncTimer()
   }
 })
 
@@ -428,7 +468,9 @@ onUnmounted(() => {
   stopOpenPauseStatusTimer()
   stopListingAlertTimer()
   stopRiskAlertTimer()
+  stopNotificationSyncTimer()
   window.removeEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, notificationHistoryChangeHandler)
+  document.removeEventListener('visibilitychange', notificationVisibilityChangeHandler)
 })
 
 async function handleLogout() {

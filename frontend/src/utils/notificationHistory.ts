@@ -56,6 +56,15 @@ export async function listPopupNotifications(options: {
   }
 }
 
+export async function getPopupNotificationUnreadCount(): Promise<number> {
+  const res = await get('/api/trading/notifications/unread-count', { silent: true })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new Error(data?.detail || '获取弹窗未读数失败')
+  }
+  return Number(data?.unread_count ?? 0)
+}
+
 export async function addPopupNotification(input: Omit<PopupNotification, 'id' | 'created_at' | 'updated_at' | 'read_at'>) {
   try {
     const res = await post('/api/trading/notifications', input)
