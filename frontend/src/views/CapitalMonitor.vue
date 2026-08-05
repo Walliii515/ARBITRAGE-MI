@@ -7,7 +7,7 @@ import { get, post } from '../utils/request'
 import { showError, showSuccess } from '../utils/message'
 
 interface CapitalRow {
-  id: number
+  id?: number
   snapshot_at: string
   exchange: 'binance' | 'gate' | 'total'
   equity_usdt: number | null
@@ -21,6 +21,8 @@ interface CapitalRow {
   fee_cost_usdt: number | null
   total_pnl_usdt: number | null
   gross_total_pnl_usdt: number | null
+  daily_realized_pnl_usdt?: number | null
+  daily_return_pct?: number | null
   account_balance_usdt?: number | null
   account_unrealized_pnl_usdt?: number | null
   bnb_available?: number | null
@@ -441,6 +443,25 @@ function buildDailyReturnSeries(rows: CapitalRow[]): ChartSeries[] {
   const sortedRows = rows
     .slice()
     .sort((a, b) => new Date(a.snapshot_at).getTime() - new Date(b.snapshot_at).getTime())
+  const backendDailyRows = sortedRows.filter((row) => (
+    row.daily_realized_pnl_usdt != null || row.daily_return_pct != null
+  ))
+  if (backendDailyRows.length > 0) {
+    const profitPoints = backendDailyRows
+      .filter((row) => Number.isFinite(Number(row.daily_realized_pnl_usdt)))
+      .map((row) => ({
+        time: dayStartKey(row.snapshot_at) || row.snapshot_at,
+        value: Number(row.daily_realized_pnl_usdt),
+      }))
+    const returnPoints = backendDailyRows
+      .filter((row) => Number.isFinite(Number(row.daily_return_pct)))
+      .map((row) => ({
+        time: dayStartKey(row.snapshot_at) || row.snapshot_at,
+        value: Number(row.daily_return_pct),
+      }))
+    return dailyReturnSeriesFromPoints(profitPoints, returnPoints)
+  }
+
   const buckets = new Map<string, CapitalRow[]>()
   for (const row of sortedRows) {
     const dayKey = dayStartKey(row.snapshot_at)
@@ -469,6 +490,13 @@ function buildDailyReturnSeries(rows: CapitalRow[]): ChartSeries[] {
     })
   }
 
+  return dailyReturnSeriesFromPoints(profitPoints, returnPoints)
+}
+
+function dailyReturnSeriesFromPoints(
+  profitPoints: Array<{ time: string; value: number }>,
+  returnPoints: Array<{ time: string; value: number }>,
+): ChartSeries[] {
   return [
     {
       exchange: chartExchange.value,

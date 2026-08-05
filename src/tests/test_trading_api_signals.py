@@ -315,6 +315,37 @@ class CapitalHistoryQueryTests(unittest.TestCase):
         self.assertNotIn('account_latency_ms', sql)
         self.assertEqual(params, [600, 600, 7, 'total'])
 
+    def test_daily_return_endpoint_uses_calendar_day_aggregation(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{
+            'snapshot_at': '2026-08-05 00:00:00',
+            'exchange': 'total',
+            'equity_usdt': Decimal('15000.00'),
+            'daily_realized_pnl_usdt': Decimal('1.23'),
+            'daily_return_pct': Decimal('0.0082'),
+        }]
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('api.trading_api.db_manager.get_cursor', return_value=context):
+            result = asyncio.run(get_capital_history(
+                days=30,
+                hours=None,
+                exchange='total',
+                metric='daily_return',
+            ))
+
+        self.assertEqual(result['interval'], '1d')
+        self.assertEqual(result['metric'], 'daily_return')
+        self.assertEqual(result['rows'][0]['daily_realized_pnl_usdt'], 1.23)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('DATE(snapshot_at) AS summary_date', sql)
+        self.assertIn('MIN(id) AS first_id', sql)
+        self.assertIn('MAX(id) AS last_id', sql)
+        self.assertNotIn('FROM_UNIXTIME(FLOOR', sql)
+        self.assertEqual(params, [30, 'total'])
+
     def test_gate_risk_metric_forces_gate_exchange(self):
         cursor = MagicMock()
         cursor.fetchall.return_value = []

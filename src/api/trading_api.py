@@ -864,6 +864,52 @@ def _capital_history_select_columns(metric: str) -> str:
     return ',\n            '.join(columns)
 
 
+def _load_capital_daily_return_rows(
+    days: int,
+    exchange: Optional[str],
+) -> List[Dict[str, Any]]:
+    where = [
+        "snapshot_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)",
+        "JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'",
+        "total_pnl_usdt IS NOT NULL",
+    ]
+    params: List[Any] = [days]
+    if exchange in ('binance', 'gate', 'total'):
+        where.append("exchange = %s")
+        params.append(exchange)
+    where_sql = " AND ".join(where)
+    force_index = 'FORCE INDEX (idx_exchange_snapshot)' if exchange else ''
+    sql = f"""
+        SELECT
+            DATE_FORMAT(grouped.summary_date, '%%Y-%%m-%%d 00:00:00') AS snapshot_at,
+            grouped.exchange,
+            first_row.equity_usdt,
+            last_row.total_pnl_usdt - first_row.total_pnl_usdt AS daily_realized_pnl_usdt,
+            CASE
+                WHEN first_row.equity_usdt IS NULL OR ABS(first_row.equity_usdt) < 0.000000001
+                    THEN NULL
+                ELSE (last_row.total_pnl_usdt - first_row.total_pnl_usdt) / first_row.equity_usdt * 100
+            END AS daily_return_pct
+        FROM (
+            SELECT
+                DATE(snapshot_at) AS summary_date,
+                exchange,
+                MIN(id) AS first_id,
+                MAX(id) AS last_id
+            FROM mi_capital_snapshot {force_index}
+            WHERE {where_sql}
+            GROUP BY DATE(snapshot_at), exchange
+        ) grouped
+        INNER JOIN mi_capital_snapshot first_row ON first_row.id = grouped.first_id
+        INNER JOIN mi_capital_snapshot last_row ON last_row.id = grouped.last_id
+        ORDER BY grouped.summary_date ASC, FIELD(grouped.exchange, 'binance', 'gate', 'total')
+        LIMIT 10000
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+
+
 def _calculate_capital_annualized_return(
     rows: List[Dict[str, Any]],
     period_days: int,
@@ -1718,6 +1764,17 @@ async def get_capital_history(
     metric: str = Query('equity_usdt', description="资金趋势指标"),
 ):
     """按时间范围自动采样，并只返回当前资金趋势需要的字段。"""
+    if metric == 'daily_return':
+        if hours is not None:
+            days = 1
+        rows = _load_capital_daily_return_rows(days, exchange)
+        return {
+            'rows': _serialize_rows(rows),
+            'metric': metric,
+            'interval': '1d',
+            'window': {'hours': hours} if hours is not None else {'days': days},
+        }
+
     interval, bucket_sec = _capital_history_interval(hours, days)
     select_columns = _capital_history_select_columns(metric)
     if metric == 'gate_cross_risk':
