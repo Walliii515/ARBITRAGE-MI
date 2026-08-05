@@ -334,6 +334,7 @@ _gate_cross_risk_notifier: Optional[GateCrossRiskNotifier] = None
 _last_margin_danger_force_refresh_ts: float = 0.0
 _delist_risk_report: Dict = {'items': [], 'summary': {'total': 0, 'critical': 0, 'warning': 0}}
 _delist_risk_report_ts: float = 0.0
+_negative_funding_watch_assets: Set[str] = set()
 
 # 开仓/平仓检查执行器单例（避免每次循环重复创建 ExecutorClient）
 _trading_executor: Optional['TradingExecutor'] = None
@@ -2095,6 +2096,8 @@ def _run_open_position_check_once():
 
         if hasattr(_trading_executor, 'set_delist_risk_report'):
             _trading_executor.set_delist_risk_report(_delist_risk_report)
+        if hasattr(_trading_executor, 'set_negative_funding_watch_assets'):
+            _trading_executor.set_negative_funding_watch_assets(_negative_funding_watch_assets)
         _trading_executor.update_account_capital_status(
             _account_summary_with_live_gate_cross_risk(),
             _latest_account_summary_ts,
@@ -2323,11 +2326,13 @@ def _publish_close_position_results(results: List[Dict]) -> None:
 
 def _run_close_position_check_once():
     """Run emergency account-risk exits before the ordinary orderbook close path."""
+    global _negative_funding_watch_assets
     start = time.monotonic()
     try:
         tracker = PositionTracker(_contract_meta)
         positions = tracker.get_holding_positions()
         if not positions:
+            _negative_funding_watch_assets = set()
             return
 
         global _closing_executor
@@ -2405,6 +2410,7 @@ def _run_close_position_check_once():
         results = _closing_executor.check_and_close(
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset
         )
+        _negative_funding_watch_assets = _closing_executor.negative_funding_watch_assets(positions)
         _publish_close_position_results(results)
     except Exception as e:
         logger.error(f"平仓检查失败: {e}", exc_info=True)

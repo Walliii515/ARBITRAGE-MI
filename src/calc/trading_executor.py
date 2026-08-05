@@ -280,6 +280,7 @@ class TradingExecutor:
         self._holding_spot_amount_by_asset: Dict[str, float] = {}
         self._holding_weighted_basis_by_asset: Dict[str, float] = {}
         self._holding_exchange_risk_by_asset: Dict[str, bool] = {}
+        self._negative_funding_watch_assets: Set[str] = set()
         fallback_available_ratio = max(float(cfg.min_available_ratio or 0), 0.0)
         self.min_available_ratio = fallback_available_ratio
         self.min_binance_available_ratio = (
@@ -513,6 +514,12 @@ class TradingExecutor:
             grouped.setdefault(asset, []).append(item)
         self._delist_open_block_by_asset = grouped
 
+    def set_negative_funding_watch_assets(self, assets) -> None:
+        """接收平仓侧的负资金费监控集合，监控期间禁止同币继续加仓。"""
+        self._negative_funding_watch_assets = {
+            str(asset or '').strip().upper() for asset in (assets or []) if asset
+        }
+
     def update_account_capital_status(self, account_summary: Optional[Dict], snapshot_ts: float):
         """更新交易所真实资金缓存，供开仓热路径只读。"""
         self._account_summary = account_summary
@@ -608,6 +615,18 @@ class TradingExecutor:
                 if str(base_asset or '').upper() in exchange_risk_blocked_assets:
                     reason = '交易所仓位风险(desynced)暂停开仓'
                     self._resolve_signal(base_asset, 'conditions_lost', reason)
+                    self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
+                    continue
+
+                if str(base_asset or '').upper() in self._negative_funding_watch_assets:
+                    reason = '负资金费风险监控中，暂停同币开仓'
+                    self._resolve_signal(base_asset, 'conditions_lost', reason)
+                    self._record_presignal_rejection(
+                        base_asset,
+                        reason,
+                        row.get('open_vwap_basis_bps'),
+                    )
                     self._peak_state.pop(base_asset, None)
                     self._open_resiliency.clear(base_asset)
                     continue

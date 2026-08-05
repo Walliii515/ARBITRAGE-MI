@@ -183,7 +183,7 @@ class RealExecutor:
         spot_order = dict(order_group.get('spot_order', {}) or {})
         future_order = dict(order_group.get('future_order', {}) or {})
         close_reason = str(order_group.get('execution_reason') or '')
-        if close_reason != 'take_profit':
+        if close_reason != 'take_profit' and not order_group.get('allow_protective_close'):
             future_order.pop('protective_price', None)
         future_order.pop('execution_style', None)
 
