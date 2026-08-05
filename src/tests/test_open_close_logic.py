@@ -4857,6 +4857,45 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
         self.assertEqual(group['execution_reason'], 'take_profit')
 
+    def test_close_order_target_amount_uses_target_qty_and_close_vwap(self):
+        pos = {
+            'base_asset': 'TUT',
+            'spot_open_qty': 2100.0,
+            'spot_open_price': 0.01855,
+            'future_open_qty': 2100.0,
+            'future_open_price': 0.018725,
+            'future_contract': 'TUT_USDT',
+        }
+        close_row = {
+            'spot_close_vwap': 0.02387,
+            'future_close_vwap': 0.023782,
+        }
+
+        with patch('calc.closing_executor.config.get_float', return_value=160.0):
+            group = self.ce._build_close_order_group(
+                pos,
+                close_reason='take_profit',
+                orderbook_row=close_row,
+            )
+
+        self.assertAlmostEqual(group['spot_order']['target_amount'], 50.127)
+        self.assertAlmostEqual(group['future_order']['target_amount'], 49.9422)
+        self.assertEqual(group['spot_order']['target_qty'], 2100.0)
+        self.assertEqual(group['future_order']['target_qty'], 2100.0)
+
+    def test_close_order_target_amount_falls_back_to_position_open_price(self):
+        group = self.ce._build_close_order_group({
+            'base_asset': 'TUT',
+            'spot_open_qty': 2100.0,
+            'spot_open_price': 0.01855,
+            'future_open_qty': 2100.0,
+            'future_open_price': 0.018725,
+            'future_contract': 'TUT_USDT',
+        }, close_reason='margin_close', orderbook_row={'base_asset': 'TUT'})
+
+        self.assertAlmostEqual(group['spot_order']['target_amount'], 38.955)
+        self.assertAlmostEqual(group['future_order']['target_amount'], 39.3225)
+
     def test_take_profit_threshold_includes_gate_taker_close_fee(self):
         self.assertEqual(self.ce.fee_full_bps, 22.0)
 

@@ -2052,6 +2052,7 @@ class ClosingExecutor:
             pos,
             close_reason=close_reason,
             future_protective_price=future_protective_price,
+            orderbook_row=orderbook_row,
         )
         exec_result = self.executor_client.execute(order_group, orderbook_row)
         actual_close_basis_bps = self._save_close(
@@ -2082,6 +2083,7 @@ class ClosingExecutor:
         pos: Dict,
         close_reason: Optional[str] = None,
         future_protective_price: Optional[float] = None,
+        orderbook_row: Optional[Dict] = None,
     ) -> Dict:
         """
         生成平仓订单组：
@@ -2091,7 +2093,20 @@ class ClosingExecutor:
         ba = pos.get('base_asset', '')
         spot_symbol = pos.get('spot_symbol') or f"{ba}USDT"
         future_contract = pos.get('future_contract', '')
-        target_amount = config.get_float('trade.open.amount_usdt', 500)
+        spot_target_qty = float(pos.get('spot_open_qty') or 0)
+        future_target_qty = float(pos.get('future_open_qty') or 0)
+        spot_target_amount = self._close_leg_target_amount(
+            spot_target_qty,
+            orderbook_row,
+            price_keys=('spot_close_vwap', 'spot_price_bid_1', 'spot_bid_price_1'),
+            fallback_price=pos.get('spot_open_price'),
+        )
+        future_target_amount = self._close_leg_target_amount(
+            future_target_qty,
+            orderbook_row,
+            price_keys=('future_close_vwap', 'future_price_ask_1', 'future_ask_price_1'),
+            fallback_price=pos.get('future_open_price'),
+        )
 
         spot_order = {
             'order_uuid': order_uuid,
@@ -2102,8 +2117,8 @@ class ClosingExecutor:
             'market_type': 'spot',
             'trade_direction': 'sell',
             'status': 'pending',
-            'target_qty': float(pos.get('spot_open_qty') or 0),
-            'target_amount': target_amount,
+            'target_qty': spot_target_qty,
+            'target_amount': spot_target_amount,
         }
 
         future_order = {
@@ -2115,8 +2130,8 @@ class ClosingExecutor:
             'market_type': 'future',
             'trade_direction': 'buy',
             'status': 'pending',
-            'target_qty': float(pos.get('future_open_qty') or 0),
-            'target_amount': target_amount,
+            'target_qty': future_target_qty,
+            'target_amount': future_target_amount,
         }
         if close_reason == 'take_profit' and future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
@@ -2131,6 +2146,29 @@ class ClosingExecutor:
             'execution_reason': close_reason,
         }
         return order_group
+
+    @staticmethod
+    def _close_leg_target_amount(
+        target_qty: float,
+        orderbook_row: Optional[Dict],
+        price_keys: tuple,
+        fallback_price,
+    ) -> Optional[float]:
+        """Estimate close notional from target quantity, never from current open config."""
+        row = orderbook_row or {}
+        reference_price = next(
+            (
+                price
+                for key in price_keys
+                if (price := _float_or_none(row.get(key))) is not None and price > 0
+            ),
+            None,
+        )
+        if reference_price is None:
+            reference_price = _float_or_none(fallback_price)
+        if target_qty <= 0 or reference_price is None or reference_price <= 0:
+            return None
+        return target_qty * reference_price
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         if base_asset in self.contract_meta:

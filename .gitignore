@@ -12,6 +12,10 @@ __pycache__/
 # Logs
 src/log/
 
+# Downloaded market data
+/data/binance_spot_daily/
+/data/binance_spot_1h/
+
 # Node
 frontend/node_modules/
 frontend/dist/
