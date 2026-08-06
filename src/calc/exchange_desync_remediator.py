@@ -82,6 +82,16 @@ class ExchangeDesyncRemediator:
         if mark_positions:
             self._mark_positions_exchange_risk(selected_positions, risk)
 
+        dust_result = self._try_remediate_full_asset_dust(
+            base_asset=base_asset,
+            positions=selected_positions,
+            available_qty=available_qty,
+            missing_contracts=missing_contracts,
+            risk=risk,
+        )
+        if dust_result is not None:
+            return dust_result
+
         results = []
         for pos in selected_positions:
             target_qty = min(_float(pos.get('spot_open_qty')), remaining_available)
@@ -130,6 +140,132 @@ class ExchangeDesyncRemediator:
             'failure_count': failure_count,
             'results': results,
         }
+
+    def _try_remediate_full_asset_dust(
+        self,
+        base_asset: str,
+        positions: List[Dict],
+        available_qty: float,
+        missing_contracts: float,
+        risk: Dict,
+    ) -> Optional[Dict]:
+        """仅在 Gate 已归零且全部现货都是尘埃时转换并核销本地残仓。"""
+        converter = getattr(self.executor, 'convert_binance_spot_dust_to_bnb', None)
+        if not callable(converter) or not positions or available_qty <= 0:
+            return None
+        if str(risk.get('type') or '') != 'missing_gate_position':
+            return None
+        if abs(_float(risk.get('exchange_contracts'))) > 1e-9:
+            return None
+
+        selected_contracts = sum(abs(_float(pos.get('future_open_contracts'))) for pos in positions)
+        if abs(selected_contracts - float(missing_contracts or 0)) > 1e-9:
+            return None
+        selected_spot_qty = sum(max(0.0, _float(pos.get('spot_open_qty'))) for pos in positions)
+        spot_meta = (getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {}
+        qty_tolerance = max(_float(spot_meta.get('step_size')) * 1e-6, 1e-8)
+        if abs(selected_spot_qty - available_qty) > qty_tolerance:
+            return None
+
+        min_notional = _float(spot_meta.get('min_notional'))
+        price = self._estimate_binance_spot_price(base_asset, risk)
+        if price <= 0:
+            price = max((_float(pos.get('spot_open_price')) for pos in positions), default=0.0)
+        if min_notional <= 0 or price <= 0 or available_qty * price + 1e-9 >= min_notional:
+            return None
+
+        conversion = converter(base_asset)
+        if not conversion.get('success'):
+            reason = conversion.get('reason') or 'dust_conversion_failed'
+            for pos in positions:
+                self._append_risk_detail(pos.get('id'), f"尘埃转换失败|{reason}")
+            return {
+                'attempted': True,
+                'success': False,
+                'action': 'convert_binance_dust_to_bnb',
+                'base_asset': base_asset,
+                'positions': len(positions),
+                'matching_positions': len(positions),
+                'success_count': 0,
+                'failure_count': len(positions),
+                'reason': reason,
+                'results': [],
+            }
+
+        converted_qty = _float(conversion.get('source_qty'))
+        if abs(converted_qty - available_qty) > qty_tolerance:
+            reason = f'dust_conversion_qty_mismatch:{converted_qty:g}!={available_qty:g}'
+            for pos in positions:
+                self._append_risk_detail(pos.get('id'), reason)
+            return {
+                'attempted': True,
+                'success': False,
+                'action': 'convert_binance_dust_to_bnb',
+                'base_asset': base_asset,
+                'positions': len(positions),
+                'matching_positions': len(positions),
+                'success_count': 0,
+                'failure_count': len(positions),
+                'reason': reason,
+                'results': [],
+            }
+
+        self._close_positions_after_dust_conversion(positions, conversion, risk)
+        logger.warning(
+            "Gate 缺腿尘埃处置完成 | %s | positions=%s | spot_qty=%s | bnb=%s | tran_id=%s",
+            base_asset, len(positions), conversion.get('source_qty'),
+            conversion.get('bnb_qty'), conversion.get('transaction_id'),
+        )
+        results = [
+            {'attempted': True, 'success': True, 'position_id': pos.get('id')}
+            for pos in positions
+        ]
+        return {
+            'attempted': True,
+            'success': True,
+            'action': 'convert_binance_dust_to_bnb',
+            'base_asset': base_asset,
+            'positions': len(positions),
+            'matching_positions': len(positions),
+            'success_count': len(positions),
+            'failure_count': 0,
+            'source_qty': conversion.get('source_qty'),
+            'bnb_qty': conversion.get('bnb_qty'),
+            'transaction_id': conversion.get('transaction_id'),
+            'results': results,
+        }
+
+    def _close_positions_after_dust_conversion(
+        self,
+        positions: List[Dict],
+        conversion: Dict,
+        risk: Dict,
+    ) -> None:
+        ids = [int(pos['id']) for pos in positions if pos.get('id') is not None]
+        if not ids:
+            return
+        reason = (
+            "交易所断腿尘埃处置|Binance小额资产转BNB|"
+            f"asset={conversion.get('asset')}|qty={conversion.get('source_qty')}|"
+            f"bnb={conversion.get('bnb_qty')}|tran_id={conversion.get('transaction_id')}|"
+            f"关联风险={risk.get('type', 'unknown')}"
+        )
+        placeholders = ','.join(['%s'] * len(ids))
+        sql = f"""
+            UPDATE mi_trade_position SET
+                status = 'closed',
+                closed_at = %s,
+                close_reason = CONCAT(COALESCE(close_reason, ''), '|', %s),
+                spot_close_price = %s,
+                spot_close_amount = spot_open_qty * %s,
+                exchange_risk_status = 'resolved'
+            WHERE id IN ({placeholders})
+              AND status = 'holding'
+              AND exchange_risk_status = 'desynced'
+        """
+        price = _float(conversion.get('exec_price_usdt')) or None
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (datetime.now(), reason, price, price, *ids))
 
     def remediate_gate_extra_position(
         self,

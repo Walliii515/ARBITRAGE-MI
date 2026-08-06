@@ -405,6 +405,8 @@ class ClosingExecutor:
         for pos in ordered_positions:
             if pos.get('status') != 'holding':
                 continue
+            if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
+                continue
 
             danger = self._margin_danger_state(pos, cross_risk=cross_risk)
             liq_danger = (
@@ -544,6 +546,8 @@ class ClosingExecutor:
 
         for pos in positions:
             if pos.get('status') != 'holding':
+                continue
+            if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
                 continue
 
             ba = pos.get('base_asset', '')

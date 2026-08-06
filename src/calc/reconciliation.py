@@ -567,10 +567,15 @@ class Reconciler:
 
             risk_type = str(risk.get('type') or '')
             if risk_type in {'adl', 'liquidation', 'missing_gate_position', 'qty_mismatch'}:
+                remediation_risk = {
+                    **risk,
+                    'local_contracts': float(item.get('local_contracts') or 0),
+                    'exchange_contracts': float(item.get('exchange_contracts') or 0),
+                }
                 result = self.remediator.remediate_gate_short_desync(
                     base_asset=item.get('base_asset'),
                     missing_contracts=float(item.get('missing_contracts') or 0),
-                    risk=risk,
+                    risk=remediation_risk,
                     require_desynced=True,
                 )
             elif risk_type == 'extra_gate_position':

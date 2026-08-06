@@ -375,6 +375,33 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(parsed['exec_qty'], 12)
         self.assertEqual(parsed['exec_amount'], 15.0)
 
+    def test_binance_dust_conversion_returns_auditable_execution_value(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._binance_signed_post = MagicMock(return_value={
+            'transferResult': [{
+                'fromAsset': 'BICO',
+                'amount': '0.2',
+                'transferedAmount': '0.00000955',
+                'serviceChargeAmount': '0.00000019',
+                'tranId': 12345,
+            }],
+        })
+        executor._get_binance_usdt_price = MagicMock(return_value=800.0)
+
+        result = executor.convert_binance_spot_dust_to_bnb('bico')
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['source_qty'], 0.2)
+        self.assertEqual(result['transaction_id'], '12345')
+        self.assertAlmostEqual(result['exec_amount_usdt'], 0.00764)
+        self.assertAlmostEqual(result['exec_price_usdt'], 0.0382)
+        executor._binance_signed_post.assert_called_once_with(
+            '/sapi/v1/asset/dust',
+            {'asset': 'BICO', 'accountType': 'SPOT'},
+        )
+
     def test_gate_ioc_zero_fill_is_no_fill_not_data_error(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
@@ -4228,6 +4255,21 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         with patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)):
             self.ce._save_close(pos, order_group, exec_result, close_reason, detail)
         return cursor, triggered
+
+    def test_desynced_position_is_not_submitted_to_close_executor_again(self):
+        pos = {
+            **self.pos,
+            'id': 379,
+            'status': 'holding',
+            'exchange_risk_status': 'desynced',
+        }
+        execute = MagicMock()
+
+        with patch.object(self.ce, '_execute_close', execute):
+            result = self.ce.check_and_close([pos], {}, {'BTC': {'base_asset': 'BTC'}})
+
+        self.assertEqual(result, [])
+        execute.assert_not_called()
 
     def test_future_only_take_profit_marks_desync_and_triggers_reconciliation(self):
         class FakeCursor:

@@ -963,6 +963,47 @@ class RealExecutor:
         """公开的 Binance 现货单腿执行入口，用于交易所断腿自动处置。"""
         return self._place_binance_spot_order(order)
 
+    def convert_binance_spot_dust_to_bnb(self, base_asset: str) -> Dict:
+        """将现货账户中不可交易的小额资产转换为 BNB。"""
+        base_asset = str(base_asset or '').strip().upper()
+        if not base_asset or base_asset in {'BNB', 'USDT'}:
+            return {'success': False, 'reason': f'invalid_dust_asset:{base_asset or "empty"}'}
+        try:
+            data = self._binance_signed_post('/sapi/v1/asset/dust', {
+                'asset': base_asset,
+                'accountType': 'SPOT',
+            })
+        except Exception as exc:
+            logger.warning("Binance 尘埃转换失败 | %s | %s", base_asset, exc)
+            return {'success': False, 'reason': str(exc)[:200]}
+
+        transfers = data.get('transferResult') if isinstance(data, dict) else None
+        matched = next((
+            item for item in (transfers or [])
+            if str(item.get('fromAsset') or '').upper() == base_asset
+            and (self._float_or_none(item.get('amount')) or 0) > 0
+        ), None)
+        if not matched:
+            return {'success': False, 'reason': 'dust_conversion_missing_transfer_result', 'raw': data}
+
+        source_qty = self._float_or_none(matched.get('amount')) or 0.0
+        bnb_qty = self._float_or_none(matched.get('transferedAmount')) or 0.0
+        service_charge_bnb = self._float_or_none(matched.get('serviceChargeAmount')) or 0.0
+        bnb_price = self._get_binance_usdt_price('BNB') or 0.0
+        exec_amount = bnb_qty * bnb_price if bnb_price > 0 else None
+        exec_price = exec_amount / source_qty if exec_amount is not None and source_qty > 0 else None
+        return {
+            'success': True,
+            'asset': base_asset,
+            'source_qty': source_qty,
+            'bnb_qty': bnb_qty,
+            'service_charge_bnb': service_charge_bnb,
+            'transaction_id': str(matched.get('tranId') or ''),
+            'exec_price_usdt': exec_price,
+            'exec_amount_usdt': exec_amount,
+            'raw': data,
+        }
+
     def place_gate_futures_order(self, order: Dict) -> Dict:
         """公开的 Gate 合约单腿执行入口，用于交易所断腿 reduce-only 处置。"""
         return self._place_gate_futures_order(order)

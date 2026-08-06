@@ -669,6 +669,98 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         executor.place_binance_spot_order.assert_not_called()
         remediator._append_risk_detail.assert_called_once()
 
+    def test_missing_gate_full_asset_dust_converts_to_bnb_and_resolves_positions(self):
+        class FakeExecutor:
+            contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+            spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.1}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock(return_value={
+                    'success': True,
+                    'asset': 'BICO',
+                    'source_qty': 0.2,
+                    'bnb_qty': 0.00000955,
+                    'transaction_id': 'dust-1',
+                    'exec_price_usdt': 0.03,
+                })
+
+        positions = [{
+            'id': position_id,
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.1,
+            'spot_open_price': 0.024,
+            'future_open_qty': 0.1,
+            'future_open_contracts': 1,
+        } for position_id in (365, 379)]
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
+        remediator._load_positions_to_remediate = MagicMock(return_value=positions)
+        remediator._load_binance_available_qty = MagicMock(return_value=0.2)
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.03)
+        remediator._close_positions_after_dust_conversion = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'BICO',
+            2.0,
+            {
+                'type': 'missing_gate_position',
+                'local_contracts': 2.0,
+                'exchange_contracts': 0.0,
+            },
+            require_desynced=True,
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['action'], 'convert_binance_dust_to_bnb')
+        self.assertEqual(result['success_count'], 2)
+        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
+        remediator._close_positions_after_dust_conversion.assert_called_once()
+
+    def test_dust_conversion_does_not_touch_asset_with_unrelated_spot_balance(self):
+        class FakeExecutor:
+            contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+            spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.1}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock()
+                self.place_binance_spot_order = MagicMock()
+
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
+        remediator._load_positions_to_remediate = MagicMock(return_value=[{
+            'id': 379,
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.1,
+            'spot_open_price': 0.024,
+            'future_open_qty': 0.1,
+            'future_open_contracts': 1,
+        }])
+        remediator._load_binance_available_qty = MagicMock(return_value=0.2)
+        remediator._append_risk_detail = MagicMock()
+
+        result = remediator.remediate_gate_short_desync(
+            'BICO',
+            1.0,
+            {
+                'type': 'missing_gate_position',
+                'local_contracts': 1.0,
+                'exchange_contracts': 0.0,
+            },
+            require_desynced=True,
+        )
+
+        self.assertFalse(result['success'])
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
+        executor.place_binance_spot_order.assert_not_called()
+
     def test_gate_adl_does_not_reuse_partial_prior_spot_fill(self):
         class FakeExecutor:
             contract_meta = {'BEL': {'quanto_multiplier': 1}}
