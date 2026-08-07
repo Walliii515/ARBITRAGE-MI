@@ -141,6 +141,41 @@ class ExchangeDesyncRemediator:
             'results': results,
         }
 
+    def remediate_post_close_spot_dust(
+        self,
+        base_asset: str,
+        local_spot_qty: float,
+        exchange_spot_qty: float,
+    ) -> Dict:
+        """Convert a fully reconciled spot-only close remainder and retire its local positions."""
+        base_asset = str(base_asset or '').upper()
+        if not self.cfg.enabled:
+            return {'attempted': False, 'reason': 'disabled'}
+        if local_spot_qty <= 0 or exchange_spot_qty <= 0:
+            return {'attempted': False, 'reason': 'spot_qty<=0'}
+
+        positions = self._load_post_close_spot_dust_positions(base_asset)
+        if not positions:
+            return {'attempted': False, 'reason': 'no_post_close_spot_dust_positions'}
+
+        risk = {
+            'type': 'post_close_spot_dust',
+            'local_contracts': 0.0,
+            'exchange_contracts': 0.0,
+            'spot_price': self._estimate_binance_spot_price(base_asset, {}),
+        }
+        available_qty = self._load_binance_available_qty(base_asset)
+        result = self._try_remediate_full_asset_dust(
+            base_asset=base_asset,
+            positions=positions,
+            available_qty=available_qty,
+            missing_contracts=0.0,
+            risk=risk,
+            expected_spot_qty=local_spot_qty,
+            exchange_spot_qty=exchange_spot_qty,
+        )
+        return result or {'attempted': False, 'reason': 'post_close_spot_not_convertible'}
+
     def _try_remediate_full_asset_dust(
         self,
         base_asset: str,
@@ -148,23 +183,32 @@ class ExchangeDesyncRemediator:
         available_qty: float,
         missing_contracts: float,
         risk: Dict,
+        expected_spot_qty: Optional[float] = None,
+        exchange_spot_qty: Optional[float] = None,
     ) -> Optional[Dict]:
         """仅在 Gate 已归零且全部现货都是尘埃时转换并核销本地残仓。"""
         converter = getattr(self.executor, 'convert_binance_spot_dust_to_bnb', None)
         if not callable(converter) or not positions or available_qty <= 0:
             return None
-        if str(risk.get('type') or '') != 'missing_gate_position':
+        risk_type = str(risk.get('type') or '')
+        if risk_type not in {'missing_gate_position', 'post_close_spot_dust'}:
             return None
         if abs(_float(risk.get('exchange_contracts'))) > 1e-9:
             return None
 
         selected_contracts = sum(abs(_float(pos.get('future_open_contracts'))) for pos in positions)
-        if abs(selected_contracts - float(missing_contracts or 0)) > 1e-9:
+        if risk_type == 'missing_gate_position' and abs(selected_contracts - float(missing_contracts or 0)) > 1e-9:
+            return None
+        if risk_type == 'post_close_spot_dust' and selected_contracts > 1e-9:
             return None
         selected_spot_qty = sum(max(0.0, _float(pos.get('spot_open_qty'))) for pos in positions)
         spot_meta = (getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {}
         qty_tolerance = max(_float(spot_meta.get('step_size')) * 1e-6, 1e-8)
         if abs(selected_spot_qty - available_qty) > qty_tolerance:
+            return None
+        if expected_spot_qty is not None and abs(selected_spot_qty - expected_spot_qty) > qty_tolerance:
+            return None
+        if exchange_spot_qty is not None and abs(available_qty - exchange_spot_qty) > qty_tolerance:
             return None
 
         min_notional = _float(spot_meta.get('min_notional'))
@@ -212,8 +256,9 @@ class ExchangeDesyncRemediator:
 
         self._close_positions_after_dust_conversion(positions, conversion, risk)
         logger.warning(
-            "Gate 缺腿尘埃处置完成 | %s | positions=%s | spot_qty=%s | bnb=%s | tran_id=%s",
-            base_asset, len(positions), conversion.get('source_qty'),
+            "尘埃处置完成 | %s | type=%s | positions=%s | spot_qty=%s | bnb=%s | tran_id=%s",
+            base_asset, risk_type,
+            len(positions), conversion.get('source_qty'),
             conversion.get('bnb_qty'), conversion.get('transaction_id'),
         )
         results = [
@@ -244,8 +289,13 @@ class ExchangeDesyncRemediator:
         ids = [int(pos['id']) for pos in positions if pos.get('id') is not None]
         if not ids:
             return
+        reason_prefix = (
+            '平仓残余尘埃处置'
+            if str(risk.get('type') or '') == 'post_close_spot_dust'
+            else '交易所断腿尘埃处置'
+        )
         reason = (
-            "交易所断腿尘埃处置|Binance小额资产转BNB|"
+            f"{reason_prefix}|Binance小额资产转BNB|"
             f"asset={conversion.get('asset')}|qty={conversion.get('source_qty')}|"
             f"bnb={conversion.get('bnb_qty')}|tran_id={conversion.get('transaction_id')}|"
             f"关联风险={risk.get('type', 'unknown')}"
@@ -258,14 +308,32 @@ class ExchangeDesyncRemediator:
                 close_reason = CONCAT(COALESCE(close_reason, ''), '|', %s),
                 spot_close_price = %s,
                 spot_close_amount = spot_open_qty * %s,
-                exchange_risk_status = 'resolved'
+                exchange_risk_status = CASE
+                    WHEN exchange_risk_status = 'desynced' THEN 'resolved'
+                    ELSE exchange_risk_status
+                END
             WHERE id IN ({placeholders})
               AND status = 'holding'
-              AND exchange_risk_status = 'desynced'
         """
         price = _float(conversion.get('exec_price_usdt')) or None
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, (datetime.now(), reason, price, price, *ids))
+
+    def _load_post_close_spot_dust_positions(self, base_asset: str) -> List[Dict]:
+        sql = """
+            SELECT p.*
+            FROM mi_trade_position p
+            WHERE p.status = 'holding'
+              AND UPPER(p.base_asset) = %s
+              AND p.spot_open_qty > 0
+              AND p.future_open_qty <= 0.00000001
+              AND p.future_open_contracts = 0
+              AND p.close_reason LIKE '%%部分平仓保留剩余%%'
+            ORDER BY p.opened_at ASC, p.id ASC
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, (base_asset,))
+            return cursor.fetchall()
 
     def remediate_gate_extra_position(
         self,
@@ -975,9 +1043,14 @@ class ExchangeDesyncRemediator:
             UPDATE mi_trade_position
             SET exchange_risk_detail = CONCAT(COALESCE(exchange_risk_detail, ''), '|', %(message)s)
             WHERE id = %(position_id)s
+              AND COALESCE(exchange_risk_detail, '') NOT LIKE %(message_like)s
         """
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, {'message': message, 'position_id': position_id})
+            cursor.execute(sql, {
+                'message': message,
+                'message_like': f'%{message}%',
+                'position_id': position_id,
+            })
 
     def _mark_positions_exchange_risk(self, positions: List[Dict], risk: Dict):
         ids = [int(row['id']) for row in positions if row.get('id') is not None]

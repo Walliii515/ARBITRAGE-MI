@@ -56,6 +56,72 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertFalse(rows[0]['is_match'])
         self.assertAlmostEqual(rows[0]['diff_value'], 0.1)
 
+    def test_matched_post_close_spot_dust_is_sent_to_shared_remediator(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_post_close_spot_dust = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'convert_binance_dust_to_bnb',
+        })
+
+        results = reconciler._auto_remediate_post_close_spot_dust(
+            binance_rows=[{
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'FRAX',
+                'local_value': 0.18,
+                'exchange_value': 0.18,
+                'is_match': True,
+            }],
+            gate_rows=[{
+                'exchange': 'gate',
+                'dimension': 'position',
+                'base_asset': 'FRAX',
+                'local_value': 0.0,
+                'exchange_value': 0.0,
+                'is_match': True,
+            }],
+        )
+
+        self.assertEqual(len(results), 1)
+        reconciler.remediator.remediate_post_close_spot_dust.assert_called_once_with(
+            base_asset='FRAX',
+            local_spot_qty=0.18,
+            exchange_spot_qty=0.18,
+        )
+
+    def test_post_close_spot_dust_is_not_touched_while_gate_position_remains(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_post_close_spot_dust = MagicMock()
+
+        results = reconciler._auto_remediate_post_close_spot_dust(
+            binance_rows=[{
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'FRAX',
+                'local_value': 0.18,
+                'exchange_value': 0.18,
+                'is_match': True,
+            }],
+            gate_rows=[{
+                'exchange': 'gate',
+                'dimension': 'position',
+                'base_asset': 'FRAX',
+                'local_value': 1.0,
+                'exchange_value': 1.0,
+                'is_match': True,
+            }],
+        )
+
+        self.assertEqual(results, [])
+        reconciler.remediator.remediate_post_close_spot_dust.assert_not_called()
+
     def test_gate_risk_type_from_values(self):
         self.assertEqual(
             Reconciler._gate_risk_type_from_values(local_value=10, exchange_value=0),
@@ -719,6 +785,82 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(result['success_count'], 2)
         executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
         remediator._close_positions_after_dust_conversion.assert_called_once()
+
+    def test_post_close_full_asset_dust_converts_to_bnb_and_closes_normal_positions(self):
+        class FakeExecutor:
+            spot_meta = {'FRAX': {'min_notional': 5.0, 'step_size': 0.01}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock(return_value={
+                    'success': True,
+                    'asset': 'FRAX',
+                    'source_qty': 0.18,
+                    'bnb_qty': 0.000001,
+                    'transaction_id': 'dust-frax',
+                    'exec_price_usdt': 0.31,
+                })
+
+        positions = [{
+            'id': position_id,
+            'base_asset': 'FRAX',
+            'spot_open_qty': 0.09,
+            'spot_open_price': 0.312,
+            'future_open_qty': 0.0,
+            'future_open_contracts': 0,
+            'exchange_risk_status': 'normal',
+        } for position_id in (406, 407)]
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_post_close_spot_dust_positions = MagicMock(return_value=positions)
+        remediator._load_binance_available_qty = MagicMock(return_value=0.18)
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.31)
+        remediator._close_positions_after_dust_conversion = MagicMock()
+
+        result = remediator.remediate_post_close_spot_dust(
+            'FRAX',
+            local_spot_qty=0.18,
+            exchange_spot_qty=0.18,
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['success_count'], 2)
+        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('FRAX')
+        remediator._close_positions_after_dust_conversion.assert_called_once()
+
+    def test_post_close_dust_does_not_convert_unrelated_exchange_spot(self):
+        class FakeExecutor:
+            spot_meta = {'FRAX': {'min_notional': 5.0, 'step_size': 0.01}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock()
+
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_post_close_spot_dust_positions = MagicMock(return_value=[{
+            'id': 407,
+            'base_asset': 'FRAX',
+            'spot_open_qty': 0.09,
+            'spot_open_price': 0.312,
+            'future_open_qty': 0.0,
+            'future_open_contracts': 0,
+        }])
+        remediator._load_binance_available_qty = MagicMock(return_value=0.18)
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.31)
+
+        result = remediator.remediate_post_close_spot_dust(
+            'FRAX',
+            local_spot_qty=0.09,
+            exchange_spot_qty=0.18,
+        )
+
+        self.assertFalse(result['attempted'])
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
 
     def test_dust_conversion_does_not_touch_asset_with_unrelated_spot_balance(self):
         class FakeExecutor:

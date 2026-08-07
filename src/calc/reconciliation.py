@@ -181,6 +181,9 @@ class Reconciler:
                 gate_risks = self._mark_gate_desync_risks(snapshot_at, gate_rows)
             if self.cfg.auto_remediate_enabled:
                 remediation_results.extend(self._auto_remediate_gate_risks(snapshot_at, gate_risks, binance_rows))
+                remediation_results.extend(
+                    self._auto_remediate_post_close_spot_dust(binance_rows, gate_rows)
+                )
             rows.extend(gate_rows)
         except Exception as e:
             logger.warning(f'Gate 期货对账拉取失败: {e}', exc_info=True)
@@ -596,6 +599,46 @@ class Reconciler:
 
             self._record_reconciliation_risk_event(snapshot_at, item, result)
             results.append(result)
+        return results
+
+    def _auto_remediate_post_close_spot_dust(
+        self,
+        binance_rows: List[Dict],
+        gate_rows: List[Dict],
+    ) -> List[Dict]:
+        """Retire matched spot dust only after both local and exchange Gate positions are zero."""
+        gate_by_asset = {
+            str(row.get('base_asset') or '').upper(): row
+            for row in gate_rows
+            if row.get('exchange') == 'gate' and row.get('dimension') == 'position'
+        }
+        results: List[Dict] = []
+        for spot_row in binance_rows:
+            if spot_row.get('exchange') != 'binance' or spot_row.get('dimension') != 'position':
+                continue
+            if not spot_row.get('is_match'):
+                continue
+            local_spot_qty = float(spot_row.get('local_value') or 0)
+            exchange_spot_qty = float(spot_row.get('exchange_value') or 0)
+            if local_spot_qty <= BINANCE_SPOT_TOLERANCE or exchange_spot_qty <= BINANCE_SPOT_TOLERANCE:
+                continue
+
+            base_asset = str(spot_row.get('base_asset') or '').upper()
+            gate_row = gate_by_asset.get(base_asset)
+            if not gate_row or not gate_row.get('is_match'):
+                continue
+            if abs(float(gate_row.get('local_value') or 0)) > 1e-9:
+                continue
+            if abs(float(gate_row.get('exchange_value') or 0)) > 1e-9:
+                continue
+
+            result = self.remediator.remediate_post_close_spot_dust(
+                base_asset=base_asset,
+                local_spot_qty=local_spot_qty,
+                exchange_spot_qty=exchange_spot_qty,
+            )
+            if result.get('attempted'):
+                results.append(result)
         return results
 
     def _auto_remediate_binance_spot_for_gate_extra(
