@@ -154,6 +154,14 @@ class ExchangeDesyncRemediator:
         if local_spot_qty <= 0 or exchange_spot_qty <= 0:
             return {'attempted': False, 'reason': 'spot_qty<=0'}
 
+        cooldown_remaining = self._dust_conversion_cooldown_remaining_sec()
+        if cooldown_remaining > 0:
+            return {
+                'attempted': False,
+                'reason': 'binance_dust_conversion_cooldown',
+                'cooldown_remaining_sec': cooldown_remaining,
+            }
+
         positions = self._load_post_close_spot_dust_positions(base_asset)
         if not positions:
             return {'attempted': False, 'reason': 'no_post_close_spot_dust_positions'}
@@ -334,6 +342,25 @@ class ExchangeDesyncRemediator:
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, (base_asset,))
             return cursor.fetchall()
+
+    @staticmethod
+    def _dust_conversion_cooldown_remaining_sec() -> float:
+        """Binance accepts at most one dust conversion request per account each hour."""
+        sql = """
+            SELECT MAX(closed_at) AS last_converted_at
+            FROM mi_trade_position
+            WHERE status = 'closed'
+              AND closed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+              AND close_reason LIKE '%%Binance小额资产转BNB%%'
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone() or {}
+        last_converted_at = row.get('last_converted_at')
+        if not last_converted_at:
+            return 0.0
+        elapsed = (datetime.now() - last_converted_at).total_seconds()
+        return max(0.0, 3600.0 - elapsed)
 
     def remediate_gate_extra_position(
         self,

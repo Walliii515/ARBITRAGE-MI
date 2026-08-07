@@ -815,6 +815,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             ExchangeDesyncRemediationConfig(enabled=True),
         )
         remediator._load_post_close_spot_dust_positions = MagicMock(return_value=positions)
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=0.0)
         remediator._load_binance_available_qty = MagicMock(return_value=0.18)
         remediator._estimate_binance_spot_price = MagicMock(return_value=0.31)
         remediator._close_positions_after_dust_conversion = MagicMock()
@@ -850,6 +851,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'future_open_qty': 0.0,
             'future_open_contracts': 0,
         }])
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=0.0)
         remediator._load_binance_available_qty = MagicMock(return_value=0.18)
         remediator._estimate_binance_spot_price = MagicMock(return_value=0.31)
 
@@ -860,6 +862,32 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         )
 
         self.assertFalse(result['attempted'])
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
+
+    def test_post_close_dust_respects_binance_hourly_conversion_cooldown(self):
+        class FakeExecutor:
+            spot_meta = {'HEI': {'min_notional': 5.0, 'step_size': 0.0001}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock()
+
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=3590.0)
+        remediator._load_post_close_spot_dust_positions = MagicMock()
+
+        result = remediator.remediate_post_close_spot_dust(
+            'HEI',
+            local_spot_qty=0.1568,
+            exchange_spot_qty=0.1568,
+        )
+
+        self.assertFalse(result['attempted'])
+        self.assertEqual(result['reason'], 'binance_dust_conversion_cooldown')
+        remediator._load_post_close_spot_dust_positions.assert_not_called()
         executor.convert_binance_spot_dust_to_bnb.assert_not_called()
 
     def test_dust_conversion_does_not_touch_asset_with_unrelated_spot_balance(self):
