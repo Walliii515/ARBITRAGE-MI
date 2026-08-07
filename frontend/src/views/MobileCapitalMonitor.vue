@@ -4,7 +4,7 @@ import type { ECharts, EChartsOption } from 'echarts'
 import { get } from '../utils/request'
 
 type Exchange = 'binance' | 'gate' | 'total'
-type PeriodDays = 7 | 30 | 90
+type PeriodDays = 1 | 3 | 7 | 30 | 90
 
 interface CapitalRow {
   snapshot_at: string
@@ -56,6 +56,8 @@ let chartTimer: ReturnType<typeof setInterval> | null = null
 let requestVersion = 0
 
 const periodOptions: Array<{ value: PeriodDays; label: string }> = [
+  { value: 1, label: '1天' },
+  { value: 3, label: '3天' },
   { value: 7, label: '7天' },
   { value: 30, label: '30天' },
   { value: 90, label: '90天' },
@@ -106,6 +108,14 @@ const annualizedHint = computed(() => {
   return `近 ${annualized.value.period_days} 天`
 })
 
+const todayRealizedValue = computed(() => {
+  const today = localDateKey(new Date())
+  const row = dailyRows.value
+    .filter((item) => item.exchange === 'total' && localDateKey(parseDate(item.snapshot_at)) === today)
+    .at(-1)
+  return row?.daily_realized_pnl_usdt ?? null
+})
+
 function isFiniteNumber(value: unknown): boolean {
   return value !== null && value !== undefined && Number.isFinite(Number(value))
 }
@@ -143,6 +153,15 @@ function formatTime(date: Date): string {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
+function localDateKey(date: Date | null): string {
+  if (!date) return ''
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-')
+}
+
 function axisTime(value: string): string {
   const date = parseDate(value)
   if (!date) return value
@@ -178,12 +197,14 @@ async function readJson(url: string): Promise<any> {
 
 async function fetchSummary(silent = false) {
   try {
-    const [latest, liveRisk] = await Promise.all([
+    const [latest, liveRisk, annualizedData] = await Promise.all([
       readJson('/api/trading/capital/latest'),
       readJson('/api/trading/capital/gate-cross-risk/live'),
+      readJson('/api/trading/capital/annualized-return?days=7'),
     ])
     latestRows.value = latest.rows || []
     gateRisk.value = liveRisk.risk || null
+    annualized.value = annualizedData
     lastUpdatedAt.value = new Date()
     if (!silent) errorMessage.value = ''
   } catch (error: any) {
@@ -204,13 +225,11 @@ async function fetchPeriodData() {
   const days = selectedDays.value
   const version = ++requestVersion
   try {
-    const [annualizedData, equityData, dailyData] = await Promise.all([
-      readJson(`/api/trading/capital/annualized-return?days=${days}`),
+    const [equityData, dailyData] = await Promise.all([
       readJson(`/api/trading/capital/history?days=${days}&exchange=total&metric=equity_usdt`),
       readJson(`/api/trading/capital/history?days=${days}&exchange=total&metric=daily_return`),
     ])
     if (version !== requestVersion) return
-    annualized.value = annualizedData
     equityRows.value = equityData.rows || []
     dailyRows.value = dailyData.rows || []
     errorMessage.value = ''
@@ -284,7 +303,9 @@ function updateEquityChart() {
 
 function updateDailyChart() {
   if (!dailyChart) return
-  const rows = dailyRows.value.filter((row) => row.exchange === 'total')
+  const rows = dailyRows.value
+    .filter((row) => row.exchange === 'total')
+    .slice(-selectedDays.value)
   const option = baseChartOption()
   option.grid = { top: 28, right: 48, bottom: 34, left: 48 }
   option.legend = { top: 0, right: 0, itemWidth: 12, itemHeight: 8, textStyle: { color: '#8b98aa', fontSize: 10 } }
@@ -392,6 +413,30 @@ onBeforeUnmount(() => {
 
     <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
 
+    <section class="total-card" :aria-busy="loading">
+      <div class="total-card-title">
+        <span class="exchange-dot total"></span>
+        <h2>总计</h2>
+      </div>
+      <div class="total-primary-metric">
+        <span>总资产</span>
+        <strong>{{ formatAmount(latestByExchange.total?.equity_usdt) }}</strong>
+        <small>USDT</small>
+      </div>
+      <div class="total-secondary-grid">
+        <div>
+          <span>今日已实现</span>
+          <strong :class="valueClass(todayRealizedValue)">{{ signedAmount(todayRealizedValue) }}</strong>
+          <small>USDT</small>
+        </div>
+        <div>
+          <span>已实现年化</span>
+          <strong :class="valueClass(annualizedValue)">{{ formatPercent(annualizedValue) }}</strong>
+          <small>{{ annualizedHint }}</small>
+        </div>
+      </div>
+    </section>
+
     <section class="exchange-grid" :aria-busy="loading">
       <article v-for="exchange in (['binance', 'gate'] as const)" :key="exchange" class="exchange-card">
         <div class="exchange-title">
@@ -407,27 +452,14 @@ onBeforeUnmount(() => {
           <span>可用资金</span>
           <strong>{{ formatAmount(latestByExchange[exchange]?.available_usdt) }} <small>USDT</small></strong>
         </div>
+        <div v-if="exchange === 'gate'" class="secondary-metric gate-mmr-metric">
+          <span>全仓 MMR <i :class="mmrClass(displayedRiskStatus)">{{ displayedRiskLabel }}</i></span>
+          <strong :class="mmrClass(displayedRiskStatus)">{{ formatPercent(displayedMmr, 1) }}</strong>
+        </div>
         <div v-if="exchange === 'binance'" class="secondary-metric">
           <span>BNB 可用</span>
           <strong>{{ formatBnb(latestByExchange.binance?.bnb_available) }} <small>BNB</small></strong>
         </div>
-      </article>
-    </section>
-
-    <section class="highlight-grid">
-      <article class="highlight-card">
-        <div class="highlight-label">
-          <span>Gate 全仓 MMR</span>
-          <i :class="mmrClass(displayedRiskStatus)">{{ displayedRiskLabel }}</i>
-        </div>
-        <strong :class="mmrClass(displayedRiskStatus)">{{ formatPercent(displayedMmr, 1) }}</strong>
-        <small>500% 停止开仓 · 300% 风险退出</small>
-      </article>
-
-      <article class="highlight-card">
-        <div class="highlight-label"><span>已实现年化</span></div>
-        <strong :class="valueClass(annualizedValue)">{{ formatPercent(annualizedValue) }}</strong>
-        <small>{{ annualizedHint }}</small>
       </article>
     </section>
 
@@ -551,15 +583,14 @@ footer {
   line-height: 1.45;
 }
 
-.exchange-grid,
-.highlight-grid {
+.exchange-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
+.total-card,
 .exchange-card,
-.highlight-card,
 .chart-card {
   min-width: 0;
   border: 1px solid var(--mobile-border);
@@ -568,6 +599,22 @@ footer {
   box-shadow: 0 10px 30px rgba(0, 0, 0, .13);
 }
 
+.total-card { padding: 15px; }
+.total-card-title { display: flex; align-items: center; gap: 7px; }
+.total-card-title h2 { font-size: 14px; font-weight: 680; }
+.exchange-dot.total { background: #76b4ff; box-shadow: 0 0 10px rgba(118, 180, 255, .55); }
+.total-primary-metric { margin: 15px 0 13px; }
+.total-primary-metric > span,
+.total-secondary-grid span { display: block; color: var(--mobile-muted); font-size: 11px; }
+.total-primary-metric > strong { display: inline-block; margin-top: 4px; font-size: clamp(29px, 8vw, 36px); font-weight: 760; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+.total-primary-metric > small { margin-left: 5px; color: var(--mobile-muted); font-size: 9px; }
+.total-secondary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid > div { min-width: 0; padding-top: 11px; }
+.total-secondary-grid > div + div { margin-left: 13px; padding-left: 13px; border-left: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid strong { display: block; margin-top: 5px; overflow: hidden; font-size: 17px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.total-secondary-grid small { display: block; min-height: 14px; margin-top: 2px; color: var(--mobile-muted); font-size: 9px; line-height: 1.4; }
+
+.exchange-grid { margin-top: 10px; }
 .exchange-card { padding: 14px 13px 12px; }
 .exchange-title { display: flex; align-items: center; gap: 7px; }
 .exchange-title h2 { font-size: 13px; font-weight: 650; }
@@ -585,13 +632,8 @@ footer {
 .secondary-metric + .secondary-metric { margin-top: 8px; }
 .secondary-metric strong { min-width: 0; overflow: hidden; font-size: 12px; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .secondary-metric small { color: var(--mobile-muted); font-size: 8px; font-weight: 500; }
-
-.highlight-grid { margin-top: 10px; }
-.highlight-card { padding: 13px; }
-.highlight-label { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
-.highlight-label i { overflow: hidden; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-.highlight-card > strong { display: block; margin: 11px 0 5px; font-size: clamp(23px, 6.4vw, 29px); font-weight: 750; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
-.highlight-card > small { display: block; min-height: 26px; color: var(--mobile-muted); font-size: 9px; line-height: 1.45; }
+.gate-mmr-metric > span { display: inline-flex; align-items: center; gap: 4px; }
+.gate-mmr-metric i { font-size: 9px; font-style: normal; }
 
 .safe,
 .positive { color: #35d39a !important; }
@@ -602,7 +644,7 @@ footer {
 
 .period-selector {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 4px;
   margin: 16px 0 10px;
   padding: 4px;
@@ -638,8 +680,8 @@ footer { padding: 18px 0 4px; text-align: center; }
 @media (max-width: 350px) {
   .mobile-capital-page { padding-inline: 10px; }
   .mobile-header { margin-inline: -10px; }
-  .exchange-grid, .highlight-grid { gap: 7px; }
-  .exchange-card, .highlight-card { padding-inline: 10px; }
+  .exchange-grid { gap: 7px; }
+  .exchange-card { padding-inline: 10px; }
 }
 
 @media (min-width: 700px) {
