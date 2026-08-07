@@ -34,7 +34,8 @@ export async function request(url: string, options: RequestOptions = {}): Promis
     if (response.status === 401) {
       removeToken()
       ElMessage.error('登录已过期,请重新登录')
-      router.push({ name: 'login' })
+      const currentPath = router.currentRoute.value.fullPath
+      router.push({ name: 'login', query: { redirect: currentPath } })
       throw new Error('未授权')
     }
     

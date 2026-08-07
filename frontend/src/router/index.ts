@@ -81,6 +81,12 @@ const router = createRouter({
       component: () => import('../views/CapitalMonitor.vue'),
     },
     {
+      path: '/mobile/capital',
+      name: 'mobile-capital',
+      component: () => import('../views/MobileCapitalMonitor.vue'),
+      meta: { standalone: true },
+    },
+    {
       path: '/connections',
       name: 'connections',
       component: () => import('../views/ConnectionStatus.vue'),
@@ -114,7 +120,7 @@ router.beforeEach((to) => {
   
   if (!loggedIn && to.name !== 'login') {
     // 未登录且访问的不是登录页 -> 跳转登录
-    return { name: 'login' }
+    return { name: 'login', query: { redirect: to.fullPath } }
   }
 
   if (loggedIn && to.name === 'login') {

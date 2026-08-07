@@ -42,6 +42,9 @@ const NOTIFICATION_SYNC_INTERVAL_MS = 10 * 1000
 
 // 判断是否为登录页
 const isLoginPage = computed(() => route.name === 'login')
+const isStandalonePage = computed(() => route.meta.standalone === true)
+const isShelllessPage = computed(() => isLoginPage.value || isStandalonePage.value)
+const isAppShellPage = computed(() => !isShelllessPage.value)
 
 // ───── 成交引擎模式标识 ─────
 type TradingMode = 'virtual' | 'testnet' | 'mainnet' | 'unknown'
@@ -69,7 +72,7 @@ const notificationCount = computed(() => notificationUnreadCount.value)
 const notificationHasMore = computed(() => notificationPagination.value.page < notificationPagination.value.total_pages)
 
 async function refreshNotificationHistory(syncRecent = true, showLoading = false) {
-  if (isLoginPage.value || notificationRefreshing.value) return
+  if (!isAppShellPage.value || notificationRefreshing.value) return
   notificationRefreshing.value = true
   const useLoadingState = showLoading && notificationHistory.value.length === 0
   if (useLoadingState) notificationLoading.value = true
@@ -161,7 +164,7 @@ function handleNotificationPopoverShow() {
 }
 
 async function syncNotificationHistoryIfChanged() {
-  if (isLoginPage.value || notificationRefreshing.value) return
+  if (!isAppShellPage.value || notificationRefreshing.value) return
   try {
     const unreadCount = await getPopupNotificationUnreadCount()
     if (unreadCount !== notificationUnreadCount.value) {
@@ -432,16 +435,16 @@ function stopRiskAlertTimer() {
 
 const notificationHistoryChangeHandler = () => void refreshNotificationHistory(false)
 const notificationVisibilityChangeHandler = () => {
-  if (document.visibilityState === 'visible') {
+  if (isAppShellPage.value && document.visibilityState === 'visible') {
     void syncNotificationHistoryIfChanged()
   }
 }
 
 onMounted(() => {
-  void refreshNotificationHistory(true, true)
+  if (isAppShellPage.value) void refreshNotificationHistory(true, true)
   window.addEventListener(POPUP_NOTIFICATION_HISTORY_EVENT, notificationHistoryChangeHandler)
   document.addEventListener('visibilitychange', notificationVisibilityChangeHandler)
-  if (!isLoginPage.value) {
+  if (isAppShellPage.value) {
     startOpenPauseStatusTimer()
     startListingAlertTimer()
     startRiskAlertTimer()
@@ -449,8 +452,8 @@ onMounted(() => {
   }
 })
 
-watch(isLoginPage, (loginPage) => {
-  if (loginPage) {
+watch(isAppShellPage, (appShellPage) => {
+  if (!appShellPage) {
     stopOpenPauseStatusTimer()
     stopListingAlertTimer()
     stopRiskAlertTimer()
@@ -492,8 +495,8 @@ function toggleMenu() {
 </script>
 
 <template>
-  <!-- 登录页不显示侧边栏 -->
-  <router-view v-if="isLoginPage" />
+  <!-- 登录页与独立移动页不显示侧边栏 -->
+  <router-view v-if="isShelllessPage" />
   
   <!-- 其他页面显示完整布局 -->
   <el-container v-else class="app-container">

@@ -1,5 +1,6 @@
 import { BarChart, LineChart } from 'echarts/charts'
 import {
+  DataZoomComponent,
   GridComponent,
   LegendComponent,
   TooltipComponent,
@@ -10,6 +11,7 @@ import { CanvasRenderer } from 'echarts/renderers'
 use([
   BarChart,
   LineChart,
+  DataZoomComponent,
   GridComponent,
   LegendComponent,
   TooltipComponent,

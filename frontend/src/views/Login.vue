@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { User, Lock } from '@element-plus/icons-vue'
 import { setToken } from '../utils/auth'
 import { ElMessage } from 'element-plus'
 
 const router = useRouter()
+const route = useRoute()
 const loginForm = ref({
   username: '',
   password: ''
@@ -36,7 +37,9 @@ async function handleLogin() {
     const data = await response.json()
     setToken(data.token)
     ElMessage.success('登录成功')
-    router.push('/')
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+    const destination = redirect.startsWith('/') && !redirect.startsWith('//') ? redirect : '/'
+    router.replace(destination)
   } catch (error: any) {
     ElMessage.error(error.message || '登录失败')
   } finally {
