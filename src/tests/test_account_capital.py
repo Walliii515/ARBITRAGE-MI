@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from calc.account_capital import (
     AccountCapitalConfig,
     AccountCapitalSnapshotter,
+    BinanceBnbBalanceNotifier,
     GateCrossRiskNotifier,
     build_default_capital_snapshotter,
     rebuild_capital_daily_summaries,
@@ -416,6 +417,79 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         with patch('calc.account_capital.upsert_popup_notification') as upsert:
             first = notifier.record(datetime(2026, 7, 16, 11, 1, 0), risk)
             duplicate = notifier.record(datetime(2026, 7, 16, 11, 2, 0), risk)
+
+        self.assertEqual(first, 1)
+        self.assertEqual(duplicate, 0)
+        upsert.assert_called_once()
+
+    def test_binance_bnb_notification_warns_when_fee_asset_value_is_low(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(),
+            AccountCapitalConfig(binance_bnb_min_available_usdt=1.0),
+        )
+        binance = {
+            'detail': {
+                'bnb_fee_asset': {
+                    'free': 0.001,
+                    'price_usdt': 500,
+                    'free_value_usdt': 0.5,
+                },
+            },
+        }
+
+        item = snapshotter._build_binance_bnb_notification(
+            datetime(2026, 8, 7, 12, 0, 0),
+            binance,
+        )
+
+        self.assertEqual(item['title'], 'Binance BNB 可用不足')
+        self.assertEqual(item['type'], 'warning')
+        self.assertEqual(item['source'], 'binance_bnb_balance')
+        self.assertEqual(item['dedup_key'], 'binance_bnb_balance:low:20260807120000')
+        self.assertIn('BNB可用价值=0.50 USDT', item['message'])
+        self.assertIn('阈值=1.00 USDT', item['message'])
+        self.assertEqual(item['payload']['free_bnb'], 0.001)
+        self.assertEqual(item['payload']['free_value_usdt'], 0.5)
+
+    def test_binance_bnb_notification_is_silent_when_balance_is_enough(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(),
+            AccountCapitalConfig(binance_bnb_min_available_usdt=1.0),
+        )
+        binance = {
+            'detail': {
+                'bnb_fee_asset': {
+                    'free': 0.01,
+                    'price_usdt': 500,
+                    'free_value_usdt': 5.0,
+                },
+            },
+        }
+
+        item = snapshotter._build_binance_bnb_notification(
+            datetime(2026, 8, 7, 12, 0, 0),
+            binance,
+        )
+
+        self.assertIsNone(item)
+
+    def test_binance_bnb_notifier_skips_same_cooldown_bucket(self):
+        notifier = BinanceBnbBalanceNotifier(AccountCapitalConfig(
+            binance_bnb_notify_cooldown_sec=3600,
+        ))
+        binance = {
+            'detail': {
+                'bnb_fee_asset': {
+                    'free': 0.001,
+                    'price_usdt': 500,
+                    'free_value_usdt': 0.5,
+                },
+            },
+        }
+
+        with patch('calc.account_capital.upsert_popup_notification') as upsert:
+            first = notifier.record(datetime(2026, 8, 7, 12, 1, 0), binance)
+            duplicate = notifier.record(datetime(2026, 8, 7, 12, 2, 0), binance)
 
         self.assertEqual(first, 1)
         self.assertEqual(duplicate, 0)

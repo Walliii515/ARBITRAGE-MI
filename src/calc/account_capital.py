@@ -44,6 +44,9 @@ class AccountCapitalConfig:
     gate_cross_warning_notify_cooldown_sec: int = 3600
     gate_cross_danger_notify_cooldown_sec: int = 300
     gate_cross_unknown_notify_cooldown_sec: int = 300
+    binance_bnb_notify_enabled: bool = True
+    binance_bnb_min_available_usdt: float = 1.0
+    binance_bnb_notify_cooldown_sec: int = 3600
 
 
 class GateCrossRiskNotifier:
@@ -135,6 +138,74 @@ class GateCrossRiskNotifier:
         }
 
 
+class BinanceBnbBalanceNotifier:
+    """Write low-BNB fee-asset alerts without repeatedly inserting the same bucket."""
+
+    def __init__(self, cfg: Optional[AccountCapitalConfig] = None):
+        self.cfg = cfg or AccountCapitalConfig()
+        self._last_recorded_dedup_key: Optional[str] = None
+
+    def record(self, event_at: datetime, binance_row: Dict) -> int:
+        item = self.build_notification(event_at, binance_row)
+        if not item:
+            return 0
+        dedup_key = item.get('dedup_key')
+        if dedup_key and dedup_key == self._last_recorded_dedup_key:
+            return 0
+        try:
+            upsert_popup_notification(**item)
+            self._last_recorded_dedup_key = dedup_key
+            return 1
+        except Exception as exc:
+            logger.warning(
+                "Binance BNB 余额铃铛消息写入失败 | free_value_usdt=%s error=%s",
+                (item.get('payload') or {}).get('free_value_usdt'),
+                exc,
+                exc_info=True,
+            )
+            return 0
+
+    def build_notification(self, event_at: datetime, binance_row: Dict) -> Optional[Dict]:
+        if not self.cfg.binance_bnb_notify_enabled:
+            return None
+
+        bnb = _capital_detail(binance_row).get('bnb_fee_asset') or {}
+        if not isinstance(bnb, dict):
+            return None
+
+        free_value_usdt = _float_or_none(bnb.get('free_value_usdt'))
+        threshold_usdt = float(self.cfg.binance_bnb_min_available_usdt or 0)
+        if free_value_usdt is None or free_value_usdt >= threshold_usdt:
+            return None
+
+        free_bnb = _float_or_none(bnb.get('free'))
+        price_usdt = _float_or_none(bnb.get('price_usdt'))
+        cooldown = max(int(self.cfg.binance_bnb_notify_cooldown_sec or 0), 1)
+        return {
+            'title': 'Binance BNB 可用不足',
+            'message': ' | '.join([
+                f"BNB可用价值={_format_usdt(free_value_usdt)}",
+                f"阈值={_format_usdt(threshold_usdt)}",
+                f"BNB可用数量={_format_number(free_bnb, 6)}",
+                f"BNB价格={_format_usdt(price_usdt)}",
+                '请及时买入 BNB 以覆盖 Binance 手续费抵扣',
+            ]),
+            'type': 'warning',
+            'source': 'binance_bnb_balance',
+            'dedup_key': (
+                "binance_bnb_balance:low:"
+                f"{_notification_bucket(event_at, cooldown)}"
+            ),
+            'event_at': event_at,
+            'payload': {
+                'free_bnb': free_bnb,
+                'free_value_usdt': free_value_usdt,
+                'threshold_usdt': threshold_usdt,
+                'price_usdt': price_usdt,
+            },
+        }
+
+
 def build_default_gate_cross_risk_notifier() -> GateCrossRiskNotifier:
     return GateCrossRiskNotifier(AccountCapitalConfig(
         gate_cross_notify_enabled=config.get_bool(
@@ -221,6 +292,18 @@ def build_default_capital_snapshotter(
                 'account_capital.gate_cross_risk.unknown_notification_cooldown_sec',
                 300,
             ),
+            binance_bnb_notify_enabled=config.get_bool(
+                'account_capital.binance_bnb.notification_enabled',
+                True,
+            ),
+            binance_bnb_min_available_usdt=config.get_float(
+                'account_capital.binance_bnb.min_available_usdt',
+                1.0,
+            ),
+            binance_bnb_notify_cooldown_sec=config.get_int(
+                'account_capital.binance_bnb.notification_cooldown_sec',
+                3600,
+            ),
         ),
         gate_cross_risk_provider=gate_cross_risk_provider,
     )
@@ -239,6 +322,7 @@ class AccountCapitalSnapshotter:
         self.cfg = cfg or AccountCapitalConfig()
         self._gate_cross_risk_provider = gate_cross_risk_provider
         self._gate_cross_risk_notifier = GateCrossRiskNotifier(self.cfg)
+        self._binance_bnb_notifier = BinanceBnbBalanceNotifier(self.cfg)
 
     def run_once(self, strategy_pnl_summary: Optional[Dict] = None) -> Dict:
         snapshot_at = datetime.now()
@@ -248,13 +332,17 @@ class AccountCapitalSnapshotter:
         total = self._build_total_row(snapshot_at, binance, gate, pnl)
         rows = [binance, gate, total]
         self._insert_rows(rows)
-        notification_count = self._record_gate_cross_risk_notification(snapshot_at, gate)
+        gate_notification_count = self._record_gate_cross_risk_notification(snapshot_at, gate)
+        bnb_notification_count = self._record_binance_bnb_notification(snapshot_at, binance)
         self.cleanup_old_snapshots()
         return {
             'success': True,
             'snapshot_at': snapshot_at.strftime('%Y-%m-%d %H:%M:%S'),
             'summary': self.rows_to_summary(rows),
-            'notifications': {'gate_cross_risk': notification_count},
+            'notifications': {
+                'gate_cross_risk': gate_notification_count,
+                'binance_bnb_balance': bnb_notification_count,
+            },
         }
 
     def get_latest_summary(self) -> Optional[Dict]:
@@ -489,6 +577,12 @@ class AccountCapitalSnapshotter:
 
     def _build_gate_cross_risk_notification(self, snapshot_at: datetime, risk: Dict) -> Optional[Dict]:
         return self._gate_cross_risk_notifier.build_notification(snapshot_at, risk)
+
+    def _record_binance_bnb_notification(self, snapshot_at: datetime, binance_row: Dict) -> int:
+        return self._binance_bnb_notifier.record(snapshot_at, binance_row)
+
+    def _build_binance_bnb_notification(self, snapshot_at: datetime, binance_row: Dict) -> Optional[Dict]:
+        return self._binance_bnb_notifier.build_notification(snapshot_at, binance_row)
 
     def _build_total_row(self, snapshot_at: datetime, binance: Dict, gate: Dict, pnl: Dict) -> Dict:
         realized_pnl = _float(binance.get('realized_pnl_usdt')) + _float(gate.get('realized_pnl_usdt'))

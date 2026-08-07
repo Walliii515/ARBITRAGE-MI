@@ -1548,6 +1548,13 @@ onBeforeUnmount(() => {
               <span v-if="hasAmount(latestByExchange[exchange]?.account_unrealized_pnl_usdt)" class="metric-unit">USDT</span>
             </strong>
           </div>
+          <div class="equity-breakdown-item">
+            <span>已实现盈亏</span>
+            <strong :class="Number(latestByExchange[exchange]?.realized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
+              <span>{{ formatAmount(latestByExchange[exchange]?.realized_pnl_usdt) }}</span>
+              <span v-if="hasAmount(latestByExchange[exchange]?.realized_pnl_usdt)" class="metric-unit">USDT</span>
+            </strong>
+          </div>
         </div>
         <div class="metric-row available-row">
           <span class="metric-label-with-help">
@@ -1596,13 +1603,6 @@ onBeforeUnmount(() => {
             <span class="metric-separator">/ ≈</span>
             <span>{{ formatAmount(latestByExchange.binance?.bnb_available_usdt) }}</span>
             <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
-          </strong>
-        </div>
-        <div v-if="showSummaryDetails" class="metric-row">
-          <span>已实现盈亏</span>
-          <strong :class="Number(latestByExchange[exchange]?.realized_pnl_usdt || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'">
-            <span>{{ formatAmount(latestByExchange[exchange]?.realized_pnl_usdt) }}</span>
-            <span v-if="hasAmount(latestByExchange[exchange]?.realized_pnl_usdt)" class="metric-unit">USDT</span>
           </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
