@@ -44,6 +44,10 @@ interface AnnualizedReturn {
   realized_available_days?: number | null
 }
 
+interface ReconciliationRow {
+  is_match: boolean | number | null
+}
+
 interface FundTransferTask {
   id: number
   status: string
@@ -75,6 +79,7 @@ const equityRows = ref<CapitalRow[]>([])
 const dailyRows = ref<CapitalRow[]>([])
 const gateRisk = ref<GateCrossRisk | null>(null)
 const annualized = ref<AnnualizedReturn | null>(null)
+const reconciliationRows = ref<ReconciliationRow[]>([])
 const selectedDays = ref<PeriodDays>(7)
 const loading = ref(true)
 const refreshing = ref(false)
@@ -169,6 +174,19 @@ const annualizedHint = computed(() => {
   }
   return `近 ${annualized.value.period_days} 天`
 })
+
+const reconciliationState = computed<'matched' | 'mismatched' | 'unknown'>(() => {
+  if (reconciliationRows.value.length === 0) return 'unknown'
+  return reconciliationRows.value.every((row) => row.is_match === true || row.is_match === 1)
+    ? 'matched'
+    : 'mismatched'
+})
+
+const reconciliationLabel = computed(() => ({
+  matched: '一致',
+  mismatched: '不一致',
+  unknown: '--',
+})[reconciliationState.value])
 
 const todayRealizedValue = computed(() => {
   const today = localDateKey(new Date())
@@ -564,6 +582,15 @@ async function fetchRisk() {
   }
 }
 
+async function fetchReconciliation() {
+  try {
+    const data = await readJson('/api/trading/reconciliation/latest')
+    reconciliationRows.value = Array.isArray(data.rows) ? data.rows : []
+  } catch {
+    // 短暂读取失败时保留最近一次有效对账状态，不影响资金与风险数据展示。
+  }
+}
+
 async function fetchPeriodData() {
   const days = selectedDays.value
   const version = ++requestVersion
@@ -584,7 +611,7 @@ async function fetchPeriodData() {
 
 async function refreshAll() {
   refreshing.value = true
-  await Promise.all([fetchSummary(), fetchPeriodData()])
+  await Promise.all([fetchSummary(), fetchPeriodData(), fetchReconciliation()])
   refreshing.value = false
   loading.value = false
 }
@@ -718,6 +745,7 @@ async function initCharts() {
 function handleVisibilityChange() {
   if (document.visibilityState !== 'visible') return
   void fetchSummary(true)
+  void fetchReconciliation()
   void syncNotificationUnreadCount()
 }
 
@@ -735,7 +763,10 @@ watch(notificationOpen, (open) => {
 
 onMounted(async () => {
   await Promise.all([refreshAll(), initCharts(), fetchMobileNotifications(true), fetchMobileFundTransfer()])
-  summaryTimer = setInterval(() => void fetchSummary(true), 30_000)
+  summaryTimer = setInterval(() => {
+    void fetchSummary(true)
+    void fetchReconciliation()
+  }, 30_000)
   riskTimer = setInterval(() => void fetchRisk(), 5_000)
   chartTimer = setInterval(() => void fetchPeriodData(), 60_000)
   notificationTimer = setInterval(() => void syncNotificationUnreadCount(), 10_000)
@@ -762,8 +793,18 @@ onBeforeUnmount(() => {
 <template>
   <main class="mobile-capital-page">
     <header class="mobile-header">
-      <div>
-        <h1>资金监控</h1>
+      <div class="header-copy">
+        <div class="mobile-title-row">
+          <h1>资金监控</h1>
+          <div class="mobile-title-actions" aria-label="资金操作">
+            <button class="header-operation-button fund-transfer-button" :disabled="fundTransferBusy" @click="openMobileFundTransfer">
+              {{ activeFundTransfer ? `划转中 #${activeFundTransfer.id}` : '资金划转' }}
+            </button>
+            <button class="header-operation-button bnb-buy-button" :disabled="bnbBuying" @click="buyMobileBnb">
+              {{ bnbBuying ? '买入中...' : '买 BNB' }}
+            </button>
+          </div>
+        </div>
         <p>{{ refreshTime }}</p>
       </div>
       <div class="header-actions">
@@ -814,24 +855,16 @@ onBeforeUnmount(() => {
           <strong :class="valueClass(annualizedValue)">{{ formatPercent(annualizedValue) }}</strong>
           <small>{{ annualizedHint }}</small>
         </div>
+        <div>
+          <span>对账情况</span>
+          <strong :class="{
+            safe: reconciliationState === 'matched',
+            danger: reconciliationState === 'mismatched',
+            muted: reconciliationState === 'unknown',
+          }">{{ reconciliationLabel }}</strong>
+          <small>最新一轮</small>
+        </div>
       </div>
-    </section>
-
-    <section class="mobile-fund-actions" aria-label="资金操作">
-      <button class="fund-transfer-button" :disabled="fundTransferBusy" @click="openMobileFundTransfer">
-        <span class="operation-icon" aria-hidden="true">⇄</span>
-        <span>
-          <strong>{{ activeFundTransfer ? `划转中 #${activeFundTransfer.id}` : '资金划转' }}</strong>
-          <small>{{ activeFundTransfer ? fundTransferStatusLabel(activeFundTransfer) : 'Binance → Gate' }}</small>
-        </span>
-      </button>
-      <button class="bnb-buy-button" :disabled="bnbBuying" @click="buyMobileBnb">
-        <span class="operation-icon bnb-icon" aria-hidden="true">B</span>
-        <span>
-          <strong>{{ bnbBuying ? '买入中...' : '买 BNB' }}</strong>
-          <small>手续费余额</small>
-        </span>
-      </button>
     </section>
 
     <section class="exchange-grid" :aria-busy="loading">
@@ -979,11 +1012,21 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(18px) saturate(140%);
 }
 
+.header-copy { min-width: 0; }
+.mobile-title-row { display: flex; min-width: 0; align-items: center; gap: 8px; }
+
 .mobile-header h1 {
+  flex: 0 0 auto;
   font-size: 21px;
   font-weight: 720;
   letter-spacing: -.02em;
 }
+
+.mobile-title-actions { display: flex; min-width: 0; align-items: center; gap: 5px; }
+.header-operation-button { min-width: 0; height: 30px; overflow: hidden; border: 1px solid #2a496d; border-radius: 9px; padding: 0 8px; background: rgba(41, 79, 119, .42); color: #8fc3ff; font-family: inherit; font-size: 10px; font-weight: 680; line-height: 28px; text-overflow: ellipsis; white-space: nowrap; touch-action: manipulation; }
+.header-operation-button:active { transform: scale(.96); }
+.header-operation-button:disabled { opacity: .58; }
+.header-operation-button.bnb-buy-button { border-color: rgba(245, 185, 66, .38); background: rgba(99, 71, 23, .38); color: #f5c45f; }
 
 .mobile-header p,
 .chart-heading p,
@@ -993,7 +1036,7 @@ footer {
   font-size: 11px;
 }
 
-.header-actions { display: flex; align-items: center; gap: 7px; }
+.header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; }
 
 .bell-button,
 .refresh-button {
@@ -1050,58 +1093,45 @@ footer {
   box-shadow: 0 10px 30px rgba(0, 0, 0, .13);
 }
 
-.total-card { padding: 15px; }
+.total-card { padding: 12px; }
 .total-card-title { display: flex; align-items: center; gap: 7px; }
 .total-card-title h2 { font-size: 14px; font-weight: 680; }
 .exchange-dot.total { background: #76b4ff; box-shadow: 0 0 10px rgba(118, 180, 255, .55); }
-.total-primary-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, .75fr); align-items: end; gap: 13px; margin: 15px 0 13px; }
+.total-primary-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, .75fr); align-items: end; gap: 11px; margin: 9px 0 8px; }
 .total-primary-metric,
 .total-mmr-metric { min-width: 0; }
 .total-primary-metric > span,
 .total-secondary-grid span { display: block; color: var(--mobile-muted); font-size: 11px; }
-.total-primary-metric > strong { display: inline-block; max-width: 100%; margin-top: 4px; overflow: hidden; font-size: clamp(27px, 7.5vw, 34px); font-weight: 760; letter-spacing: -.04em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.total-primary-metric > strong { display: inline-block; max-width: 100%; margin-top: 2px; overflow: hidden; font-size: clamp(25px, 7vw, 31px); font-weight: 760; letter-spacing: -.04em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-primary-metric > small { margin-left: 5px; color: var(--mobile-muted); font-size: 9px; }
-.total-mmr-metric { padding-left: 13px; border-left: 1px solid rgba(43, 55, 72, .7); }
+.total-mmr-metric { padding-left: 11px; border-left: 1px solid rgba(43, 55, 72, .7); }
 .total-mmr-label { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
 .total-mmr-label > span { color: var(--mobile-muted); font-size: 10px; white-space: nowrap; }
 .total-mmr-label > i { overflow: hidden; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-.total-mmr-metric > strong { display: block; margin-top: 5px; overflow: hidden; font-size: clamp(24px, 6.8vw, 30px); font-weight: 750; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.total-mmr-metric > strong { display: block; margin-top: 2px; overflow: hidden; font-size: clamp(22px, 6.2vw, 27px); font-weight: 750; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-mmr-metric > small { display: block; margin-top: 1px; color: var(--mobile-muted); font-size: 9px; }
-.total-secondary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
-.total-secondary-grid > div { min-width: 0; padding-top: 11px; }
-.total-secondary-grid > div + div { margin-left: 13px; padding-left: 13px; border-left: 1px solid rgba(43, 55, 72, .7); }
-.total-secondary-grid strong { display: block; margin-top: 5px; overflow: hidden; font-size: 17px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.total-secondary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid > div { min-width: 0; padding-top: 8px; }
+.total-secondary-grid > div + div { margin-left: 8px; padding-left: 8px; border-left: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid strong { display: block; margin-top: 2px; overflow: hidden; font-size: 15px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-secondary-grid small { display: block; min-height: 14px; margin-top: 2px; color: var(--mobile-muted); font-size: 9px; line-height: 1.4; }
 
-.mobile-fund-actions { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, .75fr); gap: 9px; margin-top: 10px; }
-.mobile-fund-actions button { display: flex; min-width: 0; min-height: 54px; align-items: center; gap: 9px; border: 1px solid #2a3d56; border-radius: 14px; padding: 8px 11px; background: linear-gradient(145deg, rgba(29, 51, 75, .94), rgba(21, 36, 53, .94)); color: #eaf3ff; font-family: inherit; text-align: left; touch-action: manipulation; }
-.mobile-fund-actions button:active { transform: scale(.98); }
-.mobile-fund-actions button:disabled { opacity: .58; }
-.mobile-fund-actions .bnb-buy-button { border-color: rgba(245, 185, 66, .34); background: linear-gradient(145deg, rgba(65, 50, 22, .8), rgba(40, 32, 20, .86)); }
-.operation-icon { display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 10px; background: rgba(76, 153, 255, .15); color: #76b4ff; font-size: 18px; font-weight: 720; }
-.operation-icon.bnb-icon { background: rgba(245, 185, 66, .14); color: #f5b942; font-size: 14px; }
-.mobile-fund-actions button > span:last-child { min-width: 0; }
-.mobile-fund-actions strong,
-.mobile-fund-actions small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-fund-actions strong { font-size: 13px; font-weight: 680; }
-.mobile-fund-actions small { margin-top: 3px; color: #8fa0b4; font-size: 9px; }
-
-.exchange-grid { margin-top: 10px; }
-.exchange-card { padding: 14px 13px 12px; }
+.exchange-grid { margin-top: 8px; gap: 8px; }
+.exchange-card { padding: 11px 10px 9px; }
 .exchange-title { display: flex; align-items: center; gap: 7px; }
 .exchange-title h2 { font-size: 13px; font-weight: 650; }
 .exchange-dot { width: 7px; height: 7px; border-radius: 50%; }
 .exchange-dot.binance { background: #f5b942; box-shadow: 0 0 9px rgba(245, 185, 66, .55); }
 .exchange-dot.gate { background: #38d6b4; box-shadow: 0 0 9px rgba(56, 214, 180, .55); }
 
-.primary-metric { margin: 16px 0 13px; }
+.primary-metric { margin: 9px 0 8px; }
 .primary-metric > span,
 .secondary-metric > span,
 .highlight-label > span { display: block; color: var(--mobile-muted); font-size: 11px; }
-.primary-metric strong { display: block; margin-top: 5px; overflow: hidden; font-size: clamp(20px, 5.6vw, 25px); font-weight: 740; letter-spacing: -.035em; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.primary-metric strong { display: block; margin-top: 2px; overflow: hidden; font-size: clamp(19px, 5.2vw, 23px); font-weight: 740; letter-spacing: -.035em; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .primary-metric small { color: var(--mobile-muted); font-size: 9px; }
-.secondary-metric { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; padding-top: 9px; border-top: 1px solid rgba(43, 55, 72, .7); }
-.secondary-metric + .secondary-metric { margin-top: 8px; }
+.secondary-metric { display: flex; align-items: baseline; justify-content: space-between; gap: 5px; padding-top: 6px; border-top: 1px solid rgba(43, 55, 72, .7); }
+.secondary-metric + .secondary-metric { margin-top: 6px; }
 .secondary-metric strong { min-width: 0; overflow: hidden; font-size: 12px; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .secondary-metric small { color: var(--mobile-muted); font-size: 8px; font-weight: 500; }
 .gate-mmr-metric > span { display: inline-flex; align-items: center; gap: 4px; }

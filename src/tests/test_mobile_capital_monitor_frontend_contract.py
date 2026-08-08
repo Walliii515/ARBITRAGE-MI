@@ -28,11 +28,12 @@ def test_mobile_capital_only_requests_required_monitoring_data():
         '/api/trading/capital/latest',
         '/api/trading/capital/gate-cross-risk/live',
         '/api/trading/capital/annualized-return?days=7',
+        '/api/trading/reconciliation/latest',
         '&exchange=total&metric=equity_usdt',
         '&exchange=total&metric=daily_return',
     ):
         assert endpoint in MOBILE_SOURCE
-    for label in ('总计', '总资产', '今日已实现', '可用资金', 'BNB 可用', '全仓 MMR', '已实现年化', '总资产曲线', '每日收益'):
+    for label in ('总计', '总资产', '今日已实现', '可用资金', 'BNB 可用', '全仓 MMR', '已实现年化', '对账情况', '总资产曲线', '每日收益'):
         assert label in MOBILE_SOURCE
 
 
@@ -96,3 +97,19 @@ def test_mobile_capital_exposes_guarded_fund_transfer_and_bnb_actions():
     assert 'number > 200' in MOBILE_SOURCE
     assert 'number > available' in MOBILE_SOURCE
     assert "activeFundTransfer ? `划转中 #${activeFundTransfer.id}`" in MOBILE_SOURCE
+
+
+def test_mobile_capital_places_actions_beside_title_and_summarizes_reconciliation():
+    title_row_start = MOBILE_SOURCE.index('<div class="mobile-title-row">')
+    title_row_end = MOBILE_SOURCE.index('</div>', MOBILE_SOURCE.index('class="mobile-title-actions"'))
+    title_row = MOBILE_SOURCE[title_row_start:title_row_end]
+    assert title_row.index('<h1>资金监控</h1>') < title_row.index('aria-label="资金操作"')
+    assert '<section class="mobile-fund-actions"' not in MOBILE_SOURCE
+
+    annualized_metric = MOBILE_SOURCE.index('<span>已实现年化</span>')
+    reconciliation_metric = MOBILE_SOURCE.index('<span>对账情况</span>')
+    assert annualized_metric < reconciliation_metric
+    assert "matched: '一致'" in MOBILE_SOURCE
+    assert "mismatched: '不一致'" in MOBILE_SOURCE
+    assert "reconciliationRows.value.every" in MOBILE_SOURCE
+    assert 'grid-template-columns: repeat(3, minmax(0, 1fr));' in MOBILE_SOURCE
