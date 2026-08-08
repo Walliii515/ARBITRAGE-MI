@@ -625,6 +625,10 @@ function toggleMenu() {
             <el-icon><TrendCharts /></el-icon>
             <template #title>资金监控</template>
           </el-menu-item>
+          <el-menu-item index="/mobile/capital">
+            <el-icon><Monitor /></el-icon>
+            <template #title>移动端</template>
+          </el-menu-item>
           <el-menu-item index="/reconciliation">
             <el-icon><DataAnalysis /></el-icon>
             <template #title>持仓对账</template>

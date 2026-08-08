@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { ECharts, EChartsOption } from 'echarts'
-import { get } from '../utils/request'
+import { ElMessageBox } from 'element-plus'
+import { get, post } from '../utils/request'
+import { showError, showSuccess } from '../utils/message'
 import {
   getPopupNotificationUnreadCount,
   listPopupNotifications,
@@ -42,6 +44,32 @@ interface AnnualizedReturn {
   realized_available_days?: number | null
 }
 
+interface FundTransferTask {
+  id: number
+  status: string
+  status_message?: string | null
+  requested_amount: number
+  received_amount?: number | null
+  attention_required?: boolean | number
+  last_error?: string | null
+}
+
+interface FundTransferLimits {
+  coin: string
+  network: string
+  destination_masked: string
+  fee: number
+  minimum_received_amount: number
+  binance_forward_free: number
+  minimum_transfer_amount: number
+  maximum_transfer_amount: number
+}
+
+interface FundTransferPreview extends FundTransferLimits {
+  requested_amount: number
+  received_amount: number
+}
+
 const latestRows = ref<CapitalRow[]>([])
 const equityRows = ref<CapitalRow[]>([])
 const dailyRows = ref<CapitalRow[]>([])
@@ -58,6 +86,9 @@ const notificationUnreadCount = ref(0)
 const notificationLoading = ref(false)
 const notificationRefreshing = ref(false)
 const notificationError = ref('')
+const activeFundTransfer = ref<FundTransferTask | null>(null)
+const fundTransferBusy = ref(false)
+const bnbBuying = ref(false)
 const equityChartRef = ref<HTMLDivElement | null>(null)
 const dailyChartRef = ref<HTMLDivElement | null>(null)
 let equityChart: ECharts | null = null
@@ -67,6 +98,7 @@ let summaryTimer: ReturnType<typeof setInterval> | null = null
 let riskTimer: ReturnType<typeof setInterval> | null = null
 let chartTimer: ReturnType<typeof setInterval> | null = null
 let notificationTimer: ReturnType<typeof setInterval> | null = null
+let fundTransferTimer: ReturnType<typeof setInterval> | null = null
 let requestVersion = 0
 let previousBodyOverflow = ''
 
@@ -77,6 +109,21 @@ const periodOptions: Array<{ value: PeriodDays; label: string }> = [
   { value: 30, label: '30天' },
   { value: 90, label: '90天' },
 ]
+
+const fundTransferStatusLabels: Record<string, string> = {
+  queued: '等待划到 Binance 主账户',
+  binance_transfer_submitted: '核验 Binance 内部划转',
+  binance_master_funded: 'Binance 主账户已到账',
+  binance_withdraw_submitted: '核验 Binance 提现',
+  binance_withdrawing: 'Binance 提现处理中',
+  binance_withdraw_completed: '等待 Gate 入账',
+  gate_deposit_confirmed: 'Gate 主账户已到账',
+  gate_transfer_submitted: '核验 Gate 内部划转',
+  gate_transfer_retry_required: 'Gate 内部划转待处理',
+  rollback_pending: '准备退回 Binance 子账户',
+  rollback_submitted: '核验 Binance 回滚',
+  rollback_retry_required: 'Binance 回滚待处理',
+}
 
 const latestByExchange = computed(() => {
   const result: Partial<Record<Exchange, CapitalRow>> = {}
@@ -279,6 +326,208 @@ async function markAllMobileNotificationsRead() {
     notificationUnreadCount.value = Number(data?.unread_count ?? 0)
   } catch {
     // request.ts 已显示失败原因。
+  }
+}
+
+function fundTransferStatusLabel(task: FundTransferTask): string {
+  return task.status_message || fundTransferStatusLabels[task.status] || task.status
+}
+
+async function fetchMobileFundTransfer(silent = true) {
+  const previousActiveId = activeFundTransfer.value?.id
+  try {
+    const response = await get('/api/trading/capital/fund-transfer?limit=10', { silent })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data?.detail || `HTTP ${response.status}`)
+    activeFundTransfer.value = data.active || null
+    if (previousActiveId && !activeFundTransfer.value) {
+      try {
+        await post('/api/trading/capital/run', undefined, { silent: true })
+      } catch {
+        // 资金任务已结束，快照刷新失败不改变任务结果。
+      }
+      await refreshAll()
+      await fetchMobileNotifications(true)
+    }
+  } catch (error: any) {
+    if (!silent) showError(error?.message || '读取资金划转状态失败')
+  }
+}
+
+async function fetchMobileFundTransferLimits(): Promise<FundTransferLimits | null> {
+  try {
+    const response = await get('/api/trading/capital/fund-transfer/limits', { silent: true })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data?.detail || `HTTP ${response.status}`)
+    return data.limits
+  } catch (error: any) {
+    showError(error?.message || '读取实时划转额度失败')
+    return null
+  }
+}
+
+async function preflightMobileFundTransfer(amount: number): Promise<FundTransferPreview | null> {
+  try {
+    const response = await get(
+      `/api/trading/capital/fund-transfer/preflight?amount=${encodeURIComponent(String(amount))}`,
+      { silent: true },
+    )
+    const data = await response.json()
+    if (!response.ok) throw new Error(data?.detail || `HTTP ${response.status}`)
+    return data.preview
+  } catch (error: any) {
+    showError(error?.message || '资金划转预检失败')
+    return null
+  }
+}
+
+async function openMobileFundTransfer() {
+  if (fundTransferBusy.value) return
+  fundTransferBusy.value = true
+  try {
+    await fetchMobileFundTransfer(false)
+    const active = activeFundTransfer.value
+    if (active) {
+      const attention = active.attention_required
+        ? '\n该任务需要人工关注，请在桌面资金监控中执行恢复核验。'
+        : '\n任务会自动推进，移动端将持续刷新状态。'
+      await ElMessageBox.alert(
+        `任务 #${active.id}\n${fundTransferStatusLabel(active)}\n划转金额 ${formatAmount(active.requested_amount)} USDT${attention}`,
+        '资金划转进行中',
+        { confirmButtonText: '知道了', customClass: 'mobile-operation-message-box' },
+      )
+      return
+    }
+
+    const limits = await fetchMobileFundTransferLimits()
+    if (!limits) return
+    let amount = 0
+    try {
+      const result = await ElMessageBox.prompt(
+        `Binance 可划转余额 ${formatAmount(limits.binance_forward_free)} ${limits.coin}\n`
+        + `实时范围 ${formatAmount(limits.minimum_transfer_amount)}–${formatAmount(limits.maximum_transfer_amount)} ${limits.coin}\n`
+        + `网络 ${limits.network}，到账地址 ${limits.destination_masked}`,
+        '资金划转',
+        {
+          confirmButtonText: '实时预检',
+          cancelButtonText: '取消',
+          inputPlaceholder: `输入划转金额 (${limits.coin})`,
+          inputValue: String(Math.min(
+            Number(limits.maximum_transfer_amount || 0),
+            Math.max(10, Number(limits.minimum_transfer_amount || 0)),
+          )),
+          inputType: 'text',
+          customClass: 'mobile-operation-message-box',
+          inputValidator: (value: string) => {
+            const number = Number(value)
+            if (!Number.isFinite(number) || number <= 0) return '请输入有效金额'
+            if (number < Number(limits.minimum_transfer_amount)) return `不能低于 ${formatAmount(limits.minimum_transfer_amount)}`
+            if (number > Number(limits.maximum_transfer_amount)) return `不能超过 ${formatAmount(limits.maximum_transfer_amount)}`
+            return true
+          },
+        },
+      )
+      amount = Number(result.value)
+    } catch {
+      return
+    }
+
+    const preview = await preflightMobileFundTransfer(amount)
+    if (!preview) return
+    let password = ''
+    try {
+      const result = await ElMessageBox.prompt(
+        `Binance forward 将减少 ${formatAmount(preview.requested_amount)} ${preview.coin}\n`
+        + `链上手续费 ${formatAmount(preview.fee)} ${preview.coin}\n`
+        + `预计 Gate 到账 ${formatAmount(preview.received_amount)} ${preview.coin}\n`
+        + `网络 ${preview.network}，地址 ${preview.destination_masked}\n\n确认后将执行真实资金划转，请输入当前登录密码。`,
+        '确认真实资金划转',
+        {
+          confirmButtonText: '确认真实划转',
+          cancelButtonText: '取消',
+          inputType: 'password',
+          inputPlaceholder: '当前登录密码',
+          customClass: 'mobile-operation-message-box mobile-operation-danger',
+          inputValidator: (value: string) => Boolean(value) || '请输入当前登录密码',
+        },
+      )
+      password = result.value
+    } catch {
+      return
+    }
+
+    const response = await post('/api/trading/capital/fund-transfer', {
+      amount: preview.requested_amount,
+      password,
+    }, { silent: true })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data?.detail || `HTTP ${response.status}`)
+    activeFundTransfer.value = data.task
+    showSuccess('资金划转任务已创建，正向开仓已独立暂停')
+    await fetchMobileNotifications(true)
+  } catch (error: any) {
+    showError(error?.message || '创建资金划转任务失败')
+  } finally {
+    fundTransferBusy.value = false
+  }
+}
+
+async function buyMobileBnb() {
+  if (bnbBuying.value) return
+  const binance = latestByExchange.value.binance
+  const available = Number(binance?.available_usdt ?? 0)
+  let amount = 0
+  try {
+    const result = await ElMessageBox.prompt(
+      `当前 BNB 可用 ${formatBnb(binance?.bnb_available)} BNB\nBinance USDT 可用 ${formatAmount(available)} USDT`,
+      '买入 BNB',
+      {
+        confirmButtonText: '继续确认',
+        cancelButtonText: '取消',
+        inputValue: '20',
+        inputPlaceholder: '输入 USDT 金额',
+        inputType: 'text',
+        customClass: 'mobile-operation-message-box',
+        inputValidator: (value: string) => {
+          const number = Number(value)
+          if (!Number.isFinite(number) || number < 5) return '买入金额至少 5 USDT'
+          if (number > 200) return '单次买入不能超过 200 USDT'
+          if (number > available) return `可用余额仅 ${formatAmount(available)} USDT`
+          return /^\d+(\.\d{1,2})?$/.test(value) || '金额最多保留 2 位小数'
+        },
+      },
+    )
+    amount = Number(result.value)
+  } catch {
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `确认使用 ${formatAmount(amount)} USDT 在 Binance 现货账户真实买入 BNB？`,
+      '确认真实买入',
+      {
+        confirmButtonText: '确认买入',
+        cancelButtonText: '取消',
+        type: 'warning',
+        customClass: 'mobile-operation-message-box mobile-operation-danger',
+      },
+    )
+  } catch {
+    return
+  }
+
+  bnbBuying.value = true
+  try {
+    const response = await post('/api/trading/capital/binance-bnb/buy', { amount_usdt: amount }, { silent: true })
+    const data = await response.json()
+    if (!response.ok || data.success === false) throw new Error(data?.detail || data?.message || `HTTP ${response.status}`)
+    showSuccess(data.message || 'BNB 买入成功')
+    await fetchSummary()
+  } catch (error: any) {
+    showError(error?.message || 'BNB 买入失败')
+  } finally {
+    bnbBuying.value = false
   }
 }
 
@@ -485,11 +734,14 @@ watch(notificationOpen, (open) => {
 })
 
 onMounted(async () => {
-  await Promise.all([refreshAll(), initCharts(), fetchMobileNotifications(true)])
+  await Promise.all([refreshAll(), initCharts(), fetchMobileNotifications(true), fetchMobileFundTransfer()])
   summaryTimer = setInterval(() => void fetchSummary(true), 30_000)
   riskTimer = setInterval(() => void fetchRisk(), 5_000)
   chartTimer = setInterval(() => void fetchPeriodData(), 60_000)
   notificationTimer = setInterval(() => void syncNotificationUnreadCount(), 10_000)
+  fundTransferTimer = setInterval(() => {
+    if (activeFundTransfer.value) void fetchMobileFundTransfer()
+  }, 3_000)
   document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
@@ -498,6 +750,7 @@ onBeforeUnmount(() => {
   if (riskTimer) clearInterval(riskTimer)
   if (chartTimer) clearInterval(chartTimer)
   if (notificationTimer) clearInterval(notificationTimer)
+  if (fundTransferTimer) clearInterval(fundTransferTimer)
   if (notificationOpen.value) document.body.style.overflow = previousBodyOverflow
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   resizeObserver?.disconnect()
@@ -562,6 +815,23 @@ onBeforeUnmount(() => {
           <small>{{ annualizedHint }}</small>
         </div>
       </div>
+    </section>
+
+    <section class="mobile-fund-actions" aria-label="资金操作">
+      <button class="fund-transfer-button" :disabled="fundTransferBusy" @click="openMobileFundTransfer">
+        <span class="operation-icon" aria-hidden="true">⇄</span>
+        <span>
+          <strong>{{ activeFundTransfer ? `划转中 #${activeFundTransfer.id}` : '资金划转' }}</strong>
+          <small>{{ activeFundTransfer ? fundTransferStatusLabel(activeFundTransfer) : 'Binance → Gate' }}</small>
+        </span>
+      </button>
+      <button class="bnb-buy-button" :disabled="bnbBuying" @click="buyMobileBnb">
+        <span class="operation-icon bnb-icon" aria-hidden="true">B</span>
+        <span>
+          <strong>{{ bnbBuying ? '买入中...' : '买 BNB' }}</strong>
+          <small>手续费余额</small>
+        </span>
+      </button>
     </section>
 
     <section class="exchange-grid" :aria-busy="loading">
@@ -803,6 +1073,19 @@ footer {
 .total-secondary-grid strong { display: block; margin-top: 5px; overflow: hidden; font-size: 17px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-secondary-grid small { display: block; min-height: 14px; margin-top: 2px; color: var(--mobile-muted); font-size: 9px; line-height: 1.4; }
 
+.mobile-fund-actions { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, .75fr); gap: 9px; margin-top: 10px; }
+.mobile-fund-actions button { display: flex; min-width: 0; min-height: 54px; align-items: center; gap: 9px; border: 1px solid #2a3d56; border-radius: 14px; padding: 8px 11px; background: linear-gradient(145deg, rgba(29, 51, 75, .94), rgba(21, 36, 53, .94)); color: #eaf3ff; font-family: inherit; text-align: left; touch-action: manipulation; }
+.mobile-fund-actions button:active { transform: scale(.98); }
+.mobile-fund-actions button:disabled { opacity: .58; }
+.mobile-fund-actions .bnb-buy-button { border-color: rgba(245, 185, 66, .34); background: linear-gradient(145deg, rgba(65, 50, 22, .8), rgba(40, 32, 20, .86)); }
+.operation-icon { display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 10px; background: rgba(76, 153, 255, .15); color: #76b4ff; font-size: 18px; font-weight: 720; }
+.operation-icon.bnb-icon { background: rgba(245, 185, 66, .14); color: #f5b942; font-size: 14px; }
+.mobile-fund-actions button > span:last-child { min-width: 0; }
+.mobile-fund-actions strong,
+.mobile-fund-actions small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-fund-actions strong { font-size: 13px; font-weight: 680; }
+.mobile-fund-actions small { margin-top: 3px; color: #8fa0b4; font-size: 9px; }
+
 .exchange-grid { margin-top: 10px; }
 .exchange-card { padding: 14px 13px 12px; }
 .exchange-title { display: flex; align-items: center; gap: 7px; }
@@ -893,6 +1176,12 @@ footer { padding: 18px 0 4px; text-align: center; }
 .notification-item > button { display: block; min-height: 30px; margin: 9px 0 0 auto; }
 .notification-state { display: grid; min-height: 210px; place-items: center; gap: 10px; color: #8290a4; font-size: 12px; text-align: center; }
 .notification-state-error { color: #ff8585; }
+
+:global(.mobile-operation-message-box) { width: min(420px, calc(100vw - 28px)); border-radius: 16px; }
+:global(.mobile-operation-message-box .el-message-box__message) { line-height: 1.65; white-space: pre-line; overflow-wrap: anywhere; }
+:global(.mobile-operation-message-box .el-input__inner) { min-height: 44px; font-size: 16px; }
+:global(.mobile-operation-message-box .el-message-box__btns button) { min-height: 42px; }
+:global(.mobile-operation-danger .el-button--primary) { --el-button-bg-color: #d94b59; --el-button-border-color: #d94b59; --el-button-hover-bg-color: #e65c69; --el-button-hover-border-color: #e65c69; }
 
 @media (max-width: 350px) {
   .mobile-capital-page { padding-inline: 10px; }

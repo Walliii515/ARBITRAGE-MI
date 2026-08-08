@@ -11,12 +11,16 @@ ROUTER_SOURCE = (
 APP_SOURCE = (REPO_ROOT / 'frontend' / 'src' / 'App.vue').read_text(encoding='utf-8')
 
 
-def test_mobile_capital_route_is_standalone_and_not_added_to_menu():
+def test_mobile_capital_route_is_standalone_and_linked_below_capital_menu():
     assert "path: '/mobile/capital'" in ROUTER_SOURCE
     assert "meta: { standalone: true }" in ROUTER_SOURCE
     assert 'isStandalonePage' in APP_SOURCE
     assert '<router-view v-if="isShelllessPage" />' in APP_SOURCE
-    assert 'index="/mobile/capital"' not in APP_SOURCE
+    capital_menu = APP_SOURCE.index('index="/capital"')
+    mobile_menu = APP_SOURCE.index('index="/mobile/capital"')
+    reconciliation_menu = APP_SOURCE.index('index="/reconciliation"')
+    assert capital_menu < mobile_menu < reconciliation_menu
+    assert '<template #title>移动端</template>' in APP_SOURCE
 
 
 def test_mobile_capital_only_requests_required_monitoring_data():
@@ -73,3 +77,22 @@ def test_mobile_capital_has_persistent_notification_bell_and_mobile_sheet():
     assert 'markAllMobileNotificationsRead' in MOBILE_SOURCE
     assert 'class="notification-sheet"' in MOBILE_SOURCE
     assert 'env(safe-area-inset-bottom)' in MOBILE_SOURCE
+
+
+def test_mobile_capital_exposes_guarded_fund_transfer_and_bnb_actions():
+    assert 'aria-label="资金操作"' in MOBILE_SOURCE
+    assert '@click="openMobileFundTransfer"' in MOBILE_SOURCE
+    assert '@click="buyMobileBnb"' in MOBILE_SOURCE
+    assert '/api/trading/capital/fund-transfer/limits' in MOBILE_SOURCE
+    assert '/api/trading/capital/fund-transfer/preflight?amount=' in MOBILE_SOURCE
+    assert "post('/api/trading/capital/fund-transfer'" in MOBILE_SOURCE
+    assert "post('/api/trading/capital/binance-bnb/buy'" in MOBILE_SOURCE
+
+    preflight = MOBILE_SOURCE.index('const preview = await preflightMobileFundTransfer(amount)')
+    transfer_post = MOBILE_SOURCE.index("post('/api/trading/capital/fund-transfer'")
+    assert preflight < transfer_post
+    assert '请输入当前登录密码' in MOBILE_SOURCE
+    assert 'number < 5' in MOBILE_SOURCE
+    assert 'number > 200' in MOBILE_SOURCE
+    assert 'number > available' in MOBILE_SOURCE
+    assert "activeFundTransfer ? `划转中 #${activeFundTransfer.id}`" in MOBILE_SOURCE
