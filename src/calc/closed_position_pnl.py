@@ -126,6 +126,9 @@ def update_closed_position_pnl(cursor, position_id: int, pnl: Dict, columns: set
         'total_pnl_bps': pnl['total_pnl_bps'],
         'fee_cost': -pnl['fee_cost'],
         'fee_bps': pnl['fee_bps'],
+        'realized_pnl_spot': pnl['realized_spot_pnl'],
+        'realized_pnl_future': pnl['realized_future_pnl'],
+        'realized_pnl_total': pnl['realized_pnl'],
         'realized_spot_pnl': pnl['realized_spot_pnl'],
         'realized_future_pnl': pnl['realized_future_pnl'],
     }
