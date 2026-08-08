@@ -5955,10 +5955,10 @@ class TestPositionPnlFees(unittest.TestCase):
 
         pos = {'id': 1, 'base_asset': 'BANK', 'funding_total_pnl': 0.03}
         orders = [
-            {'order_side': 'open', 'market_type': 'spot', 'status': 'executed', 'exec_amount': 10.00, 'fee_amount_usdt': 0.01},
-            {'order_side': 'open', 'market_type': 'future', 'status': 'executed', 'exec_amount': 10.05, 'fee_rate': 0.0005},
-            {'order_side': 'close', 'market_type': 'spot', 'status': 'executed', 'exec_amount': 10.08, 'fee_rate': 0.00075},
-            {'order_side': 'close', 'market_type': 'future', 'status': 'executed', 'exec_amount': 9.95, 'fee_amount_usdt': 0.005},
+            {'order_side': 'open', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 1.0, 'exec_amount': 10.00, 'fee_amount_usdt': 0.01},
+            {'order_side': 'open', 'market_type': 'future', 'status': 'executed', 'exec_qty': 1.0, 'exec_amount': 10.05, 'fee_rate': 0.0005},
+            {'order_side': 'close', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 1.0, 'exec_amount': 10.08, 'fee_rate': 0.00075},
+            {'order_side': 'close', 'market_type': 'future', 'status': 'executed', 'exec_qty': 1.0, 'exec_amount': 9.95, 'fee_amount_usdt': 0.005},
         ]
 
         pnl = compute_closed_position_pnl(pos, orders)
@@ -5967,6 +5967,7 @@ class TestPositionPnlFees(unittest.TestCase):
         self.assertAlmostEqual(pnl['realized_pnl'], 0.18)
         self.assertAlmostEqual(pnl['fee_cost'], 0.027585, places=6)
         self.assertAlmostEqual(pnl['total_pnl'], 0.182415, places=6)
+        self.assertAlmostEqual(pnl['close_spread_bps'], -128.9683, places=4)
 
     def test_closed_realtime_pnl_prefers_stored_order_level_values(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl

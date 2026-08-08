@@ -42,6 +42,22 @@ def _sum_exec_amount(orders: Iterable[Dict], order_side: str, market_type: str) 
     )
 
 
+def _sum_exec_qty(orders: Iterable[Dict], order_side: str, market_type: str) -> float:
+    return sum(
+        abs(_float(order.get('exec_qty')))
+        for order in orders
+        if str(order.get('order_side') or '').lower() == order_side
+        and str(order.get('market_type') or '').lower() == market_type
+        and str(order.get('status') or '').lower() == 'executed'
+    )
+
+
+def _basis_bps(spot_price: float, future_price: float) -> Optional[float]:
+    if spot_price <= 0 or future_price <= 0:
+        return None
+    return (future_price - spot_price) / spot_price * 10000
+
+
 def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
     """
     用真实成交额计算正向套利已平仓收益。
@@ -78,6 +94,11 @@ def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[D
         return None
 
     open_notional = spot_open
+    spot_close_qty = _sum_exec_qty(executed_orders, 'close', 'spot')
+    future_close_qty = _sum_exec_qty(executed_orders, 'close', 'future')
+    close_spread_bps = None
+    if spot_close_qty > 0 and future_close_qty > 0:
+        close_spread_bps = _basis_bps(spot_close / spot_close_qty, future_close / future_close_qty)
     realized_spot = spot_close - spot_open
     realized_future = future_open - future_close
     realized_pnl = realized_spot + realized_future
@@ -96,12 +117,13 @@ def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[D
         'fee_bps': round(-fee_cost / open_notional * 10000, 4),
         'total_pnl': round(total_pnl, 8),
         'total_pnl_bps': round(total_pnl / open_notional * 10000, 4),
+        'close_spread_bps': round(close_spread_bps, 4) if close_spread_bps is not None else None,
     }
 
 
 def fetch_executed_position_orders(position_id: int) -> list[Dict]:
     sql = """
-        SELECT order_side, market_type, status, exec_amount, target_amount,
+        SELECT order_side, market_type, status, exec_price, exec_qty, exec_amount, target_amount,
                fee_rate, fee_amount_usdt
         FROM mi_trade_order
         WHERE position_id = %s
@@ -132,6 +154,8 @@ def update_closed_position_pnl(cursor, position_id: int, pnl: Dict, columns: set
         'realized_spot_pnl': pnl['realized_spot_pnl'],
         'realized_future_pnl': pnl['realized_future_pnl'],
     }
+    if pnl.get('close_spread_bps') is not None:
+        candidate_values['close_spread_bps'] = pnl['close_spread_bps']
     values = {key: value for key, value in candidate_values.items() if key in columns}
     if not values:
         return False

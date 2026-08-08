@@ -558,7 +558,10 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             ExchangeDesyncRemediationConfig(enabled=True),
         )
         cursor = FakeCursor()
-        with patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+        with (
+            patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=FakeCtx(cursor)),
+            patch.object(remediator, '_compute_closed_position_pnl', return_value=None),
+        ):
             remediator._close_position(
                 {
                     'id': 438,
@@ -575,6 +578,64 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertIsNone(cursor.params['future_close_price'])
         self.assertIsNone(cursor.params['future_close_amount'])
         self.assertIsNone(cursor.params['close_spread_bps'])
+
+    def test_close_position_updates_order_level_pnl_when_available(self):
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1}}
+
+        class FakeCursor:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+
+        class FakeCtx:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __enter__(self):
+                return self.cursor
+
+            def __exit__(self, *args):
+                return False
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        cursor = FakeCursor()
+        pnl = {
+            'realized_pnl': 0.12,
+            'realized_pnl_bps': 12.0,
+            'total_pnl': 0.10,
+            'total_pnl_bps': 10.0,
+            'fee_cost': 0.02,
+            'fee_bps': -2.0,
+            'realized_spot_pnl': 0.2,
+            'realized_future_pnl': -0.08,
+            'funding_pnl': 0.0,
+            'close_spread_bps': 8.5,
+        }
+        with (
+            patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=FakeCtx(cursor)),
+            patch.object(remediator, '_compute_closed_position_pnl', return_value=pnl),
+            patch.object(remediator, '_position_columns', return_value={
+                'realized_pnl', 'realized_pnl_bps', 'total_pnl', 'total_pnl_bps',
+                'fee_cost', 'fee_bps', 'close_spread_bps',
+            }),
+        ):
+            remediator._close_position(
+                {'id': 438, 'base_asset': 'AI', 'future_open_qty': 10.0},
+                {'exec_price': 0.025, 'exec_amount': 0.25},
+                {'type': 'missing_gate_position', 'future_close_price': 0.026},
+                '交易所断腿自动处置|missing_gate_position',
+                datetime(2026, 6, 30, 11, 2, 20),
+            )
+
+        self.assertEqual(len(cursor.calls), 2)
+        self.assertIn('total_pnl', cursor.calls[1][0])
+        self.assertIn(0.10, cursor.calls[1][1])
 
     def test_gate_adl_reuses_prior_spot_fill_when_available_spot_is_zero(self):
         class FakeExecutor:

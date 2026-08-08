@@ -13,6 +13,12 @@ from typing import Dict, List, Optional
 from calc.order_fee_resolver import build_order_execution_fields
 from calc.orderbook_enricher import calc_vwap_basis_bps
 from calc.real_executor import RealExecutor
+from calc.closed_position_pnl import (
+    compute_closed_position_pnl,
+    existing_position_columns,
+    fetch_executed_position_orders,
+    update_closed_position_pnl,
+)
 from common.database import db_manager
 from common.logger import get_logger
 
@@ -48,6 +54,7 @@ class ExchangeDesyncRemediator:
     def __init__(self, executor: RealExecutor, cfg: ExchangeDesyncRemediationConfig):
         self.executor = executor
         self.cfg = cfg
+        self._position_columns_cache: Optional[set[str]] = None
 
     def remediate_gate_short_desync(
         self,
@@ -1064,6 +1071,30 @@ class ExchangeDesyncRemediator:
                 'close_spread_bps': round(close_spread, 2) if close_spread is not None else None,
                 'position_id': pos.get('id'),
             })
+            pnl_values = self._compute_closed_position_pnl(pos)
+            if pnl_values:
+                update_closed_position_pnl(
+                    cursor,
+                    int(pos.get('id')),
+                    pnl_values,
+                    self._position_columns(),
+                )
+
+    def _position_columns(self) -> set[str]:
+        if self._position_columns_cache is None:
+            self._position_columns_cache = existing_position_columns()
+        return self._position_columns_cache
+
+    def _compute_closed_position_pnl(self, pos: Dict) -> Optional[Dict]:
+        position_id = pos.get('id')
+        if position_id is None:
+            return None
+        try:
+            orders = fetch_executed_position_orders(int(position_id))
+            return compute_closed_position_pnl(pos, orders)
+        except Exception as e:
+            logger.warning(f"断腿兜底收益计算失败 | position_id={position_id} | err={e}")
+            return None
 
     def _append_risk_detail(self, position_id: int, message: str):
         sql = """

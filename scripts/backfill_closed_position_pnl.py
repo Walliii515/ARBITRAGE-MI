@@ -44,7 +44,7 @@ def _load_orders(position_ids: List[int]) -> Dict[int, List[Dict]]:
         return {}
     placeholders = ','.join(['%s'] * len(position_ids))
     sql = f"""
-        SELECT position_id, order_side, market_type, status, exec_amount, target_amount,
+        SELECT position_id, order_side, market_type, status, exec_price, exec_qty, exec_amount, target_amount,
                fee_rate, fee_amount_usdt
         FROM mi_trade_order
         WHERE position_id IN ({placeholders})
