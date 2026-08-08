@@ -53,3 +53,14 @@ def test_mobile_capital_uses_iphone_safe_areas_and_touch_targets():
     assert 'height: 44px' in MOBILE_SOURCE
     assert 'min-height: 44px' in MOBILE_SOURCE
     assert 'touch-action: manipulation' in MOBILE_SOURCE
+
+
+def test_mobile_capital_has_persistent_notification_bell_and_mobile_sheet():
+    assert 'aria-label="查看推送消息"' in MOBILE_SOURCE
+    assert 'notificationUnreadCount > 99' in MOBILE_SOURCE
+    assert "readStatus: 'all'" in MOBILE_SOURCE
+    assert 'syncRecent' in MOBILE_SOURCE
+    assert 'markMobileNotificationRead(item)' in MOBILE_SOURCE
+    assert 'markAllMobileNotificationsRead' in MOBILE_SOURCE
+    assert 'class="notification-sheet"' in MOBILE_SOURCE
+    assert 'env(safe-area-inset-bottom)' in MOBILE_SOURCE
