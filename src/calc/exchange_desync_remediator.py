@@ -199,15 +199,6 @@ class ExchangeDesyncRemediator:
         """Manually close a fully reconstructed tiny hedge and convert its spot dust."""
         if not self.cfg.enabled:
             return {'success': False, 'attempted': False, 'reason': 'disabled'}
-        cooldown_remaining = self._dust_conversion_cooldown_remaining_sec()
-        if cooldown_remaining > 0:
-            return {
-                'success': False,
-                'attempted': False,
-                'reason': 'binance_dust_conversion_cooldown',
-                'cooldown_remaining_sec': round(cooldown_remaining, 1),
-            }
-
         positions = self._load_holding_positions_with_execution_remainders()
         grouped: Dict[str, List[Dict]] = {}
         for pos in positions:
@@ -219,6 +210,23 @@ class ExchangeDesyncRemediator:
         gate_by_asset = {
             str(row.get('base_asset') or '').upper(): row for row in (gate_positions or [])
         }
+        recovered = self._recover_completed_dust_cleanup(
+            grouped,
+            balances_by_asset,
+            gate_by_asset,
+        )
+        if recovered is not None:
+            return recovered
+
+        cooldown_remaining = self._dust_conversion_cooldown_remaining_sec()
+        if cooldown_remaining > 0:
+            return {
+                'success': False,
+                'attempted': False,
+                'reason': 'binance_dust_conversion_cooldown',
+                'cooldown_remaining_sec': round(cooldown_remaining, 1),
+            }
+
         skipped: List[Dict] = []
         for base_asset in sorted(grouped):
             prepared = self._prepare_dust_cleanup_candidate(
@@ -245,6 +253,51 @@ class ExchangeDesyncRemediator:
             'message': '未发现可安全兑换的小额残余',
             'skipped': skipped,
         }
+
+    def _recover_completed_dust_cleanup(
+        self,
+        grouped: Dict[str, List[Dict]],
+        balances_by_asset: Dict[str, Dict],
+        gate_by_asset: Dict[str, Dict],
+    ) -> Optional[Dict]:
+        """Finalize history after both exchange actions succeeded but DB finalization stopped."""
+        for base_asset in sorted(grouped):
+            positions = grouped[base_asset]
+            if not positions or any(
+                '部分平仓保留剩余' not in str(pos.get('close_reason') or '')
+                for pos in positions
+            ):
+                continue
+            ledger_spot = sum(_float(pos.get('_spot_remaining_qty')) for pos in positions)
+            ledger_future = sum(_float(pos.get('_future_remaining_qty')) for pos in positions)
+            local_spot = sum(_float(pos.get('spot_open_qty')) for pos in positions)
+            exchange_spot = _float((balances_by_asset.get(base_asset) or {}).get('total'))
+            exchange_gate = abs(_float((gate_by_asset.get(base_asset) or {}).get('size')))
+            dust_order_count = sum(int(pos.get('dust_cleanup_order_count') or 0) for pos in positions)
+            if (
+                local_spot <= 1e-8
+                or ledger_spot > 1e-8
+                or ledger_future > 1e-8
+                or exchange_spot > 1e-8
+                or exchange_gate > 1e-8
+                or dust_order_count <= 0
+            ):
+                continue
+
+            reason = (
+                f'平仓残余尘埃处置恢复|asset={base_asset}|'
+                f'positions={len(positions)}|两腿交易所及订单账本均已归零'
+            )
+            self._finalize_dust_positions(positions, reason)
+            return {
+                'success': True,
+                'attempted': True,
+                'action': 'finalize_completed_dust_cleanup',
+                'base_asset': base_asset,
+                'positions': len(positions),
+                'message': f'{base_asset} 小额残余交易已完成，历史持仓已恢复结算',
+            }
+        return None
 
     def _prepare_dust_cleanup_candidate(
         self,
@@ -546,6 +599,11 @@ class ExchangeDesyncRemediator:
             reason=reason,
         )
 
+        self._finalize_dust_positions(positions, reason)
+
+    def _finalize_dust_positions(self, positions: List[Dict], reason: str) -> None:
+        """Close local history from the already complete executed-order ledger."""
+
         now = datetime.now()
         for pos in positions:
             position_id = int(pos['id'])
@@ -566,7 +624,6 @@ class ExchangeDesyncRemediator:
                     spot_open_price = %(spot_open_price)s,
                     future_open_price = %(future_open_price)s,
                     spot_open_amount = %(spot_open_amount)s,
-                    future_open_amount = %(future_open_amount)s,
                     spot_close_price = %(spot_close_price)s,
                     future_close_price = %(future_close_price)s,
                     spot_close_amount = %(spot_close_amount)s,
@@ -635,7 +692,6 @@ class ExchangeDesyncRemediator:
             'spot_open_price': spot_open_price,
             'future_open_price': future_open_price,
             'spot_open_amount': spot_open_amount,
-            'future_open_amount': future_open_amount,
             'spot_close_price': spot_price,
             'future_close_price': future_price,
             'spot_close_amount': spot_amount or None,
@@ -668,7 +724,8 @@ class ExchangeDesyncRemediator:
             raise ValueError(
                 f'dust_allocation_qty_mismatch:{market_type}:{expected_total:g}!={total_qty:g}'
             )
-        for index, pos in enumerate(eligible):
+        allocated_orders = []
+        for pos in eligible:
             expected_qty = _float(pos.get(key))
             qty = min(expected_qty, remaining)
             if qty <= 0:
@@ -702,11 +759,15 @@ class ExchangeDesyncRemediator:
                 'exchange_order_id': exchange_order_id,
                 'executed_at': datetime.now(),
             }
-            self._insert_allocated_close_order(order)
+            allocated_orders.append(order)
             remaining = max(0.0, remaining - qty)
 
+        with db_manager.get_cursor() as cursor:
+            for order in allocated_orders:
+                self._insert_allocated_close_order(order, cursor=cursor)
+
     @staticmethod
-    def _insert_allocated_close_order(order: Dict) -> None:
+    def _insert_allocated_close_order(order: Dict, cursor=None) -> None:
         sql = """
             INSERT INTO mi_trade_order (
                 order_uuid, position_id, base_asset, spot_symbol, future_contract,
@@ -727,8 +788,11 @@ class ExchangeDesyncRemediator:
                 %(exchange_order_id)s, %(executed_at)s
             )
         """
-        with db_manager.get_cursor() as cursor:
+        if cursor is not None:
             cursor.execute(sql, order)
+            return
+        with db_manager.get_cursor() as owned_cursor:
+            owned_cursor.execute(sql, order)
 
     @staticmethod
     def _zero_local_future_dust(positions: List[Dict], reason: str) -> None:
@@ -772,7 +836,10 @@ class ExchangeDesyncRemediator:
                        AS order_future_open_qty,
                    COALESCE(SUM(CASE WHEN o.status = 'executed' AND o.order_side = 'close'
                                       AND o.market_type = 'future' THEN ABS(o.exec_qty) ELSE 0 END), 0)
-                       AS order_future_close_qty
+                       AS order_future_close_qty,
+                   COALESCE(SUM(CASE WHEN o.status = 'executed' AND o.order_side = 'close'
+                                      AND o.reject_reason LIKE '%%小额资产转BNB%%' THEN 1 ELSE 0 END), 0)
+                       AS dust_cleanup_order_count
             FROM mi_trade_position p
             LEFT JOIN mi_trade_order o ON o.position_id = p.id
             WHERE p.status = 'holding'

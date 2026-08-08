@@ -1265,10 +1265,36 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(status_params['future_open_qty'], 1.0)
         self.assertEqual(status_params['future_open_contracts'], 10.0)
         self.assertEqual(status_params['spot_open_amount'], 10.0)
-        self.assertEqual(status_params['future_open_amount'], 10.1)
+        self.assertNotIn('future_open_amount', status_sql)
         pnl = update_pnl.call_args.args[2]
         self.assertAlmostEqual(pnl['realized_pnl'], 0.3)
         self.assertAlmostEqual(pnl['total_pnl'], 0.8)
+
+    def test_manual_cleanup_recovers_completed_exchange_actions_before_cooldown(self):
+        executor = MagicMock()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_holding_positions_with_execution_remainders = MagicMock(return_value=[{
+            'id': 432,
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.91513,
+            'close_reason': '负资金费风险|部分平仓保留剩余',
+            '_spot_remaining_qty': 0.0,
+            '_future_remaining_qty': 0.0,
+            'dust_cleanup_order_count': 1,
+        }])
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=3500.0)
+        remediator._finalize_dust_positions = MagicMock()
+
+        result = remediator.cleanup_post_close_dust([], [])
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['action'], 'finalize_completed_dust_cleanup')
+        self.assertEqual(result['base_asset'], 'BICO')
+        remediator._finalize_dust_positions.assert_called_once()
+        remediator._dust_conversion_cooldown_remaining_sec.assert_not_called()
 
     def test_binance_extra_spot_remediation_sells_surplus(self):
         class FakeExecutor:
