@@ -1435,7 +1435,7 @@ async def open_status():
             'trade.open.min_gate_available_ratio',
             config.get_float('trade.open.min_available_ratio', 0.10),
         ),
-        'max_asset_exposure_ratio': config.get_float('trade.open.max_asset_exposure_ratio', 0.20),
+        'max_asset_exposure_ratio': config.get_float('trade.open.max_asset_exposure_ratio', 0.15),
     }
 
 
@@ -1922,10 +1922,10 @@ def _run_open_position_check_once():
                     'trade.open.min_gate_available_ratio',
                     config.get_float('trade.open.min_available_ratio', 0.10),
                 ),
-                max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.20),
+                max_asset_exposure_ratio=config.get_float('trade.open.max_asset_exposure_ratio', 0.15),
                 quality_scale_in_enabled=config.get_bool('trade.open.quality_scale_in.enabled', False),
                 quality_scale_in_enhanced_ratio=config.get_float(
-                    'trade.open.quality_scale_in.enhanced_ratio', 0.30
+                    'trade.open.quality_scale_in.enhanced_ratio', 0.25
                 ),
                 quality_scale_in_min_funding_24h_bps=config.get_float(
                     'trade.open.quality_scale_in.min_funding_24h_bps', 50.0

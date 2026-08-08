@@ -53,10 +53,10 @@ trade:
     min_available_ratio: 0.10               # 兼容旧字段；未配置分交易所阈值时使用
     min_binance_available_ratio: 0.08       # Binance 下单后可用资金最低比例；主要预留手续费/现货兜底
     min_gate_available_ratio: 0.15          # Gate 下单后可用资金最低比例；预留给全仓风险处置
-    max_asset_exposure_ratio: 0.20          # 单币集中度：等额 Binance spot 名义金额 / Binance 总资金
+    max_asset_exposure_ratio: 0.15          # 单币集中度：等额 Binance spot 名义金额 / Binance 总资金
     quality_scale_in:
       enabled: true                         # 普通单标的额度用完后，极优机会允许进入增强额度
-      enhanced_ratio: 0.30                  # 增强后单标的 Binance spot 集中度上限
+      enhanced_ratio: 0.25                  # 增强后单标的 Binance spot 集中度上限
       min_funding_24h_bps: 50               # 24h funding 足够厚才允许加仓
       min_basis_improvement_bps: 8          # 优质加仓最低基差改善要求
       basis_improvement_ratio: 0.25         # 相对已有加权入场基差的改善比例
@@ -169,7 +169,7 @@ trade:
     min_funding_24h_bps: 3                  # funding 不要求很厚，但实时24h不能太差
     min_entry_buffer_bps: 25                # 当前基差至少高于 entry_floor 的额外安全垫
     min_net_edge_bps: 20                    # 当前基差 - 平仓p20 - 全部手续费 - 滑点缓冲后的最低净空间
-    scale_in_min_basis_improvement_bps: 20  # 使用30%增强额度时，相对已有加权入场基差的最低改善
+    scale_in_min_basis_improvement_bps: 20  # 使用25%增强额度时，相对已有加权入场基差的最低改善
     close_take_profit_bps: 30               # 高基差仓单独净止盈阈值，避免按普通carry仓长期占用资金
     close_positive_funding_hold_enabled: false # 高基差仓默认不因下一期小额正资金费暂缓止盈
 
