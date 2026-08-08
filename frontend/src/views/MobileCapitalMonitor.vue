@@ -535,10 +535,20 @@ onBeforeUnmount(() => {
         <span class="exchange-dot total"></span>
         <h2>总计</h2>
       </div>
-      <div class="total-primary-metric">
-        <span>总资产</span>
-        <strong>{{ formatAmount(latestByExchange.total?.equity_usdt) }}</strong>
-        <small>USDT</small>
+      <div class="total-primary-grid">
+        <div class="total-primary-metric">
+          <span>总资产</span>
+          <strong>{{ formatAmount(latestByExchange.total?.equity_usdt) }}</strong>
+          <small>USDT</small>
+        </div>
+        <div class="total-mmr-metric">
+          <div class="total-mmr-label">
+            <span>Gate 全仓 MMR</span>
+            <i :class="mmrClass(displayedRiskStatus)">{{ displayedRiskLabel }}</i>
+          </div>
+          <strong :class="mmrClass(displayedRiskStatus)">{{ formatPercent(displayedMmr, 1) }}</strong>
+          <small>官方账户级</small>
+        </div>
       </div>
       <div class="total-secondary-grid">
         <div>
@@ -774,11 +784,19 @@ footer {
 .total-card-title { display: flex; align-items: center; gap: 7px; }
 .total-card-title h2 { font-size: 14px; font-weight: 680; }
 .exchange-dot.total { background: #76b4ff; box-shadow: 0 0 10px rgba(118, 180, 255, .55); }
-.total-primary-metric { margin: 15px 0 13px; }
+.total-primary-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, .75fr); align-items: end; gap: 13px; margin: 15px 0 13px; }
+.total-primary-metric,
+.total-mmr-metric { min-width: 0; }
 .total-primary-metric > span,
 .total-secondary-grid span { display: block; color: var(--mobile-muted); font-size: 11px; }
-.total-primary-metric > strong { display: inline-block; margin-top: 4px; font-size: clamp(29px, 8vw, 36px); font-weight: 760; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+.total-primary-metric > strong { display: inline-block; max-width: 100%; margin-top: 4px; overflow: hidden; font-size: clamp(27px, 7.5vw, 34px); font-weight: 760; letter-spacing: -.04em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-primary-metric > small { margin-left: 5px; color: var(--mobile-muted); font-size: 9px; }
+.total-mmr-metric { padding-left: 13px; border-left: 1px solid rgba(43, 55, 72, .7); }
+.total-mmr-label { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+.total-mmr-label > span { color: var(--mobile-muted); font-size: 10px; white-space: nowrap; }
+.total-mmr-label > i { overflow: hidden; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.total-mmr-metric > strong { display: block; margin-top: 5px; overflow: hidden; font-size: clamp(24px, 6.8vw, 30px); font-weight: 750; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.total-mmr-metric > small { display: block; margin-top: 1px; color: var(--mobile-muted); font-size: 9px; }
 .total-secondary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
 .total-secondary-grid > div { min-width: 0; padding-top: 11px; }
 .total-secondary-grid > div + div { margin-left: 13px; padding-left: 13px; border-left: 1px solid rgba(43, 55, 72, .7); }

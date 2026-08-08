@@ -40,6 +40,15 @@ def test_mobile_capital_layout_places_total_first_and_gate_mmr_inside_gate_card(
     assert 'class="highlight-grid"' not in MOBILE_SOURCE
 
 
+def test_mobile_capital_repeats_gate_mmr_beside_total_equity():
+    total_grid_start = MOBILE_SOURCE.index('<div class="total-primary-grid">')
+    total_grid_end = MOBILE_SOURCE.index('<div class="total-secondary-grid">', total_grid_start)
+    total_grid = MOBILE_SOURCE[total_grid_start:total_grid_end]
+    assert total_grid.index('<span>总资产</span>') < total_grid.index('<span>Gate 全仓 MMR</span>')
+    assert 'formatPercent(displayedMmr, 1)' in total_grid
+    assert MOBILE_SOURCE.count('formatPercent(displayedMmr, 1)') == 2
+
+
 def test_mobile_capital_chart_supports_one_three_seven_thirty_and_ninety_days():
     for days in (1, 3, 7, 30, 90):
         assert f"value: {days}, label: '{days}天'" in MOBILE_SOURCE
