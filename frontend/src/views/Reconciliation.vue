@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from 'vue'
+import { Coin } from '@element-plus/icons-vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type { ColDef, GridReadyEvent, ICellRendererParams } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
@@ -44,6 +45,7 @@ const rowData = shallowRef<ReconRow[]>([])
 const latestRows = shallowRef<ReconRow[]>([])
 const loading = ref(false)
 const running = ref(false)
+const dustCleaning = ref(false)
 const activeTab = ref<'raw' | 'exposure'>('raw')
 const filterDays = ref(1)
 const mismatchesOnly = ref(false)
@@ -384,6 +386,26 @@ async function runReconciliation() {
   }
 }
 
+async function cleanupDust() {
+  dustCleaning.value = true
+  try {
+    const res = await post('/api/trading/reconciliation/dust/cleanup')
+    const data = await res.json()
+    if (data.success) {
+      showSuccess(data.message || '小额残余清理完成')
+      paginationCurrentPage.value = 1
+      await fetchRows()
+      await fetchLatestRows()
+    } else {
+      showError(data.message || '小额残余清理失败')
+    }
+  } catch (e: any) {
+    showError(e?.message || '小额残余清理请求失败')
+  } finally {
+    dustCleaning.value = false
+  }
+}
+
 function resetAndFetch() {
   paginationCurrentPage.value = 1
   fetchRows()
@@ -433,6 +455,26 @@ onMounted(async () => {
       >
         立即对账
       </el-button>
+
+      <el-popconfirm
+        width="360"
+        title="仅清理订单账本和两家交易所都能完整解释、且低于最小成交额的平仓残余。确认执行？"
+        confirm-button-text="确认清理"
+        cancel-button-text="取消"
+        @confirm="cleanupDust"
+      >
+        <template #reference>
+          <el-button
+            size="small"
+            type="warning"
+            plain
+            :icon="Coin"
+            :loading="dustCleaning"
+          >
+            小额兑换
+          </el-button>
+        </template>
+      </el-popconfirm>
 
       <div v-if="activeTab === 'raw'" class="filter-group">
         <span class="filter-label">时间：</span>

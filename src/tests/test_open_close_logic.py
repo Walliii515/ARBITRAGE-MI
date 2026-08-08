@@ -397,6 +397,9 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(result['transaction_id'], '12345')
         self.assertAlmostEqual(result['exec_amount_usdt'], 0.00764)
         self.assertAlmostEqual(result['exec_price_usdt'], 0.0382)
+        self.assertAlmostEqual(result['service_charge_usdt'], 0.000152)
+        self.assertAlmostEqual(result['gross_exec_amount_usdt'], 0.007792)
+        self.assertAlmostEqual(result['gross_exec_price_usdt'], 0.03896)
         executor._binance_signed_post.assert_called_once_with(
             '/sapi/v1/asset/dust',
             {'asset': 'BICO', 'accountType': 'SPOT'},
@@ -4318,10 +4321,47 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 
         self.assertTrue(marked)
         self.assertEqual(cursor.params['risk_type'], 'missing_gate_position')
+        self.assertEqual(cursor.params['future_open_qty'], 0.0)
+        self.assertEqual(cursor.params['future_open_contracts'], 0.0)
         self.assertIn('Gate期货已成交但Binance现货失败', cursor.params['detail'])
         self.assertIn('close_reason=take_profit', cursor.params['detail'])
         self.ce._trigger_reconciliation('close_future_only_desync', 'BEL')
         self.assertEqual(triggered, [('close_future_only_desync', 'BEL')])
+
+    def test_future_only_partial_retry_decrements_local_gate_remainder(self):
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('calc.closing_executor.db_manager.get_cursor', return_value=context):
+            marked = self.ce._mark_future_only_close_desync(
+                {
+                    'id': 432,
+                    'base_asset': 'BICO',
+                    'future_open_qty': 0.2,
+                    'future_open_contracts': 2,
+                },
+                {
+                    'success': False,
+                    'message': 'Binance 现货低于最小名义金额',
+                    'future_order': {
+                        'exec_price': 0.0566,
+                        'exec_qty': 0.1,
+                        'exchange_order_id': 'gate-bico-dust',
+                    },
+                    'spot_order': None,
+                },
+                'negative_funding_exit',
+                '负资金费风险',
+            )
+
+        self.assertTrue(marked)
+        params = cursor.execute.call_args.args[1]
+        self.assertEqual(params['risk_type'], 'qty_mismatch')
+        self.assertAlmostEqual(params['future_open_qty'], 0.1)
+        self.assertEqual(params['future_open_contracts'], 1.0)
 
     def test_take_profit_partial_fill_keeps_remaining_position(self):
         class FakeCursor:

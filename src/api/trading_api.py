@@ -425,12 +425,12 @@ async def get_orders(
         if delist_risk_assets:
             placeholders = ','.join(['%s'] * len(delist_risk_assets))
             base_where_clauses.append(
-                "(p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal' "
+                "(p.exchange_risk_status = 'desynced' "
                 f"OR UPPER(TRIM(p.base_asset)) IN ({placeholders}))"
             )
             base_params.extend(delist_risk_assets)
         else:
-            base_where_clauses.append("p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal'")
+            base_where_clauses.append("p.exchange_risk_status = 'desynced'")
 
     where_clauses = list(base_where_clauses)
     params = list(base_params)
@@ -450,13 +450,13 @@ async def get_orders(
     if delist_risk_assets:
         risk_placeholders = ','.join(['%s'] * len(delist_risk_assets))
         summary_risk_expr = (
-            "p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal' "
+            "p.exchange_risk_status = 'desynced' "
             f"OR UPPER(TRIM(p.base_asset)) IN ({risk_placeholders})"
         )
         # SELECT 中的 risk_expr 占位符会先于 WHERE 被绑定。
         summary_params = list(delist_risk_assets) + list(base_params)
     else:
-        summary_risk_expr = "p.exchange_risk_status IS NOT NULL AND p.exchange_risk_status <> 'normal'"
+        summary_risk_expr = "p.exchange_risk_status = 'desynced'"
         summary_params = list(base_params)
 
     summary_sql = f"""
@@ -1565,6 +1565,49 @@ async def run_reconciliation_now():
     except Exception as e:
         logger.error(f'手动对账失败: {e}', exc_info=True)
         return {'success': False, 'message': f'对账失败: {e}'}
+    finally:
+        with _recon_lock:
+            _recon_running = False
+
+
+@router.post(
+    '/reconciliation/dust/cleanup',
+    dependencies=[Depends(verify_token_dependency)],
+)
+async def cleanup_reconciliation_dust():
+    """Clean one fully explained post-close dust hedge, then refresh reconciliation."""
+    global _recon_running
+    if config.get_trade_mode() == 'virtual':
+        return {'success': False, 'message': 'virtual 模式不执行小额兑换'}
+    if not config.get_bool('reconciliation.enabled', True):
+        return {'success': False, 'message': '对账功能已关闭'}
+
+    with _recon_lock:
+        if _recon_running:
+            return {'success': False, 'message': '对账任务正在执行中'}
+        _recon_running = True
+
+    try:
+        def _cleanup_and_reconcile():
+            reconciler = build_default_reconciler()
+            cleanup = reconciler.cleanup_post_close_dust()
+            reconciliation = reconciler.run_once()
+            return cleanup, reconciliation
+
+        cleanup, reconciliation = await asyncio.to_thread(_cleanup_and_reconcile)
+        message = cleanup.get('message') or (
+            '小额残余清理完成'
+            if cleanup.get('success')
+            else f"小额残余清理失败: {cleanup.get('reason') or 'unknown'}"
+        )
+        return {
+            **cleanup,
+            'message': message,
+            'reconciliation': reconciliation,
+        }
+    except Exception as e:
+        logger.error(f'小额残余清理失败: {e}', exc_info=True)
+        return {'success': False, 'message': f'小额残余清理失败: {e}'}
     finally:
         with _recon_lock:
             _recon_running = False

@@ -2644,9 +2644,17 @@ class ClosingExecutor:
         base_asset = str(pos.get('base_asset') or '').upper()
         position_id = pos.get('id')
         open_qty = abs(float(pos.get('future_open_qty') or 0))
-        risk_type = 'missing_gate_position'
-        if open_qty > 0 and abs(future_qty) + 1e-9 < open_qty:
-            risk_type = 'qty_mismatch'
+        future_remaining = max(0.0, open_qty - abs(future_qty))
+        future_contracts_remaining = self._remaining_future_contracts(
+            pos,
+            open_qty,
+            future_remaining,
+        )
+        risk_type = (
+            'missing_gate_position'
+            if future_remaining <= CLOSE_QTY_TOLERANCE
+            else 'qty_mismatch'
+        )
         message = str(exec_result.get('message') or '')
         exchange_order_id = future_exec.get('exchange_order_id')
         detail = (
@@ -2658,7 +2666,9 @@ class ClosingExecutor:
         reason = f"交易所仓位风险:{risk_type}|{detail}"
         sql = """
             UPDATE mi_trade_position
-            SET exchange_risk_status = 'desynced',
+            SET future_open_qty = %(future_open_qty)s,
+                future_open_contracts = %(future_open_contracts)s,
+                exchange_risk_status = 'desynced',
                 exchange_risk_type = %(risk_type)s,
                 exchange_risk_at = %(risk_at)s,
                 exchange_risk_detail = %(detail)s,
@@ -2672,6 +2682,8 @@ class ClosingExecutor:
         """
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, {
+                'future_open_qty': future_remaining,
+                'future_open_contracts': future_contracts_remaining,
                 'risk_type': risk_type,
                 'risk_at': datetime.now(),
                 'detail': detail,

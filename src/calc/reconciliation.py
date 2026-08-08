@@ -214,6 +214,12 @@ class Reconciler:
             ),
         }
 
+    def cleanup_post_close_dust(self) -> Dict:
+        """Refresh both exchanges and clean one fully explained tiny close remainder."""
+        binance_balances = self.executor.fetch_binance_spot_balances()
+        gate_positions = self.executor.fetch_gate_futures_positions()
+        return self.remediator.cleanup_post_close_dust(binance_balances, gate_positions)
+
     def run_with_fast_confirmation(self) -> Dict:
         """Run a second fresh reconciliation shortly after an unconfirmed mismatch."""
         first = self.run_once()

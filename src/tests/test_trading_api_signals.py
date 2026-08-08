@@ -23,6 +23,7 @@ from api.trading_api import (
     get_gate_cross_risk_summary,
     register_capital_strategy_pnl_provider,
     run_capital_snapshot_now,
+    cleanup_reconciliation_dust,
 )
 from fastapi import HTTPException
 
@@ -96,6 +97,34 @@ class ManualCapitalSnapshotTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertIn('本次未写入', result['message'])
         builder.assert_not_called()
+
+
+class ManualDustCleanupTests(unittest.TestCase):
+    def tearDown(self):
+        trading_api._recon_running = False
+
+    def test_cleanup_runs_exchange_refresh_then_reconciliation(self):
+        reconciler = MagicMock()
+        reconciler.cleanup_post_close_dust.return_value = {
+            'success': True,
+            'attempted': True,
+            'message': 'BICO 小额残余已清理',
+        }
+        reconciler.run_once.return_value = {
+            'success': True,
+            'mismatch_count': 0,
+        }
+        with patch('api.trading_api.config.get_trade_mode', return_value='real'), \
+                patch('api.trading_api.config.get_bool', return_value=True), \
+                patch('api.trading_api.build_default_reconciler', return_value=reconciler):
+            result = asyncio.run(cleanup_reconciliation_dust())
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['message'], 'BICO 小额残余已清理')
+        self.assertEqual(result['reconciliation']['mismatch_count'], 0)
+        reconciler.cleanup_post_close_dust.assert_called_once_with()
+        reconciler.run_once.assert_called_once_with()
+        self.assertFalse(trading_api._recon_running)
 
 
 class CapitalLatestAccountAggregationTests(unittest.TestCase):

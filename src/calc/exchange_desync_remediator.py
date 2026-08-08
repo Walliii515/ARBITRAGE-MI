@@ -191,6 +191,220 @@ class ExchangeDesyncRemediator:
         )
         return result or {'attempted': False, 'reason': 'post_close_spot_not_convertible'}
 
+    def cleanup_post_close_dust(
+        self,
+        binance_balances: List[Dict],
+        gate_positions: List[Dict],
+    ) -> Dict:
+        """Manually close a fully reconstructed tiny hedge and convert its spot dust."""
+        if not self.cfg.enabled:
+            return {'success': False, 'attempted': False, 'reason': 'disabled'}
+        cooldown_remaining = self._dust_conversion_cooldown_remaining_sec()
+        if cooldown_remaining > 0:
+            return {
+                'success': False,
+                'attempted': False,
+                'reason': 'binance_dust_conversion_cooldown',
+                'cooldown_remaining_sec': round(cooldown_remaining, 1),
+            }
+
+        positions = self._load_holding_positions_with_execution_remainders()
+        grouped: Dict[str, List[Dict]] = {}
+        for pos in positions:
+            grouped.setdefault(str(pos.get('base_asset') or '').upper(), []).append(pos)
+
+        balances_by_asset = {
+            str(row.get('asset') or '').upper(): row for row in (binance_balances or [])
+        }
+        gate_by_asset = {
+            str(row.get('base_asset') or '').upper(): row for row in (gate_positions or [])
+        }
+        skipped: List[Dict] = []
+        for base_asset in sorted(grouped):
+            prepared = self._prepare_dust_cleanup_candidate(
+                base_asset,
+                grouped[base_asset],
+                balances_by_asset.get(base_asset),
+                gate_by_asset.get(base_asset),
+            )
+            if not prepared.get('eligible'):
+                if prepared.get('candidate'):
+                    skipped.append({
+                        'base_asset': base_asset,
+                        'reason': prepared.get('reason'),
+                    })
+                continue
+            result = self._execute_dust_cleanup(prepared)
+            result['skipped'] = skipped
+            return result
+
+        return {
+            'success': True,
+            'attempted': False,
+            'action': 'no_safe_dust_found',
+            'message': '未发现可安全兑换的小额残余',
+            'skipped': skipped,
+        }
+
+    def _prepare_dust_cleanup_candidate(
+        self,
+        base_asset: str,
+        positions: List[Dict],
+        balance: Optional[Dict],
+        gate_position: Optional[Dict],
+    ) -> Dict:
+        if not positions or any(
+            '部分平仓保留剩余' not in str(pos.get('close_reason') or '')
+            for pos in positions
+        ):
+            return {'eligible': False, 'candidate': False, 'reason': 'contains_active_position'}
+
+        spot_meta = (getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {}
+        min_notional = _float(spot_meta.get('min_notional'))
+        step_size = _float(spot_meta.get('step_size'))
+        qty_tolerance = max(step_size * 1e-6, 1e-8)
+        if min_notional <= 0:
+            return {'eligible': False, 'candidate': True, 'reason': 'missing_spot_min_notional'}
+
+        local_spot_qty = sum(max(0.0, _float(pos.get('spot_open_qty'))) for pos in positions)
+        ledger_spot_qty = sum(max(0.0, _float(pos.get('_spot_remaining_qty'))) for pos in positions)
+        exchange_spot_qty = _float((balance or {}).get('total'))
+        free_spot_qty = _float((balance or {}).get('free'), exchange_spot_qty)
+        if abs(local_spot_qty - ledger_spot_qty) > qty_tolerance:
+            return {'eligible': False, 'candidate': True, 'reason': 'local_spot_not_explained_by_orders'}
+        if abs(exchange_spot_qty - ledger_spot_qty) > qty_tolerance:
+            return {'eligible': False, 'candidate': True, 'reason': 'exchange_spot_not_explained_by_orders'}
+        if abs(free_spot_qty - exchange_spot_qty) > qty_tolerance:
+            return {'eligible': False, 'candidate': True, 'reason': 'spot_balance_locked'}
+
+        price = self._estimate_binance_spot_price(base_asset, {})
+        if price <= 0:
+            price = max((_float(pos.get('spot_open_price')) for pos in positions), default=0.0)
+        spot_notional = exchange_spot_qty * price
+        if price <= 0 or spot_notional + 1e-9 >= min_notional:
+            return {'eligible': False, 'candidate': True, 'reason': 'spot_not_dust'}
+
+        multiplier = self._quanto_multiplier(base_asset)
+        ledger_future_qty = sum(max(0.0, _float(pos.get('_future_remaining_qty'))) for pos in positions)
+        ledger_contracts = ledger_future_qty / multiplier if multiplier > 0 else 0.0
+        if ledger_spot_qty <= qty_tolerance and ledger_contracts <= 1e-6:
+            return {'eligible': False, 'candidate': False, 'reason': 'no_execution_remainder'}
+        gate_size = _float((gate_position or {}).get('size'))
+        if gate_size > 1e-9:
+            return {'eligible': False, 'candidate': True, 'reason': 'gate_position_not_short'}
+        exchange_contracts = abs(gate_size)
+        if abs(exchange_contracts - ledger_contracts) > 1e-6:
+            return {'eligible': False, 'candidate': True, 'reason': 'gate_position_not_explained_by_orders'}
+        gate_mark_price = _float((gate_position or {}).get('mark_price'), price)
+        gate_notional = exchange_contracts * multiplier * gate_mark_price
+        if gate_notional + 1e-9 >= min_notional:
+            return {'eligible': False, 'candidate': True, 'reason': 'gate_position_not_dust'}
+
+        return {
+            'eligible': True,
+            'candidate': True,
+            'base_asset': base_asset,
+            'positions': positions,
+            'spot_qty': exchange_spot_qty,
+            'spot_notional': spot_notional,
+            'gate_contracts': exchange_contracts,
+            'gate_qty': ledger_future_qty,
+            'gate_mark_price': gate_mark_price,
+            'gate_position': gate_position or {},
+        }
+
+    def _execute_dust_cleanup(self, prepared: Dict) -> Dict:
+        base_asset = prepared['base_asset']
+        positions = prepared['positions']
+        gate_contracts = _float(prepared.get('gate_contracts'))
+        gate_result: Optional[Dict] = None
+        reason = (
+            f"手动小额兑换|asset={base_asset}|spot={prepared.get('spot_qty'):g}|"
+            f"gate_contracts={gate_contracts:g}"
+        )
+        if gate_contracts > 0:
+            gate_result = self.remediate_gate_extra_position(
+                base_asset=base_asset,
+                extra_contracts=gate_contracts,
+                risk={
+                    'type': 'post_close_dust',
+                    'contract': f'{base_asset}_USDT',
+                    'exchange_size': _float((prepared.get('gate_position') or {}).get('size')),
+                    'mark_price': prepared.get('gate_mark_price'),
+                },
+            )
+            if not gate_result.get('success'):
+                return {
+                    'success': False,
+                    'attempted': True,
+                    'action': 'close_gate_dust_future',
+                    'base_asset': base_asset,
+                    'reason': gate_result.get('reason') or 'gate_dust_close_failed',
+                    'gate_result': gate_result,
+                }
+            future_result = gate_result.get('future_result') or {}
+            expected_qty = _float(prepared.get('gate_qty'))
+            if _float(future_result.get('exec_qty')) + 1e-9 < expected_qty:
+                return {
+                    'success': False,
+                    'attempted': True,
+                    'action': 'close_gate_dust_future',
+                    'base_asset': base_asset,
+                    'reason': 'gate_dust_close_partial',
+                    'gate_result': gate_result,
+                }
+            self._record_allocated_dust_orders(
+                positions,
+                market_type='future',
+                total_qty=expected_qty,
+                exec_price=_float(future_result.get('exec_price')),
+                exchange_order_id=future_result.get('exchange_order_id'),
+                liquidity_role=future_result.get('liquidity_role') or 'taker',
+                fee_amount=_float(future_result.get('fee_amount')),
+                fee_amount_usdt=_float(future_result.get('fee_amount_usdt')),
+                fee_asset=future_result.get('fee_asset') or 'USDT',
+                reason=reason,
+            )
+            self._zero_local_future_dust(positions, reason)
+
+        conversion = self.executor.convert_binance_spot_dust_to_bnb(base_asset)
+        if not conversion.get('success'):
+            return {
+                'success': False,
+                'attempted': True,
+                'action': 'convert_binance_dust_to_bnb',
+                'base_asset': base_asset,
+                'reason': conversion.get('reason') or 'dust_conversion_failed',
+                'gate_result': gate_result,
+            }
+        if abs(_float(conversion.get('source_qty')) - _float(prepared.get('spot_qty'))) > 1e-8:
+            return {
+                'success': False,
+                'attempted': True,
+                'action': 'convert_binance_dust_to_bnb',
+                'base_asset': base_asset,
+                'reason': 'dust_conversion_qty_mismatch',
+                'conversion': conversion,
+            }
+
+        self._close_positions_after_dust_conversion(
+            positions,
+            conversion,
+            {'type': 'post_close_dust', 'detail': reason},
+        )
+        return {
+            'success': True,
+            'attempted': True,
+            'action': 'cleanup_post_close_dust',
+            'base_asset': base_asset,
+            'positions': len(positions),
+            'spot_qty': conversion.get('source_qty'),
+            'bnb_qty': conversion.get('bnb_qty'),
+            'gate_contracts_closed': gate_contracts,
+            'transaction_id': conversion.get('transaction_id'),
+            'message': f'{base_asset} 小额残余已清理，共关闭 {len(positions)} 笔持仓',
+        }
+
     def _try_remediate_full_asset_dust(
         self,
         base_asset: str,
@@ -306,7 +520,7 @@ class ExchangeDesyncRemediator:
             return
         reason_prefix = (
             '平仓残余尘埃处置'
-            if str(risk.get('type') or '') == 'post_close_spot_dust'
+            if str(risk.get('type') or '') in {'post_close_spot_dust', 'post_close_dust'}
             else '交易所断腿尘埃处置'
         )
         reason = (
@@ -315,40 +529,271 @@ class ExchangeDesyncRemediator:
             f"bnb={conversion.get('bnb_qty')}|tran_id={conversion.get('transaction_id')}|"
             f"关联风险={risk.get('type', 'unknown')}"
         )
+        gross_price = (
+            _float(conversion.get('gross_exec_price_usdt'))
+            or _float(conversion.get('exec_price_usdt'))
+        )
+        self._record_allocated_dust_orders(
+            positions,
+            market_type='spot',
+            total_qty=_float(conversion.get('source_qty')),
+            exec_price=gross_price,
+            exchange_order_id=f"dust:{conversion.get('transaction_id') or ''}",
+            liquidity_role='unknown',
+            fee_amount=_float(conversion.get('service_charge_bnb')),
+            fee_amount_usdt=_float(conversion.get('service_charge_usdt')),
+            fee_asset='BNB',
+            reason=reason,
+        )
+
+        now = datetime.now()
+        for pos in positions:
+            position_id = int(pos['id'])
+            orders = fetch_executed_position_orders(position_id)
+            close_values = self._close_execution_values(
+                orders,
+                str(pos.get('base_asset') or ''),
+            )
+            pnl_values = compute_closed_position_pnl(pos, orders)
+            sql = """
+                UPDATE mi_trade_position SET
+                    status = 'closed',
+                    closed_at = %(closed_at)s,
+                    close_reason = CONCAT(COALESCE(close_reason, ''), '|', %(reason)s),
+                    spot_open_qty = %(spot_open_qty)s,
+                    future_open_qty = %(future_open_qty)s,
+                    future_open_contracts = %(future_open_contracts)s,
+                    spot_open_price = %(spot_open_price)s,
+                    future_open_price = %(future_open_price)s,
+                    spot_open_amount = %(spot_open_amount)s,
+                    future_open_amount = %(future_open_amount)s,
+                    spot_close_price = %(spot_close_price)s,
+                    future_close_price = %(future_close_price)s,
+                    spot_close_amount = %(spot_close_amount)s,
+                    future_close_amount = %(future_close_amount)s,
+                    close_spread_bps = %(close_spread_bps)s,
+                    exchange_risk_status = CASE
+                        WHEN exchange_risk_status = 'desynced' THEN 'resolved'
+                        ELSE exchange_risk_status
+                    END
+                WHERE id = %(position_id)s
+                  AND status = 'holding'
+            """
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, {
+                    'closed_at': now,
+                    'reason': reason,
+                    'position_id': position_id,
+                    **close_values,
+                })
+                updated = int(getattr(cursor, 'rowcount', 0) or 0)
+                if updated and pnl_values:
+                    update_closed_position_pnl(
+                        cursor,
+                        position_id,
+                        pnl_values,
+                        self._position_columns(),
+                    )
+
+    def _close_execution_values(self, orders: List[Dict], base_asset: str) -> Dict:
+        def _sum(order_side: str, market_type: str, field: str) -> float:
+            return sum(
+                _float(order.get(field))
+                for order in orders
+                if str(order.get('order_side') or '').lower() == order_side
+                and str(order.get('market_type') or '').lower() == market_type
+                and str(order.get('status') or '').lower() == 'executed'
+            )
+
+        spot_open_qty = _sum('open', 'spot', 'exec_qty')
+        spot_open_amount = _sum('open', 'spot', 'exec_amount')
+        future_open_qty = _sum('open', 'future', 'exec_qty')
+        future_open_amount = _sum('open', 'future', 'exec_amount')
+        spot_qty = _sum('close', 'spot', 'exec_qty')
+        spot_amount = _sum('close', 'spot', 'exec_amount')
+        future_qty = _sum('close', 'future', 'exec_qty')
+        future_amount = _sum('close', 'future', 'exec_amount')
+        spot_open_price = spot_open_amount / spot_open_qty if spot_open_qty > 0 else None
+        future_open_price = future_open_amount / future_open_qty if future_open_qty > 0 else None
+        multiplier = self._quanto_multiplier(base_asset)
+        future_open_contracts = (
+            future_open_qty / multiplier
+            if future_open_qty > 0 and multiplier > 0
+            else 0.0
+        )
+        spot_price = spot_amount / spot_qty if spot_qty > 0 else None
+        future_price = future_amount / future_qty if future_qty > 0 else None
+        close_spread = (
+            calc_vwap_basis_bps(spot_price, future_price)
+            if spot_price and future_price
+            else None
+        )
+        return {
+            'spot_open_qty': spot_open_qty,
+            'future_open_qty': future_open_qty,
+            'future_open_contracts': future_open_contracts,
+            'spot_open_price': spot_open_price,
+            'future_open_price': future_open_price,
+            'spot_open_amount': spot_open_amount,
+            'future_open_amount': future_open_amount,
+            'spot_close_price': spot_price,
+            'future_close_price': future_price,
+            'spot_close_amount': spot_amount or None,
+            'future_close_amount': future_amount or None,
+            'close_spread_bps': round(close_spread, 4) if close_spread is not None else None,
+        }
+
+    def _record_allocated_dust_orders(
+        self,
+        positions: List[Dict],
+        *,
+        market_type: str,
+        total_qty: float,
+        exec_price: float,
+        exchange_order_id: Optional[str],
+        liquidity_role: str,
+        fee_amount: float,
+        fee_amount_usdt: float,
+        fee_asset: str,
+        reason: str,
+    ) -> None:
+        if total_qty <= 0 or exec_price <= 0:
+            return
+        remaining = total_qty
+        order_uuid = str(uuid.uuid4())
+        key = '_spot_remaining_qty' if market_type == 'spot' else '_future_remaining_qty'
+        eligible = [pos for pos in positions if _float(pos.get(key)) > 0]
+        expected_total = sum(_float(pos.get(key)) for pos in eligible)
+        if abs(expected_total - total_qty) > 1e-8:
+            raise ValueError(
+                f'dust_allocation_qty_mismatch:{market_type}:{expected_total:g}!={total_qty:g}'
+            )
+        for index, pos in enumerate(eligible):
+            expected_qty = _float(pos.get(key))
+            qty = min(expected_qty, remaining)
+            if qty <= 0:
+                continue
+            ratio = qty / total_qty
+            amount = qty * exec_price
+            order = {
+                'order_uuid': order_uuid,
+                'position_id': int(pos['id']),
+                'base_asset': str(pos.get('base_asset') or '').upper(),
+                'spot_symbol': pos.get('spot_symbol'),
+                'future_contract': pos.get('future_contract'),
+                'order_side': 'close',
+                'market_type': market_type,
+                'trade_direction': 'sell' if market_type == 'spot' else 'buy',
+                'leverage': 1.0 if market_type == 'spot' else 0.0,
+                'status': 'executed',
+                'channel': 'Live',
+                'reject_reason': reason,
+                'target_qty': qty,
+                'target_amount': amount,
+                'exec_price': exec_price,
+                'exec_qty': qty,
+                'exec_amount': amount,
+                'coverage_ratio': 0.0,
+                'liquidity_role': liquidity_role,
+                'fee_rate': None,
+                'fee_amount': fee_amount * ratio,
+                'fee_amount_usdt': fee_amount_usdt * ratio,
+                'fee_asset': fee_asset,
+                'exchange_order_id': exchange_order_id,
+                'executed_at': datetime.now(),
+            }
+            self._insert_allocated_close_order(order)
+            remaining = max(0.0, remaining - qty)
+
+    @staticmethod
+    def _insert_allocated_close_order(order: Dict) -> None:
+        sql = """
+            INSERT INTO mi_trade_order (
+                order_uuid, position_id, base_asset, spot_symbol, future_contract,
+                order_side, market_type, trade_direction, leverage, status, channel,
+                reject_reason, target_qty, target_amount,
+                exec_price, exec_qty, exec_amount, coverage_ratio,
+                open_coverage, open_vwap_basis_bps, risk_relief_bps,
+                open_marginal_basis_bps, funding_rate_24h,
+                liquidity_role, fee_rate, fee_amount, fee_amount_usdt, fee_asset,
+                exchange_order_id, executed_at
+            ) VALUES (
+                %(order_uuid)s, %(position_id)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
+                %(order_side)s, %(market_type)s, %(trade_direction)s, %(leverage)s, %(status)s, %(channel)s,
+                %(reject_reason)s, %(target_qty)s, %(target_amount)s,
+                %(exec_price)s, %(exec_qty)s, %(exec_amount)s, %(coverage_ratio)s,
+                NULL, NULL, NULL, NULL, NULL,
+                %(liquidity_role)s, %(fee_rate)s, %(fee_amount)s, %(fee_amount_usdt)s, %(fee_asset)s,
+                %(exchange_order_id)s, %(executed_at)s
+            )
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, order)
+
+    @staticmethod
+    def _zero_local_future_dust(positions: List[Dict], reason: str) -> None:
+        ids = [int(pos['id']) for pos in positions if _float(pos.get('_future_remaining_qty')) > 0]
+        if not ids:
+            return
         placeholders = ','.join(['%s'] * len(ids))
         sql = f"""
-            UPDATE mi_trade_position SET
-                status = 'closed',
-                closed_at = %s,
-                close_reason = CONCAT(COALESCE(close_reason, ''), '|', %s),
-                spot_close_price = %s,
-                spot_close_amount = spot_open_qty * %s,
-                exchange_risk_status = CASE
-                    WHEN exchange_risk_status = 'desynced' THEN 'resolved'
-                    ELSE exchange_risk_status
-                END
+            UPDATE mi_trade_position
+            SET future_open_qty = 0,
+                future_open_contracts = 0,
+                close_reason = CONCAT(COALESCE(close_reason, ''), '|', %s)
             WHERE id IN ({placeholders})
               AND status = 'holding'
         """
-        price = _float(conversion.get('exec_price_usdt')) or None
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, (datetime.now(), reason, price, price, *ids))
+            cursor.execute(sql, (f'{reason}|Gate小额空头已归零', *ids))
 
     def _load_post_close_spot_dust_positions(self, base_asset: str) -> List[Dict]:
-        sql = """
-            SELECT p.*
+        return [
+            pos for pos in self._load_holding_positions_with_execution_remainders(base_asset)
+            if _float(pos.get('_future_remaining_qty')) <= 1e-8
+            and '部分平仓保留剩余' in str(pos.get('close_reason') or '')
+        ]
+
+    @staticmethod
+    def _load_holding_positions_with_execution_remainders(
+        base_asset: Optional[str] = None,
+    ) -> List[Dict]:
+        asset_clause = "AND UPPER(p.base_asset) = %s" if base_asset else ""
+        sql = f"""
+            SELECT p.*,
+                   COALESCE(SUM(CASE WHEN o.status = 'executed' AND o.order_side = 'open'
+                                      AND o.market_type = 'spot' THEN ABS(o.exec_qty) ELSE 0 END), 0)
+                       AS order_spot_open_qty,
+                   COALESCE(SUM(CASE WHEN o.status = 'executed' AND o.order_side = 'close'
+                                      AND o.market_type = 'spot' THEN ABS(o.exec_qty) ELSE 0 END), 0)
+                       AS order_spot_close_qty,
+                   COALESCE(SUM(CASE WHEN o.status = 'executed' AND o.order_side = 'open'
+                                      AND o.market_type = 'future' THEN ABS(o.exec_qty) ELSE 0 END), 0)
+                       AS order_future_open_qty,
+                   COALESCE(SUM(CASE WHEN o.status = 'executed' AND o.order_side = 'close'
+                                      AND o.market_type = 'future' THEN ABS(o.exec_qty) ELSE 0 END), 0)
+                       AS order_future_close_qty
             FROM mi_trade_position p
+            LEFT JOIN mi_trade_order o ON o.position_id = p.id
             WHERE p.status = 'holding'
-              AND UPPER(p.base_asset) = %s
-              AND p.spot_open_qty > 0
-              AND p.future_open_qty <= 0.00000001
-              AND p.future_open_contracts = 0
-              AND p.close_reason LIKE '%%部分平仓保留剩余%%'
-            ORDER BY p.opened_at ASC, p.id ASC
+              {asset_clause}
+            GROUP BY p.id
+            ORDER BY UPPER(p.base_asset), p.opened_at, p.id
         """
+        params = (base_asset,) if base_asset else None
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, (base_asset,))
-            return cursor.fetchall()
+            cursor.execute(sql, params)
+            rows = list(cursor.fetchall())
+        for row in rows:
+            row['_spot_remaining_qty'] = max(
+                0.0,
+                _float(row.get('order_spot_open_qty')) - _float(row.get('order_spot_close_qty')),
+            )
+            row['_future_remaining_qty'] = max(
+                0.0,
+                _float(row.get('order_future_open_qty')) - _float(row.get('order_future_close_qty')),
+            )
+        return rows
 
     @staticmethod
     def _dust_conversion_cooldown_remaining_sec() -> float:

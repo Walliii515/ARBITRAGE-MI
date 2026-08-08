@@ -1097,6 +1097,179 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertFalse(result['attempted'])
         self.assertEqual(result['reason'], 'extra_gate_position_not_confirmed_short')
 
+    def test_manual_dust_cleanup_reconstructs_bico_from_order_ledger(self):
+        class FakeExecutor:
+            contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+            spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.00001}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock(return_value={
+                    'success': True,
+                    'asset': 'BICO',
+                    'source_qty': 0.91513,
+                    'bnb_qty': 0.00007,
+                    'transaction_id': 'dust-bico',
+                    'gross_exec_price_usdt': 0.0565,
+                })
+
+        positions = [
+            {
+                'id': 432,
+                'base_asset': 'BICO',
+                'spot_symbol': 'BICOUSDT',
+                'future_contract': 'BICO_USDT',
+                'spot_open_qty': 0.4,
+                'spot_open_price': 0.056,
+                'close_reason': '负资金费风险|部分平仓保留剩余',
+                '_spot_remaining_qty': 0.4,
+                '_future_remaining_qty': 0.3,
+            },
+            {
+                'id': 433,
+                'base_asset': 'BICO',
+                'spot_symbol': 'BICOUSDT',
+                'future_contract': 'BICO_USDT',
+                'spot_open_qty': 0.51513,
+                'spot_open_price': 0.056,
+                'close_reason': '负资金费风险|部分平仓保留剩余',
+                '_spot_remaining_qty': 0.51513,
+                '_future_remaining_qty': 0.3,
+            },
+        ]
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=0.0)
+        remediator._load_holding_positions_with_execution_remainders = MagicMock(return_value=positions)
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.0566)
+        remediator.remediate_gate_extra_position = MagicMock(return_value={
+            'success': True,
+            'future_result': {
+                'success': True,
+                'exec_qty': 0.6,
+                'exec_price': 0.0566,
+                'exchange_order_id': 'gate-dust-close',
+            },
+        })
+        remediator._record_allocated_dust_orders = MagicMock()
+        remediator._zero_local_future_dust = MagicMock()
+        remediator._close_positions_after_dust_conversion = MagicMock()
+
+        result = remediator.cleanup_post_close_dust(
+            [{'asset': 'BICO', 'total': 0.91513, 'free': 0.91513}],
+            [{'base_asset': 'BICO', 'size': -6, 'mark_price': 0.0566}],
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['base_asset'], 'BICO')
+        self.assertEqual(result['positions'], 2)
+        self.assertEqual(result['gate_contracts_closed'], 6.0)
+        remediator.remediate_gate_extra_position.assert_called_once()
+        self.assertEqual(
+            remediator.remediate_gate_extra_position.call_args.kwargs['extra_contracts'],
+            6.0,
+        )
+        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
+        remediator._zero_local_future_dust.assert_called_once()
+        remediator._close_positions_after_dust_conversion.assert_called_once()
+
+    def test_manual_dust_cleanup_rejects_unexplained_gate_position(self):
+        class FakeExecutor:
+            contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+            spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.00001}}
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb = MagicMock()
+
+        position = {
+            'id': 432,
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.91513,
+            'spot_open_price': 0.056,
+            'close_reason': '部分平仓保留剩余',
+            '_spot_remaining_qty': 0.91513,
+            '_future_remaining_qty': 0.6,
+        }
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=0.0)
+        remediator._load_holding_positions_with_execution_remainders = MagicMock(
+            return_value=[position]
+        )
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.0566)
+
+        result = remediator.cleanup_post_close_dust(
+            [{'asset': 'BICO', 'total': 0.91513, 'free': 0.91513}],
+            [{'base_asset': 'BICO', 'size': -8, 'mark_price': 0.0566}],
+        )
+
+        self.assertTrue(result['success'])
+        self.assertFalse(result['attempted'])
+        self.assertEqual(
+            result['skipped'],
+            [{'base_asset': 'BICO', 'reason': 'gate_position_not_explained_by_orders'}],
+        )
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
+
+    def test_dust_close_marks_history_closed_and_recalculates_pnl(self):
+        executor = MagicMock()
+        executor.contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        position = {
+            'id': 432,
+            'base_asset': 'BICO',
+            'funding_total_pnl': 0.5,
+            '_spot_remaining_qty': 0.1,
+            '_future_remaining_qty': 0.0,
+        }
+        orders = [
+            {'order_side': 'open', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10},
+            {'order_side': 'open', 'market_type': 'future', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10.1},
+            {'order_side': 'close', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10.2},
+            {'order_side': 'close', 'market_type': 'future', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10},
+        ]
+        cursor = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch.object(remediator, '_record_allocated_dust_orders'), \
+                patch.object(remediator, '_position_columns', return_value={'total_pnl'}), \
+                patch('calc.exchange_desync_remediator.fetch_executed_position_orders', return_value=orders), \
+                patch('calc.exchange_desync_remediator.update_closed_position_pnl') as update_pnl, \
+                patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=context):
+            remediator._close_positions_after_dust_conversion(
+                [position],
+                {
+                    'asset': 'BICO',
+                    'source_qty': 0.1,
+                    'bnb_qty': 0.00001,
+                    'transaction_id': 'dust-bico',
+                    'gross_exec_price_usdt': 0.0565,
+                },
+                {'type': 'post_close_dust'},
+            )
+
+        status_sql, status_params = cursor.execute.call_args_list[0].args
+        self.assertIn("status = 'closed'", status_sql)
+        self.assertIn("THEN 'resolved'", status_sql)
+        self.assertEqual(status_params['spot_open_qty'], 1.0)
+        self.assertEqual(status_params['future_open_qty'], 1.0)
+        self.assertEqual(status_params['future_open_contracts'], 10.0)
+        self.assertEqual(status_params['spot_open_amount'], 10.0)
+        self.assertEqual(status_params['future_open_amount'], 10.1)
+        pnl = update_pnl.call_args.args[2]
+        self.assertAlmostEqual(pnl['realized_pnl'], 0.3)
+        self.assertAlmostEqual(pnl['total_pnl'], 0.8)
+
     def test_binance_extra_spot_remediation_sells_surplus(self):
         class FakeExecutor:
             contract_meta = {'BEL': {'quanto_multiplier': 1}}

@@ -992,15 +992,30 @@ class RealExecutor:
         bnb_price = self._get_binance_usdt_price('BNB') or 0.0
         exec_amount = bnb_qty * bnb_price if bnb_price > 0 else None
         exec_price = exec_amount / source_qty if exec_amount is not None and source_qty > 0 else None
+        service_charge_usdt = service_charge_bnb * bnb_price if bnb_price > 0 else None
+        gross_exec_amount = (
+            exec_amount + service_charge_usdt
+            if exec_amount is not None and service_charge_usdt is not None
+            else None
+        )
+        gross_exec_price = (
+            gross_exec_amount / source_qty
+            if gross_exec_amount is not None and source_qty > 0
+            else None
+        )
         return {
             'success': True,
             'asset': base_asset,
             'source_qty': source_qty,
             'bnb_qty': bnb_qty,
             'service_charge_bnb': service_charge_bnb,
+            'service_charge_usdt': service_charge_usdt,
+            'bnb_price_usdt': bnb_price or None,
             'transaction_id': str(matched.get('tranId') or ''),
             'exec_price_usdt': exec_price,
             'exec_amount_usdt': exec_amount,
+            'gross_exec_price_usdt': gross_exec_price,
+            'gross_exec_amount_usdt': gross_exec_amount,
             'raw': data,
         }
 

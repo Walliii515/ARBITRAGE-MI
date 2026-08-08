@@ -455,7 +455,10 @@ const exchangeRiskFormatter = (params: ValueFormatterParams) => {
   const row = params.data as PositionRow | undefined
   if (!row) return ''
   const hasDelistRisk = !!(row.delist_risks && row.delist_risks.length > 0)
-  if ((!row.exchange_risk_status || row.exchange_risk_status === 'normal') && !hasDelistRisk) return ''
+  if (
+    (!row.exchange_risk_status || ['normal', 'resolved'].includes(row.exchange_risk_status))
+    && !hasDelistRisk
+  ) return ''
   const typeMap: Record<string, string> = {
     adl: 'ADL自动减仓',
     delist_risk: '下架风险',
