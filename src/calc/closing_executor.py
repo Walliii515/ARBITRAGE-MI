@@ -29,6 +29,12 @@ from calc.orderbook_resiliency import (
 )
 from calc.execution_audit import format_execution_audit
 from calc.order_fee_resolver import build_order_execution_fields
+from calc.closed_position_pnl import (
+    compute_closed_position_pnl,
+    existing_position_columns,
+    fetch_executed_position_orders,
+    update_closed_position_pnl,
+)
 from calc.dynamic_take_profit import (
     DynamicTakeProfitConfig,
     evaluate_dynamic_take_profit,
@@ -118,11 +124,14 @@ class ClosingExecutor:
             config.get_int('trade.close.negative_funding_exit_extreme_confirmations', 2),
             1,
         )
-        self.negative_funding_exit_max_opportunistic_loss_bps = config.get_float(
-            'trade.close.negative_funding_exit_max_opportunistic_loss_bps', 25.0
+        self.negative_funding_exit_opportunistic_min_net_profit_bps = config.get_float(
+            'trade.close.negative_funding_exit_opportunistic_min_net_profit_bps', 20.0
+        )
+        self.negative_funding_exit_opportunistic_window_min = config.get_float(
+            'trade.close.negative_funding_exit_opportunistic_window_min', 60.0
         )
         self.negative_funding_exit_hard_budget_bps = config.get_float(
-            'trade.close.negative_funding_exit_hard_budget_bps', 14.0
+            'trade.close.negative_funding_exit_hard_budget_bps', 25.0
         )
         self.delist_risk_exit_enabled = config.get_bool(
             'trade.close.delist_risk_exit_enabled', True
@@ -213,6 +222,7 @@ class ClosingExecutor:
         self._active_close_vwap_threshold_meta: Dict[str, Dict] = {}
         self._delist_risk_by_asset: Dict[str, List[Dict]] = {}
         self._negative_funding_extreme_counts: Dict[str, int] = {}
+        self._position_columns_cache: Optional[set[str]] = None
         # OrderBookManager 引用（由外部注入）
         self._gate_manager = None
         self._spot_manager = None
@@ -658,11 +668,12 @@ class ClosingExecutor:
                             continue
                         refreshed_mode = self._negative_funding_exit_mode(pos, gate_basis)
                         if refreshed_mode is None:
-                            refreshed_loss = self._projected_exit_loss_bps(pos, gate_basis)
+                            refreshed_net = self._projected_net_bps(pos, gate_basis)
                             logger.info(
                                 f"负资金费机会平仓复核取消 | {ba} | "
-                                f"预计损失{refreshed_loss:.1f}bps>"
-                                f"{self.negative_funding_exit_max_opportunistic_loss_bps:.1f}bps | "
+                                f"预计净收益{refreshed_net:.1f}bps<"
+                                f"{self.negative_funding_exit_opportunistic_min_net_profit_bps:.1f}bps "
+                                f"或距结算超过{self.negative_funding_exit_opportunistic_window_min:.0f}min | "
                                 f"gate_basis={gate_basis:.1f}bps"
                             )
                             self._valley_state.pop(valley_key, None)
@@ -1051,7 +1062,7 @@ class ClosingExecutor:
         pos: Dict,
         close_basis_bps: Optional[float] = None,
     ) -> bool:
-        """负 funding 强制退出：严重临近结算，或监控仓预计退出损失超限。"""
+        """负 funding 退出：严重临近结算、预算耗尽，或窗口内达到择机净收益。"""
         return self._negative_funding_exit_mode(pos, close_basis_bps) is not None
 
     def _delist_exit_risks(self, pos: Dict) -> List[Dict]:
@@ -1192,6 +1203,9 @@ class ClosingExecutor:
         comps = self._profit_components(pos, close_basis_bps)
         return max(0.0, -comps['net_profit_bps'])
 
+    def _projected_net_bps(self, pos: Dict, close_basis_bps: float) -> float:
+        return self._profit_components(pos, close_basis_bps)['net_profit_bps']
+
     def _negative_funding_budget_force(self, pos: Dict) -> bool:
         if not self.negative_funding_exit_enabled:
             return False
@@ -1221,14 +1235,20 @@ class ClosingExecutor:
             return None
         if self._negative_current_24h_bps(pos) <= 0:
             return None
-        threshold = abs(float(self.negative_funding_exit_max_opportunistic_loss_bps or 0.0))
-        if threshold <= 0:
+        window_min = abs(float(self.negative_funding_exit_opportunistic_window_min or 0.0))
+        if window_min <= 0:
             return None
+        next_min = self._time_to_next_funding_min(pos)
+        if next_min is None or next_min < 0 or next_min > window_min:
+            return None
+        min_net_profit = float(
+            self.negative_funding_exit_opportunistic_min_net_profit_bps or 0.0
+        )
         if close_basis_bps is None:
             close_basis_bps = _float_or_none(pos.get('current_spread_bps'))
         if close_basis_bps is None:
             return None
-        if self._projected_exit_loss_bps(pos, close_basis_bps) <= threshold:
+        if self._projected_net_bps(pos, close_basis_bps) >= min_net_profit:
             return 'opportunistic'
         return None
 
@@ -1960,21 +1980,27 @@ class ClosingExecutor:
         paid_threshold = abs(float(self.negative_funding_exit_paid_bps or 0.0))
         watch_window_min = abs(float(self.negative_funding_exit_watch_window_min or 0.0))
         hard_budget = abs(float(self.negative_funding_exit_hard_budget_bps or 0.0))
+        opportunistic_window_min = abs(
+            float(self.negative_funding_exit_opportunistic_window_min or 0.0)
+        )
+        opportunistic_min_net = float(
+            self.negative_funding_exit_opportunistic_min_net_profit_bps or 0.0
+        )
         next_bps = self._next_funding_bps(pos)
         next_min = self._time_to_next_funding_min(pos)
         next_negative_bps = max(0.0, -(next_bps or 0.0))
         funding_budget = paid_neg + next_negative_bps
         next_text = 'NA' if next_bps is None else f'{next_bps:+.1f}bps'
         next_min_text = 'NA' if next_min is None else f'{next_min:.1f}min'
-        projected_text = '预计退出损失NA'
+        projected_text = '预计净收益NA'
         composition_text = '组成(NA)'
         if close_basis_bps is not None:
             comps = self._profit_components(pos, close_basis_bps)
-            projected_loss = max(0.0, -comps['net_profit_bps'])
-            comparison = '<=' if projected_loss <= self.negative_funding_exit_max_opportunistic_loss_bps else '>'
+            projected_net = comps['net_profit_bps']
+            comparison = '>=' if projected_net >= opportunistic_min_net else '<'
             projected_text = (
-                f"预计退出损失{projected_loss:.1f}{comparison}"
-                f"{self.negative_funding_exit_max_opportunistic_loss_bps:.1f}bps"
+                f"预计净收益{projected_net:.1f}{comparison}"
+                f"{opportunistic_min_net:.1f}bps"
             )
             composition_text = (
                 f"组成(价差{comps['spread_profit_bps']:+.1f}"
@@ -1990,7 +2016,8 @@ class ClosingExecutor:
             f"|阈值(当前{current_threshold:.1f}@{current_window_min:.0f}min,"
             f"next≤-{next_threshold:.1f},极端监控{extreme_threshold:.1f},"
             f"确认{self.negative_funding_exit_extreme_confirmations}次,"
-            f"已付监控{paid_threshold:.1f},观察窗{watch_window_min:.0f}min)"
+            f"已付监控{paid_threshold:.1f},观察窗{watch_window_min:.0f}min,"
+            f"择机{opportunistic_min_net:.1f}bps@{opportunistic_window_min:.0f}min)"
             f"|next={next_text}|距结算{next_min_text}"
         )
 
@@ -2420,6 +2447,7 @@ class ClosingExecutor:
 
         # ── 更新持仓状态为 closed（仅成交成功时）──
         if exec_result.get('success'):
+            pnl_values = self._compute_closed_position_pnl(position_id, pos)
             update_sql = """
                 UPDATE mi_trade_position SET
                     status            = 'closed',
@@ -2443,11 +2471,33 @@ class ClosingExecutor:
                     'close_spread_bps':     close_spread_bps,
                     'position_id':          position_id,
                 })
+                if pnl_values:
+                    update_closed_position_pnl(
+                        cursor,
+                        int(position_id),
+                        pnl_values,
+                        self._position_columns(),
+                    )
             logger.info(
                 f"持仓状态更新为 closed | position_id={position_id} | "
-                f"close_spread_bps={close_spread_bps}"
+                f"close_spread_bps={close_spread_bps} | pnl={pnl_values}"
             )
         return close_spread_bps
+
+    def _position_columns(self) -> set[str]:
+        if self._position_columns_cache is None:
+            self._position_columns_cache = existing_position_columns()
+        return self._position_columns_cache
+
+    def _compute_closed_position_pnl(self, position_id, pos: Dict) -> Optional[Dict]:
+        if position_id is None:
+            return None
+        try:
+            orders = fetch_executed_position_orders(int(position_id))
+            return compute_closed_position_pnl(pos, orders)
+        except Exception as e:
+            logger.warning(f"已平仓收益计算失败 | position_id={position_id} | err={e}")
+            return None
 
     def _close_partial_fill_state(self, pos: Dict, order_group: Dict, exec_result: Dict) -> Dict:
         if not exec_result.get('success'):

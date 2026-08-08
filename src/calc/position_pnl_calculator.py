@@ -264,20 +264,41 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             fee_cost_usdt = fee_cost_full
             pos['fee_cost'] = fee_cost_usdt
 
-            # 已实现盈亏 = 纯价差利润（开仓基差 - 平仓基差）
-            open_spread = float(pos.get('open_spread_bps') or 0)
-            close_spread = float(pos.get('close_spread_bps') or 0)
-            spread_pnl_bps = open_spread - close_spread
-            pos['realized_pnl_bps'] = round(spread_pnl_bps, 2)
-            pos['realized_pnl'] = round(
-                spread_pnl_bps / 10000 * open_notional, 4
-            )
+            stored_realized = _float_or_none(pos.get('realized_pnl'))
+            stored_realized_bps = _float_or_none(pos.get('realized_pnl_bps'))
+            stored_total = _float_or_none(pos.get('total_pnl'))
+            stored_total_bps = _float_or_none(pos.get('total_pnl_bps'))
+            if stored_realized is not None:
+                pos['realized_pnl'] = round(stored_realized, 4)
+                pos['realized_pnl_bps'] = round(
+                    stored_realized_bps
+                    if stored_realized_bps is not None
+                    else (stored_realized / open_notional * 10000 if open_notional else 0.0),
+                    2,
+                )
+            else:
+                # 老数据缺少落库收益时，继续用基差估算兜底展示。
+                open_spread = float(pos.get('open_spread_bps') or 0)
+                close_spread = float(pos.get('close_spread_bps') or 0)
+                spread_pnl_bps = open_spread - close_spread
+                pos['realized_pnl_bps'] = round(spread_pnl_bps, 2)
+                pos['realized_pnl'] = round(
+                    spread_pnl_bps / 10000 * open_notional, 4
+                )
 
-            # 总盈亏
-            pos['total_pnl_bps'], pos['total_pnl'] = _calc_total_pnl(
-                0, spread_pnl_bps, funding_pnl_bps, fee_bps_full,
-                0, pos['realized_pnl'], funding_pnl, fee_cost_usdt
-            )
+            if stored_total is not None:
+                pos['total_pnl'] = round(stored_total, 4)
+                pos['total_pnl_bps'] = round(
+                    stored_total_bps
+                    if stored_total_bps is not None
+                    else (stored_total / open_notional * 10000 if open_notional else 0.0),
+                    2,
+                )
+            else:
+                pos['total_pnl_bps'], pos['total_pnl'] = _calc_total_pnl(
+                    0, pos['realized_pnl_bps'], funding_pnl_bps, fee_bps_full,
+                    0, pos['realized_pnl'], funding_pnl, fee_cost_usdt
+                )
             continue
 
         if vwap_data:

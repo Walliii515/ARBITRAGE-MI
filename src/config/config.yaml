@@ -275,8 +275,9 @@ trade:
     negative_funding_exit_extreme_confirmations: 2 # 极端负费至少连续出现2轮，过滤单次抖动
     negative_funding_exit_paid_bps: 7       # 历史实际已支付负资金费累计达到该阈值进入监控
     negative_funding_exit_watch_window_min: 30 # 下一期明显负费且距结算30分钟内时提前进入监控
-    negative_funding_exit_max_opportunistic_loss_bps: 25 # 监控仓仅在最新VWAP预计退出损失不超过该值时择机退出
-    negative_funding_exit_hard_budget_bps: 14 # 已付负费+下一期预计负费达到该预算时直接退出
+    negative_funding_exit_opportunistic_min_net_profit_bps: 20 # 监控仓仅在最新VWAP预计净收益达到该值时择机退出
+    negative_funding_exit_opportunistic_window_min: 60 # 择机退出只允许在距下一次资金费结算60分钟内触发
+    negative_funding_exit_hard_budget_bps: 25 # 已付负费+下一期预计负费达到该预算时直接退出
     delist_risk_exit_enabled: true          # 标的临近下架窗口时走风险平仓，不等待止盈/正资金费
     delist_risk_exit_days: 2                # 距下架时间小于等于该天数时触发下架风险平仓
     delist_risk_refresh_interval_sec: 60    # 每分钟刷新Gate/Binance下架计划；平仓关键路径只读内存缓存

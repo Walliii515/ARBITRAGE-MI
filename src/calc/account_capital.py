@@ -761,7 +761,8 @@ class AccountCapitalSnapshotter:
             SELECT id, status, opened_at, closed_at,
                    spot_open_amount, spot_close_amount,
                    future_open_qty, future_open_price, future_close_amount,
-                   open_spread_bps, close_spread_bps, funding_total_pnl
+                   open_spread_bps, close_spread_bps, funding_total_pnl,
+                   realized_pnl, realized_pnl_bps, total_pnl, total_pnl_bps
             FROM mi_trade_position
             WHERE opened_at <= %s
               AND (closed_at IS NULL OR closed_at >= %s)
@@ -804,6 +805,10 @@ class AccountCapitalSnapshotter:
         }
 
     def _position_strategy_realized_pnl(self, pos: Dict) -> float:
+        stored_realized = _float_or_none(pos.get('realized_pnl'))
+        if stored_realized is not None:
+            return stored_realized
+
         open_spread = _float_or_none(pos.get('open_spread_bps'))
         close_spread = _float_or_none(pos.get('close_spread_bps'))
         spot_open_amount = _float_or_none(pos.get('spot_open_amount'))
