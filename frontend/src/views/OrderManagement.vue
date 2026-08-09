@@ -792,9 +792,7 @@ onUnmounted(() => {
           <el-button :type="!exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(false)">全部</el-button>
           <el-button :type="exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(true)">有风险</el-button>
         </el-button-group>
-      </div>
 
-      <div class="filter-row" style="margin-top: 10px;">
         <span class="filter-label">时间：</span>
         <el-button-group size="small">
           <el-button :type="filterDays === 1 ? 'primary' : 'default'" @click="setDaysFilter(1)">今日</el-button>
@@ -822,61 +820,57 @@ onUnmounted(() => {
           />
         </el-select>
 
-        <el-button
-          size="small"
-          type="primary"
-          style="margin-left: auto;"
-          :loading="activeLoading"
-          @click="fetchActiveOrders"
-        >
-          刷新
-        </el-button>
+        <div class="filter-actions">
+          <el-button
+            size="small"
+            type="primary"
+            :loading="activeLoading"
+            @click="fetchActiveOrders"
+          >
+            刷新
+          </el-button>
 
-        <el-button
-          size="small"
-          type="danger"
-          :loading="closeAllLoading"
-          @click="handleCloseAll"
-        >
-          ✖ 一键平仓
-        </el-button>
+          <el-button
+            size="small"
+            type="danger"
+            :loading="closeAllLoading"
+            @click="handleCloseAll"
+          >
+            ✖ 一键平仓
+          </el-button>
+        </div>
       </div>
     </el-card>
 
     <el-card shadow="never" class="grid-card">
-      <template #header>
-        <div class="grid-header">
-          <span>订单管理</span>
-          <div class="header-actions">
-            <el-popover
-              placement="bottom-end"
-              :width="260"
-              trigger="click"
-              @before-enter="refreshColumnVisibilities"
+      <div class="tab-actions">
+        <el-popover
+          placement="bottom-end"
+          :width="260"
+          trigger="click"
+          @before-enter="refreshColumnVisibilities"
+        >
+          <template #reference>
+            <el-button size="small">列选择</el-button>
+          </template>
+          <div class="column-picker">
+            <div
+              v-for="col in columnVisibilities"
+              :key="col.colId"
+              class="column-picker-item"
             >
-              <template #reference>
-                <el-button size="small">列选择</el-button>
-              </template>
-              <div class="column-picker">
-                <div
-                  v-for="col in columnVisibilities"
-                  :key="col.colId"
-                  class="column-picker-item"
-                >
-                  <el-checkbox
-                    :model-value="col.visible"
-                    @change="(val: boolean | string | number) => toggleColumnVisibility(col.colId, !!val)"
-                  />
-                  <span class="column-picker-label">{{ col.headerName }}</span>
-                </div>
-              </div>
-            </el-popover>
-            <el-button size="small" @click="saveColumnState">
-              保存列配置
-            </el-button>
+              <el-checkbox
+                :model-value="col.visible"
+                @change="(val: boolean | string | number) => toggleColumnVisibility(col.colId, !!val)"
+              />
+              <span class="column-picker-label">{{ col.headerName }}</span>
+            </div>
           </div>
-        </div>
-      </template>
+        </el-popover>
+        <el-button size="small" @click="saveColumnState">
+          保存列配置
+        </el-button>
+      </div>
       <el-tabs v-model="activeTab" class="order-tabs" @tab-change="onTabChange">
         <el-tab-pane label="开仓" name="open">
           <div ref="openGridContainerRef">
@@ -1001,11 +995,11 @@ onUnmounted(() => {
 .monitor-page {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .status-card :deep(.el-card__body) {
-  padding: 12px 16px;
+  padding: 10px 14px;
 }
 
 .filter-row {
@@ -1016,9 +1010,18 @@ onUnmounted(() => {
   overflow-x: auto;
 }
 
-.filter-row :deep(.el-radio-group) {
-  flex-wrap: nowrap;
+.filter-row :deep(.el-button-group),
+.filter-row :deep(.el-select) {
   flex-shrink: 0;
+}
+
+.filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding-left: 16px;
 }
 
 .filter-label {
@@ -1027,21 +1030,36 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.grid-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+.grid-card {
+  position: relative;
 }
 
-.header-actions {
+.grid-card :deep(.el-card__body) {
+  padding: 0;
+}
+
+.tab-actions {
+  position: absolute;
+  z-index: 2;
+  top: 6px;
+  right: 12px;
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
+.order-tabs :deep(.el-tabs__header) {
+  margin: 0;
+  padding: 0 180px 0 14px;
+}
+
+.order-tabs :deep(.el-tabs__content) {
+  padding-top: 8px;
+}
+
 .orderbook-grid {
   width: 100%;
-  height: calc(100vh - 220px);
+  height: calc(100vh - 156px);
   min-height: 420px;
 }
 

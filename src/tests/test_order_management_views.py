@@ -141,6 +141,19 @@ def test_order_management_uses_two_grids_and_independent_column_configs():
     assert 'autoRefreshTimer = setInterval(fetchOrders, 2000)' in source
 
 
+def test_order_management_uses_compact_single_row_toolbar_and_tab_actions():
+    source = (
+        Path(__file__).parents[2] / 'frontend' / 'src' / 'views' / 'OrderManagement.vue'
+    ).read_text(encoding='utf-8')
+
+    assert source.count('class="filter-row"') == 1
+    assert '<span>订单管理</span>' not in source
+    assert '<template #header>' not in source
+    assert 'class="tab-actions"' in source
+    assert '.grid-card :deep(.el-card__body)' in source
+    assert 'height: calc(100vh - 156px)' in source
+
+
 def test_funding_snapshot_migration_backfills_both_sides_and_adds_query_indexes():
     migration = (
         Path(__file__).parents[1] / 'migrations' / '035_add_forward_position_funding_snapshots.sql'
