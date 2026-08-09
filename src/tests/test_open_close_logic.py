@@ -401,8 +401,43 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertAlmostEqual(result['gross_exec_amount_usdt'], 0.007792)
         self.assertAlmostEqual(result['gross_exec_price_usdt'], 0.03896)
         executor._binance_signed_post.assert_called_once_with(
-            '/sapi/v1/asset/dust',
-            {'asset': 'BICO', 'accountType': 'SPOT'},
+            '/sapi/v1/asset/dust-convert/convert',
+            {'asset': ['BICO'], 'accountType': 'SPOT', 'targetAsset': 'BNB'},
+        )
+
+    def test_binance_dust_conversion_batch_returns_asset_results(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._binance_signed_post = MagicMock(return_value={
+            'transferResult': [
+                {
+                    'fromAsset': 'BICO',
+                    'amount': '0.2',
+                    'transferedAmount': '0.00000955',
+                    'serviceChargeAmount': '0.00000019',
+                    'tranId': 12345,
+                },
+                {
+                    'fromAsset': 'FRAX',
+                    'amount': '0.18',
+                    'transferedAmount': '0.000006',
+                    'serviceChargeAmount': '0.00000012',
+                    'tranId': 12346,
+                },
+            ],
+        })
+        executor._get_binance_usdt_price = MagicMock(return_value=800.0)
+
+        result = executor.convert_binance_spot_dust_to_bnb_batch(['frax', 'bico'])
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['converted_assets'], ['BICO', 'FRAX'])
+        self.assertEqual(result['results']['BICO']['transaction_id'], '12345')
+        self.assertEqual(result['results']['FRAX']['source_qty'], 0.18)
+        executor._binance_signed_post.assert_called_once_with(
+            '/sapi/v1/asset/dust-convert/convert',
+            {'asset': ['BICO', 'FRAX'], 'accountType': 'SPOT', 'targetAsset': 'BNB'},
         )
 
     def test_gate_ioc_zero_fill_is_no_fill_not_data_error(self):

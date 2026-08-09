@@ -964,58 +964,110 @@ class RealExecutor:
         return self._place_binance_spot_order(order)
 
     def convert_binance_spot_dust_to_bnb(self, base_asset: str) -> Dict:
-        """将现货账户中不可交易的小额资产转换为 BNB。"""
+        """将单个现货小额资产转换为 BNB。"""
+        result = self.convert_binance_spot_dust_to_bnb_batch([base_asset])
         base_asset = str(base_asset or '').strip().upper()
-        if not base_asset or base_asset in {'BNB', 'USDT'}:
-            return {'success': False, 'reason': f'invalid_dust_asset:{base_asset or "empty"}'}
-        try:
-            data = self._binance_signed_post('/sapi/v1/asset/dust', {
+        asset_result = (result.get('results') or {}).get(base_asset)
+        if asset_result:
+            return asset_result
+        if not result.get('success'):
+            return {
+                'success': False,
                 'asset': base_asset,
+                'reason': result.get('reason') or 'dust_conversion_failed',
+                'raw': result.get('raw'),
+            }
+        return {
+            'success': False,
+            'asset': base_asset,
+            'reason': 'dust_conversion_missing_transfer_result',
+            'raw': result.get('raw'),
+        }
+
+    def convert_binance_spot_dust_to_bnb_batch(self, base_assets: List[str]) -> Dict:
+        """将多个现货小额资产一次性转换为 BNB。"""
+        assets = sorted({
+            str(asset or '').strip().upper()
+            for asset in (base_assets or [])
+            if str(asset or '').strip()
+        })
+        invalid_assets = [asset for asset in assets if asset in {'BNB', 'USDT'}]
+        assets = [asset for asset in assets if asset not in {'BNB', 'USDT'}]
+        if not assets:
+            reason = (
+                f'invalid_dust_asset:{",".join(invalid_assets) or "empty"}'
+                if invalid_assets else 'invalid_dust_asset:empty'
+            )
+            return {'success': False, 'reason': reason, 'results': {}}
+        try:
+            data = self._binance_signed_post('/sapi/v1/asset/dust-convert/convert', {
+                'asset': assets,
                 'accountType': 'SPOT',
+                'targetAsset': 'BNB',
             })
         except Exception as exc:
-            logger.warning("Binance 尘埃转换失败 | %s | %s", base_asset, exc)
-            return {'success': False, 'reason': str(exc)[:200]}
+            logger.warning("Binance 批量尘埃转换失败 | %s | %s", ','.join(assets), exc)
+            return {
+                'success': False,
+                'reason': str(exc)[:200],
+                'assets': assets,
+                'results': {},
+            }
 
         transfers = data.get('transferResult') if isinstance(data, dict) else None
-        matched = next((
-            item for item in (transfers or [])
-            if str(item.get('fromAsset') or '').upper() == base_asset
-            and (self._float_or_none(item.get('amount')) or 0) > 0
-        ), None)
-        if not matched:
-            return {'success': False, 'reason': 'dust_conversion_missing_transfer_result', 'raw': data}
-
-        source_qty = self._float_or_none(matched.get('amount')) or 0.0
-        bnb_qty = self._float_or_none(matched.get('transferedAmount')) or 0.0
-        service_charge_bnb = self._float_or_none(matched.get('serviceChargeAmount')) or 0.0
         bnb_price = self._get_binance_usdt_price('BNB') or 0.0
-        exec_amount = bnb_qty * bnb_price if bnb_price > 0 else None
-        exec_price = exec_amount / source_qty if exec_amount is not None and source_qty > 0 else None
-        service_charge_usdt = service_charge_bnb * bnb_price if bnb_price > 0 else None
-        gross_exec_amount = (
-            exec_amount + service_charge_usdt
-            if exec_amount is not None and service_charge_usdt is not None
-            else None
-        )
-        gross_exec_price = (
-            gross_exec_amount / source_qty
-            if gross_exec_amount is not None and source_qty > 0
-            else None
-        )
+        results: Dict[str, Dict] = {}
+        for item in (transfers or []):
+            asset = str(item.get('fromAsset') or '').upper()
+            if asset not in assets:
+                continue
+            source_qty = self._float_or_none(item.get('amount')) or 0.0
+            if source_qty <= 0:
+                continue
+            bnb_qty = self._float_or_none(item.get('transferedAmount')) or 0.0
+            service_charge_bnb = self._float_or_none(item.get('serviceChargeAmount')) or 0.0
+            exec_amount = bnb_qty * bnb_price if bnb_price > 0 else None
+            exec_price = exec_amount / source_qty if exec_amount is not None and source_qty > 0 else None
+            service_charge_usdt = service_charge_bnb * bnb_price if bnb_price > 0 else None
+            gross_exec_amount = (
+                exec_amount + service_charge_usdt
+                if exec_amount is not None and service_charge_usdt is not None
+                else None
+            )
+            gross_exec_price = (
+                gross_exec_amount / source_qty
+                if gross_exec_amount is not None and source_qty > 0
+                else None
+            )
+            results[asset] = {
+                'success': True,
+                'asset': asset,
+                'source_qty': source_qty,
+                'bnb_qty': bnb_qty,
+                'service_charge_bnb': service_charge_bnb,
+                'service_charge_usdt': service_charge_usdt,
+                'bnb_price_usdt': bnb_price or None,
+                'transaction_id': str(item.get('tranId') or ''),
+                'exec_price_usdt': exec_price,
+                'exec_amount_usdt': exec_amount,
+                'gross_exec_price_usdt': gross_exec_price,
+                'gross_exec_amount_usdt': gross_exec_amount,
+                'raw': data,
+            }
+        if not results:
+            return {
+                'success': False,
+                'reason': 'dust_conversion_missing_transfer_result',
+                'assets': assets,
+                'results': {},
+                'raw': data,
+            }
         return {
             'success': True,
-            'asset': base_asset,
-            'source_qty': source_qty,
-            'bnb_qty': bnb_qty,
-            'service_charge_bnb': service_charge_bnb,
-            'service_charge_usdt': service_charge_usdt,
+            'assets': assets,
+            'converted_assets': sorted(results),
+            'results': results,
             'bnb_price_usdt': bnb_price or None,
-            'transaction_id': str(matched.get('tranId') or ''),
-            'exec_price_usdt': exec_price,
-            'exec_amount_usdt': exec_amount,
-            'gross_exec_price_usdt': gross_exec_price,
-            'gross_exec_amount_usdt': gross_exec_amount,
             'raw': data,
         }
 
@@ -1027,7 +1079,7 @@ class RealExecutor:
         payload = dict(params)
         payload.setdefault('recvWindow', 5000)
         payload['timestamp'] = int(time.time() * 1000)
-        query_string = urlencode(payload)
+        query_string = urlencode(payload, doseq=True)
         payload['signature'] = self._binance_sign(query_string)
         headers = {'X-MBX-APIKEY': self.config.binance_api_key}
         resp = self._session.post(

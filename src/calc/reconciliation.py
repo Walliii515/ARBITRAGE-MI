@@ -892,6 +892,7 @@ class Reconciler:
             if row.get('exchange') == 'gate' and row.get('dimension') == 'position'
         }
         results: List[Dict] = []
+        candidates: List[Dict] = []
         for spot_row in binance_rows:
             if spot_row.get('exchange') != 'binance' or spot_row.get('dimension') != 'position':
                 continue
@@ -911,11 +912,13 @@ class Reconciler:
             if abs(float(gate_row.get('exchange_value') or 0)) > 1e-9:
                 continue
 
-            result = self.remediator.remediate_post_close_spot_dust(
-                base_asset=base_asset,
-                local_spot_qty=local_spot_qty,
-                exchange_spot_qty=exchange_spot_qty,
-            )
+            candidates.append({
+                'base_asset': base_asset,
+                'local_spot_qty': local_spot_qty,
+                'exchange_spot_qty': exchange_spot_qty,
+            })
+        if candidates:
+            result = self.remediator.remediate_post_close_spot_dust_batch(candidates)
             if result.get('attempted'):
                 results.append(result)
         return results

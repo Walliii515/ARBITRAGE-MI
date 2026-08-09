@@ -61,10 +61,10 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
             executor=object(),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
-        reconciler.remediator.remediate_post_close_spot_dust = MagicMock(return_value={
+        reconciler.remediator.remediate_post_close_spot_dust_batch = MagicMock(return_value={
             'attempted': True,
             'success': True,
-            'action': 'convert_binance_dust_to_bnb',
+            'action': 'cleanup_post_close_dust_batch',
         })
 
         results = reconciler._auto_remediate_post_close_spot_dust(
@@ -87,18 +87,74 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         )
 
         self.assertEqual(len(results), 1)
-        reconciler.remediator.remediate_post_close_spot_dust.assert_called_once_with(
-            base_asset='FRAX',
-            local_spot_qty=0.18,
-            exchange_spot_qty=0.18,
+        reconciler.remediator.remediate_post_close_spot_dust_batch.assert_called_once_with([{
+            'base_asset': 'FRAX',
+            'local_spot_qty': 0.18,
+            'exchange_spot_qty': 0.18,
+        }])
+
+    def test_matched_post_close_spot_dust_is_batched(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
+        reconciler.remediator.remediate_post_close_spot_dust_batch = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'cleanup_post_close_dust_batch',
+        })
+
+        results = reconciler._auto_remediate_post_close_spot_dust(
+            binance_rows=[
+                {
+                    'exchange': 'binance',
+                    'dimension': 'position',
+                    'base_asset': 'FRAX',
+                    'local_value': 0.18,
+                    'exchange_value': 0.18,
+                    'is_match': True,
+                },
+                {
+                    'exchange': 'binance',
+                    'dimension': 'position',
+                    'base_asset': 'BICO',
+                    'local_value': 0.2,
+                    'exchange_value': 0.2,
+                    'is_match': True,
+                },
+            ],
+            gate_rows=[
+                {
+                    'exchange': 'gate',
+                    'dimension': 'position',
+                    'base_asset': 'FRAX',
+                    'local_value': 0.0,
+                    'exchange_value': 0.0,
+                    'is_match': True,
+                },
+                {
+                    'exchange': 'gate',
+                    'dimension': 'position',
+                    'base_asset': 'BICO',
+                    'local_value': 0.0,
+                    'exchange_value': 0.0,
+                    'is_match': True,
+                },
+            ],
+        )
+
+        self.assertEqual(len(results), 1)
+        reconciler.remediator.remediate_post_close_spot_dust_batch.assert_called_once_with([
+            {'base_asset': 'FRAX', 'local_spot_qty': 0.18, 'exchange_spot_qty': 0.18},
+            {'base_asset': 'BICO', 'local_spot_qty': 0.2, 'exchange_spot_qty': 0.2},
+        ])
 
     def test_post_close_spot_dust_is_not_touched_while_gate_position_remains(self):
         reconciler = Reconciler(
             executor=object(),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
-        reconciler.remediator.remediate_post_close_spot_dust = MagicMock()
+        reconciler.remediator.remediate_post_close_spot_dust_batch = MagicMock()
 
         results = reconciler._auto_remediate_post_close_spot_dust(
             binance_rows=[{
@@ -120,7 +176,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         )
 
         self.assertEqual(results, [])
-        reconciler.remediator.remediate_post_close_spot_dust.assert_not_called()
+        reconciler.remediator.remediate_post_close_spot_dust_batch.assert_not_called()
 
     def test_gate_risk_type_from_values(self):
         self.assertEqual(
@@ -959,6 +1015,9 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'future_open_qty': 0.0,
             'future_open_contracts': 0,
             'exchange_risk_status': 'normal',
+            'close_reason': '普通平仓|部分平仓保留剩余',
+            '_spot_remaining_qty': 0.09,
+            '_future_remaining_qty': 0.0,
         } for position_id in (406, 407)]
         executor = FakeExecutor()
         remediator = ExchangeDesyncRemediator(
@@ -1264,6 +1323,84 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
         remediator._zero_local_future_dust.assert_called_once()
         remediator._close_positions_after_dust_conversion.assert_called_once()
+
+    def test_manual_dust_cleanup_batches_multiple_spot_dust_assets(self):
+        class FakeExecutor:
+            contract_meta = {}
+            spot_meta = {
+                'BICO': {'min_notional': 5.0, 'step_size': 0.00001},
+                'FRAX': {'min_notional': 5.0, 'step_size': 0.01},
+            }
+
+            def __init__(self):
+                self.convert_binance_spot_dust_to_bnb_batch = MagicMock(return_value={
+                    'success': True,
+                    'results': {
+                        'BICO': {
+                            'success': True,
+                            'asset': 'BICO',
+                            'source_qty': 0.2,
+                            'bnb_qty': 0.00002,
+                            'transaction_id': 'dust-bico',
+                            'gross_exec_price_usdt': 0.05,
+                        },
+                        'FRAX': {
+                            'success': True,
+                            'asset': 'FRAX',
+                            'source_qty': 0.18,
+                            'bnb_qty': 0.00001,
+                            'transaction_id': 'dust-frax',
+                            'gross_exec_price_usdt': 0.31,
+                        },
+                    },
+                })
+
+        positions = [
+            {
+                'id': 501,
+                'base_asset': 'BICO',
+                'spot_open_qty': 0.2,
+                'spot_open_price': 0.05,
+                'close_reason': '普通平仓|部分平仓保留剩余',
+                '_spot_remaining_qty': 0.2,
+                '_future_remaining_qty': 0.0,
+            },
+            {
+                'id': 502,
+                'base_asset': 'FRAX',
+                'spot_open_qty': 0.18,
+                'spot_open_price': 0.31,
+                'close_reason': '普通平仓|部分平仓保留剩余',
+                '_spot_remaining_qty': 0.18,
+                '_future_remaining_qty': 0.0,
+            },
+        ]
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._dust_conversion_cooldown_remaining_sec = MagicMock(return_value=0.0)
+        remediator._load_holding_positions_with_execution_remainders = MagicMock(return_value=positions)
+        remediator._estimate_binance_spot_price = MagicMock(side_effect=lambda asset, _risk: {
+            'BICO': 0.05,
+            'FRAX': 0.31,
+        }[asset])
+        remediator._close_positions_after_dust_conversion = MagicMock()
+
+        result = remediator.cleanup_post_close_dust(
+            [
+                {'asset': 'BICO', 'total': 0.2, 'free': 0.2},
+                {'asset': 'FRAX', 'total': 0.18, 'free': 0.18},
+            ],
+            [],
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['asset_count'], 2)
+        self.assertEqual(result['positions'], 2)
+        executor.convert_binance_spot_dust_to_bnb_batch.assert_called_once_with(['BICO', 'FRAX'])
+        self.assertEqual(remediator._close_positions_after_dust_conversion.call_count, 2)
 
     def test_manual_dust_cleanup_rejects_unexplained_gate_position(self):
         class FakeExecutor:
