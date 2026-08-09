@@ -199,6 +199,14 @@ class ClosingExecutor:
             'account_capital.gate_cross_risk.danger_mmr_pct',
             300.0,
         )
+        self.margin_profit_release_mmr_pct = config.get_float(
+            'account_capital.gate_cross_risk.profit_release_mmr_pct',
+            350.0,
+        )
+        self.margin_critical_mmr_pct = config.get_float(
+            'account_capital.gate_cross_risk.critical_mmr_pct',
+            200.0,
+        )
         self.margin_recovery_target_mmr_pct = config.get_float(
             'account_capital.gate_cross_risk.warning_mmr_pct',
             500.0,
@@ -213,10 +221,12 @@ class ClosingExecutor:
             0.0,
         )
         self._gate_cross_risk_cache: Dict[str, object] = {'ts': 0.0, 'risk': None}
+        self._auto_fund_transfer_enabled_provider: Optional[Callable[[], bool]] = None
         self._margin_close_inflight = set()
         self._margin_close_inflight_lock = threading.Lock()
         self._margin_recovery_active = False
         self._margin_recovery_last_close_snapshot_ts = 0.0
+        self._margin_profit_release_last_close_snapshot_ts = 0.0
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -334,6 +344,13 @@ class ClosingExecutor:
         """Inject the shared real-time Gate cross-risk snapshot provider."""
         self._gate_cross_risk_provider = callback
 
+    def set_auto_fund_transfer_enabled_provider(
+        self,
+        callback: Optional[Callable[[], bool]],
+    ):
+        """Tie proactive profitable releases to the forward-open automation switch."""
+        self._auto_fund_transfer_enabled_provider = callback
+
     def set_delist_risk_report(self, report: Optional[Dict]):
         """注入异步刷新得到的下架风险报告；平仓关键路径只读内存。"""
         grouped: Dict[str, List[Dict]] = {}
@@ -353,14 +370,7 @@ class ClosingExecutor:
         positions: List[Dict],
         orderbook_rows_by_asset: Optional[Dict[str, Dict]] = None,
     ) -> List[Dict]:
-        """Execute the Gate cross-margin emergency path without market-data gates.
-
-        Only a fresh shared Gate risk snapshot may trigger this path. Account MMR
-        danger starts a staged recovery episode: close one priority holding, wait
-        for a newer account snapshot, and stop after MMR recovers to the warning
-        threshold. Liquidation-distance danger only applies to the affected
-        contract. Failed attempts never enter the ordinary close cooldown.
-        """
+        """Run profitable release, controlled recovery, or critical Gate reduction."""
         if not self.margin_danger_path_enabled:
             return []
 
@@ -412,20 +422,51 @@ class ClosingExecutor:
             and snapshot_ts > 0
             and snapshot_ts <= self._margin_recovery_last_close_snapshot_ts
         )
+        profit_release_active = (
+            not account_recovery_active
+            and account_mmr is not None
+            and self.margin_danger_mmr_pct < account_mmr <= self.margin_profit_release_mmr_pct
+            and risk_status in {'warning', 'danger'}
+            and self._auto_fund_transfer_enabled()
+        )
+        profit_snapshot_already_used = (
+            profit_release_active
+            and snapshot_ts > 0
+            and snapshot_ts <= self._margin_profit_release_last_close_snapshot_ts
+        )
+        critical_recovery = (
+            account_recovery_active
+            and account_mmr is not None
+            and account_mmr <= self.margin_critical_mmr_pct
+        )
 
         rows = orderbook_rows_by_asset or {}
         results = []
-        ordered_positions = self._sort_margin_danger_positions(positions, cross_risk)
+        desynced_assets = self._desynced_assets(positions)
+        if profit_release_active:
+            ordered_positions = self._prioritize_liq_danger(
+                self._sort_profitable_release_positions(positions),
+                cross_risk,
+            )
+        elif account_recovery_active and not critical_recovery:
+            ordered_positions = self._sort_controlled_recovery_positions(positions, cross_risk)
+        else:
+            ordered_positions = self._sort_margin_danger_positions(positions, cross_risk)
         for pos in ordered_positions:
             if pos.get('status') != 'holding':
                 continue
+            base_asset = str(pos.get('base_asset') or '').upper()
+            if base_asset in desynced_assets:
+                continue
             if self._mark_incomplete_holding_desync(pos):
+                desynced_assets.add(base_asset)
                 self._trigger_reconciliation(
                     'incomplete_holding_desync',
-                    str(pos.get('base_asset') or ''),
+                    base_asset,
                 )
                 continue
             if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
+                desynced_assets.add(base_asset)
                 continue
 
             danger = self._margin_danger_state(pos, cross_risk=cross_risk)
@@ -433,9 +474,16 @@ class ClosingExecutor:
                 danger.get('liq_distance_bps') is not None
                 and float(danger['liq_distance_bps']) <= self.margin_danger_liq_distance_bps
             )
-            if not liq_danger and not account_recovery_active:
+            if not liq_danger and not account_recovery_active and not profit_release_active:
                 continue
             if account_snapshot_already_used and not liq_danger:
+                continue
+            if profit_snapshot_already_used and not liq_danger:
+                continue
+            projected_net_bps = self._margin_position_net_bps(pos)
+            if profit_release_active and not liq_danger and (
+                projected_net_bps is None or projected_net_bps <= 0
+            ):
                 continue
             if account_recovery_active:
                 danger = dict(danger)
@@ -448,8 +496,15 @@ class ClosingExecutor:
                     reasons.append(recovery_reason)
                 danger['active'] = True
                 danger['reasons'] = reasons
+            elif profit_release_active:
+                danger = dict(danger)
+                danger['active'] = True
+                danger['reasons'] = [
+                    f"MMR{account_mmr:.2f}%<={self.margin_profit_release_mmr_pct:.1f}%",
+                    f"预计净盈利{projected_net_bps:.1f}bps",
+                    '释放Binance资金用于自动补资',
+                ]
 
-            base_asset = str(pos.get('base_asset') or '').upper()
             inflight_key = self._margin_close_key(pos)
             if not self._claim_margin_close(inflight_key):
                 logger.warning(
@@ -460,9 +515,24 @@ class ClosingExecutor:
                 continue
 
             orderbook_row = rows.get(base_asset) or {'base_asset': base_asset}
+            stage = (
+                'critical_200'
+                if critical_recovery
+                else (
+                    'liquidation_distance'
+                    if liq_danger
+                    else ('profit_release_350' if profit_release_active else 'controlled_300')
+                )
+            )
+            prefix = {
+                'critical_200': '保证金灾难路径',
+                'liquidation_distance': '保证金危险路径',
+                'profit_release_350': '保证金盈利释放',
+                'controlled_300': '保证金危险路径',
+            }[stage]
             detail = self._build_margin_close_detail(
                 pos,
-                '保证金危险路径',
+                prefix,
                 danger,
                 cross_risk=cross_risk,
             )
@@ -476,15 +546,32 @@ class ClosingExecutor:
                     pre_gate_basis_bps=None,
                 )
                 result.setdefault('position_id', pos.get('id'))
+                result.setdefault('margin_risk_stage', stage)
                 results.append(result)
-                if result.get('success'):
+                gate_reduction_consumed = bool(result.get('gate_reduction_consumed'))
+                if result.get('success') or gate_reduction_consumed:
                     if account_recovery_active:
                         self._margin_recovery_last_close_snapshot_ts = snapshot_ts
+                    if profit_release_active:
+                        self._margin_profit_release_last_close_snapshot_ts = snapshot_ts
+                if result.get('success'):
                     logger.critical(
                         "Gate全仓危险平仓成功 | %s | position_id=%s | %s",
                         base_asset,
                         pos.get('id'),
                         ';'.join(danger.get('reasons') or []),
+                    )
+                    return results
+                if gate_reduction_consumed:
+                    logger.critical(
+                        "Gate全仓已减仓但Binance未完整平仓，当前风险快照已消费并转交对账 | "
+                        "%s | position_id=%s | gate_qty=%s | spot_qty=%s | snapshot_ts=%s | msg=%s",
+                        base_asset,
+                        pos.get('id'),
+                        result.get('future_exec_qty'),
+                        result.get('spot_exec_qty'),
+                        snapshot_ts,
+                        result.get('message'),
                     )
                     return results
                 else:
@@ -494,6 +581,7 @@ class ClosingExecutor:
                         pos.get('id'),
                         result.get('message'),
                     )
+                    return results
             except Exception as exc:
                 logger.critical(
                     "Gate全仓危险平仓异常，将在下一轮立即重试 | %s | position_id=%s | %s",
@@ -509,10 +597,162 @@ class ClosingExecutor:
                     'close_reason': 'margin_close',
                     'message': str(exc),
                 })
+                return results
             finally:
                 self._release_margin_close(inflight_key)
 
         return results
+
+    def _auto_fund_transfer_enabled(self) -> bool:
+        callback = self._auto_fund_transfer_enabled_provider
+        if callback is None:
+            return True
+        try:
+            return bool(callback())
+        except Exception as exc:
+            logger.warning('读取自动补资开关失败: %s', exc, exc_info=True)
+            return False
+
+    def _margin_position_net_bps(self, pos: Dict) -> Optional[float]:
+        close_basis = _float_or_none(pos.get('current_spread_bps'))
+        if close_basis is None:
+            return None
+        return self._projected_net_bps(pos, close_basis)
+
+    def _margin_position_profit_usdt(self, pos: Dict) -> Optional[float]:
+        net_bps = self._margin_position_net_bps(pos)
+        if net_bps is None:
+            return None
+        notional = max(
+            _float_or_none(pos.get('spot_open_amount')) or 0.0,
+            (_float_or_none(pos.get('spot_open_qty')) or 0.0)
+            * (_float_or_none(pos.get('spot_open_price')) or 0.0),
+        )
+        return notional * net_bps / 10000.0
+
+    def _sort_profitable_release_positions(
+        self,
+        positions: Optional[List[Dict]],
+    ) -> List[Dict]:
+        """Release the largest currently profitable Binance allocation first."""
+        metrics = []
+        for index, pos in enumerate(positions or []):
+            net_bps = self._margin_position_net_bps(pos)
+            profit_usdt = self._margin_position_profit_usdt(pos)
+            metrics.append((index, pos, net_bps, profit_usdt))
+        metrics.sort(key=lambda item: (
+            item[2] is None or item[2] <= 0,
+            -(item[3] or 0.0),
+            -(_float_or_none(item[1].get('spot_open_amount')) or 0.0),
+            item[0],
+        ))
+        return [pos for _, pos, _, _ in metrics]
+
+    def _prioritize_liq_danger(
+        self,
+        positions: List[Dict],
+        cross_risk: Optional[Dict],
+    ) -> List[Dict]:
+        danger_contracts = {}
+        for item in (cross_risk or {}).get('close_priority') or []:
+            if not isinstance(item, dict):
+                continue
+            distance = _float_or_none(item.get('liq_distance_bps'))
+            if distance is None or distance > self.margin_danger_liq_distance_bps:
+                continue
+            contract = str(item.get('contract') or '').strip().upper()
+            danger_contracts[contract] = distance
+        indexed = list(enumerate(positions or []))
+        indexed.sort(key=lambda item: (
+            str(item[1].get('future_contract') or '').strip().upper() not in danger_contracts,
+            danger_contracts.get(
+                str(item[1].get('future_contract') or '').strip().upper(),
+                float('inf'),
+            ),
+            item[0],
+        ))
+        return [pos for _, pos in indexed]
+
+    def _sort_controlled_recovery_positions(
+        self,
+        positions: Optional[List[Dict]],
+        cross_risk: Optional[Dict],
+    ) -> List[Dict]:
+        """Prefer lower-loss holdings among candidates with useful MMR relief."""
+        holdings = list(positions or [])
+        risk_rows = {
+            str(item.get('contract') or '').strip().upper(): item
+            for item in (cross_risk or {}).get('close_priority') or []
+            if isinstance(item, dict)
+        }
+        total_qty_by_contract: Dict[str, float] = {}
+        for pos in holdings:
+            contract = str(pos.get('future_contract') or '').strip().upper()
+            total_qty_by_contract[contract] = total_qty_by_contract.get(contract, 0.0) + abs(
+                _float_or_none(pos.get('future_open_qty')) or 0.0
+            )
+
+        decorated = []
+        for index, pos in enumerate(holdings):
+            contract = str(pos.get('future_contract') or '').strip().upper()
+            risk_item = risk_rows.get(contract) or {}
+            contract_maintenance = max(
+                _float_or_none(risk_item.get('maintenance_margin_usdt')) or 0.0,
+                0.0,
+            )
+            total_qty = total_qty_by_contract.get(contract, 0.0)
+            qty = abs(_float_or_none(pos.get('future_open_qty')) or 0.0)
+            maintenance_release = (
+                contract_maintenance * qty / total_qty if total_qty > 0 else 0.0
+            )
+            liq_distance = _float_or_none(risk_item.get('liq_distance_bps'))
+            liq_danger = (
+                liq_distance is not None
+                and liq_distance <= self.margin_danger_liq_distance_bps
+            )
+            decorated.append({
+                'index': index,
+                'pos': pos,
+                'maintenance_release': maintenance_release,
+                'net_bps': self._margin_position_net_bps(pos),
+                'liq_danger': liq_danger,
+                'liq_distance': liq_distance,
+            })
+
+        max_release = max(
+            (item['maintenance_release'] for item in decorated if not item['liq_danger']),
+            default=0.0,
+        )
+        if max_release <= 0 or not any(item['net_bps'] is not None for item in decorated):
+            return self._sort_margin_danger_positions(holdings, cross_risk)
+        equity = _float_or_none((cross_risk or {}).get('account_equity_usdt')) or 0.0
+        total_maintenance = (
+            _float_or_none((cross_risk or {}).get('maintenance_margin_usdt')) or 0.0
+        )
+        target_multiple = max(self.margin_recovery_target_mmr_pct / 100.0, 0.01)
+        required_release = max(total_maintenance - equity / target_multiple, 0.0)
+        useful_release = min(required_release, max_release * 0.8) if max_release > 0 else 0.0
+
+        def sort_key(item: Dict):
+            if item['liq_danger']:
+                return (
+                    0,
+                    item['liq_distance'] if item['liq_distance'] is not None else float('inf'),
+                    -item['maintenance_release'],
+                    item['index'],
+                )
+            economically_known = item['net_bps'] is not None
+            useful = item['maintenance_release'] >= useful_release if useful_release > 0 else True
+            return (
+                1 if useful else 2,
+                0 if economically_known else 1,
+                -(item['net_bps'] if economically_known else float('-inf')),
+                -item['maintenance_release'],
+                item['index'],
+            )
+
+        decorated.sort(key=sort_key)
+        return [item['pos'] for item in decorated]
 
     @staticmethod
     def _sort_margin_danger_positions(
@@ -563,20 +803,25 @@ class ClosingExecutor:
         results = []
         self._active_close_vwap_threshold_meta = close_vwap_threshold_meta or {}
         self._observe_negative_funding_extremes(positions)
+        desynced_assets = self._desynced_assets(positions)
 
         for pos in positions:
             if pos.get('status') != 'holding':
                 continue
+            ba = str(pos.get('base_asset') or '').upper()
+            if ba in desynced_assets:
+                continue
             if self._mark_incomplete_holding_desync(pos):
+                desynced_assets.add(ba)
                 self._trigger_reconciliation(
                     'incomplete_holding_desync',
-                    str(pos.get('base_asset') or ''),
+                    ba,
                 )
                 continue
             if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
+                desynced_assets.add(ba)
                 continue
 
-            ba = pos.get('base_asset', '')
             current_spread_bps = pos.get('current_spread_bps')
 
             if current_spread_bps is None:
@@ -2237,12 +2482,21 @@ class ClosingExecutor:
                 pre_gate_basis_bps,
                 actual_close_basis_bps,
             )
+            future_exec_qty = abs(
+                _float_or_none((exec_result.get('future_order') or {}).get('exec_qty')) or 0.0
+            )
+            spot_exec_qty = abs(
+                _float_or_none((exec_result.get('spot_order') or {}).get('exec_qty')) or 0.0
+            )
             return {
                 'base_asset': ba,
-                'success': exec_result['success'],
+                'success': bool(exec_result.get('success')),
                 'order_uuid': order_group['order_uuid'],
                 'close_reason': close_reason,
                 'message': exec_result.get('message'),
+                'future_exec_qty': future_exec_qty,
+                'spot_exec_qty': spot_exec_qty,
+                'gate_reduction_consumed': future_exec_qty > CLOSE_QTY_TOLERANCE,
                 'pre_gate_basis_bps': pre_gate_basis_bps,
                 'actual_close_basis_bps': actual_close_basis_bps,
                 'close_basis_slip_bps': close_basis_slip_bps,
@@ -2842,12 +3096,28 @@ class ClosingExecutor:
             })
             updated = int(getattr(cursor, 'rowcount', 0) or 0)
 
+        if updated:
+            pos['future_open_qty'] = future_remaining
+            pos['future_open_contracts'] = future_contracts_remaining
+            pos['exchange_risk_status'] = 'desynced'
+            pos['exchange_risk_type'] = risk_type
+
         logger.critical(
             "平仓出现待处置断腿 | %s | position_id=%s | close_reason=%s | risk_type=%s | "
             "future_price=%s | future_qty=%s | spot_reason=%s",
             base_asset, position_id, close_reason, risk_type, future_price, future_qty, message,
         )
         return updated > 0
+
+    @staticmethod
+    def _desynced_assets(positions: Optional[List[Dict]]) -> set[str]:
+        return {
+            str(pos.get('base_asset') or '').upper()
+            for pos in (positions or [])
+            if pos.get('status') == 'holding'
+            and str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced'
+            and str(pos.get('base_asset') or '').strip()
+        }
 
     def _trigger_reconciliation(self, reason: str, base_asset: str):
         callback = self._reconciliation_trigger

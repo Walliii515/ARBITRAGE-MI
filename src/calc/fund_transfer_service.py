@@ -119,6 +119,8 @@ class FundTransferService:
         amount: Decimal,
         user_id: str,
         username: str,
+        initiator: str = 'manual',
+        context_detail: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if self.store.get_active():
             raise ValueError('已有划转任务或待处理异常，请先完成恢复')
@@ -153,14 +155,18 @@ class FundTransferService:
         except Exception:
             self._open_locked = bool(self.store.get_active())
             raise
+        detail = {
+            'binance_forward_free_before': str(forward_free),
+            'binance_master_free_before': str(master_free),
+            'gross_amount_semantics': 'requested_amount_includes_withdraw_fee',
+            'initiator': str(initiator or 'manual'),
+        }
+        if context_detail:
+            detail.update(context_detail)
         task = self.store.update(
             task['id'],
             started_at=self.now_fn(),
-            detail={
-                'binance_forward_free_before': str(forward_free),
-                'binance_master_free_before': str(master_free),
-                'gross_amount_semantics': 'requested_amount_includes_withdraw_fee',
-            },
+            detail=detail,
         )
         logger.warning(
             '资金划转任务已创建: id=%s amount=%s coin=%s network=%s',

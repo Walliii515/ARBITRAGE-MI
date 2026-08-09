@@ -72,6 +72,26 @@ def test_annualized_return_and_gate_risk_details_share_one_three_column_row():
 
     annualized = summary_grid.index('策略年化收益率')
     minimum_mmr = summary_grid.index('近7天最低全仓MMR')
-    priority_asset = summary_grid.index('低于500%首平候选')
+    priority_asset = summary_grid.index('300%风险首平候选')
     assert annualized < minimum_mmr < priority_asset
     assert 'grid-template-columns: repeat(3, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
+
+
+def test_gate_mmr_help_describes_auto_funding_and_tiered_close_rules():
+    help_start = CAPITAL_MONITOR_SOURCE.index('<div class="mmr-help">')
+    help_end = CAPITAL_MONITOR_SOURCE.index('</el-popover>', help_start)
+    help_content = CAPITAL_MONITOR_SOURCE[help_start:help_end]
+
+    for threshold in ('500%', '350%', '300%', '200%', '100%'):
+        assert threshold in help_content
+    for rule in (
+        'Gate维持保证金 × 7 - Gate账户权益',
+        'Binance Forward 可用资金的 70%',
+        'max(总资产 × 2%, 50 USDT)',
+        'max(100 USDT, Gate维持保证金 × 50%, 交易所最低额)',
+        '一次只退出一个本地完整套利仓位',
+        '关闭正向开仓只停止新自动任务',
+    ):
+        assert rule in help_content
+    assert 'max-height: min(70vh, 560px);' in CAPITAL_MONITOR_SOURCE
+    assert 'overflow-y: auto;' in CAPITAL_MONITOR_SOURCE

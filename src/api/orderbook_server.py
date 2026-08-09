@@ -87,6 +87,7 @@ from calc.fund_transfer_service import (
     fund_transfer_open_locked,
     get_fund_transfer_service,
 )
+from calc.auto_fund_transfer import AutoFundTransferCoordinator
 from exchange_apis.get_binance_margin_borrow import BinanceMarginBorrowClient, BinanceMarginBorrowConfig
 
 setup_logging()
@@ -116,6 +117,13 @@ def _json_dumps(data) -> str:
                 return obj.strftime('%Y-%m-%d %H:%M:%S')
             raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
         return json.dumps(data, default=_default, ensure_ascii=False)
+
+
+def _optional_float(value) -> Optional[float]:
+    try:
+        return float(value) if value is not None and value != '' else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _orjson_default(obj):
@@ -331,6 +339,7 @@ _gate_position_risk_cache: List[Dict] = []
 _gate_position_risk_cache_ts: float = 0.0
 _gate_cross_risk_monitor: Optional[GateCrossRiskMonitor] = None
 _gate_cross_risk_notifier: Optional[GateCrossRiskNotifier] = None
+_auto_fund_transfer_coordinator: Optional[AutoFundTransferCoordinator] = None
 _last_margin_danger_force_refresh_ts: float = 0.0
 _delist_risk_report: Dict = {'items': [], 'summary': {'total': 0, 'critical': 0, 'warning': 0}}
 _delist_risk_report_ts: float = 0.0
@@ -1568,7 +1577,42 @@ def _refresh_gate_cross_risk_once() -> Dict:
         _gate_cross_risk_monitor = build_default_gate_cross_risk_monitor()
     snapshot = _gate_cross_risk_monitor.refresh()
     _get_gate_cross_risk_notifier().record(datetime.now(), snapshot)
+    _evaluate_auto_fund_transfer(snapshot)
     return snapshot
+
+
+def _evaluate_auto_fund_transfer(snapshot: Dict) -> Dict:
+    """Create automatic funding only while the forward-open switch is enabled."""
+    global _auto_fund_transfer_coordinator
+    if not config.get_bool(
+        'account_capital.gate_cross_risk.auto_fund_transfer.enabled', True
+    ):
+        return {'action': 'disabled_by_config'}
+    if _open_paused:
+        return {'action': 'disabled_with_forward_open'}
+    if str((snapshot or {}).get('health_status') or '') != 'healthy':
+        return {'action': 'risk_snapshot_not_healthy'}
+    if _auto_fund_transfer_coordinator is None:
+        _auto_fund_transfer_coordinator = AutoFundTransferCoordinator(
+            get_fund_transfer_service()
+        )
+    summary = _latest_account_summary or {}
+    binance = summary.get('binance') or {}
+    summary_age = (
+        time.time() - _latest_account_summary_ts
+        if _latest_account_summary_ts > 0
+        else None
+    )
+    try:
+        return _auto_fund_transfer_coordinator.evaluate(
+            snapshot,
+            forward_open_enabled=True,
+            binance_equity_usdt=binance.get('net_value'),
+            account_summary_age_sec=summary_age,
+        )
+    except Exception as exc:
+        logger.error('Gate全仓MMR自动补资评估失败: %s', exc, exc_info=True)
+        return {'action': 'error', 'error': str(exc)[:300]}
 
 
 def _record_gate_cross_risk_collection_failure(exc: Exception) -> int:
@@ -1616,6 +1660,16 @@ def _configure_closing_executor(executor):
         executor.set_reconciliation_trigger(_trigger_reconciliation_once)
     if hasattr(executor, 'set_gate_cross_risk_provider'):
         executor.set_gate_cross_risk_provider(_get_live_gate_cross_risk_snapshot)
+    if hasattr(executor, 'set_auto_fund_transfer_enabled_provider'):
+        executor.set_auto_fund_transfer_enabled_provider(
+            lambda: (
+                not _open_paused
+                and config.get_bool(
+                    'account_capital.gate_cross_risk.auto_fund_transfer.enabled',
+                    True,
+                )
+            )
+        )
     return executor
 
 
@@ -2371,7 +2425,45 @@ def _run_close_position_check_once():
                     _get_gate_position_risk_snapshot(force_refresh=True),
                 )
 
-        emergency_results = _closing_executor.check_and_close_margin_danger(positions, {})
+        margin_orderbook_rows: Dict[str, Dict] = {}
+        live_risk = _get_live_gate_cross_risk_snapshot() or {}
+        live_mmr = _optional_float(live_risk.get('account_mmr_pct'))
+        profit_release_threshold = config.get_float(
+            'account_capital.gate_cross_risk.profit_release_mmr_pct',
+            350.0,
+        )
+        can_enrich_margin_economics = (
+            live_mmr is not None
+            and live_mmr <= profit_release_threshold
+            and svc
+            and svc.state == SERVICE_RUNNING
+            and svc.gate_manager
+            and svc.spot_manager
+            and svc._gate_ws_connected()
+            and svc._binance_ws_connected()
+        )
+        if can_enrich_margin_economics:
+            margin_rows = _get_merged_rows()
+            close_vwaps = {}
+            for row in margin_rows or []:
+                asset = str(row.get('base_asset') or '').upper()
+                if not asset:
+                    continue
+                margin_orderbook_rows[asset] = row
+                spot_close = row.get('spot_close_vwap')
+                future_close = row.get('future_close_vwap')
+                if spot_close is not None and future_close is not None:
+                    close_vwaps[asset] = {
+                        'spot_close_vwap': float(spot_close),
+                        'future_close_vwap': float(future_close),
+                    }
+            tracker.attach_funding_histories(positions)
+            calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
+
+        emergency_results = _closing_executor.check_and_close_margin_danger(
+            positions,
+            margin_orderbook_rows,
+        )
         if emergency_results:
             _publish_close_position_results(emergency_results)
             return

@@ -358,7 +358,9 @@ account_capital:
     max_age_sec: 5
     force_refresh_min_interval_sec: 2
     warning_mmr_pct: 500
+    profit_release_mmr_pct: 350
     danger_mmr_pct: 300
+    critical_mmr_pct: 200
     warning_liq_distance_bps: 600
     danger_liq_distance_bps: 300
     min_available_pct: 15
@@ -366,6 +368,19 @@ account_capital:
     warning_notification_cooldown_sec: 3600
     danger_notification_cooldown_sec: 300
     unknown_notification_cooldown_sec: 300
+    auto_fund_transfer:
+      enabled: true
+      trigger_mmr_pct: 500
+      target_mmr_pct: 700
+      target_buffer_ratio: 0.15
+      max_binance_free_ratio: 0.70
+      binance_equity_reserve_ratio: 0.02
+      binance_absolute_reserve_usdt: 50
+      minimum_amount_usdt: 100
+      minimum_mmr_uplift_pct: 50
+      account_summary_max_age_sec: 120
+      attempt_cooldown_sec: 10
+      completed_cooldown_sec: 30
 
 # 基础持仓对账配置（Binance 现货 + Gate 期货；可识别 Gate ADL/断腿并标记持仓风险）
 reconciliation:

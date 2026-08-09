@@ -753,10 +753,10 @@ function gatePriorityReasonText(): string {
     ? '距强平价已进入 300bps 危险区，优先级最高'
     : '按维持保证金占用从高到低排序'
   const mmr = Number(gateCrossRisk.value.account_mmr_pct)
-  if (Number.isFinite(mmr) && mmr <= 500) {
-    return `${reason}；当前已停开，MMR降至300%时执行`
+  if (Number.isFinite(mmr) && mmr <= 300) {
+    return `${reason}；当前处于300%分步风险减仓`
   }
-  return `${reason}；500%停开，MMR降至300%时执行`
+  return `${reason}；350%先释放盈利仓，降至300%后按风险候选减仓`
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -1657,15 +1657,27 @@ onBeforeUnmount(() => {
               <div class="mmr-help">
                 <div class="mmr-help-row">
                   <strong class="risk-warning">500%</strong>
-                  <span>停止新的正向开仓并写入铃铛告警。已有持仓不会因为 500% 被强平，仍会执行普通止盈、负资金费、下架风险和对账兜底平仓。</span>
+                  <span>停止新的正向开仓并写入铃铛告警；正向开仓开关开启时，同时创建 Binance → Gate 自动划转任务，目标 MMR 为 700%。关闭正向开仓只停止新自动任务，已经创建的划转任务会继续执行到完成或异常。</span>
+                </div>
+                <div class="mmr-help-formula">
+                  <strong>自动划转金额</strong>
+                  <span>所需额 = max(0, Gate维持保证金 × 7 - Gate账户权益) × 1.15；单次最多使用 Binance Forward 可用资金的 70%，且 Binance 至少保留 max(总资产 × 2%, 50 USDT)。最低有效额 = max(100 USDT, Gate维持保证金 × 50%, 交易所最低额)；不足最低有效额时不提现，并写入铃铛通知人工处理。</span>
+                </div>
+                <div class="mmr-help-row">
+                  <strong class="risk-warning">350%</strong>
+                  <span>每个新的 Gate 官方风险快照最多平一笔预计整组套利净收益为正的仓位，释放 Binance 资金后再次尝试自动划转；没有可确认的盈利仓位时不会为了该档位强行平仓。</span>
                 </div>
                 <div class="mmr-help-row">
                   <strong class="risk-danger">300%</strong>
-                  <span>使用 5 秒内的 Gate 官方账户 MMR，按风险顺序全量退出全部正向持仓：先平距强平价不超过 300bps 的合约，再按维持保证金从高到低处理；每笔先以 reduce-only 市价买回 Gate 空头，再市价卖出 Binance 现货。该路径不依赖盘口、WS 或普通平仓冷却，失败会在下一轮立即重试。</span>
+                  <span>进入分步风险减仓，每个新的官方风险快照最多平一笔。在能够有效释放维持保证金的候选中优先预计损失较小的完整套利仓位，并持续处理到 MMR 恢复至 500%；任一腿平仓失败即停止本轮，交由下一轮和持仓对账继续处理。</span>
+                </div>
+                <div class="mmr-help-row">
+                  <strong class="risk-danger">200%</strong>
+                  <span>进入最高级安全路径，不再按盈亏选择，先处理距强平价不超过 300bps 的合约，再按维持保证金释放能力排序；仍然一次只退出一个本地完整套利仓位，不提交跨仓位聚合全平。</span>
                 </div>
                 <div class="mmr-help-row">
                   <strong>100%</strong>
-                  <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在 300% 完成主动退出。</span>
+                  <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在到达该线前完成主动处置。</span>
                 </div>
                 <div class="mmr-help-note">
                   独立危险条件：任一正向空头距强平价不超过 300bps 时，不等待账户 MMR 降至 300%，立即市价平掉该合约对应的完整套利仓位。
@@ -1765,7 +1777,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="gate-risk-review-item">
-          <span class="gate-risk-review-label">低于500%首平候选</span>
+          <span class="gate-risk-review-label">300%风险首平候选</span>
           <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
             {{ gatePriorityAsset }}
           </strong>
@@ -2342,21 +2354,33 @@ onBeforeUnmount(() => {
 .mmr-help {
   display: grid;
   gap: 10px;
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  padding-right: 4px;
   color: var(--app-text);
   font-size: 12px;
   line-height: 1.55;
 }
 
-.mmr-help-row {
+.mmr-help-row,
+.mmr-help-formula {
   display: grid;
   grid-template-columns: 48px minmax(0, 1fr);
   align-items: start;
   gap: 10px;
 }
 
-.mmr-help-row strong {
+.mmr-help-row strong,
+.mmr-help-formula strong {
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+}
+
+.mmr-help-formula {
+  grid-template-columns: 92px minmax(0, 1fr);
+  padding: 8px;
+  border: 1px solid var(--app-border);
+  background: var(--app-bg);
 }
 
 .mmr-help-note {

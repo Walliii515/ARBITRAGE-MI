@@ -37,6 +37,182 @@ def _risk_position(**overrides):
 
 
 class TestClosingExecutorGateCrossRisk(unittest.TestCase):
+    def test_350_stage_closes_only_profitable_position_and_uses_one_snapshot_once(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='warning', account_mmr_pct=340.0),
+        }
+        losing = _risk_position(
+            open_spread_bps=100.0,
+            current_spread_bps=600.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        profitable = _risk_position(
+            id=12,
+            base_asset='AI',
+            future_contract='AI_USDT',
+            spot_symbol='AIUSDT',
+            spot_open_amount=100.0,
+            open_spread_bps=800.0,
+            current_spread_bps=100.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close',
+        })
+
+        first = ce.check_and_close_margin_danger([losing, profitable], {})
+        second = ce.check_and_close_margin_danger([losing, profitable], {})
+
+        self.assertEqual([item['position_id'] for item in first], [12])
+        self.assertEqual(first[0]['margin_risk_stage'], 'profit_release_350')
+        self.assertIn('保证金盈利释放', ce._execute_close.call_args.args[2])
+        self.assertEqual(second, [])
+        ce._execute_close.assert_called_once()
+
+    def test_350_stage_is_disabled_with_auto_funding_switch(self):
+        ce = make_closing_executor()
+        ce.set_auto_fund_transfer_enabled_provider(lambda: False)
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='warning', account_mmr_pct=340.0),
+        }
+        ce._execute_close = MagicMock()
+
+        result = ce.check_and_close_margin_danger([
+            _risk_position(open_spread_bps=800.0, current_spread_bps=100.0),
+        ], {})
+
+        self.assertEqual(result, [])
+        ce._execute_close.assert_not_called()
+
+    def test_300_stage_prefers_lower_loss_with_comparable_mmr_relief(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(
+                status='danger',
+                account_mmr_pct=290.0,
+                account_equity_usdt=290.0,
+                maintenance_margin_usdt=100.0,
+                close_priority=[
+                    {
+                        'contract': 'TUT_USDT',
+                        'maintenance_margin_usdt': 100.0,
+                        'liq_distance_bps': 1000.0,
+                    },
+                    {
+                        'contract': 'AI_USDT',
+                        'maintenance_margin_usdt': 90.0,
+                        'liq_distance_bps': 1000.0,
+                    },
+                ],
+            ),
+        }
+        losing = _risk_position(
+            open_spread_bps=100.0,
+            current_spread_bps=600.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        profitable = _risk_position(
+            id=12,
+            base_asset='AI',
+            future_contract='AI_USDT',
+            spot_symbol='AIUSDT',
+            open_spread_bps=800.0,
+            current_spread_bps=100.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'AI', 'success': True, 'close_reason': 'margin_close',
+        })
+
+        result = ce.check_and_close_margin_danger([losing, profitable], {})
+
+        self.assertEqual([item['position_id'] for item in result], [12])
+        self.assertEqual(result[0]['margin_risk_stage'], 'controlled_300')
+
+    def test_200_stage_uses_pure_gate_priority_but_still_closes_one_position(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(
+                status='danger',
+                account_mmr_pct=190.0,
+                close_priority=[
+                    {'contract': 'TUT_USDT', 'maintenance_margin_usdt': 100.0},
+                    {'contract': 'AI_USDT', 'maintenance_margin_usdt': 90.0},
+                ],
+            ),
+        }
+        losing = _risk_position(
+            open_spread_bps=100.0,
+            current_spread_bps=600.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        profitable = _risk_position(
+            id=12,
+            base_asset='AI',
+            future_contract='AI_USDT',
+            spot_symbol='AIUSDT',
+            open_spread_bps=800.0,
+            current_spread_bps=100.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT', 'success': True, 'close_reason': 'margin_close',
+        })
+
+        result = ce.check_and_close_margin_danger([losing, profitable], {})
+
+        self.assertEqual([item['position_id'] for item in result], [11])
+        self.assertEqual(result[0]['margin_risk_stage'], 'critical_200')
+        ce._execute_close.assert_called_once()
+
+    def test_risk_close_failure_stops_current_round_before_next_asset(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(
+                status='danger',
+                account_mmr_pct=190.0,
+                close_priority=[
+                    {'contract': 'TUT_USDT'},
+                    {'contract': 'AI_USDT'},
+                ],
+            ),
+        }
+        positions = [
+            _risk_position(gate_liq_price=2.0, gate_mark_price=1.0),
+            _risk_position(
+                id=12,
+                base_asset='AI',
+                future_contract='AI_USDT',
+                spot_symbol='AIUSDT',
+                gate_liq_price=2.0,
+                gate_mark_price=1.0,
+            ),
+        ]
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': False,
+            'close_reason': 'margin_close',
+            'message': 'Binance现货拒单',
+        })
+
+        result = ce.check_and_close_margin_danger(positions, {})
+
+        self.assertEqual(len(result), 1)
+        self.assertFalse(result[0]['success'])
+        ce._execute_close.assert_called_once()
+
     def test_cross_margin_missing_refresh_uses_account_mmr_not_contract_mmr(self):
         ce = make_closing_executor()
         ce._gate_cross_risk_cache = {
