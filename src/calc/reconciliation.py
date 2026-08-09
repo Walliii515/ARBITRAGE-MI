@@ -451,9 +451,43 @@ class Reconciler:
             multiplier = self._quanto_multiplier(asset)
             local_spot_qty = float(local_spot.get(asset, 0.0) or 0.0)
             local_gate_contracts = float(local_gate.get(asset, 0.0) or 0.0)
-            local_gate_qty = local_gate_contracts * multiplier
             binance_qty = float(binance.get(asset, 0.0) or 0.0)
             gate_contract_qty = float(gate_contracts.get(asset, 0.0) or 0.0)
+            if multiplier <= 0:
+                detail = {
+                    'status': 'metadata_unavailable',
+                    'risk_type': None,
+                    'quanto_multiplier': None,
+                    'local_spot_qty': local_spot_qty,
+                    'local_gate_contracts': local_gate_contracts,
+                    'binance_qty': binance_qty,
+                    'gate_contracts': gate_contract_qty,
+                    'recommended_action': 'wait_for_contract_metadata',
+                    'binance_detail': binance_detail.get(asset, {}),
+                    'gate_detail': gate_detail.get(asset, {}),
+                }
+                rows.append({
+                    'snapshot_at': snapshot_at,
+                    'exchange': 'combined',
+                    'base_asset': asset,
+                    'dimension': 'exposure',
+                    'local_value': None,
+                    'exchange_value': None,
+                    'diff_value': None,
+                    'diff_ratio': None,
+                    'is_match': False,
+                    'detail': detail,
+                })
+                logger.error(
+                    "对账缺少 Gate 合约乘数，禁止自动处置 | asset=%s | "
+                    "local_contracts=%s | exchange_contracts=%s",
+                    asset,
+                    local_gate_contracts,
+                    gate_contract_qty,
+                )
+                continue
+
+            local_gate_qty = local_gate_contracts * multiplier
             gate_qty = gate_contract_qty * multiplier
             tolerance = self._combined_exposure_tolerance(asset, multiplier)
             local_diff = local_spot_qty - local_gate_qty
@@ -512,9 +546,10 @@ class Reconciler:
     def _quanto_multiplier(self, base_asset: str) -> float:
         meta = getattr(self.executor, 'contract_meta', {}) or {}
         try:
-            return float((meta.get(base_asset) or {}).get('quanto_multiplier') or 1.0)
+            multiplier = float((meta.get(base_asset) or {}).get('quanto_multiplier') or 0.0)
+            return multiplier if multiplier > 0 else 0.0
         except (TypeError, ValueError):
-            return 1.0
+            return 0.0
 
     @staticmethod
     def _combined_risk_type(binance_qty: float, gate_qty: float, tolerance: float) -> Optional[str]:
@@ -968,17 +1003,65 @@ class Reconciler:
 
             risk_type = str(risk.get('type') or '')
             if risk_type in {'adl', 'liquidation', 'missing_gate_position', 'qty_mismatch'}:
-                remediation_risk = {
-                    **risk,
-                    'local_contracts': float(item.get('local_contracts') or 0),
-                    'exchange_contracts': float(item.get('exchange_contracts') or 0),
-                }
-                result = self.remediator.remediate_gate_short_desync(
-                    base_asset=item.get('base_asset'),
-                    missing_contracts=float(item.get('missing_contracts') or 0),
-                    risk=remediation_risk,
-                    require_desynced=True,
-                )
+                base_asset = str(item.get('base_asset') or '').upper()
+                multiplier = self._quanto_multiplier(base_asset)
+                binance_row = binance_by_asset.get(base_asset)
+                if multiplier <= 0:
+                    result = {
+                        'attempted': False,
+                        'reason': 'missing_contract_multiplier',
+                        'base_asset': base_asset,
+                    }
+                elif not binance_row:
+                    result = {
+                        'attempted': False,
+                        'reason': 'missing_binance_position_snapshot',
+                        'base_asset': base_asset,
+                    }
+                else:
+                    binance_qty = float(binance_row.get('exchange_value') or 0.0)
+                    gate_qty = float(item.get('exchange_contracts') or 0.0) * multiplier
+                    tolerance = self._combined_exposure_tolerance(base_asset, multiplier)
+                    spot_excess = binance_qty - gate_qty
+                    remediation_risk = {
+                        **risk,
+                        'local_contracts': float(item.get('local_contracts') or 0),
+                        'exchange_contracts': float(item.get('exchange_contracts') or 0),
+                        'binance_qty': binance_qty,
+                        'gate_qty': gate_qty,
+                        'quanto_multiplier': multiplier,
+                    }
+                    if spot_excess > tolerance:
+                        if gate_qty <= tolerance:
+                            result = self.remediator.remediate_binance_spot_only_exposure(
+                                base_asset=base_asset,
+                                spot_qty=spot_excess,
+                                risk=remediation_risk,
+                            )
+                        else:
+                            result = self.remediator.remediate_binance_spot_desync(
+                                base_asset=base_asset,
+                                local_qty=gate_qty,
+                                exchange_qty=binance_qty,
+                                risk=remediation_risk,
+                            )
+                    elif spot_excess < -tolerance:
+                        result = self.remediator.remediate_gate_extra_position(
+                            base_asset=base_asset,
+                            extra_contracts=(-spot_excess) / multiplier,
+                            risk={
+                                **remediation_risk,
+                                'exchange_size': -float(item.get('exchange_contracts') or 0.0),
+                            },
+                        )
+                    else:
+                        result = {
+                            'attempted': False,
+                            'reason': 'exchange_legs_balanced_local_ledger_stale',
+                            'base_asset': base_asset,
+                            'binance_qty': binance_qty,
+                            'gate_qty': gate_qty,
+                        }
             elif risk_type == 'extra_gate_position':
                 result = self.remediator.remediate_gate_extra_position(
                     base_asset=item.get('base_asset'),

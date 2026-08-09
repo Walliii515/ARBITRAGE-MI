@@ -1,7 +1,7 @@
 # coding: utf-8
 """
-更新 Gate.io 永续合约数据到数据库，包含永续合约基本信息和当期费率
-全删全进 mi_gate_future_contracts
+更新 Gate.io 永续合约数据到数据库，包含永续合约基本信息和当期费率。
+全量替换必须在同一事务中完成，避免交易热路径读到空表。
 """
 import sys
 import os
@@ -92,19 +92,8 @@ def ensure_base_asset_column():
         raise
 
 
-def clear_table():
-    """清空表数据"""
-    try:
-        with db_manager.get_cursor() as cursor:
-            cursor.execute("DELETE FROM mi_gate_future_contracts")
-            log_print("✓ 已清空表数据")
-    except Exception as e:
-        logger.exception(f"✗ 清空表失败: {e}")
-        raise
-
-
-def insert_contracts(contracts):
-    """插入合约数据到数据库"""
+def _insert_contracts(cursor, contracts):
+    """使用已有事务插入合约数据。"""
     insert_sql = """
     INSERT INTO mi_gate_future_contracts (
         name, base_asset, type, quanto_multiplier, order_price_round, order_size_min, order_size_max,
@@ -125,47 +114,67 @@ def insert_contracts(contracts):
     
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     success_count = 0
-    
+
+    for contract in contracts:
+        data = {
+            'name': contract.get('name'),
+            'base_asset': contract.get('base_asset') or parse_base_asset(contract.get('name')),
+            'type': contract.get('type'),
+            'quanto_multiplier': float(contract.get('quanto_multiplier', 0)),
+            'order_price_round': contract.get('order_price_round'),
+            'order_size_min': int(contract.get('order_size_min', 0)),
+            'order_size_max': int(contract.get('order_size_max', 0)),
+            'enable_decimal': 1 if contract.get('enable_decimal') else 0,
+            'leverage_min': int(contract.get('leverage_min', 0)),
+            'leverage_max': int(contract.get('leverage_max', 0)),
+            'maker_fee_rate': float(contract.get('maker_fee_rate', 0)),
+            'taker_fee_rate': float(contract.get('taker_fee_rate', 0)),
+            'maintenance_rate': (
+                float(contract.get('maintenance_rate'))
+                if contract.get('maintenance_rate') else None
+            ),
+            'funding_rate': float(contract.get('funding_rate', 0)),
+            'funding_rate_24h': calculate_24h_funding_rate_value(
+                contract.get('funding_rate'),
+                contract.get('funding_interval'),
+            ),
+            'funding_interval': int(contract.get('funding_interval', 0)),
+            'funding_next_apply': (
+                datetime.fromtimestamp(int(contract.get('funding_next_apply', 0)))
+                .strftime('%Y-%m-%d %H:%M:%S')
+                if contract.get('funding_next_apply') else None
+            ),
+            'status': contract.get('status'),
+            'funding_rate_limit': float(contract.get('funding_rate_limit', 0)),
+            'volume_24h_settle': contract.get('volume_24h_settle', 0),
+            'updated_at': now,
+        }
+        cursor.execute(insert_sql, data)
+        success_count += 1
+    return success_count
+
+
+def insert_contracts(contracts):
+    """插入合约数据到数据库。"""
     try:
         with db_manager.get_cursor() as cursor:
-            for contract in contracts:
-                # 处理数据
-                data = {
-                    'name': contract.get('name'),
-                    'base_asset': contract.get('base_asset') or parse_base_asset(contract.get('name')),
-                    'type': contract.get('type'),
-                    'quanto_multiplier': float(contract.get('quanto_multiplier', 0)),
-                    'order_price_round': contract.get('order_price_round'),
-                    'order_size_min': int(contract.get('order_size_min', 0)),
-                    'order_size_max': int(contract.get('order_size_max', 0)),
-                    'enable_decimal': 1 if contract.get('enable_decimal') else 0,
-                    'leverage_min': int(contract.get('leverage_min', 0)),
-                    'leverage_max': int(contract.get('leverage_max', 0)),
-                    'maker_fee_rate': float(contract.get('maker_fee_rate', 0)),
-                    'taker_fee_rate': float(contract.get('taker_fee_rate', 0)),
-                    'maintenance_rate': float(contract.get('maintenance_rate', 0)) if contract.get('maintenance_rate') else None,
-                    'funding_rate': float(contract.get('funding_rate', 0)),
-                    'funding_rate_24h': calculate_24h_funding_rate_value(
-                        contract.get('funding_rate'), 
-                        contract.get('funding_interval')
-                    ),
-                    'funding_interval': int(contract.get('funding_interval', 0)),
-                    'funding_next_apply': datetime.fromtimestamp(
-                        int(contract.get('funding_next_apply', 0))
-                    ).strftime('%Y-%m-%d %H:%M:%S') if contract.get('funding_next_apply') else None,
-                    'status': contract.get('status'),
-                    'funding_rate_limit': float(contract.get('funding_rate_limit', 0)),
-                    'volume_24h_settle': contract.get('volume_24h_settle', 0),
-                    'updated_at': now
-                }
-                
-                cursor.execute(insert_sql, data)
-                success_count += 1
-            
-            log_print(f"✓ 成功插入 {success_count} 条合约数据")
-            
+            success_count = _insert_contracts(cursor, contracts)
+        log_print(f"✓ 成功插入 {success_count} 条合约数据")
     except Exception as e:
         logger.exception(f"✗ 插入数据失败: {e}")
+        raise
+
+
+def replace_contracts(contracts):
+    """在同一事务中替换整张合约元数据表。"""
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute("DELETE FROM mi_gate_future_contracts")
+            success_count = _insert_contracts(cursor, contracts)
+        log_print(f"✓ 原子替换 {success_count} 条合约数据")
+        return success_count
+    except Exception as e:
+        logger.exception(f"✗ 原子替换合约数据失败: {e}")
         raise
 
 
@@ -204,13 +213,9 @@ def update_gate_future_contracts():
         # 4. 确保 base_asset 列存在
         ensure_base_asset_column()
 
-        # 5. 清空表
-        log_print("\n[3/3] 正在清空表数据...")
-        clear_table()
-        
-        # 6. 插入新数据
-        log_print("\n正在插入新数据...")
-        insert_contracts(merged_contracts)
+        # 5. 同一事务内替换，读方不会看到空表
+        log_print("\n[3/3] 正在原子替换表数据...")
+        replace_contracts(merged_contracts)
         
         # 7. 完成
         log_print("\n" + "=" * 60)

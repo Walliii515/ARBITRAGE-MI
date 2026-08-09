@@ -167,6 +167,148 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertAlmostEqual(row['detail']['gate_qty'], 9.0)
         self.assertAlmostEqual(row['detail']['exchange_diff'], 1.0)
 
+    def test_combined_exposure_missing_multiplier_fails_closed(self):
+        executor = MagicMock()
+        executor.contract_meta = {}
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+
+        rows = reconciler._build_combined_exposure_rows(
+            snapshot_at=datetime(2026, 8, 10, 5, 28, 58),
+            local_spot={'TUT': 19300.0},
+            local_gate={'TUT': 193.0},
+            binance_balances=[{'asset': 'TUT', 'total': 19300.0}],
+            gate_positions=[{'base_asset': 'TUT', 'size': '-193'}],
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]['is_match'])
+        self.assertIsNone(rows[0]['detail']['risk_type'])
+        self.assertEqual(rows[0]['detail']['status'], 'metadata_unavailable')
+        self.assertEqual(
+            rows[0]['detail']['recommended_action'],
+            'wait_for_contract_metadata',
+        )
+        self.assertEqual(
+            reconciler._mark_combined_exposure_risks(rows[0]['snapshot_at'], rows),
+            [],
+        )
+
+    def test_gate_local_mismatch_does_not_trade_when_exchange_legs_are_balanced(self):
+        executor = MagicMock()
+        executor.contract_meta = {'TUT': {'quanto_multiplier': 100.0}}
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_binance_spot_desync = MagicMock()
+        reconciler.remediator.remediate_binance_spot_only_exposure = MagicMock()
+        reconciler.remediator.remediate_gate_extra_position = MagicMock()
+        reconciler._record_reconciliation_risk_event = MagicMock()
+
+        results = reconciler._auto_remediate_gate_risks(
+            datetime(2026, 8, 10, 5, 31, 5),
+            [{
+                'base_asset': 'TUT',
+                'confirmed': True,
+                'risk': {'type': 'qty_mismatch', 'contract': 'TUT_USDT'},
+                'local_contracts': 193.0,
+                'exchange_contracts': 2.0,
+                'missing_contracts': 191.0,
+            }],
+            [{
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'TUT',
+                'local_value': 19300.0,
+                'exchange_value': 200.0,
+            }],
+        )
+
+        self.assertEqual(
+            results[0]['reason'],
+            'exchange_legs_balanced_local_ledger_stale',
+        )
+        reconciler.remediator.remediate_binance_spot_desync.assert_not_called()
+        reconciler.remediator.remediate_binance_spot_only_exposure.assert_not_called()
+        reconciler.remediator.remediate_gate_extra_position.assert_not_called()
+
+    def test_gate_local_mismatch_sells_only_actual_binance_excess(self):
+        executor = MagicMock()
+        executor.contract_meta = {'TUT': {'quanto_multiplier': 100.0}}
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_binance_spot_desync = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+        })
+        reconciler._record_reconciliation_risk_event = MagicMock()
+
+        reconciler._auto_remediate_gate_risks(
+            datetime(2026, 8, 10, 5, 29, 1),
+            [{
+                'base_asset': 'TUT',
+                'confirmed': True,
+                'risk': {'type': 'qty_mismatch', 'contract': 'TUT_USDT'},
+                'local_contracts': 193.0,
+                'exchange_contracts': 2.0,
+                'missing_contracts': 191.0,
+            }],
+            [{
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'TUT',
+                'local_value': 19300.0,
+                'exchange_value': 19300.0,
+            }],
+        )
+
+        kwargs = reconciler.remediator.remediate_binance_spot_desync.call_args.kwargs
+        self.assertEqual(kwargs['base_asset'], 'TUT')
+        self.assertEqual(kwargs['local_qty'], 200.0)
+        self.assertEqual(kwargs['exchange_qty'], 19300.0)
+
+    def test_gate_local_mismatch_closes_only_actual_gate_excess(self):
+        executor = MagicMock()
+        executor.contract_meta = {'TUT': {'quanto_multiplier': 100.0}}
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+        })
+        reconciler._record_reconciliation_risk_event = MagicMock()
+
+        reconciler._auto_remediate_gate_risks(
+            datetime(2026, 8, 10, 6, 23, 59),
+            [{
+                'base_asset': 'TUT',
+                'confirmed': True,
+                'risk': {'type': 'qty_mismatch', 'contract': 'TUT_USDT'},
+                'local_contracts': 193.0,
+                'exchange_contracts': 2.0,
+                'missing_contracts': 191.0,
+            }],
+            [{
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'TUT',
+                'local_value': 19300.0,
+                'exchange_value': 0.0,
+            }],
+        )
+
+        kwargs = reconciler.remediator.remediate_gate_extra_position.call_args.kwargs
+        self.assertEqual(kwargs['base_asset'], 'TUT')
+        self.assertEqual(kwargs['extra_contracts'], 2.0)
+        self.assertEqual(kwargs['risk']['exchange_size'], -2.0)
+
     def test_combined_binance_excess_uses_spot_only_reduction_when_gate_is_flat(self):
         reconciler = Reconciler(
             executor=object(),

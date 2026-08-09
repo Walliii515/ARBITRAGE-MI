@@ -1308,6 +1308,12 @@ class ExchangeDesyncRemediator:
             }
 
         quanto_multiplier = self._quanto_multiplier(base_asset)
+        if quanto_multiplier <= 0:
+            return {
+                'attempted': False,
+                'reason': 'missing_contract_multiplier',
+                'base_asset': base_asset,
+            }
         target_qty = float(extra_contracts) * quanto_multiplier
         if target_qty <= 0:
             return {'attempted': False, 'reason': 'target_qty<=0'}
@@ -2073,9 +2079,10 @@ class ExchangeDesyncRemediator:
     def _quanto_multiplier(self, base_asset: str) -> float:
         meta = getattr(self.executor, 'contract_meta', {}) or {}
         try:
-            return float((meta.get(base_asset) or {}).get('quanto_multiplier') or 1.0)
+            multiplier = float((meta.get(base_asset) or {}).get('quanto_multiplier') or 0.0)
+            return multiplier if multiplier > 0 else 0.0
         except (TypeError, ValueError):
-            return 1.0
+            return 0.0
 
     def _load_binance_available_qty(self, base_asset: str) -> float:
         balances = self.executor.fetch_binance_account_balances()
