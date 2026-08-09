@@ -415,6 +415,12 @@ class ClosingExecutor:
         for pos in ordered_positions:
             if pos.get('status') != 'holding':
                 continue
+            if self._mark_incomplete_holding_desync(pos):
+                self._trigger_reconciliation(
+                    'incomplete_holding_desync',
+                    str(pos.get('base_asset') or ''),
+                )
+                continue
             if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
                 continue
 
@@ -556,6 +562,12 @@ class ClosingExecutor:
 
         for pos in positions:
             if pos.get('status') != 'holding':
+                continue
+            if self._mark_incomplete_holding_desync(pos):
+                self._trigger_reconciliation(
+                    'incomplete_holding_desync',
+                    str(pos.get('base_asset') or ''),
+                )
                 continue
             if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
                 continue
@@ -2289,6 +2301,8 @@ class ClosingExecutor:
         fallback_price,
     ) -> Optional[float]:
         """Estimate close notional from target quantity, never from current open config."""
+        if target_qty <= 0:
+            return 0.0
         row = orderbook_row or {}
         reference_price = next(
             (
@@ -2300,7 +2314,7 @@ class ClosingExecutor:
         )
         if reference_price is None:
             reference_price = _float_or_none(fallback_price)
-        if target_qty <= 0 or reference_price is None or reference_price <= 0:
+        if reference_price is None or reference_price <= 0:
             return None
         return target_qty * reference_price
 
@@ -2382,6 +2396,26 @@ class ClosingExecutor:
             order['funding_rate_24h'] = pos.get('funding_rate_24h')
 
             exec_data = exec_result.get(market_key) or {}
+            target_amount = _float_or_none(order.get('target_amount'))
+            if target_amount is None:
+                exec_amount = _float_or_none(exec_data.get('exec_amount'))
+                exec_price = _float_or_none(exec_data.get('exec_price'))
+                target_qty = abs(_float_or_none(order.get('target_qty')) or 0.0)
+                if exec_amount is not None:
+                    target_amount = abs(exec_amount)
+                elif exec_price is not None and exec_price > 0 and target_qty > 0:
+                    target_amount = target_qty * exec_price
+                else:
+                    target_amount = 0.0
+                logger.warning(
+                    "平仓订单缺少目标金额，使用成交/零值兜底 | position_id=%s | "
+                    "market=%s | target_qty=%s | target_amount=%s",
+                    position_id,
+                    market_key,
+                    order.get('target_qty'),
+                    target_amount,
+                )
+            order['target_amount'] = target_amount
             leg_executed = bool(
                 exec_data
                 and exec_data.get('exec_price') is not None
@@ -2527,6 +2561,8 @@ class ClosingExecutor:
         balanced = (
             spot_exec > CLOSE_QTY_TOLERANCE
             and future_exec > CLOSE_QTY_TOLERANCE
+            and spot_shortfall > CLOSE_QTY_TOLERANCE
+            and future_shortfall > CLOSE_QTY_TOLERANCE
             and abs(spot_exec - expected_spot_exec) <= balance_tolerance
         )
         return {
@@ -2621,6 +2657,60 @@ class ClosingExecutor:
         if updated:
             logger.warning("普通平仓部分成交断腿标记 | position_id=%s | %s", pos.get('id'), detail)
         return bool(updated)
+
+    def _mark_incomplete_holding_desync(self, pos: Dict) -> bool:
+        """Move one-legged local remainders out of every ordinary close path."""
+        if str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced':
+            return False
+
+        spot_qty = abs(_float_or_none(pos.get('spot_open_qty')) or 0.0)
+        future_qty = abs(_float_or_none(pos.get('future_open_qty')) or 0.0)
+        spot_active = spot_qty > CLOSE_QTY_TOLERANCE
+        future_active = future_qty > CLOSE_QTY_TOLERANCE
+        if spot_active == future_active:
+            return False
+
+        risk_type = 'missing_gate_position' if spot_active else 'missing_binance_position'
+        detail = (
+            f"本地holding缺腿|asset={str(pos.get('base_asset') or '').upper()}|"
+            f"spot_qty={spot_qty:g}|future_qty={future_qty:g}"
+        )
+        reason = f"交易所仓位风险:{risk_type}|{detail}"
+        sql = """
+            UPDATE mi_trade_position
+            SET exchange_risk_status = 'desynced',
+                exchange_risk_type = %(risk_type)s,
+                exchange_risk_at = %(risk_at)s,
+                exchange_risk_detail = %(detail)s,
+                close_reason = CASE
+                    WHEN close_reason IS NULL OR close_reason = '' THEN %(reason)s
+                    WHEN close_reason NOT LIKE %(reason_like)s THEN CONCAT(close_reason, '|', %(reason)s)
+                    ELSE close_reason
+                END
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+              AND COALESCE(exchange_risk_status, 'normal') <> 'desynced'
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'risk_type': risk_type,
+                'risk_at': datetime.now(),
+                'detail': detail,
+                'reason': reason,
+                'reason_like': '%本地holding缺腿%',
+                'position_id': pos.get('id'),
+            })
+            updated = int(cursor.rowcount or 0)
+
+        pos['exchange_risk_status'] = 'desynced'
+        pos['exchange_risk_type'] = risk_type
+        if updated:
+            logger.critical(
+                "本地单边holding转交对账兜底 | position_id=%s | %s",
+                pos.get('id'),
+                detail,
+            )
+        return True
 
     def _mark_future_only_close_desync(
         self,

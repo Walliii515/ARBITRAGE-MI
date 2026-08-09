@@ -4516,6 +4516,84 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         ))
         self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
 
+    def test_full_future_fill_with_spot_dust_marks_desync(self):
+        """期货已归零时，即使现货余量小于 step，也不能保留为普通双腿持仓。"""
+        self.ce.spot_meta = {'BEL': {'step_size': 1.0}}
+        cursor, triggered = self._record_save_close(
+            self._bel_close_position(qty=410.0),
+            self._bel_close_order_group(qty=410.0),
+            self._close_exec_result(409.5, 410.0),
+            close_reason='margin_close',
+            detail='保证金危险路径',
+        )
+
+        risk_calls = [
+            (sql, params) for sql, params in cursor.calls
+            if "exchange_risk_status = 'desynced'" in sql
+        ]
+        self.assertEqual(len(risk_calls), 1)
+        self.assertIn('spot=409.5/410|future=410/410', risk_calls[0][1]['detail'])
+        self.assertFalse(any(
+            'spot_open_qty = %(spot_open_qty)s' in sql for sql, _ in cursor.calls
+        ))
+        self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
+
+    def test_save_close_never_persists_null_target_amount(self):
+        pos = self._bel_close_position(qty=0.5)
+        pos['future_open_qty'] = 0.0
+        pos['future_open_contracts'] = 0.0
+        order_group = self._bel_close_order_group(qty=0.5)
+        order_group['future_order']['target_qty'] = 0.0
+        order_group['future_order']['target_amount'] = None
+        exec_result = {
+            'success': False,
+            'message': 'Gate 平仓数量无效',
+            'spot_order': None,
+            'future_order': None,
+            'execution_stats': {},
+        }
+
+        cursor, _ = self._record_save_close(
+            pos,
+            order_group,
+            exec_result,
+            close_reason='margin_close',
+            detail='保证金危险路径',
+        )
+
+        insert_params = [
+            params for sql, params in cursor.calls if 'INSERT INTO mi_trade_order' in sql
+        ]
+        self.assertEqual(len(insert_params), 2)
+        self.assertTrue(all(params['target_amount'] is not None for params in insert_params))
+        self.assertEqual(insert_params[1]['target_amount'], 0.0)
+
+    def test_incomplete_spot_only_holding_is_marked_missing_gate(self):
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+        pos = {
+            'id': 387,
+            'status': 'holding',
+            'base_asset': 'TUT',
+            'spot_open_qty': 0.535,
+            'future_open_qty': 0.0,
+            'exchange_risk_status': 'normal',
+        }
+
+        with patch('calc.closing_executor.db_manager.get_cursor', return_value=context):
+            marked = self.ce._mark_incomplete_holding_desync(pos)
+
+        self.assertTrue(marked)
+        params = cursor.execute.call_args.args[1]
+        self.assertEqual(params['position_id'], 387)
+        self.assertEqual(params['risk_type'], 'missing_gate_position')
+        self.assertIn('spot_qty=0.535|future_qty=0', params['detail'])
+        self.assertEqual(pos['exchange_risk_status'], 'desynced')
+        self.assertEqual(pos['exchange_risk_type'], 'missing_gate_position')
+
     def test_take_profit_full_fill_marks_position_closed(self):
         cursor, triggered = self._record_save_close(
             self._bel_close_position(qty=410.0),
@@ -5677,6 +5755,29 @@ class TestMarginDangerPath(unittest.TestCase):
         self.assertEqual(results[-1]['close_reason'], 'margin_close')
         args = ce._execute_close.call_args.args
         self.assertEqual(args[3], {'base_asset': 'TUT'})
+
+    def test_danger_path_marks_incomplete_holding_and_never_submits_close(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='safe', account_mmr_pct=800.0),
+        }
+        pos = self._risk_position(
+            spot_open_qty=0.7,
+            future_open_qty=0.0,
+            future_open_contracts=0.0,
+        )
+        ce._mark_incomplete_holding_desync = MagicMock(return_value=True)
+        ce._execute_close = MagicMock()
+        triggered = []
+        ce.set_reconciliation_trigger(lambda reason, asset: triggered.append((reason, asset)))
+
+        results = ce.check_and_close_margin_danger([pos], {})
+
+        self.assertEqual(results, [])
+        ce._mark_incomplete_holding_desync.assert_called_once_with(pos)
+        ce._execute_close.assert_not_called()
+        self.assertEqual(triggered, [('incomplete_holding_desync', 'TUT')])
 
     def test_needs_fresh_margin_risk_detects_mmr_and_liq_distance(self):
         ce = make_closing_executor()
