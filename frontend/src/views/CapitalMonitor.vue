@@ -219,6 +219,24 @@ const fundTransferCreating = ref(false)
 const fundTransferRetrying = ref(false)
 const activeFundTransfer = ref<FundTransferTask | null>(null)
 const fundTransferHistory = ref<FundTransferTask[]>([])
+const mmrHelpPopperOptions = {
+  strategy: 'fixed',
+  modifiers: [
+    {
+      name: 'flip',
+      options: {
+        fallbackPlacements: ['bottom-start', 'top-start', 'left-start'],
+      },
+    },
+    {
+      name: 'preventOverflow',
+      options: {
+        boundary: 'viewport',
+        padding: 12,
+      },
+    },
+  ],
+}
 const clearDefaultTime = [
   new Date(2000, 0, 1, 0, 0, 0),
   new Date(2000, 0, 1, 23, 59, 59),
@@ -1640,8 +1658,10 @@ onBeforeUnmount(() => {
             <span>当前全仓MMR</span>
             <el-popover
               trigger="click"
-              placement="top"
-              width="min(560px, calc(100vw - 24px))"
+              placement="right-start"
+              :width="640"
+              popper-class="mmr-help-popper"
+              :popper-options="mmrHelpPopperOptions"
             >
               <template #reference>
                 <el-button
@@ -2354,7 +2374,7 @@ onBeforeUnmount(() => {
 .mmr-help {
   display: grid;
   gap: 10px;
-  max-height: min(70vh, 560px);
+  max-height: min(560px, calc(100vh - 96px));
   overflow-y: auto;
   padding-right: 4px;
   color: var(--app-text);
@@ -2831,6 +2851,10 @@ onBeforeUnmount(() => {
 </style>
 
 <style>
+.mmr-help-popper.el-popper {
+  max-width: calc(100vw - 24px);
+}
+
 .fund-transfer-dialog.el-dialog {
   display: flex;
   flex-direction: column;
