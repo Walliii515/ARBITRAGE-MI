@@ -21,6 +21,7 @@ from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
 from calc.executor_client import ExecutorClient
+from calc.asset_reduction_guard import asset_reduction_guard
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps
 from calc.orderbook_resiliency import (
     BookSideSpec,
@@ -73,7 +74,10 @@ class ClosingExecutor:
         self.funding_rate_p40_meta = funding_rate_p40_meta or {}
 
         executor_url = config.get_executor_url()
-        executor_timeout = config.get_int('trade.executor.timeout_sec', 5)
+        executor_timeout = config.get_int(
+            'trade.executor.close_timeout_sec',
+            config.get_int('trade.executor.timeout_sec', 5),
+        )
         self.executor_client = ExecutorClient(executor_url, timeout=executor_timeout)
 
         self.take_profit_mode = config.get_str('trade.close.take_profit_mode', 'fixed_net_bps')
@@ -2192,36 +2196,57 @@ class ClosingExecutor:
         future_protective_price: Optional[float] = None,
     ) -> Dict:
         """构建平仓订单组 → 调用成交引擎 → 持久化"""
-        ba = pos.get('base_asset', '')
-        order_group = self._build_close_order_group(
-            pos,
-            close_reason=close_reason,
-            future_protective_price=future_protective_price,
-            orderbook_row=orderbook_row,
-        )
-        exec_result = self.executor_client.execute(order_group, orderbook_row)
-        actual_close_basis_bps = self._save_close(
-            pos,
-            order_group,
-            exec_result,
-            close_reason,
-            close_reason_detail,
-            pre_gate_basis_bps=pre_gate_basis_bps,
-        )
-        close_basis_slip_bps = self._close_basis_slip_bps(
-            pre_gate_basis_bps,
-            actual_close_basis_bps,
-        )
-        return {
-            'base_asset': ba,
-            'success': exec_result['success'],
-            'order_uuid': order_group['order_uuid'],
-            'close_reason': close_reason,
-            'message': exec_result.get('message'),
-            'pre_gate_basis_bps': pre_gate_basis_bps,
-            'actual_close_basis_bps': actual_close_basis_bps,
-            'close_basis_slip_bps': close_basis_slip_bps,
-        }
+        ba = str(pos.get('base_asset') or '').upper()
+        guard_owner = f"closing:{close_reason}:{pos.get('id') or 'unknown'}:{uuid.uuid4().hex[:8]}"
+        with asset_reduction_guard.claim(ba, guard_owner) as acquired:
+            if not acquired:
+                active_owner = asset_reduction_guard.owner(ba)
+                logger.warning(
+                    "同币种已有减仓执行，跳过重复平仓 | %s | owner=%s | reason=%s",
+                    ba,
+                    active_owner,
+                    close_reason,
+                )
+                return {
+                    'base_asset': ba,
+                    'success': False,
+                    'order_uuid': None,
+                    'close_reason': close_reason,
+                    'message': f'同币种已有减仓执行({active_owner})',
+                    'pre_gate_basis_bps': pre_gate_basis_bps,
+                    'actual_close_basis_bps': None,
+                    'close_basis_slip_bps': None,
+                }
+
+            order_group = self._build_close_order_group(
+                pos,
+                close_reason=close_reason,
+                future_protective_price=future_protective_price,
+                orderbook_row=orderbook_row,
+            )
+            exec_result = self.executor_client.execute(order_group, orderbook_row)
+            actual_close_basis_bps = self._save_close(
+                pos,
+                order_group,
+                exec_result,
+                close_reason,
+                close_reason_detail,
+                pre_gate_basis_bps=pre_gate_basis_bps,
+            )
+            close_basis_slip_bps = self._close_basis_slip_bps(
+                pre_gate_basis_bps,
+                actual_close_basis_bps,
+            )
+            return {
+                'base_asset': ba,
+                'success': exec_result['success'],
+                'order_uuid': order_group['order_uuid'],
+                'close_reason': close_reason,
+                'message': exec_result.get('message'),
+                'pre_gate_basis_bps': pre_gate_basis_bps,
+                'actual_close_basis_bps': actual_close_basis_bps,
+                'close_basis_slip_bps': close_basis_slip_bps,
+            }
 
     def _build_close_order_group(
         self,
@@ -2534,14 +2559,13 @@ class ClosingExecutor:
             return None
 
     def _close_partial_fill_state(self, pos: Dict, order_group: Dict, exec_result: Dict) -> Dict:
-        if not exec_result.get('success'):
-            return {'partial': False}
-
         spot_target = _float_or_none((order_group.get('spot_order') or {}).get('target_qty')) or 0.0
         future_target = _float_or_none((order_group.get('future_order') or {}).get('target_qty')) or 0.0
         spot_exec = _float_or_none((exec_result.get('spot_order') or {}).get('exec_qty')) or 0.0
         future_exec = _float_or_none((exec_result.get('future_order') or {}).get('exec_qty')) or 0.0
         if spot_target <= CLOSE_QTY_TOLERANCE or future_target <= CLOSE_QTY_TOLERANCE:
+            return {'partial': False}
+        if spot_exec <= CLOSE_QTY_TOLERANCE or future_exec <= CLOSE_QTY_TOLERANCE:
             return {'partial': False}
 
         spot_shortfall = max(0.0, spot_target - spot_exec)
@@ -2557,7 +2581,10 @@ class ClosingExecutor:
         spot_step = _float_or_none(
             (self.spot_meta.get(str(pos.get('base_asset') or '').upper()) or {}).get('step_size')
         ) or 0.0
-        balance_tolerance = max(CLOSE_QTY_TOLERANCE, spot_step + 1e-12)
+        balance_tolerance = max(
+            CLOSE_QTY_TOLERANCE,
+            spot_step * (1.0 - 1e-9) if spot_step > 0 else 0.0,
+        )
         balanced = (
             spot_exec > CLOSE_QTY_TOLERANCE
             and future_exec > CLOSE_QTY_TOLERANCE
@@ -2625,6 +2652,14 @@ class ClosingExecutor:
         )
 
     def _mark_unbalanced_partial_close_desync(self, pos: Dict, state: Dict, close_reason_detail: str) -> bool:
+        spot_remaining = max(0.0, float(state.get('spot_remaining') or 0))
+        future_remaining = max(0.0, float(state.get('future_remaining') or 0))
+        if future_remaining <= CLOSE_QTY_TOLERANCE < spot_remaining:
+            risk_type = 'missing_gate_position'
+        elif spot_remaining <= CLOSE_QTY_TOLERANCE < future_remaining:
+            risk_type = 'missing_binance_position'
+        else:
+            risk_type = 'qty_mismatch'
         detail = (
             f"普通平仓部分成交且两腿不一致|asset={pos.get('base_asset')}|"
             f"spot={state.get('spot_exec'):g}/{state.get('spot_target'):g}|"
@@ -2632,8 +2667,12 @@ class ClosingExecutor:
         )
         sql = """
             UPDATE mi_trade_position
-            SET exchange_risk_status = 'desynced',
-                exchange_risk_type = 'qty_mismatch',
+            SET spot_open_qty = %(spot_open_qty)s,
+                spot_open_amount = %(spot_open_amount)s,
+                future_open_qty = %(future_open_qty)s,
+                future_open_contracts = %(future_open_contracts)s,
+                exchange_risk_status = 'desynced',
+                exchange_risk_type = %(risk_type)s,
                 exchange_risk_at = %(risk_at)s,
                 exchange_risk_detail = %(detail)s,
                 close_reason = CASE
@@ -2644,9 +2683,17 @@ class ClosingExecutor:
             WHERE id = %(position_id)s
               AND status = 'holding'
         """
-        reason = f"交易所仓位风险:qty_mismatch|{detail}|{close_reason_detail}"
+        reason = f"交易所仓位风险:{risk_type}|{detail}|{close_reason_detail}"
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, {
+                'spot_open_qty': state.get('spot_remaining'),
+                'spot_open_amount': (
+                    float(state.get('spot_remaining') or 0)
+                    * float(pos.get('spot_open_price') or 0)
+                ),
+                'future_open_qty': state.get('future_remaining'),
+                'future_open_contracts': state.get('future_contracts_remaining'),
+                'risk_type': risk_type,
                 'risk_at': datetime.now(),
                 'detail': detail,
                 'reason': reason,
@@ -2654,6 +2701,16 @@ class ClosingExecutor:
                 'position_id': pos.get('id'),
             })
             updated = int(cursor.rowcount or 0)
+        if updated:
+            pos['spot_open_qty'] = state.get('spot_remaining')
+            pos['spot_open_amount'] = (
+                float(state.get('spot_remaining') or 0)
+                * float(pos.get('spot_open_price') or 0)
+            )
+            pos['future_open_qty'] = state.get('future_remaining')
+            pos['future_open_contracts'] = state.get('future_contracts_remaining')
+            pos['exchange_risk_status'] = 'desynced'
+            pos['exchange_risk_type'] = risk_type
         if updated:
             logger.warning("普通平仓部分成交断腿标记 | position_id=%s | %s", pos.get('id'), detail)
         return bool(updated)

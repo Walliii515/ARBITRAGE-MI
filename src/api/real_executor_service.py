@@ -73,6 +73,13 @@ def _build_exchange_config(strategy: str = 'forward') -> ExchangeConfig:
             gate_api_key=gate_creds.api_key,
             gate_api_secret=gate_creds.api_secret,
             timeout_sec=int(os.getenv('EXECUTOR_TIMEOUT_SEC', '10')),
+            binance_close_retry_attempts=config.get_int('real_executor.binance_close_retry.attempts', 4),
+            binance_close_retry_base_delay_sec=config.get_float(
+                'real_executor.binance_close_retry.base_delay_sec', 0.15
+            ),
+            binance_close_retry_max_delay_sec=config.get_float(
+                'real_executor.binance_close_retry.max_delay_sec', 0.8
+            ),
             env='mainnet',
         )
     else:
@@ -84,6 +91,13 @@ def _build_exchange_config(strategy: str = 'forward') -> ExchangeConfig:
             gate_api_key=os.getenv('GATE_FUTURES_TESTNET_API_KEY', ''),
             gate_api_secret=os.getenv('GATE_FUTURES_TESTNET_API_SECRET', ''),
             timeout_sec=int(os.getenv('EXECUTOR_TIMEOUT_SEC', '10')),
+            binance_close_retry_attempts=config.get_int('real_executor.binance_close_retry.attempts', 4),
+            binance_close_retry_base_delay_sec=config.get_float(
+                'real_executor.binance_close_retry.base_delay_sec', 0.15
+            ),
+            binance_close_retry_max_delay_sec=config.get_float(
+                'real_executor.binance_close_retry.max_delay_sec', 0.8
+            ),
             env='testnet',
         )
 

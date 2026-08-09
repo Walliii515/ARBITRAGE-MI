@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import json
+import threading
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
@@ -203,6 +204,108 @@ def make_gate_cross_risk(
     }
     risk.update(overrides)
     return risk
+
+
+class TestAssetReductionOwnership(unittest.TestCase):
+    def test_closing_client_timeout_covers_internal_retry_window(self):
+        ce = make_closing_executor()
+        self.assertEqual(ce.executor_client.timeout, 120)
+
+    def test_closing_skips_asset_owned_by_reconciliation_thread(self):
+        from calc.asset_reduction_guard import asset_reduction_guard
+
+        ce = make_closing_executor()
+        ce.executor_client.execute = MagicMock()
+        claimed = threading.Event()
+        release = threading.Event()
+
+        def hold_reconciliation_claim():
+            with asset_reduction_guard.claim('TUT', 'reconciliation-test') as acquired:
+                self.assertTrue(acquired)
+                claimed.set()
+                release.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_reconciliation_claim)
+        holder.start()
+        self.assertTrue(claimed.wait(timeout=1))
+        try:
+            result = ce._execute_close(
+                {'id': 318, 'base_asset': 'TUT'},
+                'margin_close',
+                'MMR风险退出',
+                {},
+            )
+        finally:
+            release.set()
+            holder.join(timeout=2)
+
+        self.assertFalse(result['success'])
+        self.assertIn('已有减仓执行', result['message'])
+        ce.executor_client.execute.assert_not_called()
+
+    def test_guard_allows_different_assets_concurrently(self):
+        from calc.asset_reduction_guard import asset_reduction_guard
+
+        claimed = threading.Event()
+        release = threading.Event()
+
+        def hold_tut():
+            with asset_reduction_guard.claim('TUT', 'tut-close') as acquired:
+                self.assertTrue(acquired)
+                claimed.set()
+                release.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_tut)
+        holder.start()
+        self.assertTrue(claimed.wait(timeout=1))
+        try:
+            with asset_reduction_guard.claim('BEL', 'bel-close') as acquired:
+                self.assertTrue(acquired)
+                self.assertEqual(asset_reduction_guard.owner('BEL'), 'bel-close')
+        finally:
+            release.set()
+            holder.join(timeout=2)
+
+    def test_guard_is_reentrant_and_releases_after_outer_scope(self):
+        from calc.asset_reduction_guard import asset_reduction_guard
+
+        with asset_reduction_guard.claim('TUT', 'outer') as outer:
+            self.assertTrue(outer)
+            with asset_reduction_guard.claim('TUT', 'inner') as inner:
+                self.assertTrue(inner)
+                self.assertEqual(asset_reduction_guard.owner('TUT'), 'outer')
+            self.assertEqual(asset_reduction_guard.owner('TUT'), 'outer')
+        self.assertIsNone(asset_reduction_guard.owner('TUT'))
+
+    def test_guard_releases_when_execution_raises(self):
+        from calc.asset_reduction_guard import asset_reduction_guard
+
+        with self.assertRaisesRegex(RuntimeError, 'exchange down'):
+            with asset_reduction_guard.claim('TUT', 'failing-close') as acquired:
+                self.assertTrue(acquired)
+                raise RuntimeError('exchange down')
+        self.assertIsNone(asset_reduction_guard.owner('TUT'))
+
+    def test_closing_executor_releases_guard_when_executor_client_raises(self):
+        from calc.asset_reduction_guard import asset_reduction_guard
+
+        ce = make_closing_executor()
+        ce.executor_client.execute = MagicMock(side_effect=RuntimeError('executor unavailable'))
+        pos = {
+            'id': 318,
+            'base_asset': 'TUT',
+            'spot_open_qty': 100.0,
+            'spot_open_price': 0.14,
+            'future_open_qty': 100.0,
+            'future_open_price': 0.141,
+            'future_open_contracts': 100.0,
+            'future_contract': 'TUT_USDT',
+        }
+
+        with self.assertRaisesRegex(RuntimeError, 'executor unavailable'):
+            ce._execute_close(pos, 'margin_close', 'MMR风险退出', {})
+
+        self.assertIsNone(asset_reduction_guard.owner('TUT'))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1091,7 +1194,11 @@ class TestRealExecutorGateParsing(unittest.TestCase):
     def test_margin_close_marks_spot_partial_fill_as_manual_risk(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
-        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=1),
+            contract_meta={},
+            spot_meta={},
+        )
         executor._place_gate_futures_order = MagicMock(return_value={
             'success': True,
             'exec_price': 0.12092,
@@ -1130,6 +1237,609 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(result['future_order']['exchange_order_id'], 'gate-1')
         self.assertEqual(result['spot_order']['exchange_order_id'], 'spot-partial')
         self.assertIn('现货部分成交', result['message'])
+
+    def test_binance_close_price_range_rejection_retries_remaining_in_slices(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=4,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1, 'min_notional': 5}},
+        )
+        submitted = []
+
+        def place(order):
+            submitted.append(dict(order))
+            if len(submitted) == 1:
+                return {
+                    'success': False,
+                    'reason': 'order expired',
+                    'order_status': 'EXPIRED',
+                    'expiry_reason': 'EXECUTION_RULE_PRICE_RANGE_EXCEEDED',
+                    'exec_qty': 0,
+                    'exec_amount': 0,
+                }
+            qty = float(order['target_qty'])
+            return {
+                'success': True,
+                'exec_price': 0.14,
+                'exec_qty': qty,
+                'exec_amount': qty * 0.14,
+                'exchange_order_id': f'binance-{len(submitted)}',
+                'fee_amount_usdt': 0,
+            }
+
+        executor._place_binance_spot_order = MagicMock(side_effect=place)
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'tut-close-1234',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 9000,
+            'target_amount': 1260,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['exec_qty'], 9000)
+        self.assertEqual(result['retry_attempts'], 4)
+        self.assertEqual([row['target_qty'] for row in submitted], [9000, 3000, 3000, 3000])
+        self.assertTrue(all(row['trade_direction'] == 'sell' for row in submitted))
+        self.assertEqual(len({row['client_order_id'] for row in submitted}), 4)
+
+    def test_binance_close_timeout_queries_original_before_any_retry(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=4),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'Binance 请求超时',
+            'request_ambiguous': True,
+            'client_order_id': 'arb_tut_cs1',
+        })
+        executor._query_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.14,
+            'exec_qty': 9000,
+            'exec_amount': 1260,
+            'exchange_order_id': 'binance-original',
+            'fee_amount_usdt': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'tut-close-1234',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 9000,
+            'target_amount': 1260,
+        })
+
+        self.assertTrue(result['success'])
+        executor._place_binance_spot_order.assert_called_once()
+        executor._query_binance_spot_order.assert_called_once_with(
+            symbol='TUTUSDT',
+            client_order_id='arb_tut_cs1',
+        )
+
+    def test_binance_close_unknown_timeout_does_not_blindly_resubmit(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=4),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'Binance 请求超时',
+            'request_ambiguous': True,
+            'client_order_id': 'arb_tut_cs1',
+        })
+        executor._query_binance_spot_order = MagicMock(return_value=None)
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'tut-close-1234',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 9000,
+            'target_amount': 1260,
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('原订单状态未确认', result['reason'])
+        executor._place_binance_spot_order.assert_called_once()
+
+    def test_future_then_spot_retry_never_reopens_or_adds_either_leg(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=4,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_gate_futures_order = MagicMock(return_value={
+            'success': True,
+            'exec_price': 0.14,
+            'exec_qty': 9000,
+            'exec_amount': 1260,
+            'exchange_order_id': 'gate-close',
+        })
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'order expired',
+            'order_status': 'EXPIRED',
+            'expiry_reason': 'EXECUTION_RULE_PRICE_RANGE_EXCEEDED',
+            'exec_qty': 0,
+            'exec_amount': 0,
+        })
+
+        result = executor.execute({
+            'execution_sequence': 'future_then_spot',
+            'execution_reason': 'margin_close',
+            'spot_order': {
+                'order_uuid': 'tut-close-1234',
+                'base_asset': 'TUT',
+                'order_side': 'close',
+                'trade_direction': 'sell',
+                'target_qty': 9000,
+            },
+            'future_order': {
+                'base_asset': 'TUT',
+                'future_contract': 'TUT_USDT',
+                'order_side': 'close',
+                'trade_direction': 'buy',
+                'target_qty': 9000,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        executor._place_gate_futures_order.assert_called_once()
+        self.assertEqual(executor._place_binance_spot_order.call_count, 4)
+        for call in executor._place_binance_spot_order.call_args_list:
+            submitted = call.args[0]
+            self.assertEqual(submitted['order_side'], 'close')
+            self.assertEqual(submitted['trade_direction'], 'sell')
+
+    def test_binance_expired_response_preserves_price_range_reason(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        result = executor._parse_binance_response({
+            'symbol': 'TUTUSDT',
+            'status': 'EXPIRED',
+            'type': 'MARKET',
+            'executedQty': '0',
+            'cummulativeQuoteQty': '0',
+            'orderId': 123,
+            'clientOrderId': 'arb_tut_cs1',
+            'expiryReason': 'EXECUTION_RULE_PRICE_RANGE_EXCEEDED',
+        })
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['order_status'], 'EXPIRED')
+        self.assertEqual(result['expiry_reason'], 'EXECUTION_RULE_PRICE_RANGE_EXCEEDED')
+        self.assertIn('EXECUTION_RULE_PRICE_RANGE_EXCEEDED', result['reason'])
+
+    def test_binance_close_non_retryable_rejection_stops_immediately(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=4),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'HTTP 400: insufficient balance',
+            'exec_qty': 0,
+            'exec_amount': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'non-retryable',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['retry_attempts'], 1)
+        executor._place_binance_spot_order.assert_called_once()
+
+    def test_binance_close_percent_price_rejection_is_retryable(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=2,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {'success': False, 'reason': 'Filter failure: PERCENT_PRICE', 'exec_qty': 0},
+            {
+                'success': True,
+                'exec_qty': 100,
+                'exec_amount': 14,
+                'exchange_order_id': 'retry-filled',
+                'fee_amount_usdt': 0,
+            },
+        ])
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'percent-price',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['retry_attempts'], 2)
+
+    def test_binance_close_multiple_partial_fills_aggregate_actual_execution(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=3,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        submitted = []
+        responses = [
+            {'success': True, 'exec_qty': 40, 'exec_amount': 4, 'exchange_order_id': 'a', 'fee_amount_usdt': 0.1, 'fee_asset': 'USDT'},
+            {'success': True, 'exec_qty': 30, 'exec_amount': 6, 'exchange_order_id': 'b', 'fee_amount_usdt': 0.2, 'fee_asset': 'USDT'},
+            {'success': True, 'exec_qty': 30, 'exec_amount': 9, 'exchange_order_id': 'c', 'fee_amount_usdt': 0.3, 'fee_asset': 'USDT'},
+        ]
+
+        def place(order):
+            submitted.append(order['target_qty'])
+            return responses[len(submitted) - 1]
+
+        executor._place_binance_spot_order = MagicMock(side_effect=place)
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'partials',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(submitted, [100, 30, 30])
+        self.assertEqual(result['exec_qty'], 100)
+        self.assertAlmostEqual(result['exec_amount'], 19)
+        self.assertAlmostEqual(result['exec_price'], 0.19)
+        self.assertAlmostEqual(result['fee_amount_usdt'], 0.6)
+        self.assertEqual(result['exchange_order_ids'], ['a', 'b', 'c'])
+
+    def test_binance_close_exactly_one_step_remaining_is_not_complete(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=1),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_qty': 9,
+            'exec_amount': 1.26,
+            'exchange_order_id': 'partial',
+            'fee_amount_usdt': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'one-step-left',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 10,
+        })
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['remaining_qty'], 1)
+
+    def test_binance_close_sub_step_remaining_is_dust_complete(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=1),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_qty': 9.5,
+            'exec_amount': 1.33,
+            'exchange_order_id': 'dust',
+            'fee_amount_usdt': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'dust-left',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 10,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['remaining_qty'], 0.5)
+
+    def test_binance_close_retry_chunk_never_falls_below_step(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=4,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        submitted = []
+
+        def place(order):
+            submitted.append(order['target_qty'])
+            if len(submitted) == 1:
+                return {'success': False, 'order_status': 'EXPIRED', 'exec_qty': 0}
+            return {'success': True, 'exec_qty': 2, 'exec_amount': 0.28, 'fee_amount_usdt': 0}
+
+        executor._place_binance_spot_order = MagicMock(side_effect=place)
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'small-remainder',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 2,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(submitted, [2, 2])
+
+    def test_binance_close_retry_chunk_respects_min_notional(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=4),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1, 'min_notional': 5}},
+        )
+        chunk = executor._binance_close_retry_chunk_qty(
+            {'base_asset': 'TUT', 'target_qty': 100, 'target_amount': 10},
+            remaining_qty=100,
+            slots_left=3,
+            is_first=False,
+        )
+        self.assertEqual(chunk, 100)
+
+    def test_binance_close_ambiguous_query_partial_retries_only_remaining(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=2,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        submitted = []
+
+        def place(order):
+            submitted.append(order['target_qty'])
+            if len(submitted) == 1:
+                return {
+                    'success': False,
+                    'reason': 'timeout',
+                    'request_ambiguous': True,
+                    'client_order_id': 'original',
+                }
+            return {'success': True, 'exec_qty': 60, 'exec_amount': 8.4, 'fee_amount_usdt': 0}
+
+        executor._place_binance_spot_order = MagicMock(side_effect=place)
+        executor._query_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_qty': 40,
+            'exec_amount': 5.6,
+            'exchange_order_id': 'queried-partial',
+            'fee_amount_usdt': 0,
+        })
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'query-partial',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(submitted, [100, 60])
+
+    def test_binance_close_ambiguous_query_open_order_does_not_resubmit(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=4),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'reason': 'timeout',
+            'request_ambiguous': True,
+            'client_order_id': 'original',
+        })
+        executor._query_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'order_status': 'NEW',
+            'reason': '订单仍在交易所处理中',
+            'exec_qty': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'query-new',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertFalse(result['success'])
+        executor._place_binance_spot_order.assert_called_once()
+
+    def test_binance_close_caps_anomalous_overreported_fill(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(binance_close_retry_attempts=1),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': True,
+            'exec_qty': 150,
+            'exec_amount': 30,
+            'exchange_order_id': 'bad-response',
+            'fee_amount_usdt': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'cap-fill',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['exec_qty'], 100)
+        self.assertEqual(result['exec_amount'], 20)
+
+    def test_binance_close_missing_fee_in_one_fill_marks_fee_incomplete(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=2,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(side_effect=[
+            {'success': True, 'exec_qty': 50, 'exec_amount': 7, 'fee_amount_usdt': 0.01},
+            {'success': True, 'exec_qty': 50, 'exec_amount': 7},
+        ])
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'fees',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertIsNone(result['fee_amount_usdt'])
+
+    def test_binance_retry_wrapper_does_not_apply_to_buy_or_open_orders(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        delegated = {'success': True, 'exec_qty': 1}
+        executor._place_binance_spot_order = MagicMock(return_value=delegated)
+
+        for order in (
+            {'order_side': 'open', 'trade_direction': 'buy', 'target_qty': 1},
+            {'order_side': 'close', 'trade_direction': 'buy', 'target_qty': 1},
+        ):
+            with self.subTest(order=order):
+                self.assertIs(executor._place_binance_spot_close_with_retry(order), delegated)
+        self.assertEqual(executor._place_binance_spot_order.call_count, 2)
+
+    def test_binance_close_retry_attempts_are_hard_capped_at_four(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(
+                binance_close_retry_attempts=99,
+                binance_close_retry_base_delay_sec=0,
+                binance_close_retry_max_delay_sec=0,
+            ),
+            contract_meta={},
+            spot_meta={'TUT': {'step_size': 1}},
+        )
+        executor._place_binance_spot_order = MagicMock(return_value={
+            'success': False,
+            'order_status': 'EXPIRED',
+            'exec_qty': 0,
+        })
+
+        result = executor._place_binance_spot_close_with_retry({
+            'order_uuid': 'hard-cap',
+            'base_asset': 'TUT',
+            'order_side': 'close',
+            'trade_direction': 'sell',
+            'target_qty': 100,
+        })
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['retry_attempts'], 4)
+        self.assertEqual(executor._place_binance_spot_order.call_count, 4)
+
+    def test_binance_sell_base_fee_does_not_reduce_hedged_execution_qty(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        data = {
+            'symbol': 'TUTUSDT',
+            'side': 'SELL',
+            'status': 'FILLED',
+            'executedQty': '10',
+            'cummulativeQuoteQty': '1.4',
+            'orderId': 1,
+            'fills': [{
+                'price': '0.14',
+                'qty': '10',
+                'commission': '0.01',
+                'commissionAsset': 'TUT',
+            }],
+        }
+
+        sell = executor._parse_binance_response(data, trade_direction='sell')
+        buy = executor._parse_binance_response(
+            {**data, 'side': 'BUY'},
+            trade_direction='buy',
+        )
+
+        self.assertEqual(sell['exec_qty'], 10.0)
+        self.assertEqual(buy['exec_qty'], 9.99)
 
     def test_binance_spot_protective_ioc_uses_limit_ioc_params(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
@@ -4554,8 +5264,9 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     def test_full_future_fill_with_spot_dust_marks_desync(self):
         """期货已归零时，即使现货余量小于 step，也不能保留为普通双腿持仓。"""
         self.ce.spot_meta = {'BEL': {'step_size': 1.0}}
+        pos = self._bel_close_position(qty=410.0)
         cursor, triggered = self._record_save_close(
-            self._bel_close_position(qty=410.0),
+            pos,
             self._bel_close_order_group(qty=410.0),
             self._close_exec_result(409.5, 410.0),
             close_reason='margin_close',
@@ -4568,9 +5279,30 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         ]
         self.assertEqual(len(risk_calls), 1)
         self.assertIn('spot=409.5/410|future=410/410', risk_calls[0][1]['detail'])
-        self.assertFalse(any(
-            'spot_open_qty = %(spot_open_qty)s' in sql for sql, _ in cursor.calls
-        ))
+        self.assertEqual(risk_calls[0][1]['spot_open_qty'], 0.5)
+        self.assertEqual(risk_calls[0][1]['future_open_qty'], 0.0)
+        self.assertEqual(pos['spot_open_qty'], 0.5)
+        self.assertEqual(pos['future_open_qty'], 0.0)
+        self.assertEqual(risk_calls[0][1]['risk_type'], 'missing_gate_position')
+        self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
+
+    def test_partial_close_exactly_one_spot_step_imbalance_marks_desync(self):
+        self.ce.spot_meta = {'BEL': {'step_size': 1.0}}
+        pos = self._bel_close_position(qty=410.0)
+        cursor, triggered = self._record_save_close(
+            pos,
+            self._bel_close_order_group(qty=410.0),
+            self._close_exec_result(299.0, 300.0),
+        )
+
+        risk_calls = [
+            (sql, params) for sql, params in cursor.calls
+            if "exchange_risk_status = 'desynced'" in sql
+        ]
+        self.assertEqual(len(risk_calls), 1)
+        self.assertEqual(risk_calls[0][1]['spot_open_qty'], 111.0)
+        self.assertEqual(risk_calls[0][1]['future_open_qty'], 110.0)
+        self.assertEqual(risk_calls[0][1]['risk_type'], 'qty_mismatch')
         self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
 
     def test_save_close_never_persists_null_target_amount(self):
@@ -4642,8 +5374,9 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(triggered, [])
 
     def test_take_profit_unbalanced_partial_fill_marks_desync_without_closing(self):
+        pos = self._bel_close_position(qty=410.0)
         cursor, triggered = self._record_save_close(
-            self._bel_close_position(qty=410.0),
+            pos,
             self._bel_close_order_group(qty=410.0),
             self._close_exec_result(235.0, 410.0),
         )
@@ -4656,8 +5389,60 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertIn('普通平仓部分成交且两腿不一致', risk_calls[0][1]['detail'])
         self.assertIn('spot=235/410|future=410/410', risk_calls[0][1]['detail'])
         self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
-        self.assertFalse(any('spot_open_qty = %(spot_open_qty)s' in sql for sql, _ in cursor.calls))
+        self.assertEqual(risk_calls[0][1]['spot_open_qty'], 175.0)
+        self.assertEqual(risk_calls[0][1]['future_open_qty'], 0.0)
+        self.assertEqual(risk_calls[0][1]['future_open_contracts'], 0.0)
+        self.assertEqual(pos['spot_open_qty'], 175.0)
+        self.assertEqual(pos['future_open_qty'], 0.0)
+        self.assertEqual(pos['exchange_risk_status'], 'desynced')
+        self.assertEqual(pos['exchange_risk_type'], 'missing_gate_position')
         self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
+
+    def test_failed_overall_close_with_two_leg_fills_persists_actual_remainders(self):
+        pos = self._bel_close_position(qty=410.0)
+        exec_result = self._close_exec_result(235.0, 410.0)
+        exec_result['success'] = False
+        exec_result['message'] = 'Binance平仓重试未完成(filled=235,target=410)'
+
+        cursor, triggered = self._record_save_close(
+            pos,
+            self._bel_close_order_group(qty=410.0),
+            exec_result,
+            close_reason='margin_close',
+            detail='保证金危险路径',
+        )
+
+        risk_calls = [
+            (sql, params) for sql, params in cursor.calls
+            if "exchange_risk_status = 'desynced'" in sql
+        ]
+        self.assertEqual(len(risk_calls), 1)
+        params = risk_calls[0][1]
+        self.assertEqual(params['spot_open_qty'], 175.0)
+        self.assertEqual(params['spot_open_amount'], 21.0)
+        self.assertEqual(params['future_open_qty'], 0.0)
+        self.assertEqual(params['future_open_contracts'], 0.0)
+        self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
+        self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+
+    def test_failed_close_with_no_fills_does_not_create_false_desync(self):
+        exec_result = {
+            'success': False,
+            'message': 'Gate rejected',
+            'spot_order': None,
+            'future_order': None,
+            'execution_stats': {},
+        }
+        cursor, triggered = self._record_save_close(
+            self._bel_close_position(qty=410.0),
+            self._bel_close_order_group(qty=410.0),
+            exec_result,
+        )
+
+        self.assertFalse(any(
+            "exchange_risk_status = 'desynced'" in sql for sql, _ in cursor.calls
+        ))
+        self.assertEqual(triggered, [])
 
     def test_take_profit_low_notional_residual_skips_execution(self):
         class FakeCursor:

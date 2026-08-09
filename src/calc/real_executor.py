@@ -15,6 +15,7 @@ import time
 import hashlib
 import hmac
 import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -43,6 +44,9 @@ class ExchangeConfig:
     gate_api_secret: str = ''
     # 通用
     timeout_sec: int = 10
+    binance_close_retry_attempts: int = 4
+    binance_close_retry_base_delay_sec: float = 0.15
+    binance_close_retry_max_delay_sec: float = 0.8
     # 环境标识
     env: str = 'testnet'  # testnet / mainnet
 
@@ -205,14 +209,15 @@ class RealExecutor:
         spot_order['target_qty'] = float(future_result.get('exec_qty') or 0) * hedge_ratio
         spot_order['target_amount'] = future_result.get('exec_amount')
         spot_order['quantity_mode'] = 'base'
-        spot_result = self._place_binance_spot_order(spot_order)
+        spot_result = self._place_binance_spot_close_with_retry(spot_order)
         if spot_result.get('success'):
             target_qty = float(spot_order.get('target_qty') or 0)
             exec_qty = float(spot_result.get('exec_qty') or 0)
-            qty_tolerance = self._spot_close_qty_tolerance(
+            remaining_qty = max(0.0, target_qty - exec_qty)
+            if self._spot_close_has_tradable_remainder(
                 spot_order.get('base_asset'),
-            )
-            if target_qty > 0 and exec_qty + qty_tolerance < target_qty:
+                remaining_qty,
+            ):
                 result['spot_order'] = spot_result
                 result['message'] = (
                     f"现货部分成交(期货已成交,需人工处理): "
@@ -242,21 +247,33 @@ class RealExecutor:
             )
             return result
 
-        result['message'] = (
-            f"现货拒单(期货已成交,需人工处理): {spot_result.get('reason')} | "
-            f"future_exec: price={future_result.get('exec_price')}, "
-            f"qty={future_result.get('exec_qty')}"
-        )
+        spot_exec_qty = float(spot_result.get('exec_qty') or 0)
+        if spot_exec_qty > 0:
+            result['spot_order'] = spot_result
+            result['message'] = (
+                f"现货部分成交(期货已成交,剩余由对账兜底): "
+                f"filled={spot_exec_qty}, target={spot_order.get('target_qty')} | "
+                f"{spot_result.get('reason')}"
+            )
+        else:
+            result['message'] = (
+                f"现货拒单(期货已成交,需对账兜底): {spot_result.get('reason')} | "
+                f"future_exec: price={future_result.get('exec_price')}, "
+                f"qty={future_result.get('exec_qty')}"
+            )
         logger.critical(
             "⚠️ 平仓现货腿失败 | %s | Gate期货已减仓但Binance现货仍需处理: %s",
             future_order.get('base_asset'), spot_result.get('reason'),
         )
         return result
 
-    def _spot_close_qty_tolerance(self, base_asset: str) -> float:
-        """允许 Binance 按 step_size 向下截断，不把不可成交尘埃误判为断腿。"""
+    def _spot_close_has_tradable_remainder(self, base_asset: str, remaining_qty: float) -> bool:
+        """Only a remainder strictly below one Binance step is non-tradable dust."""
         step_size = float((self.spot_meta.get(base_asset) or {}).get('step_size') or 0)
-        return max(step_size, 1e-12)
+        remaining_qty = max(0.0, float(remaining_qty or 0))
+        if step_size > 0:
+            return remaining_qty >= step_size * (1.0 - 1e-9)
+        return remaining_qty > 1e-12
 
     def execute_reverse_open(self, order_group: Dict, orderbook_row: Dict) -> Dict:
         """
@@ -885,12 +902,16 @@ class RealExecutor:
         # 构造参数
         timestamp = int(time.time() * 1000)
         order_type = 'LIMIT' if order.get('protective_price') is not None else 'MARKET'
+        client_order_id = str(
+            order.get('client_order_id')
+            or f"arb_{order.get('order_uuid', '')[:8]}_spot"
+        )[:36]
         params = {
             'symbol': symbol,
             'side': side,
             'type': order_type,
             'timestamp': timestamp,
-            'newClientOrderId': f"arb_{order.get('order_uuid', '')[:8]}_spot",
+            'newClientOrderId': client_order_id,
         }
         if order_type == 'LIMIT':
             protective_price = float(order.get('protective_price') or 0)
@@ -947,17 +968,224 @@ class RealExecutor:
             if resp.status_code != 200:
                 error_msg = resp.text[:200]
                 logger.warning(f"Binance 下单失败 | {symbol} | HTTP {resp.status_code}: {error_msg}")
-                return {'success': False, 'reason': f"HTTP {resp.status_code}: {error_msg}"}
+                return {
+                    'success': False,
+                    'reason': f"HTTP {resp.status_code}: {error_msg}",
+                    'client_order_id': client_order_id,
+                    'http_status': resp.status_code,
+                    'request_ambiguous': resp.status_code >= 500,
+                }
 
             data = resp.json()
-            return self._parse_binance_response(data)
+            parsed = self._parse_binance_response(
+                data,
+                trade_direction=str(order.get('trade_direction') or '').lower(),
+            )
+            parsed.setdefault('client_order_id', client_order_id)
+            return parsed
 
         except requests.exceptions.Timeout:
-            return {'success': False, 'reason': f'Binance 请求超时({self.config.timeout_sec}s)'}
+            return {
+                'success': False,
+                'reason': f'Binance 请求超时({self.config.timeout_sec}s)',
+                'client_order_id': client_order_id,
+                'request_ambiguous': True,
+            }
         except requests.exceptions.ConnectionError as e:
-            return {'success': False, 'reason': f'Binance 连接失败: {str(e)[:100]}'}
+            return {
+                'success': False,
+                'reason': f'Binance 连接失败: {str(e)[:100]}',
+                'client_order_id': client_order_id,
+                'request_ambiguous': True,
+            }
         except Exception as e:
-            return {'success': False, 'reason': f'Binance 异常: {str(e)[:100]}'}
+            return {
+                'success': False,
+                'reason': f'Binance 异常: {str(e)[:100]}',
+                'client_order_id': client_order_id,
+            }
+
+    def _place_binance_spot_close_with_retry(self, order: Dict) -> Dict:
+        """Retry only the remaining quantity of a Binance spot close sell."""
+        if str(order.get('order_side') or '').lower() != 'close' \
+                or str(order.get('trade_direction') or '').lower() != 'sell':
+            return self._place_binance_spot_order(order)
+
+        target_qty = float(order.get('target_qty') or 0)
+        if target_qty <= 0:
+            return {'success': False, 'reason': f'Binance平仓数量无效({target_qty})'}
+
+        max_attempts = min(max(int(self.config.binance_close_retry_attempts or 1), 1), 4)
+        base_asset = str(order.get('base_asset') or '').upper()
+        total_qty = 0.0
+        total_amount = 0.0
+        attempts: List[Dict] = []
+        exchange_order_ids: List[str] = []
+        fee_amount_usdt = 0.0
+        fee_amount_usdt_complete = True
+        fee_assets = set()
+        last_result: Dict = {}
+        retry_key = str(order.get('order_uuid') or uuid.uuid4()).replace('-', '')[:16]
+
+        for attempt_index in range(max_attempts):
+            remaining_qty = max(0.0, target_qty - total_qty)
+            if not self._spot_close_has_tradable_remainder(base_asset, remaining_qty):
+                break
+
+            slots_left = max_attempts - attempt_index
+            attempt_qty = self._binance_close_retry_chunk_qty(
+                order,
+                remaining_qty,
+                slots_left,
+                is_first=attempt_index == 0,
+            )
+            attempt_order = dict(order)
+            attempt_order['target_qty'] = attempt_qty
+            attempt_order['quantity_mode'] = 'base'
+            attempt_order['client_order_id'] = (
+                f"arb_{retry_key}_cs{attempt_index + 1}"
+            )[:36]
+
+            if attempt_index > 0 and not last_result.get('success'):
+                delay = min(
+                    float(self.config.binance_close_retry_base_delay_sec or 0)
+                    * (2 ** max(attempt_index - 1, 0)),
+                    float(self.config.binance_close_retry_max_delay_sec or 0),
+                )
+                if delay > 0:
+                    time.sleep(delay)
+
+            attempt_result = self._place_binance_spot_order(attempt_order)
+            if attempt_result.get('request_ambiguous'):
+                confirmed = self._query_binance_spot_order(
+                    symbol=f"{str(order.get('base_asset') or '').upper()}USDT",
+                    client_order_id=str(attempt_result.get('client_order_id') or ''),
+                )
+                if confirmed is None:
+                    attempt_result['reason'] = (
+                        f"{attempt_result.get('reason')}; 原订单状态未确认，停止重试"
+                    )
+                    attempts.append(attempt_result)
+                    last_result = attempt_result
+                    break
+                confirmed['resolved_from_query'] = True
+                attempt_result = confirmed
+
+            attempts.append(attempt_result)
+            last_result = attempt_result
+            reported_exec_qty = max(0.0, float(attempt_result.get('exec_qty') or 0))
+            exec_qty = min(reported_exec_qty, attempt_qty, remaining_qty)
+            reported_exec_amount = max(0.0, float(attempt_result.get('exec_amount') or 0))
+            exec_amount = (
+                reported_exec_amount * exec_qty / reported_exec_qty
+                if reported_exec_qty > 0 else 0.0
+            )
+            total_qty += exec_qty
+            total_amount += exec_amount
+            exchange_order_id = str(attempt_result.get('exchange_order_id') or '')
+            if exchange_order_id:
+                exchange_order_ids.append(exchange_order_id)
+            if exec_qty > 0:
+                fee_asset = str(attempt_result.get('fee_asset') or '')
+                if fee_asset:
+                    fee_assets.add(fee_asset)
+                attempt_fee_usdt = attempt_result.get('fee_amount_usdt')
+                if attempt_fee_usdt is None:
+                    fee_amount_usdt_complete = False
+                else:
+                    fee_amount_usdt += float(attempt_fee_usdt or 0)
+
+            remaining_qty = max(0.0, target_qty - total_qty)
+            if not self._spot_close_has_tradable_remainder(base_asset, remaining_qty):
+                break
+            if exec_qty > 0:
+                continue
+            if not self._is_retryable_binance_close_rejection(attempt_result):
+                break
+
+        complete = not self._spot_close_has_tradable_remainder(
+            base_asset,
+            max(0.0, target_qty - total_qty),
+        )
+        exec_price = total_amount / total_qty if total_qty > 0 else None
+        result = {
+            'success': complete,
+            'exec_price': exec_price,
+            'exec_qty': total_qty,
+            'exec_amount': total_amount,
+            'coverage_ratio': 0,
+            'exchange_order_id': exchange_order_ids[-1] if exchange_order_ids else None,
+            'exchange_order_ids': exchange_order_ids,
+            'fee_amount_usdt': round(fee_amount_usdt, 8) if fee_amount_usdt_complete else None,
+            'fee_asset': next(iter(fee_assets)) if len(fee_assets) == 1 else ('MIXED' if fee_assets else None),
+            'retry_attempts': len(attempts),
+            'retry_results': attempts,
+            'remaining_qty': max(0.0, target_qty - total_qty),
+            'last_order_status': last_result.get('order_status'),
+            'expiry_reason': last_result.get('expiry_reason'),
+        }
+        if not complete:
+            result['reason'] = (
+                f"Binance平仓重试未完成(filled={total_qty:g},target={target_qty:g},"
+                f"attempts={len(attempts)},last={last_result.get('reason') or 'unknown'})"
+            )
+        return result
+
+    def place_binance_spot_close_with_retry(self, order: Dict) -> Dict:
+        """Public reduce-only-style spot close entry used by reconciliation remediation."""
+        return self._place_binance_spot_close_with_retry(order)
+
+    def _binance_close_retry_chunk_qty(
+        self,
+        order: Dict,
+        remaining_qty: float,
+        slots_left: int,
+        *,
+        is_first: bool,
+    ) -> float:
+        if is_first or slots_left <= 1:
+            return remaining_qty
+        base_asset = str(order.get('base_asset') or '').upper()
+        min_notional = float((self.spot_meta.get(base_asset) or {}).get('min_notional') or 0)
+        step_size = float((self.spot_meta.get(base_asset) or {}).get('step_size') or 0)
+        target_qty = float(order.get('target_qty') or 0)
+        target_amount = float(order.get('target_amount') or 0)
+        price_hint = target_amount / target_qty if target_qty > 0 and target_amount > 0 else 0.0
+        chunk_qty = remaining_qty / slots_left
+        if step_size > 0 and chunk_qty < step_size:
+            return remaining_qty
+        if min_notional > 0 and price_hint > 0 and chunk_qty * price_hint < min_notional:
+            return remaining_qty
+        return chunk_qty
+
+    @staticmethod
+    def _is_retryable_binance_close_rejection(result: Dict) -> bool:
+        status = str(result.get('order_status') or '').upper()
+        expiry_reason = str(result.get('expiry_reason') or '').upper()
+        reason = str(result.get('reason') or '').upper()
+        if status == 'EXPIRED':
+            return True
+        return 'PRICE_RANGE' in expiry_reason or 'PRICE_RANGE' in reason or 'PERCENT_PRICE' in reason
+
+    def _query_binance_spot_order(self, symbol: str, client_order_id: str) -> Optional[Dict]:
+        if not symbol or not client_order_id:
+            return None
+        try:
+            data = self._binance_signed_get('/api/v3/order', {
+                'symbol': symbol,
+                'origClientOrderId': client_order_id,
+            })
+        except Exception as exc:
+            logger.warning(
+                "Binance平仓订单状态确认失败 | %s | client_order_id=%s | %s",
+                symbol,
+                client_order_id,
+                exc,
+            )
+            return None
+        parsed = self._parse_binance_response(data)
+        parsed.setdefault('client_order_id', client_order_id)
+        return parsed
 
     def place_binance_spot_order(self, order: Dict) -> Dict:
         """公开的 Binance 现货单腿执行入口，用于交易所断腿自动处置。"""
@@ -1209,7 +1437,11 @@ class RealExecutor:
         reverse_order['target_amount'] = spot_result.get('exec_amount')
         return self._place_binance_margin_order(reverse_order)
 
-    def _parse_binance_response(self, data: Dict) -> Dict:
+    def _parse_binance_response(
+        self,
+        data: Dict,
+        trade_direction: Optional[str] = None,
+    ) -> Dict:
         """
         解析 Binance 订单响应
 
@@ -1224,15 +1456,30 @@ class RealExecutor:
         """
         status = data.get('status', '')
         exec_qty = float(data.get('executedQty', 0))
+        common = {
+            'order_status': status,
+            'expiry_reason': data.get('expiryReason'),
+            'exchange_order_id': str(data.get('orderId', '')),
+            'client_order_id': data.get('clientOrderId'),
+        }
         if status != 'FILLED' and exec_qty <= 0:
             if data.get('timeInForce') == 'IOC' or data.get('type') == 'LIMIT':
                 return {
                     'success': False,
-                    'reason': f"保护IOC未成交(fill=0,status={status}, orderId={data.get('orderId')})"
+                    'reason': f"保护IOC未成交(fill=0,status={status}, orderId={data.get('orderId')})",
+                    'exec_qty': 0.0,
+                    'exec_amount': 0.0,
+                    **common,
                 }
             return {
                 'success': False,
-                'reason': f"订单状态异常: {status}, orderId={data.get('orderId')}"
+                'reason': (
+                    f"订单状态异常: {status}, orderId={data.get('orderId')}, "
+                    f"expiryReason={data.get('expiryReason') or 'NA'}"
+                ),
+                'exec_qty': 0.0,
+                'exec_amount': 0.0,
+                **common,
             }
 
         exec_amount = float(data.get('cummulativeQuoteQty', 0))
@@ -1252,8 +1499,13 @@ class RealExecutor:
             if fee_asset:
                 commission_by_asset[fee_asset] = commission_by_asset.get(fee_asset, 0.0) + commission
 
-        # 实际可用数量 = 成交量 - 手续费
-        net_qty = exec_qty - commission_in_base
+        response_side = str(data.get('side') or '').upper()
+        is_buy = str(trade_direction or '').lower() == 'buy' or (
+            not trade_direction and response_side == 'BUY'
+        )
+        # BUY 的 base 手续费会减少到账量；SELL 的对冲成交量仍是 executedQty，
+        # 否则重试器会把手续费误当作未成交数量并继续超卖。
+        net_qty = exec_qty - commission_in_base if is_buy else exec_qty
         exec_price = exec_amount / exec_qty if exec_qty > 0 else 0
 
         if commission_in_base > 0:
@@ -1289,6 +1541,7 @@ class RealExecutor:
             'fee_amount': fee_amount,
             'fee_amount_usdt': round(fee_amount_usdt, 8) if fee_amount_usdt_complete else None,
             'fee_asset': fee_asset,
+            **common,
         }
 
     @staticmethod

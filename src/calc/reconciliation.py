@@ -84,6 +84,13 @@ def build_exchange_config() -> ExchangeConfig:
             gate_api_key=gate_creds.api_key,
             gate_api_secret=gate_creds.api_secret,
             timeout_sec=timeout_sec,
+            binance_close_retry_attempts=config.get_int('real_executor.binance_close_retry.attempts', 4),
+            binance_close_retry_base_delay_sec=config.get_float(
+                'real_executor.binance_close_retry.base_delay_sec', 0.15
+            ),
+            binance_close_retry_max_delay_sec=config.get_float(
+                'real_executor.binance_close_retry.max_delay_sec', 0.8
+            ),
             env='mainnet',
         )
     return ExchangeConfig(
@@ -94,6 +101,13 @@ def build_exchange_config() -> ExchangeConfig:
         gate_api_key=os.getenv('GATE_FUTURES_TESTNET_API_KEY', ''),
         gate_api_secret=os.getenv('GATE_FUTURES_TESTNET_API_SECRET', ''),
         timeout_sec=timeout_sec,
+        binance_close_retry_attempts=config.get_int('real_executor.binance_close_retry.attempts', 4),
+        binance_close_retry_base_delay_sec=config.get_float(
+            'real_executor.binance_close_retry.base_delay_sec', 0.15
+        ),
+        binance_close_retry_max_delay_sec=config.get_float(
+            'real_executor.binance_close_retry.max_delay_sec', 0.8
+        ),
         env='testnet',
     )
 
@@ -186,8 +200,14 @@ class Reconciler:
             gate_risks: List[Dict] = []
             if self.cfg.mark_exchange_risk:
                 gate_risks = self._mark_gate_desync_risks(snapshot_at, gate_rows)
+            gate_remediation_owned_assets: Set[str] = set()
             if self.cfg.auto_remediate_enabled:
-                remediation_results.extend(self._auto_remediate_gate_risks(snapshot_at, gate_risks, binance_rows))
+                gate_results = self._auto_remediate_gate_risks(snapshot_at, gate_risks, binance_rows)
+                remediation_results.extend(gate_results)
+                gate_remediation_owned_assets = self._gate_remediation_owned_assets(
+                    gate_risks,
+                    gate_results,
+                )
                 remediation_results.extend(
                     self._auto_remediate_post_close_spot_dust(binance_rows, gate_rows)
                 )
@@ -207,7 +227,11 @@ class Reconciler:
             combined_risks = self._mark_combined_exposure_risks(snapshot_at, combined_rows)
             if self.cfg.auto_remediate_enabled:
                 remediation_results.extend(
-                    self._auto_remediate_combined_exposure_risks(snapshot_at, combined_risks)
+                    self._auto_remediate_combined_exposure_risks(
+                        snapshot_at,
+                        combined_risks,
+                        skip_assets=gate_remediation_owned_assets,
+                    )
                 )
             rows.extend(combined_rows)
 
@@ -537,10 +561,26 @@ class Reconciler:
             rows = cursor.fetchall()
         return len(rows) >= confirm_runs - 1
 
-    def _auto_remediate_combined_exposure_risks(self, snapshot_at: datetime, risks: List[Dict]) -> List[Dict]:
+    def _auto_remediate_combined_exposure_risks(
+        self,
+        snapshot_at: datetime,
+        risks: List[Dict],
+        skip_assets: Optional[Set[str]] = None,
+    ) -> List[Dict]:
         results: List[Dict] = []
+        skip_assets = {str(asset or '').upper() for asset in (skip_assets or set())}
         for item in risks:
             risk = item.get('risk') or {}
+            base_asset = str(item.get('base_asset') or '').upper()
+            if base_asset in skip_assets:
+                result = {
+                    'attempted': False,
+                    'reason': 'gate_remediation_owns_asset_this_run',
+                    'base_asset': base_asset,
+                }
+                self._record_reconciliation_risk_event(snapshot_at, item, result)
+                results.append(result)
+                continue
             if not item.get('confirmed'):
                 result = {'attempted': False, 'reason': 'waiting_for_reconciliation_confirmation'}
                 self._record_reconciliation_risk_event(snapshot_at, item, result)
@@ -583,6 +623,17 @@ class Reconciler:
             self._record_reconciliation_risk_event(snapshot_at, item, result)
             results.append(result)
         return results
+
+    @staticmethod
+    def _gate_remediation_owned_assets(
+        gate_risks: List[Dict],
+        gate_results: List[Dict],
+    ) -> Set[str]:
+        return {
+            str(item.get('base_asset') or '').upper()
+            for item, result in zip(gate_risks, gate_results)
+            if item.get('confirmed') or result.get('attempted')
+        }
 
     def _mark_gate_desync_risks(self, snapshot_at: datetime, rows: List[Dict]) -> List[Dict]:
         """Gate 实仓不匹配时生成风险项；确认后才同步标记本地持仓。"""
@@ -940,6 +991,11 @@ class Reconciler:
         exchange_qty = float(row.get('exchange_value') or 0)
         if abs(exchange_qty - local_qty) <= BINANCE_SPOT_TOLERANCE:
             return {'attempted': False, 'reason': 'binance_spot_already_match'}
+        if exchange_qty < local_qty:
+            return {
+                'attempted': False,
+                'reason': 'reduce_only_policy_does_not_buy_missing_spot',
+            }
         return self.remediator.remediate_binance_spot_desync(
             base_asset=base_asset,
             local_qty=local_qty,

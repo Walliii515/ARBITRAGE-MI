@@ -8,11 +8,13 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Dict, List, Optional
 
 from calc.order_fee_resolver import build_order_execution_fields
 from calc.orderbook_enricher import calc_vwap_basis_bps
 from calc.real_executor import RealExecutor
+from calc.asset_reduction_guard import asset_reduction_guard
 from calc.closed_position_pnl import (
     compute_closed_position_pnl,
     existing_position_columns,
@@ -48,6 +50,32 @@ def _float(value, default: float = 0.0) -> float:
         return default
 
 
+def _guard_asset_reduction(owner: str):
+    def decorate(func):
+        @wraps(func)
+        def wrapped(self, base_asset, *args, **kwargs):
+            asset = str(base_asset or '').upper()
+            with asset_reduction_guard.claim(asset, owner) as acquired:
+                if not acquired:
+                    active_owner = asset_reduction_guard.owner(asset)
+                    logger.warning(
+                        "同币种已有减仓执行，对账处置等待新快照 | %s | owner=%s | requested=%s",
+                        asset,
+                        active_owner,
+                        owner,
+                    )
+                    return {
+                        'attempted': False,
+                        'success': False,
+                        'base_asset': asset,
+                        'reason': 'asset_reduction_inflight',
+                        'active_owner': active_owner,
+                    }
+                return func(self, asset, *args, **kwargs)
+        return wrapped
+    return decorate
+
+
 class ExchangeDesyncRemediator:
     """把 Gate 缺腿风险转成可审计的自动 spot 处置。"""
 
@@ -56,6 +84,7 @@ class ExchangeDesyncRemediator:
         self.cfg = cfg
         self._position_columns_cache: Optional[set[str]] = None
 
+    @_guard_asset_reduction('reconciliation_gate_missing')
     def remediate_gate_short_desync(
         self,
         base_asset: str,
@@ -131,8 +160,9 @@ class ExchangeDesyncRemediator:
 
             result = self._sell_spot_and_close_position(pos, target_qty, risk)
             results.append(result)
-            if result.get('success'):
-                remaining_available -= _float(result.get('spot_exec_qty'), target_qty)
+            remaining_available -= _float(result.get('spot_exec_qty'))
+            if not result.get('success'):
+                break
 
         success_count = sum(1 for item in results if item.get('success'))
         failure_count = sum(1 for item in results if item.get('attempted') and not item.get('success'))
@@ -1052,6 +1082,7 @@ class ExchangeDesyncRemediator:
         elapsed = (datetime.now() - last_converted_at).total_seconds()
         return max(0.0, 3600.0 - elapsed)
 
+    @_guard_asset_reduction('reconciliation_gate_extra')
     def remediate_gate_extra_position(
         self,
         base_asset: str,
@@ -1118,6 +1149,7 @@ class ExchangeDesyncRemediator:
             'reason': result.get('reason') if not success else None,
         }
 
+    @_guard_asset_reduction('reconciliation_binance_extra')
     def remediate_binance_spot_desync(
         self,
         base_asset: str,
@@ -1125,7 +1157,7 @@ class ExchangeDesyncRemediator:
         exchange_qty: float,
         risk: Dict,
     ) -> Dict:
-        """Binance 现货与本地 holding 不一致时，按本地数量修复多余/缺少的多头。"""
+        """Binance 现货多于本地 holding 时，仅卖出交易所侧多余数量。"""
         base_asset = str(base_asset or '').upper()
         if not self.cfg.enabled:
             return {'attempted': False, 'reason': 'disabled'}
@@ -1136,26 +1168,37 @@ class ExchangeDesyncRemediator:
         if abs(diff) <= max(float(self.cfg.min_spot_qty or 0), 1e-8):
             return {'attempted': False, 'reason': 'binance_spot_diff<=tolerance', 'diff_qty': diff}
 
-        trade_direction = 'sell' if diff > 0 else 'buy'
+        if diff < 0:
+            return {
+                'attempted': False,
+                'success': False,
+                'action': 'leave_missing_binance_spot_unfilled',
+                'base_asset': base_asset,
+                'local_qty': local_qty,
+                'exchange_qty': exchange_qty,
+                'diff_qty': diff,
+                'reason': 'reduce_only_policy_does_not_buy_missing_spot',
+            }
+
+        trade_direction = 'sell'
         target_qty = abs(diff)
-        if trade_direction == 'sell':
-            available_qty = self._load_binance_available_qty(base_asset)
-            if available_qty + 1e-9 < target_qty:
-                return {
-                    'attempted': True,
-                    'success': False,
-                    'action': 'sell_extra_binance_spot',
-                    'base_asset': base_asset,
-                    'target_qty': target_qty,
-                    'reason': 'spot_available_qty_insufficient',
-                    'available_qty': available_qty,
-                }
+        available_qty = self._load_binance_available_qty(base_asset)
+        if available_qty + 1e-9 < target_qty:
+            return {
+                'attempted': True,
+                'success': False,
+                'action': 'sell_extra_binance_spot',
+                'base_asset': base_asset,
+                'target_qty': target_qty,
+                'reason': 'spot_available_qty_insufficient',
+                'available_qty': available_qty,
+            }
 
         order_uuid = str(uuid.uuid4())
         price_hint = self._estimate_binance_spot_price(base_asset, risk)
-        action = 'sell_extra_binance_spot' if trade_direction == 'sell' else 'buy_missing_binance_spot'
+        action = 'sell_extra_binance_spot'
         reason = (
-            f"对账兜底自动处置|Binance现货{'多余' if diff > 0 else '缺少'}|"
+            f"对账兜底自动处置|Binance现货多余|"
             f"asset={base_asset}|local={local_qty:g}|exchange={exchange_qty:g}|diff={diff:g}|"
             f"关联风险={risk.get('type', 'unknown')}"
         )
@@ -1172,12 +1215,10 @@ class ExchangeDesyncRemediator:
             'target_qty': target_qty,
             'target_amount': target_qty * price_hint,
         }
-        if trade_direction == 'buy':
-            order['quantity_mode'] = 'base'
-
-        result = self.executor.place_binance_spot_order(order)
+        result = self._place_binance_spot_reduction(order)
         success = bool(result.get('success'))
-        self._insert_spot_order(order, result, reason, success, datetime.now())
+        has_fill = _float(result.get('exec_qty')) > 0
+        self._insert_spot_order(order, result, reason, success or has_fill, datetime.now())
         if success:
             logger.warning(
                 "Binance 现货对账自动处置完成 | %s | action=%s | qty=%s | px=%s",
@@ -1201,6 +1242,7 @@ class ExchangeDesyncRemediator:
             'reason': result.get('reason') if not success else None,
         }
 
+    @_guard_asset_reduction('reconciliation_spot_only')
     def remediate_binance_spot_only_exposure(
         self,
         base_asset: str,
@@ -1257,8 +1299,9 @@ class ExchangeDesyncRemediator:
                 continue
             result = self._sell_spot_and_close_position(pos, target_qty, risk)
             results.append(result)
-            if result.get('success'):
-                remaining -= _float(result.get('spot_exec_qty'), target_qty)
+            remaining -= _float(result.get('spot_exec_qty'))
+            if not result.get('success'):
+                break
             if remaining <= max(float(self.cfg.min_spot_qty or 0), 1e-8):
                 break
 
@@ -1416,10 +1459,20 @@ class ExchangeDesyncRemediator:
             'target_qty': target_qty,
             'target_amount': target_qty * _float(pos.get('spot_open_price')),
         }
-        spot_result = self.executor.place_binance_spot_order(spot_order)
+        spot_result = self._place_binance_spot_reduction(spot_order)
+        spot_exec_qty = _float(spot_result.get('exec_qty'))
+        spot_remaining_qty = max(0.0, target_qty - spot_exec_qty)
 
         if not spot_result.get('success'):
-            self._insert_spot_order(spot_order, spot_result, close_reason, False, now)
+            self._insert_spot_order(
+                spot_order,
+                spot_result,
+                close_reason,
+                spot_exec_qty > 0,
+                now,
+            )
+            if spot_exec_qty > 0:
+                self._keep_spot_only_remainder(pos, spot_exec_qty, spot_result, risk)
             self._append_risk_detail(position_id, f"自动处置失败|spot_sell_rejected:{spot_result.get('reason')}")
             logger.error(
                 "ADL 自动处置失败 | %s | position_id=%s | qty=%s | reason=%s",
@@ -1429,7 +1482,37 @@ class ExchangeDesyncRemediator:
                 'attempted': True,
                 'success': False,
                 'position_id': position_id,
+                'spot_exec_qty': spot_exec_qty,
+                'spot_remaining_qty': spot_remaining_qty,
                 'reason': spot_result.get('reason'),
+            }
+
+        if self._spot_has_tradable_remainder(base_asset, spot_remaining_qty):
+            self._insert_spot_order(spot_order, spot_result, close_reason, True, now)
+            self._keep_spot_only_remainder(pos, spot_exec_qty, spot_result, risk)
+            return {
+                'attempted': True,
+                'success': False,
+                'position_id': position_id,
+                'spot_exec_qty': spot_exec_qty,
+                'spot_remaining_qty': spot_remaining_qty,
+                'reason': 'spot_close_partial_after_retry',
+            }
+
+        position_remaining_qty = max(
+            0.0,
+            _float(pos.get('spot_open_qty')) - spot_exec_qty,
+        )
+        if self._spot_has_tradable_remainder(base_asset, position_remaining_qty):
+            self._insert_spot_order(spot_order, spot_result, close_reason, True, now)
+            self._keep_spot_only_remainder(pos, spot_exec_qty, spot_result, risk)
+            return {
+                'attempted': True,
+                'success': False,
+                'position_id': position_id,
+                'spot_exec_qty': spot_exec_qty,
+                'spot_remaining_qty': position_remaining_qty,
+                'reason': 'position_partially_reduced_waiting_fresh_snapshot',
             }
 
         self._insert_spot_order(spot_order, spot_result, close_reason, True, now)
@@ -1447,6 +1530,57 @@ class ExchangeDesyncRemediator:
             'spot_exec_qty': spot_result.get('exec_qty'),
             'spot_exec_price': spot_result.get('exec_price'),
         }
+
+    def _place_binance_spot_reduction(self, order: Dict) -> Dict:
+        retry = getattr(self.executor, 'place_binance_spot_close_with_retry', None)
+        if callable(retry):
+            return retry(order)
+        return self.executor.place_binance_spot_order(order)
+
+    def _spot_has_tradable_remainder(self, base_asset: str, remaining_qty: float) -> bool:
+        step_size = _float((getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset, {}).get('step_size'))
+        minimum = max(step_size, float(self.cfg.min_spot_qty or 0))
+        remaining_qty = max(0.0, float(remaining_qty or 0))
+        if minimum > 0:
+            return remaining_qty >= minimum * (1.0 - 1e-9)
+        return remaining_qty > 1e-8
+
+    def _keep_spot_only_remainder(
+        self,
+        pos: Dict,
+        spot_exec_qty: float,
+        spot_result: Dict,
+        risk: Dict,
+    ) -> None:
+        open_qty = max(0.0, _float(pos.get('spot_open_qty')))
+        remaining_qty = max(0.0, open_qty - max(0.0, spot_exec_qty))
+        open_price = _float(pos.get('spot_open_price'))
+        detail = (
+            f"对账兜底Binance部分成交|filled={spot_exec_qty:g}|"
+            f"remaining={remaining_qty:g}|attempts={spot_result.get('retry_attempts') or 1}"
+        )
+        sql = """
+            UPDATE mi_trade_position
+            SET spot_open_qty = %(spot_open_qty)s,
+                spot_open_amount = %(spot_open_amount)s,
+                exchange_risk_status = 'desynced',
+                exchange_risk_type = %(risk_type)s,
+                exchange_risk_at = %(risk_at)s,
+                exchange_risk_detail = CONCAT(COALESCE(exchange_risk_detail, ''), '|', %(detail)s)
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'spot_open_qty': remaining_qty,
+                'spot_open_amount': remaining_qty * open_price,
+                'risk_type': risk.get('type') or 'binance_spot_excess',
+                'risk_at': datetime.now(),
+                'detail': detail,
+                'position_id': pos.get('id'),
+            })
+        pos['spot_open_qty'] = remaining_qty
+        pos['spot_open_amount'] = remaining_qty * open_price
 
     def _risk_with_prior_future_fill(self, pos: Dict, risk: Dict) -> Dict:
         """系统风险平仓期货腿已成交时，复用真实成交价关闭后续 spot 兜底。"""
