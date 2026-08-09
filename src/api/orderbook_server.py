@@ -1631,7 +1631,7 @@ def _auto_fund_profit_release_allowed() -> bool:
             'account_capital.gate_cross_risk.auto_fund_transfer.enabled',
             True,
         )
-        and coordinator.is_profit_release_allowed()
+        and coordinator.claim_profit_release()
     )
 
 
@@ -2373,13 +2373,31 @@ async def _position_funding_loop():
 def _publish_close_position_results(results: List[Dict]) -> None:
     if not results:
         return
-    if (
-        _auto_fund_transfer_coordinator is not None
-        and any(
+    profit_release_results = [
+        result
+        for result in results
+        if result.get('margin_risk_stage') == 'profit_release_350'
+    ]
+    if _auto_fund_transfer_coordinator is not None and profit_release_results:
+        binance_funds_released = any(
             result.get('success')
-            and result.get('margin_risk_stage') == 'profit_release_350'
-            for result in results
+            or (_optional_float(result.get('spot_exec_qty')) or 0.0) > 1e-12
+            for result in profit_release_results
         )
+        _auto_fund_transfer_coordinator.finish_profit_release(
+            binance_funds_released=binance_funds_released,
+        )
+    elif _auto_fund_transfer_coordinator is not None and any(
+        result.get('margin_risk_stage') in {
+            'controlled_300',
+            'critical_200',
+            'liquidation_distance',
+        }
+        and (
+            result.get('success')
+            or (_optional_float(result.get('spot_exec_qty')) or 0.0) > 1e-12
+        )
+        for result in results
     ):
         _auto_fund_transfer_coordinator.notify_binance_funds_released()
     _record_auto_risk_close_notifications(results, event_at=datetime.now())

@@ -12,7 +12,7 @@ from api import orderbook_server
 class TestOrderbookServerEmergencyClose(unittest.TestCase):
     def test_profit_release_requires_insufficient_auto_funding_and_no_active_task(self):
         coordinator = MagicMock()
-        coordinator.is_profit_release_allowed.return_value = True
+        coordinator.claim_profit_release.return_value = True
 
         with (
             patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
@@ -29,6 +29,7 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
             patch.object(orderbook_server, 'fund_transfer_open_locked', return_value=True),
         ):
             self.assertFalse(orderbook_server._auto_fund_profit_release_allowed())
+        coordinator.claim_profit_release.assert_called_once_with()
 
     def test_paused_auto_funding_revokes_stale_profit_release_permission(self):
         coordinator = MagicMock()
@@ -62,7 +63,9 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
         ):
             orderbook_server._publish_close_position_results(results)
 
-        coordinator.notify_binance_funds_released.assert_called_once_with()
+        coordinator.finish_profit_release.assert_called_once_with(
+            binance_funds_released=True,
+        )
 
     def test_notification_store_failure_cannot_prevent_350_transfer_wakeup(self):
         coordinator = MagicMock()
@@ -81,30 +84,106 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'notification db unavailable'):
                 orderbook_server._publish_close_position_results(results)
 
-        coordinator.notify_binance_funds_released.assert_called_once_with()
+        coordinator.finish_profit_release.assert_called_once_with(
+            binance_funds_released=True,
+        )
 
-    def test_failed_or_non_350_close_does_not_wake_auto_transfer(self):
+    def test_failed_350_releases_reservation_without_waking_auto_transfer(self):
         coordinator = MagicMock()
-        cases = [
-            [{
-                'success': False,
-                'margin_risk_stage': 'profit_release_350',
-            }],
-            [{
-                'success': True,
-                'margin_risk_stage': 'controlled_300',
-            }],
-        ]
+        results = [{
+            'success': False,
+            'spot_exec_qty': 0,
+            'margin_risk_stage': 'profit_release_350',
+        }]
         with (
             patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
             patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
             patch.object(orderbook_server, 'event_loop', None),
             patch.object(orderbook_server, 'broadcast_queue', None),
         ):
-            for results in cases:
-                orderbook_server._publish_close_position_results(results)
+            orderbook_server._publish_close_position_results(results)
+
+        coordinator.finish_profit_release.assert_called_once_with(
+            binance_funds_released=False,
+        )
+
+    def test_partial_spot_fill_wakes_transfer_even_when_close_result_failed(self):
+        coordinator = MagicMock()
+        results = [{
+            'success': False,
+            'spot_exec_qty': '12.5',
+            'margin_risk_stage': 'profit_release_350',
+        }]
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
+            patch.object(orderbook_server, 'event_loop', None),
+            patch.object(orderbook_server, 'broadcast_queue', None),
+        ):
+            orderbook_server._publish_close_position_results(results)
+
+        coordinator.finish_profit_release.assert_called_once_with(
+            binance_funds_released=True,
+        )
+
+    def test_controlled_300_success_wakes_transfer_without_finishing_350_reservation(self):
+        coordinator = MagicMock()
+        results = [{
+            'success': True,
+            'margin_risk_stage': 'controlled_300',
+        }]
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
+            patch.object(orderbook_server, 'event_loop', None),
+            patch.object(orderbook_server, 'broadcast_queue', None),
+        ):
+            orderbook_server._publish_close_position_results(results)
+
+        coordinator.finish_profit_release.assert_not_called()
+        coordinator.notify_binance_funds_released.assert_called_once_with()
+
+    def test_critical_or_liquidation_spot_fill_wakes_transfer_after_failed_close(self):
+        for stage in ('critical_200', 'liquidation_distance'):
+            with self.subTest(stage=stage):
+                coordinator = MagicMock()
+                results = [{
+                    'success': False,
+                    'spot_exec_qty': '0.25',
+                    'margin_risk_stage': stage,
+                }]
+                with (
+                    patch.object(
+                        orderbook_server,
+                        '_auto_fund_transfer_coordinator',
+                        coordinator,
+                    ),
+                    patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
+                    patch.object(orderbook_server, 'event_loop', None),
+                    patch.object(orderbook_server, 'broadcast_queue', None),
+                ):
+                    orderbook_server._publish_close_position_results(results)
+
+                coordinator.notify_binance_funds_released.assert_called_once_with()
+                coordinator.finish_profit_release.assert_not_called()
+
+    def test_failed_non_350_close_without_spot_fill_does_not_wake_transfer(self):
+        coordinator = MagicMock()
+        results = [{
+            'success': False,
+            'spot_exec_qty': 0,
+            'margin_risk_stage': 'controlled_300',
+        }]
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
+            patch.object(orderbook_server, 'event_loop', None),
+            patch.object(orderbook_server, 'broadcast_queue', None),
+        ):
+            orderbook_server._publish_close_position_results(results)
 
         coordinator.notify_binance_funds_released.assert_not_called()
+        coordinator.finish_profit_release.assert_not_called()
 
     def test_live_gate_cross_risk_payload_recomputes_staleness(self):
         payload = orderbook_server._build_live_gate_cross_risk_payload(

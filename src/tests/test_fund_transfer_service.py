@@ -229,6 +229,41 @@ def test_create_task_checks_live_forward_balance_without_fixed_cap():
     with pytest.raises(ValueError, match='可用余额不足'):
         create_task(service)
 
+    assert service.open_locked is False
+    assert service.reserve_profit_release() is True
+
+
+def test_profit_release_reservation_blocks_manual_and_automatic_task_creation():
+    service, store, _, _, _ = make_service()
+
+    assert service.reserve_profit_release() is True
+    assert service.reserve_profit_release() is False
+    with pytest.raises(ValueError, match='350%盈利释放正在执行'):
+        create_task(service)
+    assert store.get_active() is None
+
+    service.release_profit_release()
+    task = create_task(service)
+    assert task['status'] == 'queued'
+
+
+def test_task_creation_reserves_channel_before_live_network_preflight():
+    service, _, _, _, _ = make_service()
+    original_preview = service.preview
+
+    def preview_with_concurrent_profit_release(amount):
+        assert service.open_locked is True
+        assert service.run_once() is None
+        assert service.open_locked is True
+        assert service.reserve_profit_release() is False
+        return original_preview(amount)
+
+    service.preview = preview_with_concurrent_profit_release
+
+    task = create_task(service)
+
+    assert task['status'] == 'queued'
+
 
 def test_queued_queries_before_submitting_internal_transfer():
     service, store, binance, _, _ = make_service()

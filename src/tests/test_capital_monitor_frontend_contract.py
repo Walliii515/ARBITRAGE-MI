@@ -92,9 +92,12 @@ def test_gate_mmr_help_describes_auto_funding_and_tiered_close_rules():
         '一次只退出一个本地完整套利仓位',
         '关闭正向开仓只停止新自动任务',
         '最近一次自动划转评估明确为“可划资金不足”',
-        '在得到新的“仍然不足”结论前不会继续释放下一笔',
-        '活动划转、失败锁、陈旧资金摘要或异常输入均禁止该档位平仓',
+        '只生成一张一次性许可',
+        '领取期间人工/自动划转均被阻止',
+        '拒单或异常会释放预约但不立即重算',
+        '在得到新的“仍然不足”结论前不会继续释放',
     ):
         assert rule in help_content
-    assert 'max-height: min(70vh, 560px);' in CAPITAL_MONITOR_SOURCE
+    assert 'max-height: min(560px, calc(100vh - 96px));' in CAPITAL_MONITOR_SOURCE
+    assert "boundary: 'viewport'" in CAPITAL_MONITOR_SOURCE
     assert 'overflow-y: auto;' in CAPITAL_MONITOR_SOURCE

@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal
+import time
 
 import pytest
 
@@ -49,6 +50,25 @@ class FakeService:
         self.free = free
         self.created = []
         self.limits_calls = 0
+        self.profit_release_reserved = False
+        self.task_creation_reserved = False
+
+    @property
+    def open_locked(self):
+        return bool(
+            self.profit_release_reserved
+            or self.task_creation_reserved
+            or self.store.get_active()
+        )
+
+    def reserve_profit_release(self):
+        if self.profit_release_reserved or self.store.get_active():
+            return False
+        self.profit_release_reserved = True
+        return True
+
+    def release_profit_release(self):
+        self.profit_release_reserved = False
 
     def limits(self):
         self.limits_calls += 1
@@ -396,6 +416,8 @@ def test_profitable_release_wakes_immediate_recheck_and_prevents_second_release(
     )
     assert insufficient['action'] == 'insufficient'
     assert coordinator.is_profit_release_allowed() is True
+    assert coordinator.claim_profit_release() is True
+    assert coordinator.claim_profit_release() is False
 
     service.free = Decimal('5000')
     coordinator.notify_binance_funds_released()
@@ -410,6 +432,94 @@ def test_profitable_release_wakes_immediate_recheck_and_prevents_second_release(
     assert created['action'] == 'created'
     assert service.limits_calls == 2
     assert coordinator.is_profit_release_allowed() is False
+
+
+def test_claimed_profit_release_blocks_auto_task_until_close_finishes():
+    service = FakeService(free=Decimal('600'))
+    coordinator, _, _ = make_coordinator(service=service, monotonic=100.0)
+    assert coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )['action'] == 'insufficient'
+
+    assert coordinator.claim_profit_release() is True
+    service.free = Decimal('5000')
+    blocked = coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )
+
+    assert blocked['action'] == 'profit_release_inflight'
+    assert service.created == []
+    coordinator.finish_profit_release(binance_funds_released=False)
+    cooldown = coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )
+    assert cooldown['action'] == 'attempt_cooldown'
+
+
+def test_claim_fails_closed_when_active_task_appears_after_insufficient_decision():
+    coordinator, service, _ = make_coordinator(
+        service=FakeService(free=Decimal('600')),
+    )
+    assert coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )['action'] == 'insufficient'
+    service.store.tasks.append({
+        'id': 101,
+        'active_slot': 1,
+        'status': 'queued',
+        'detail': {'initiator': 'manual'},
+    })
+
+    assert coordinator.claim_profit_release() is False
+    assert coordinator.is_profit_release_allowed() is False
+
+
+def test_claim_fails_closed_when_transfer_store_is_unavailable():
+    coordinator, service, _ = make_coordinator(
+        service=FakeService(free=Decimal('600')),
+    )
+    assert coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )['action'] == 'insufficient'
+    service.store.get_active = lambda: (_ for _ in ()).throw(RuntimeError('db unavailable'))
+
+    assert coordinator.claim_profit_release() is False
+    assert coordinator.is_profit_release_allowed() is False
+
+
+def test_claim_fails_fast_while_auto_evaluation_is_busy():
+    coordinator, _, _ = make_coordinator(
+        service=FakeService(free=Decimal('600')),
+    )
+    assert coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )['action'] == 'insufficient'
+    assert coordinator._lock.acquire(blocking=False) is True
+    try:
+        started = time.monotonic()
+        assert coordinator.claim_profit_release() is False
+        assert time.monotonic() - started < 0.1
+    finally:
+        coordinator._lock.release()
+    assert coordinator.is_profit_release_allowed() is True
 
 
 def test_active_manual_transfer_revokes_previous_profit_release_permission():
@@ -438,6 +548,22 @@ def test_active_manual_transfer_revokes_previous_profit_release_permission():
 
     assert result['action'] == 'task_active'
     assert coordinator.is_profit_release_allowed() is False
+
+
+def test_manual_task_creation_preflight_blocks_auto_evaluation_before_db_insert():
+    coordinator, service, _ = make_coordinator()
+    service.task_creation_reserved = True
+
+    result = coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )
+
+    assert result['action'] == 'task_creation_inflight'
+    assert service.limits_calls == 0
+    assert service.created == []
 
 
 def test_paused_stale_and_unhealthy_inputs_revoke_release_permission():

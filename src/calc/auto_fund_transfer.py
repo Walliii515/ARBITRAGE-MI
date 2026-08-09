@@ -156,11 +156,49 @@ class AutoFundTransferCoordinator:
         self._last_external_attempt_monotonic = 0.0
         self._target_recovery_checked = False
         self._profit_release_allowed = False
+        self._profit_release_inflight = False
 
     def is_profit_release_allowed(self) -> bool:
         """Allow the 350% stage only after a confirmed insufficient-funds result."""
         with self._lock:
-            return self._profit_release_allowed
+            return self._profit_release_allowed and not self._profit_release_inflight
+
+    def claim_profit_release(self) -> bool:
+        """Atomically consume one insufficient-funds decision for a 350% close."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if not self._profit_release_allowed or self._profit_release_inflight:
+                return False
+            try:
+                reserve = getattr(self.service, 'reserve_profit_release', None)
+                reserved = (
+                    bool(reserve())
+                    if callable(reserve)
+                    else not bool(self.service.store.get_active())
+                )
+            except Exception as exc:
+                self._profit_release_allowed = False
+                logger.error('领取350%%盈利释放许可失败: %s', exc, exc_info=True)
+                return False
+            self._profit_release_allowed = False
+            if not reserved:
+                return False
+            self._profit_release_inflight = True
+            return True
+        finally:
+            self._lock.release()
+
+    def finish_profit_release(self, *, binance_funds_released: bool) -> None:
+        """Release the close reservation and optionally wake transfer evaluation."""
+        with self._lock:
+            release = getattr(self.service, 'release_profit_release', None)
+            if callable(release):
+                release()
+            self._profit_release_inflight = False
+            self._profit_release_allowed = False
+            if binance_funds_released:
+                self._last_external_attempt_monotonic = 0.0
 
     def suspend_profit_release(self) -> None:
         """Stop proactive releases while automation is paused or input is unhealthy."""
@@ -169,9 +207,7 @@ class AutoFundTransferCoordinator:
 
     def notify_binance_funds_released(self) -> None:
         """Wake transfer evaluation after a profitable close frees Binance funds."""
-        with self._lock:
-            self._profit_release_allowed = False
-            self._last_external_attempt_monotonic = 0.0
+        self.finish_profit_release(binance_funds_released=True)
 
     def evaluate(
         self,
@@ -231,10 +267,16 @@ class AutoFundTransferCoordinator:
         ):
             self._profit_release_allowed = False
             return {'action': 'binance_equity_stale', 'mmr_pct': mmr}
+        if self._profit_release_inflight:
+            self._profit_release_allowed = False
+            return {'action': 'profit_release_inflight', 'mmr_pct': mmr}
         active = self.service.store.get_active()
         if active:
             self._profit_release_allowed = False
             return {'action': 'task_active', 'task_id': active.get('id'), 'mmr_pct': mmr}
+        if bool(getattr(self.service, 'open_locked', False)):
+            self._profit_release_allowed = False
+            return {'action': 'task_creation_inflight', 'mmr_pct': mmr}
         latest_auto = self._latest_auto_task()
         if self._auto_failure_blocks(latest_auto):
             self._profit_release_allowed = False

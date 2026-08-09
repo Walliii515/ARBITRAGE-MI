@@ -10,10 +10,11 @@
   2. 当前负24h资金费率临近结算且下一期仍明显为负
   3. 动态净收益止盈（含老仓退出；下单前有最终风控旁路复核）
 """
+import json
+import math
+import threading
 import time
 import uuid
-import json
-import threading
 from datetime import datetime, timedelta
 from typing import Callable, List, Dict, Optional
 
@@ -427,7 +428,6 @@ class ClosingExecutor:
             and account_mmr is not None
             and self.margin_danger_mmr_pct < account_mmr <= self.margin_profit_release_mmr_pct
             and risk_status in {'warning', 'danger'}
-            and self._auto_fund_transfer_enabled()
         )
         profit_snapshot_already_used = (
             profit_release_active
@@ -505,15 +505,6 @@ class ClosingExecutor:
                     '释放Binance资金用于自动补资',
                 ]
 
-            inflight_key = self._margin_close_key(pos)
-            if not self._claim_margin_close(inflight_key):
-                logger.warning(
-                    "保证金危险平仓已有执行中的请求，跳过重复提交 | %s | position_id=%s",
-                    base_asset,
-                    pos.get('id'),
-                )
-                continue
-
             orderbook_row = rows.get(base_asset) or {'base_asset': base_asset}
             stage = (
                 'critical_200'
@@ -536,10 +527,24 @@ class ClosingExecutor:
                 danger,
                 cross_risk=cross_risk,
             )
-            self._clear_position_close_state(base_asset, pos)
-            if profit_release_active:
-                self._margin_profit_release_last_close_snapshot_ts = snapshot_ts
+            inflight_key = self._margin_close_key(pos)
+            if not self._claim_margin_close(inflight_key):
+                logger.warning(
+                    "保证金危险平仓已有执行中的请求，跳过重复提交 | %s | position_id=%s",
+                    base_asset,
+                    pos.get('id'),
+                )
+                continue
             try:
+                if (
+                    profit_release_active
+                    and not liq_danger
+                    and not self._auto_fund_transfer_enabled()
+                ):
+                    return results
+                self._clear_position_close_state(base_asset, pos)
+                if profit_release_active:
+                    self._margin_profit_release_last_close_snapshot_ts = snapshot_ts
                 result = self._execute_close(
                     pos,
                     'margin_close',
@@ -595,6 +600,7 @@ class ClosingExecutor:
                     'base_asset': base_asset,
                     'success': False,
                     'close_reason': 'margin_close',
+                    'margin_risk_stage': stage,
                     'message': str(exc),
                 })
                 return results
@@ -615,20 +621,33 @@ class ClosingExecutor:
 
     def _margin_position_net_bps(self, pos: Dict) -> Optional[float]:
         close_basis = _float_or_none(pos.get('current_spread_bps'))
-        if close_basis is None:
+        if close_basis is None or not math.isfinite(close_basis):
             return None
-        return self._projected_net_bps(pos, close_basis)
+        try:
+            projected = self._projected_net_bps(pos, close_basis)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return projected if math.isfinite(projected) else None
 
     def _margin_position_profit_usdt(self, pos: Dict) -> Optional[float]:
         net_bps = self._margin_position_net_bps(pos)
         if net_bps is None:
             return None
-        notional = max(
-            _float_or_none(pos.get('spot_open_amount')) or 0.0,
-            (_float_or_none(pos.get('spot_open_qty')) or 0.0)
-            * (_float_or_none(pos.get('spot_open_price')) or 0.0),
-        )
-        return notional * net_bps / 10000.0
+        open_amount = _float_or_none(pos.get('spot_open_amount'))
+        open_qty = _float_or_none(pos.get('spot_open_qty'))
+        open_price = _float_or_none(pos.get('spot_open_price'))
+        notionals = [
+            value
+            for value in (
+                open_amount,
+                open_qty * open_price
+                if open_qty is not None and open_price is not None
+                else None,
+            )
+            if value is not None and math.isfinite(value) and value > 0
+        ]
+        profit = max(notionals, default=0.0) * net_bps / 10000.0
+        return profit if math.isfinite(profit) else None
 
     def _sort_profitable_release_positions(
         self,

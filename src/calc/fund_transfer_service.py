@@ -107,11 +107,62 @@ class FundTransferService:
         self.notifier = notifier
         self.now_fn = now_fn
         self._run_lock = threading.Lock()
+        self._coordination_lock = threading.Lock()
+        self._profit_release_reserved = False
+        self._task_creation_reserved = False
         self._open_locked = bool(self.store.get_active())
 
     @property
     def open_locked(self) -> bool:
-        return self._open_locked
+        with self._coordination_lock:
+            return bool(
+                self._open_locked
+                or self._task_creation_reserved
+                or self._profit_release_reserved
+            )
+
+    def reserve_profit_release(self) -> bool:
+        """Reserve the idle transfer channel for one 350% profit release."""
+        with self._coordination_lock:
+            if (
+                self._profit_release_reserved
+                or self._task_creation_reserved
+                or self._open_locked
+            ):
+                return False
+            if self.store.get_active():
+                self._open_locked = True
+                return False
+            self._profit_release_reserved = True
+            return True
+
+    def release_profit_release(self) -> None:
+        with self._coordination_lock:
+            self._profit_release_reserved = False
+
+    def _begin_task_creation(self) -> None:
+        with self._coordination_lock:
+            if self._profit_release_reserved:
+                raise ValueError('350%盈利释放正在执行，请等待本轮结束')
+            if (
+                self._task_creation_reserved
+                or self._open_locked
+                or self.store.get_active()
+            ):
+                self._open_locked = True
+                raise ValueError('已有划转任务或待处理异常，请先完成恢复')
+            self._task_creation_reserved = True
+            self._open_locked = True
+
+    def _finish_task_creation(self) -> None:
+        with self._coordination_lock:
+            self._task_creation_reserved = False
+            self._open_locked = True
+
+    def _restore_open_lock_after_create_failure(self) -> None:
+        with self._coordination_lock:
+            self._task_creation_reserved = False
+            self._open_locked = bool(self.store.get_active())
 
     def create_task(
         self,
@@ -122,52 +173,51 @@ class FundTransferService:
         initiator: str = 'manual',
         context_detail: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if self.store.get_active():
-            raise ValueError('已有划转任务或待处理异常，请先完成恢复')
-        preview = self.preview(amount)
-        requested = preview['requested_amount']
-        net_amount = preview['received_amount']
-        forward_free = preview['binance_forward_free']
-        master_free = self.binance.get_master_spot_free(self.settings.coin)
-
-        key = secrets.token_hex(10)
-        values = {
-            'task_key': key,
-            'user_id': str(user_id or 'default'),
-            'username': str(username or ''),
-            'status': 'queued',
-            'step': 'binance_forward_to_master',
-            'status_message': '等待从 Binance 子账户划转到主账户',
-            'coin': self.settings.coin,
-            'network': self.settings.network,
-            'destination_masked': _mask_address(self.settings.destination),
-            'requested_amount': requested,
-            'expected_fee': preview['fee'],
-            'withdraw_amount': net_amount,
-            'binance_transfer_client_id': f'ft_{key}_b',
-            'binance_rollback_client_id': f'ft_{key}_r',
-            'binance_withdraw_order_id': f'ft_{key}_w',
-            'gate_transfer_client_id': f'ft_{key}_g',
-        }
-        self._open_locked = True
+        self._begin_task_creation()
         try:
+            preview = self.preview(amount)
+            requested = preview['requested_amount']
+            net_amount = preview['received_amount']
+            forward_free = preview['binance_forward_free']
+            master_free = self.binance.get_master_spot_free(self.settings.coin)
+
+            key = secrets.token_hex(10)
+            values = {
+                'task_key': key,
+                'user_id': str(user_id or 'default'),
+                'username': str(username or ''),
+                'status': 'queued',
+                'step': 'binance_forward_to_master',
+                'status_message': '等待从 Binance 子账户划转到主账户',
+                'coin': self.settings.coin,
+                'network': self.settings.network,
+                'destination_masked': _mask_address(self.settings.destination),
+                'requested_amount': requested,
+                'expected_fee': preview['fee'],
+                'withdraw_amount': net_amount,
+                'binance_transfer_client_id': f'ft_{key}_b',
+                'binance_rollback_client_id': f'ft_{key}_r',
+                'binance_withdraw_order_id': f'ft_{key}_w',
+                'gate_transfer_client_id': f'ft_{key}_g',
+            }
             task = self.store.create(values)
+            detail = {
+                'binance_forward_free_before': str(forward_free),
+                'binance_master_free_before': str(master_free),
+                'gross_amount_semantics': 'requested_amount_includes_withdraw_fee',
+                'initiator': str(initiator or 'manual'),
+            }
+            if context_detail:
+                detail.update(context_detail)
+            task = self.store.update(
+                task['id'],
+                started_at=self.now_fn(),
+                detail=detail,
+            )
+            self._finish_task_creation()
         except Exception:
-            self._open_locked = bool(self.store.get_active())
+            self._restore_open_lock_after_create_failure()
             raise
-        detail = {
-            'binance_forward_free_before': str(forward_free),
-            'binance_master_free_before': str(master_free),
-            'gross_amount_semantics': 'requested_amount_includes_withdraw_fee',
-            'initiator': str(initiator or 'manual'),
-        }
-        if context_detail:
-            detail.update(context_detail)
-        task = self.store.update(
-            task['id'],
-            started_at=self.now_fn(),
-            detail=detail,
-        )
         logger.warning(
             '资金划转任务已创建: id=%s amount=%s coin=%s network=%s',
             task.get('id'), requested, self.settings.coin, self.settings.network,

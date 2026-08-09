@@ -114,6 +114,7 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
         self.assertEqual(len(first), 1)
         self.assertFalse(first[0]['success'])
+        self.assertEqual(first[0]['margin_risk_stage'], 'profit_release_350')
         self.assertEqual(same_snapshot, [])
         ce._execute_close.assert_called_once()
 
@@ -134,11 +135,14 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
         self.assertEqual(len(first), 1)
         self.assertFalse(first[0]['success'])
+        self.assertEqual(first[0]['margin_risk_stage'], 'profit_release_350')
         self.assertEqual(same_snapshot, [])
         ce._execute_close.assert_called_once()
 
     def test_350_stage_requires_live_economic_data_and_positive_net_result(self):
         ce = make_closing_executor()
+        permission = MagicMock(return_value=True)
+        ce.set_auto_fund_transfer_enabled_provider(permission)
         ce._gate_cross_risk_cache = {
             'ts': time.time(),
             'risk': make_gate_cross_risk(status='warning', account_mmr_pct=350.0),
@@ -165,6 +169,109 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
         self.assertEqual(result, [])
         ce._execute_close.assert_not_called()
+        permission.assert_not_called()
+
+    def test_350_stage_rejects_non_finite_economic_values(self):
+        for field, value in (
+            ('current_spread_bps', float('nan')),
+            ('current_spread_bps', float('inf')),
+            ('open_spread_bps', float('nan')),
+            ('funding_pnl_bps', float('inf')),
+        ):
+            with self.subTest(field=field, value=value):
+                ce = make_closing_executor()
+                permission = MagicMock(return_value=True)
+                ce.set_auto_fund_transfer_enabled_provider(permission)
+                ce._gate_cross_risk_cache = {
+                    'ts': time.time(),
+                    'risk': make_gate_cross_risk(
+                        status='warning',
+                        account_mmr_pct=340.0,
+                    ),
+                }
+                position_values = {
+                    'open_spread_bps': 800.0,
+                    'current_spread_bps': 100.0,
+                    'gate_liq_price': 2.0,
+                    'gate_mark_price': 1.0,
+                }
+                position_values[field] = value
+                position = _risk_position(**position_values)
+
+                result = ce.check_and_close_margin_danger([position], {})
+
+                self.assertEqual(result, [])
+                permission.assert_not_called()
+
+    def test_350_stage_rejects_malformed_economic_values_without_aborting_check(self):
+        ce = make_closing_executor()
+        permission = MagicMock(return_value=True)
+        ce.set_auto_fund_transfer_enabled_provider(permission)
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='warning', account_mmr_pct=340.0),
+        }
+        ce._execute_close = MagicMock()
+
+        result = ce.check_and_close_margin_danger([
+            _risk_position(
+                open_spread_bps='invalid',
+                current_spread_bps=100.0,
+                gate_liq_price=2.0,
+                gate_mark_price=1.0,
+            ),
+        ], {})
+
+        self.assertEqual(result, [])
+        permission.assert_not_called()
+        ce._execute_close.assert_not_called()
+
+    def test_350_lock_contention_does_not_consume_transfer_permission(self):
+        ce = make_closing_executor()
+        permission = MagicMock(return_value=True)
+        ce.set_auto_fund_transfer_enabled_provider(permission)
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='warning', account_mmr_pct=340.0),
+        }
+        position = _risk_position(
+            open_spread_bps=800.0,
+            current_spread_bps=100.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+        key = ce._margin_close_key(position)
+        self.assertTrue(ce._claim_margin_close(key))
+        try:
+            result = ce.check_and_close_margin_danger([position], {})
+        finally:
+            ce._release_margin_close(key)
+
+        self.assertEqual(result, [])
+        permission.assert_not_called()
+
+    def test_350_pre_execution_exception_releases_asset_lock_and_reports_stage(self):
+        ce = make_closing_executor()
+        permission = MagicMock(return_value=True)
+        ce.set_auto_fund_transfer_enabled_provider(permission)
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='warning', account_mmr_pct=340.0),
+        }
+        ce._clear_position_close_state = MagicMock(side_effect=RuntimeError('state unavailable'))
+        position = _risk_position(
+            open_spread_bps=800.0,
+            current_spread_bps=100.0,
+            gate_liq_price=2.0,
+            gate_mark_price=1.0,
+        )
+
+        result = ce.check_and_close_margin_danger([position], {})
+
+        self.assertEqual(result[0]['margin_risk_stage'], 'profit_release_350')
+        self.assertFalse(result[0]['success'])
+        self.assertEqual(ce._margin_close_inflight, set())
+        permission.assert_called_once_with()
 
     def test_mmr_just_above_350_does_not_release_a_profitable_position(self):
         ce = make_closing_executor()
@@ -188,7 +295,8 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
     def test_liquidation_distance_danger_ignores_profit_release_switch(self):
         ce = make_closing_executor()
-        ce.set_auto_fund_transfer_enabled_provider(lambda: False)
+        permission = MagicMock(return_value=False)
+        ce.set_auto_fund_transfer_enabled_provider(permission)
         ce._gate_cross_risk_cache = {
             'ts': time.time(),
             'risk': make_gate_cross_risk(status='danger', account_mmr_pct=340.0),
@@ -205,6 +313,7 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
 
         self.assertEqual(result[0]['margin_risk_stage'], 'liquidation_distance')
         ce._execute_close.assert_called_once()
+        permission.assert_not_called()
 
     def test_exact_300_and_200_boundaries_use_the_expected_safety_stage(self):
         for mmr, expected_stage in ((300.0, 'controlled_300'), (200.0, 'critical_200')):
