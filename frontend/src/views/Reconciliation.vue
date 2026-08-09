@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { Coin } from '@element-plus/icons-vue'
 import { AgGridVue } from 'ag-grid-vue3'
-import type { ColDef, GridReadyEvent, ICellRendererParams } from 'ag-grid-community'
+import type { ColDef, GridApi, GridReadyEvent, ICellRendererParams } from 'ag-grid-community'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { useGridCopy } from '../ag-grid/useGridCopy'
 import LongTextTooltip from '../ag-grid/LongTextTooltip.vue'
@@ -47,8 +47,18 @@ interface ExposureRow {
   recommended_action: string
 }
 
+interface ColumnVisibility {
+  colId: string
+  headerName: string
+  visible: boolean
+}
+
+const EXPOSURE_PAGE_KEY = 'reconciliation_exposure'
+const RAW_PAGE_KEY = 'reconciliation_raw'
 const rowData = shallowRef<ReconRow[]>([])
 const latestRows = shallowRef<ReconRow[]>([])
+const rawGridApi = shallowRef<GridApi<ReconRow> | null>(null)
+const exposureGridApi = shallowRef<GridApi<ExposureRow> | null>(null)
 const loading = ref(false)
 const running = ref(false)
 const dustCleaning = ref(false)
@@ -61,6 +71,7 @@ const paginationCurrentPage = ref(1)
 const paginationTotal = ref(0)
 const detailDialogVisible = ref(false)
 const detailRow = ref<ReconRow | null>(null)
+const columnVisibilities = ref<ColumnVisibility[]>([])
 
 const { setupGridCopy } = useGridCopy()
 
@@ -174,6 +185,9 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
   { headerName: '标的', field: 'base_asset', width: 110, pinned: 'left', sort: 'asc' },
   { headerName: '对账时间', field: 'snapshot_at', width: 165 },
   { headerName: '综合状态', field: 'status', width: 145, cellRenderer: exposureRenderer },
+  { headerName: '交易所互对', field: 'exchange_match', width: 115, cellRenderer: matchRenderer },
+  { headerName: '本地-Binance', field: 'binance_match', width: 125, cellRenderer: matchRenderer },
+  { headerName: '本地-Gate', field: 'gate_match', width: 115, cellRenderer: matchRenderer },
   {
     headerName: 'Binance实仓',
     field: 'binance_exchange_value',
@@ -215,7 +229,6 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
     valueFormatter: (p) => formatNumber(p.value),
     cellStyle: diffStyle,
   },
-  { headerName: '交易所互对', field: 'exchange_match', width: 115, cellRenderer: matchRenderer },
   {
     headerName: 'Binance本地',
     field: 'binance_local_value',
@@ -267,8 +280,6 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
     valueFormatter: (p) => formatNumber(p.value),
     cellStyle: diffStyle,
   },
-  { headerName: '本地-Binance', field: 'binance_match', width: 125, cellRenderer: matchRenderer },
-  { headerName: '本地-Gate', field: 'gate_match', width: 115, cellRenderer: matchRenderer },
   {
     headerName: '建议动作',
     field: 'recommended_action',
@@ -286,6 +297,18 @@ const defaultColDef: ColDef = {
 
 const totalPages = computed(() =>
   Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
+)
+
+const activeGridApi = computed<GridApi<ReconRow> | GridApi<ExposureRow> | null>(() =>
+  activeTab.value === 'exposure' ? exposureGridApi.value : rawGridApi.value
+)
+
+const activeColumnDefs = computed<ColDef<any>[]>(() =>
+  activeTab.value === 'exposure' ? exposureColumnDefs.value : rawColumnDefs.value
+)
+
+const activeColumnConfigKey = computed(() =>
+  activeTab.value === 'exposure' ? EXPOSURE_PAGE_KEY : RAW_PAGE_KEY
 )
 
 const exposureRows = computed<ExposureRow[]>(() => {
@@ -505,12 +528,67 @@ function onPaginationSizeChange() {
   fetchRows()
 }
 
+function refreshColumnVisibilities() {
+  const api = activeGridApi.value
+  if (!api) return
+  const states = api.getColumnState()
+  columnVisibilities.value = activeColumnDefs.value
+    .filter((col) => col.field || col.colId)
+    .map((col) => {
+      const colId = (col.field ?? col.colId) as string
+      const state = states.find((item) => item.colId === colId)
+      return { colId, headerName: col.headerName ?? colId, visible: state?.hide !== true }
+    })
+}
+
+function toggleColumnVisibility(colId: string, visible: boolean) {
+  const api = activeGridApi.value
+  if (!api) return
+  api.setColumnsVisible([colId], visible)
+  const col = columnVisibilities.value.find((item) => item.colId === colId)
+  if (col) col.visible = visible
+}
+
+async function saveColumnState() {
+  const api = activeGridApi.value
+  if (!api) return
+  try {
+    const res = await post(`/api/trading/column-config/${activeColumnConfigKey.value}`, {
+      columnState: api.getColumnState(),
+    })
+    const data = await res.json()
+    if (data?.success) showSuccess('列配置已保存')
+    else showError(data?.message || '保存列配置失败')
+  } catch {
+    showError('保存列配置失败')
+  }
+}
+
+async function loadColumnState(
+  api: GridApi<ReconRow> | GridApi<ExposureRow>,
+  pageKey: string,
+) {
+  try {
+    const res = await get(`/api/trading/column-config/${pageKey}`)
+    const data = await res.json()
+    if (Array.isArray(data?.columnState)) {
+      api.applyColumnState({ state: data.columnState, applyOrder: true })
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 function onGridReady(params: GridReadyEvent<ReconRow>) {
+  rawGridApi.value = params.api
   setupGridCopy(params.api)
+  loadColumnState(params.api, RAW_PAGE_KEY)
 }
 
 function onExposureGridReady(params: GridReadyEvent<ExposureRow>) {
+  exposureGridApi.value = params.api
   setupGridCopy(params.api)
+  loadColumnState(params.api, EXPOSURE_PAGE_KEY)
 }
 
 function onRowDoubleClicked(params: any) {
@@ -579,6 +657,21 @@ onMounted(async () => {
       />
 
       <el-button size="small" :loading="loading" @click="refreshCurrentTab">刷新</el-button>
+      <el-popover placement="bottom-end" :width="260" trigger="click" @before-enter="refreshColumnVisibilities">
+        <template #reference>
+          <el-button size="small">列选择</el-button>
+        </template>
+        <div class="column-picker">
+          <div v-for="col in columnVisibilities" :key="col.colId" class="column-picker-item">
+            <el-checkbox
+              :model-value="col.visible"
+              @change="(val: boolean | string | number) => toggleColumnVisibility(col.colId, !!val)"
+            />
+            <span>{{ col.headerName }}</span>
+          </div>
+        </div>
+      </el-popover>
+      <el-button size="small" @click="saveColumnState">保存列配置</el-button>
     </div>
 
     <el-tabs v-model="activeTab" class="recon-tabs">
@@ -743,6 +836,22 @@ onMounted(async () => {
 .summary-bad {
   color: #f56c6c;
   font-weight: 600;
+}
+
+.column-picker {
+  max-height: 360px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.column-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 22px;
 }
 
 .pagination-bar {
