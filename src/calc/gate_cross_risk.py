@@ -2,6 +2,7 @@
 """Single-source Gate cross-margin risk snapshots for the forward strategy."""
 
 import copy
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -290,6 +291,41 @@ def build_gate_cross_risk(
     thresholds: Optional[GateCrossRiskThresholds] = None,
 ) -> Dict:
     thresholds = thresholds or GateCrossRiskThresholds()
+    numeric_errors = []
+    for field, value in (
+        ('equity', equity),
+        ('available', available),
+        ('margin_used', margin_used),
+    ):
+        if _float_or_none(value) is None:
+            numeric_errors.append(field)
+    for field in (
+        'cross_mmr',
+        'cross_initial_margin',
+        'cross_maintenance_margin',
+        'cross_margin_balance',
+        'cross_available',
+    ):
+        value = account.get(field)
+        if _has_value(value) and _float_or_none(value) is None:
+            numeric_errors.append(f'account.{field}')
+    for index, pos in enumerate(positions or []):
+        for field in (
+            'size',
+            'initial_margin',
+            'maintenance_margin',
+            'unrealised_pnl',
+            'unrealized_pnl',
+            'mark_price',
+            'liq_price',
+        ):
+            value = pos.get(field)
+            if _has_value(value) and _float_or_none(value) is None:
+                numeric_errors.append(f'positions[{index}].{field}')
+
+    equity = _float(equity)
+    available = _float(available)
+    margin_used = _float(margin_used)
     active_positions = [pos for pos in positions or [] if abs(_float(pos.get('size'))) > 0]
     total_position_maintenance = 0.0
     nearest_liq = None
@@ -364,6 +400,8 @@ def build_gate_cross_risk(
     )
     if has_exposure and account_mmr_pct is None and status != 'danger':
         status = 'unknown'
+    if numeric_errors and status != 'danger':
+        status = 'unknown'
     difference_pct = None
     if account_mmr_pct is not None and computed_mmr_pct is not None:
         difference_pct = account_mmr_pct - computed_mmr_pct
@@ -372,6 +410,7 @@ def build_gate_cross_risk(
         'enabled': True,
         'status': status,
         'status_label': gate_cross_risk_status_label(status),
+        'numeric_error': ','.join(numeric_errors) if numeric_errors else None,
         'position_count': len(active_positions),
         'account_equity_usdt': _round(equity),
         'available_usdt': _round(available),
@@ -488,6 +527,7 @@ def gate_cross_risk_health(
     elif (
         positions_age_sec is None
         or risk.get('error')
+        or risk.get('numeric_error')
         or str(risk.get('status') or '').lower() == 'unknown'
     ):
         health_status = 'degraded'
@@ -529,25 +569,25 @@ def _has_value(value) -> bool:
 
 
 def _float(value) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
+    parsed = _float_or_none(value)
+    return parsed if parsed is not None else 0.0
 
 
 def _float_or_none(value) -> Optional[float]:
     if value in (None, ''):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _round(value: Optional[float], digits: int = 6) -> Optional[float]:
     if value is None:
         return None
     try:
-        return round(float(value), digits)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return round(parsed, digits) if math.isfinite(parsed) else None

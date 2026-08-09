@@ -46,6 +46,25 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
         coordinator.suspend_profit_release.assert_called_once_with()
         coordinator.evaluate.assert_not_called()
 
+    def test_auto_funding_evaluation_exception_revokes_profit_release_permission(self):
+        coordinator = MagicMock()
+        coordinator.evaluate.side_effect = RuntimeError('unexpected failure')
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_open_paused', False),
+            patch.object(orderbook_server.config, 'get_bool', return_value=True),
+            patch.object(orderbook_server, '_latest_account_summary', {
+                'binance': {'net_value': 1000.0},
+            }),
+            patch.object(orderbook_server, '_latest_account_summary_ts', 1.0),
+        ):
+            result = orderbook_server._evaluate_auto_fund_transfer({
+                'health_status': 'healthy',
+            })
+
+        self.assertEqual(result['action'], 'error')
+        coordinator.suspend_profit_release.assert_called_once_with()
+
     def test_successful_350_release_wakes_auto_transfer_before_broadcast(self):
         coordinator = MagicMock()
         results = [{

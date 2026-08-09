@@ -3,6 +3,7 @@
 - TradingExecutor: 开仓判断 + 订单生成 + 持久化
 - 成交引擎通过 ExecutorClient (HTTP) 调用独立的执行器服务（虚拟/实盘），实现虚实分离
 """
+import math
 import time
 import uuid
 from collections import deque
@@ -182,6 +183,7 @@ class TradingExecutorConfig:
     capital_required: bool = False
     capital_max_age_sec: int = 180
     gate_cross_risk_max_age_sec: float = 5.0
+    gate_cross_risk_warning_mmr_pct: float = 500.0
     binance_margin_required: bool = False
     binance_margin_min_open_level: float = 2.5
 
@@ -486,6 +488,10 @@ class TradingExecutor:
         self.capital_required = cfg.capital_required
         self.capital_max_age_sec = cfg.capital_max_age_sec
         self.gate_cross_risk_max_age_sec = max(float(cfg.gate_cross_risk_max_age_sec or 0), 0.0)
+        self.gate_cross_risk_warning_mmr_pct = max(
+            float(cfg.gate_cross_risk_warning_mmr_pct or 0),
+            0.0,
+        )
         self.binance_margin_required = bool(cfg.binance_margin_required)
         self.binance_margin_min_open_level = float(cfg.binance_margin_min_open_level or 0.0)
         self._account_summary: Optional[Dict] = None
@@ -1203,9 +1209,10 @@ class TradingExecutor:
         if value is None:
             return None
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             return None
+        return parsed if math.isfinite(parsed) else None
 
     def _parse_datetime(self, value) -> Optional[datetime]:
         if value is None:
@@ -2097,11 +2104,33 @@ class TradingExecutor:
         if gate_risk_reason:
             return False, gate_risk_reason
 
-        binance_available = float(binance.get('available') or 0)
-        gate_available = float(gate.get('available') or 0)
-        binance_total = float(binance.get('net_value') or binance.get('equity') or 0)
-        gate_total = float(gate.get('net_value') or gate.get('equity') or 0)
-        amount = float(amount_usdt if amount_usdt is not None else self.open_amount_usdt)
+        capital_values = {
+            'Binance可用资金': self._float_or_none(binance.get('available')),
+            'Gate可用资金': self._float_or_none(gate.get('available')),
+            'Binance总资金': self._float_or_none(
+                binance.get('net_value')
+                if binance.get('net_value') is not None
+                else binance.get('equity')
+            ),
+            'Gate总资金': self._float_or_none(
+                gate.get('net_value')
+                if gate.get('net_value') is not None
+                else gate.get('equity')
+            ),
+            '开仓金额': self._float_or_none(
+                amount_usdt if amount_usdt is not None else self.open_amount_usdt
+            ),
+        }
+        invalid_values = [label for label, value in capital_values.items() if value is None]
+        if invalid_values:
+            return False, f"资金风控(非有限资金数据:{','.join(invalid_values)})"
+        binance_available = capital_values['Binance可用资金']
+        gate_available = capital_values['Gate可用资金']
+        binance_total = capital_values['Binance总资金']
+        gate_total = capital_values['Gate总资金']
+        amount = capital_values['开仓金额']
+        if amount <= 0:
+            return False, '资金风控(开仓金额无效)'
         spot_required = amount * (1 + self._fee_spot_open)
         # 全仓初始保证金由 Gate 动态计算；这里保守预留完整名义金额并计入开仓手续费。
         gate_required = amount + amount * self._fee_future_open
@@ -2141,6 +2170,11 @@ class TradingExecutor:
         if not risk:
             return '资金风控(Gate全仓风险未知|无实时风险快照)'
         status = str(risk.get('status') or '').strip().lower()
+        if risk.get('numeric_error'):
+            return f"资金风控(Gate全仓风险未知|非有限数据={risk.get('numeric_error')})"
+        health_status = str(risk.get('health_status') or '').strip().lower()
+        if health_status and health_status != 'healthy':
+            return f"资金风控(Gate全仓风险未知|健康状态={health_status})"
         fetched_at_ts = self._float_or_none(risk.get('account_fetched_at_ts'))
         if fetched_at_ts is None:
             fetched_at_ts = self._float_or_none(risk.get('fetched_at_ts'))
@@ -2154,6 +2188,17 @@ class TradingExecutor:
                     f"{age:.1f}s>{self.gate_cross_risk_max_age_sec:.1f}s)"
                 )
 
+        account_mmr = self._float_or_none(risk.get('account_mmr_pct'))
+        if status == 'safe' and account_mmr is None:
+            return '资金风控(Gate全仓风险未知|MMR非有限或缺失)'
+        if (
+            status == 'safe'
+            and account_mmr <= self.gate_cross_risk_warning_mmr_pct
+        ):
+            return (
+                f"资金风控(Gate全仓风险状态冲突|safe但MMR={account_mmr:.1f}%"
+                f"<={self.gate_cross_risk_warning_mmr_pct:.1f}%)"
+            )
         if status in {'safe', 'idle'} and not risk.get('error'):
             return None
         if status not in {'warning', 'danger'}:
@@ -2161,7 +2206,6 @@ class TradingExecutor:
             return f"资金风控(Gate全仓风险未知|{detail})"
         status_label = risk.get('status_label') or ('危险' if status == 'danger' else '预警')
         parts = [f"资金风控(Gate全仓风险{status_label}"]
-        account_mmr = self._float_or_none(risk.get('account_mmr_pct'))
         if account_mmr is not None:
             parts.append(f"MMR={account_mmr:.1f}%")
         liq_distance = self._float_or_none(risk.get('nearest_liq_distance_bps'))

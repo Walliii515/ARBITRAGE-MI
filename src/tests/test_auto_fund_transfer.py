@@ -502,6 +502,34 @@ def test_claim_fails_closed_when_transfer_store_is_unavailable():
     assert coordinator.is_profit_release_allowed() is False
 
 
+def test_evaluation_store_failure_revokes_previous_release_permission():
+    coordinator, service, notifications = make_coordinator(
+        service=FakeService(free=Decimal('600')),
+    )
+    assert coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )['action'] == 'insufficient'
+    service.store.get_latest_by_initiator = (
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('db unavailable'))
+    )
+
+    result = coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )
+
+    assert result['action'] == 'evaluation_error'
+    assert 'db unavailable' in result['error']
+    assert coordinator.is_profit_release_allowed() is False
+    assert coordinator.claim_profit_release() is False
+    assert notifications[-1]['type'] == 'error'
+
+
 def test_claim_fails_fast_while_auto_evaluation_is_busy():
     coordinator, _, _ = make_coordinator(
         service=FakeService(free=Decimal('600')),
@@ -763,7 +791,7 @@ def test_active_task_short_circuits_missing_balance_without_spurious_alarm():
     assert service.limits_calls == 0
 
 
-def test_notification_failure_after_task_creation_cannot_duplicate_withdrawal():
+def test_notification_failure_after_task_creation_reports_created_without_duplicate():
     service = FakeService()
     coordinator = AutoFundTransferCoordinator(
         service,
@@ -773,13 +801,12 @@ def test_notification_failure_after_task_creation_cannot_duplicate_withdrawal():
         monotonic_fn=lambda: 100.0,
     )
 
-    with pytest.raises(RuntimeError, match='bell unavailable'):
-        coordinator.evaluate(
-            healthy_risk(),
-            forward_open_enabled=True,
-            binance_equity_usdt=Decimal('10000'),
-            account_summary_age_sec=1,
-        )
+    first = coordinator.evaluate(
+        healthy_risk(),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )
     second = coordinator.evaluate(
         healthy_risk(),
         forward_open_enabled=True,
@@ -787,9 +814,33 @@ def test_notification_failure_after_task_creation_cannot_duplicate_withdrawal():
         account_summary_age_sec=1,
     )
 
+    assert first['action'] == 'created'
     assert second['action'] == 'task_active'
     assert len(service.created) == 1
     assert coordinator.is_profit_release_allowed() is False
+
+
+def test_insufficient_notification_failure_never_authorizes_profit_release():
+    service = FakeService(free=Decimal('600'))
+    coordinator = AutoFundTransferCoordinator(
+        service,
+        policy=policy(),
+        notifier=lambda **_item: (_ for _ in ()).throw(RuntimeError('bell unavailable')),
+        now_fn=lambda: datetime(2026, 8, 9, 12, 0, 0),
+        monotonic_fn=lambda: 100.0,
+    )
+
+    result = coordinator.evaluate(
+        healthy_risk(mmr='340', equity='3400'),
+        forward_open_enabled=True,
+        binance_equity_usdt=Decimal('10000'),
+        account_summary_age_sec=1,
+    )
+
+    assert result['action'] == 'evaluation_error'
+    assert 'bell unavailable' in result['error']
+    assert coordinator.is_profit_release_allowed() is False
+    assert coordinator.claim_profit_release() is False
 
 
 def test_busy_evaluation_preserves_confirmed_insufficient_release_permission():

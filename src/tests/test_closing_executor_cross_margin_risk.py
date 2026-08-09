@@ -1084,6 +1084,7 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
             'spot_order': {'exec_qty': 10.0},
         })
         ce._save_close = MagicMock(side_effect=RuntimeError('database unavailable'))
+        ce._persist_execution_quarantine = MagicMock(return_value=True)
         ce._trigger_reconciliation = MagicMock()
         position = _risk_position()
 
@@ -1101,6 +1102,7 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
         self.assertTrue(result['execution_reduction_consumed'])
         self.assertEqual(position['exchange_risk_status'], 'desynced')
         self.assertIn('database unavailable', result['persistence_error'])
+        ce._persist_execution_quarantine.assert_called_once()
         ce._trigger_reconciliation.assert_called_once_with(
             'close_persistence_failed', 'TUT',
         )
@@ -1134,7 +1136,7 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
         self.assertNotIn('exchange_risk_status', position)
         ce._trigger_reconciliation.assert_not_called()
 
-    def test_persistence_failure_after_gate_fill_blocks_same_margin_snapshot(self):
+    def test_persistence_failure_after_gate_fill_blocks_reloaded_position(self):
         ce = make_closing_executor()
         risk = make_gate_cross_risk(status='danger', account_mmr_pct=250.0)
         ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
@@ -1150,19 +1152,65 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
             'spot_order': {'exec_qty': 0.0},
         })
         ce._save_close = MagicMock(side_effect=RuntimeError('write failed'))
+        ce._persist_execution_quarantine = MagicMock(return_value=True)
         ce._trigger_reconciliation = MagicMock()
         position = _risk_position()
 
         first = ce.check_and_close_margin_danger([position], {})
         same_snapshot = ce.check_and_close_margin_danger([position], {})
         risk['account_fetched_at_ts'] += 1.0
-        fresh_snapshot = ce.check_and_close_margin_danger([position], {})
+        fresh_snapshot = ce.check_and_close_margin_danger([_risk_position()], {})
 
         self.assertEqual(len(first), 1)
         self.assertTrue(first[0]['execution_reduction_consumed'])
         self.assertEqual(same_snapshot, [])
         self.assertEqual(fresh_snapshot, [])
         ce.executor_client.execute.assert_called_once()
+
+    def test_persistence_quarantine_clears_after_reconciliation_resolves_position(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(status='danger', account_mmr_pct=250.0)
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._build_close_order_group = MagicMock(return_value={
+            'order_uuid': 'risk-close-integrated',
+            'spot_order': {},
+            'future_order': {},
+        })
+        ce.executor_client.execute = MagicMock(return_value={
+            'success': False,
+            'message': 'Gate成交，现货失败',
+            'future_order': {'exec_qty': 10.0},
+            'spot_order': {'exec_qty': 0.0},
+        })
+        ce._save_close = MagicMock(side_effect=RuntimeError('write failed'))
+        ce._persist_execution_quarantine = MagicMock(return_value=True)
+        ce._trigger_reconciliation = MagicMock()
+
+        ce.check_and_close_margin_danger([_risk_position()], {})
+        risk['account_fetched_at_ts'] += 1.0
+        resolved = _risk_position(exchange_risk_status='resolved')
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': True,
+            'execution_reduction_consumed': True,
+            'close_reason': 'margin_close',
+        })
+
+        result = ce.check_and_close_margin_danger([resolved], {})
+
+        self.assertEqual(len(result), 1)
+        ce._execute_close.assert_called_once()
+        self.assertNotIn('TUT', ce._execution_quarantine_by_asset)
+
+    def test_persistence_quarantine_clears_when_original_position_is_closed(self):
+        ce = make_closing_executor()
+        ce._quarantine_executed_asset(_risk_position(id=11))
+        replacement = _risk_position(id=12)
+
+        desynced_assets = ce._desynced_assets([replacement])
+
+        self.assertNotIn('TUT', desynced_assets)
+        self.assertNotIn('TUT', ce._execution_quarantine_by_asset)
 
     def test_liquidation_distance_zero_fill_retries_same_snapshot(self):
         ce = make_closing_executor()

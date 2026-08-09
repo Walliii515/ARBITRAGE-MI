@@ -226,6 +226,13 @@ class AutoFundTransferCoordinator:
                 binance_equity_usdt=binance_equity_usdt,
                 account_summary_age_sec=account_summary_age_sec,
             )
+        except Exception as exc:
+            self._profit_release_allowed = False
+            try:
+                mmr = _finite_decimal((risk or {}).get('account_mmr_pct'), 'Gate MMR')
+            except Exception:
+                mmr = Decimal('0')
+            return self._evaluation_error_result(mmr, exc)
         finally:
             self._lock.release()
 
@@ -337,8 +344,11 @@ class AutoFundTransferCoordinator:
         except Exception as exc:
             return self._evaluation_error_result(mmr, exc)
         if not decision['executable']:
+            try:
+                self._notify_insufficient(risk, decision)
+            except Exception as exc:
+                return self._evaluation_error_result(mmr, exc)
             self._profit_release_allowed = True
-            self._notify_insufficient(risk, decision)
             return {'action': 'insufficient', 'mmr_pct': mmr, 'decision': decision}
 
         context = {
@@ -366,23 +376,34 @@ class AutoFundTransferCoordinator:
             )
         except Exception as exc:
             self._profit_release_allowed = False
-            self._notify_evaluation_failure(mmr, exc)
+            try:
+                self._notify_evaluation_failure(mmr, exc)
+            except Exception as notify_exc:
+                logger.error('Gate自动补资任务创建异常通知失败: %s', notify_exc, exc_info=True)
             logger.error('Gate自动补资任务创建失败: %s', exc, exc_info=True)
             return {'action': 'task_create_error', 'mmr_pct': mmr, 'error': str(exc)[:300]}
         self._profit_release_allowed = False
-        self.notifier(
-            title='Gate全仓MMR自动补资',
-            message=(
-                f"MMR={mmr:.2f}%<=500%，已创建资金划转 #{task.get('id')}，"
-                f"金额={decision['amount']:.8f} USDT，目标MMR=700%"
-            ),
-            type='warning',
-            source='auto_fund_transfer',
-            dedup_key=f"auto_fund_transfer:{task.get('id')}:created",
-            event_at=self.now_fn(),
-            payload={'task_id': task.get('id'), 'trigger_mmr_pct': str(mmr)},
-            user_id='default',
-        )
+        try:
+            self.notifier(
+                title='Gate全仓MMR自动补资',
+                message=(
+                    f"MMR={mmr:.2f}%<=500%，已创建资金划转 #{task.get('id')}，"
+                    f"金额={decision['amount']:.8f} USDT，目标MMR=700%"
+                ),
+                type='warning',
+                source='auto_fund_transfer',
+                dedup_key=f"auto_fund_transfer:{task.get('id')}:created",
+                event_at=self.now_fn(),
+                payload={'task_id': task.get('id'), 'trigger_mmr_pct': str(mmr)},
+                user_id='default',
+            )
+        except Exception as exc:
+            logger.error(
+                'Gate自动补资任务已创建，但铃铛通知失败 | task=%s | %s',
+                task.get('id'),
+                exc,
+                exc_info=True,
+            )
         logger.critical(
             'Gate全仓MMR自动补资任务已创建 | task=%s | mmr=%s%% | amount=%s',
             task.get('id'), mmr, decision['amount'],

@@ -229,6 +229,8 @@ class ClosingExecutor:
         self._margin_recovery_last_close_snapshot_ts = 0.0
         self._margin_profit_release_last_close_snapshot_ts = 0.0
         self._margin_execution_last_snapshot_ts = 0.0
+        self._execution_quarantine_by_asset: Dict[str, set[str]] = {}
+        self._execution_quarantine_lock = threading.Lock()
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -2523,6 +2525,13 @@ class ClosingExecutor:
             except Exception as exc:
                 if execution_reduction_consumed:
                     pos['exchange_risk_status'] = 'desynced'
+                    self._quarantine_executed_asset(pos)
+                    self._persist_execution_quarantine(
+                        pos,
+                        future_exec_qty=future_exec_qty,
+                        spot_exec_qty=spot_exec_qty,
+                        persistence_error=exc,
+                    )
                     self._trigger_reconciliation('close_persistence_failed', ba)
                 logger.error(
                     "平仓已执行但本地持久化失败 | %s | position_id=%s | "
@@ -3175,15 +3184,109 @@ class ClosingExecutor:
         )
         return updated > 0
 
-    @staticmethod
-    def _desynced_assets(positions: Optional[List[Dict]]) -> set[str]:
-        return {
+    def _desynced_assets(self, positions: Optional[List[Dict]]) -> set[str]:
+        rows = positions or []
+        desynced = {
             str(pos.get('base_asset') or '').upper()
-            for pos in (positions or [])
+            for pos in rows
             if pos.get('status') == 'holding'
             and str(pos.get('exchange_risk_status') or 'normal').lower() == 'desynced'
             and str(pos.get('base_asset') or '').strip()
         }
+        rows_by_asset: Dict[str, Dict[str, Dict]] = {}
+        for pos in rows:
+            if pos.get('status') != 'holding':
+                continue
+            base_asset = str(pos.get('base_asset') or '').upper()
+            if not base_asset:
+                continue
+            rows_by_asset.setdefault(base_asset, {})[str(pos.get('id'))] = pos
+
+        with self._execution_quarantine_lock:
+            for base_asset, position_ids in list(self._execution_quarantine_by_asset.items()):
+                asset_rows = rows_by_asset.get(base_asset, {})
+                unresolved_ids = set()
+                for position_id in position_ids:
+                    if position_id == '*':
+                        unresolved = any(
+                            str(row.get('exchange_risk_status') or 'normal').lower()
+                            != 'resolved'
+                            for row in asset_rows.values()
+                        )
+                    else:
+                        row = asset_rows.get(position_id)
+                        unresolved = bool(
+                            row
+                            and str(row.get('exchange_risk_status') or 'normal').lower()
+                            != 'resolved'
+                        )
+                    if unresolved:
+                        unresolved_ids.add(position_id)
+                if unresolved_ids:
+                    self._execution_quarantine_by_asset[base_asset] = unresolved_ids
+                    desynced.add(base_asset)
+                else:
+                    self._execution_quarantine_by_asset.pop(base_asset, None)
+                    logger.warning(
+                        "成交落库异常隔离已由对账状态解除 | %s | position_ids=%s",
+                        base_asset,
+                        sorted(position_ids),
+                    )
+        return desynced
+
+    def _quarantine_executed_asset(self, pos: Dict) -> None:
+        base_asset = str(pos.get('base_asset') or '').upper()
+        if not base_asset:
+            return
+        position_id = pos.get('id')
+        quarantine_id = str(position_id) if position_id is not None else '*'
+        with self._execution_quarantine_lock:
+            self._execution_quarantine_by_asset.setdefault(base_asset, set()).add(
+                quarantine_id
+            )
+
+    def _persist_execution_quarantine(
+        self,
+        pos: Dict,
+        *,
+        future_exec_qty: float,
+        spot_exec_qty: float,
+        persistence_error: Exception,
+    ) -> bool:
+        position_id = pos.get('id')
+        if position_id is None:
+            return False
+        detail = (
+            f"平仓已成交但本地持久化失败|future_qty={future_exec_qty:g}|"
+            f"spot_qty={spot_exec_qty:g}|error={str(persistence_error)[:300]}"
+        )
+        sql = """
+            UPDATE mi_trade_position
+            SET exchange_risk_status = 'desynced',
+                exchange_risk_type = 'close_persistence_failed',
+                exchange_risk_at = %(risk_at)s,
+                exchange_risk_detail = %(detail)s
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+        """
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute(sql, {
+                    'risk_at': datetime.now(),
+                    'detail': detail,
+                    'position_id': position_id,
+                })
+                updated = int(getattr(cursor, 'rowcount', 0) or 0)
+        except Exception as exc:
+            logger.error(
+                "成交落库异常的持久隔离写入失败，继续使用进程内隔离 | "
+                "position_id=%s | %s",
+                position_id,
+                exc,
+                exc_info=True,
+            )
+            return False
+        return updated > 0
 
     def _trigger_reconciliation(self, reason: str, base_asset: str):
         callback = self._reconciliation_trigger

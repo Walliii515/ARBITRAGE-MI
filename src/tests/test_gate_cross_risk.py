@@ -256,6 +256,44 @@ class TestGateCrossRisk(unittest.TestCase):
         self.assertEqual(risk['status'], 'unknown')
         self.assertIsNone(risk['account_mmr_pct'])
 
+    def test_nonfinite_account_mmr_is_unknown_and_degraded(self):
+        for invalid_mmr in ('NaN', 'Infinity', '-Infinity'):
+            risk = build_gate_cross_risk(
+                {'cross_mmr': invalid_mmr},
+                [{
+                    'contract': 'AI_USDT',
+                    'size': '-10',
+                    'maintenance_margin': '2',
+                    'mark_price': '1',
+                    'liq_price': '1.2',
+                }],
+                equity=100,
+                available=80,
+                margin_used=10,
+            )
+            risk.update({
+                'account_fetched_at_ts': 100.0,
+                'positions_fetched_at_ts': 100.0,
+            })
+            health = gate_cross_risk_health(risk, now_ts=100.0)
+
+            self.assertEqual(risk['status'], 'unknown')
+            self.assertIsNone(risk['account_mmr_pct'])
+            self.assertIn('account.cross_mmr', risk['numeric_error'])
+            self.assertEqual(health['health_status'], 'degraded')
+
+    def test_nonfinite_position_size_never_reports_idle_or_safe(self):
+        risk = build_gate_cross_risk(
+            {'cross_mmr': '8'},
+            [{'contract': 'AI_USDT', 'size': 'NaN'}],
+            equity=100,
+            available=80,
+            margin_used=10,
+        )
+
+        self.assertEqual(risk['status'], 'unknown')
+        self.assertIn('positions[0].size', risk['numeric_error'])
+
     def test_liquidation_danger_wins_when_account_mmr_is_missing(self):
         risk = build_gate_cross_risk(
             {'cross_margin_balance': '100', 'cross_available': '80'},

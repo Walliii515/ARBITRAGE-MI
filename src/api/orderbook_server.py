@@ -1617,6 +1617,7 @@ def _evaluate_auto_fund_transfer(snapshot: Dict) -> Dict:
             account_summary_age_sec=summary_age,
         )
     except Exception as exc:
+        _auto_fund_transfer_coordinator.suspend_profit_release()
         logger.error('Gate全仓MMR自动补资评估失败: %s', exc, exc_info=True)
         return {'action': 'error', 'error': str(exc)[:300]}
 
@@ -2148,6 +2149,9 @@ def _run_open_position_check_once():
                 capital_max_age_sec=config.get_int('account_capital.max_age_sec', 180),
                 gate_cross_risk_max_age_sec=config.get_float(
                     'account_capital.gate_cross_risk.max_age_sec', 5.0
+                ),
+                gate_cross_risk_warning_mmr_pct=config.get_float(
+                    'account_capital.gate_cross_risk.warning_mmr_pct', 500.0
                 ),
                 binance_margin_required=config.get_bool('account_capital.binance_margin.enabled', False),
                 binance_margin_min_open_level=config.get_float(
