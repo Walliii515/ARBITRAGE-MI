@@ -672,9 +672,6 @@ class AccountCapitalSnapshotter:
                     'gate_realized_pnl',
                     'funding_pnl',
                     'fee_cost',
-                    'binance_spot_floating_pnl',
-                    'gate_future_floating_pnl',
-                    'floating_pnl',
                     'position_count',
                     'closed_count',
                     'pnl_rows',
@@ -682,6 +679,16 @@ class AccountCapitalSnapshotter:
                 )
                 if key in strategy_pnl_summary
             })
+            if self._realtime_floating_is_complete(strategy_pnl_summary):
+                strategy_summary.update({
+                    key: strategy_pnl_summary[key]
+                    for key in (
+                        'binance_spot_floating_pnl',
+                        'gate_future_floating_pnl',
+                        'floating_pnl',
+                    )
+                    if key in strategy_pnl_summary
+                })
         binance_spot = strategy_summary['binance_spot_realized']
         binance_fee = strategy_summary['binance_fee_cost']
         fee_cost = strategy_summary['fee_cost']
@@ -718,6 +725,7 @@ class AccountCapitalSnapshotter:
         positions = self._load_strategy_positions(start_at, end_at)
         position_ids = [int(pos['id']) for pos in positions if pos.get('id') is not None]
         fee_summary = self._load_strategy_order_fee_summary(position_ids)
+        floating_summary = self._load_strategy_floating_pnl_summary(positions)
 
         funding_pnl = sum(_float(pos.get('funding_total_pnl')) for pos in positions)
         binance_spot_realized = {
@@ -749,6 +757,7 @@ class AccountCapitalSnapshotter:
             'binance_fee_cost': fee_summary['binance_fee_cost'],
             'gate_fee_cost': fee_summary['gate_fee_cost'],
             'fee_cost': fee_summary['fee_cost'],
+            **floating_summary,
             'binance_spot_realized': binance_spot_realized,
             'gate_strategy_realized': {
                 'realized_pnl': gate_realized,
@@ -759,8 +768,9 @@ class AccountCapitalSnapshotter:
     def _load_strategy_positions(self, start_at: datetime, end_at: datetime) -> List[Dict]:
         sql = """
             SELECT id, status, opened_at, closed_at,
+                   base_asset, spot_open_qty, spot_open_price,
                    spot_open_amount, spot_close_amount,
-                   future_open_qty, future_open_price, future_close_amount,
+                   future_contract, future_open_qty, future_open_price, future_close_amount,
                    open_spread_bps, close_spread_bps, funding_total_pnl,
                    realized_pnl, realized_pnl_bps, total_pnl, total_pnl_bps
             FROM mi_trade_position
@@ -770,6 +780,91 @@ class AccountCapitalSnapshotter:
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, (end_at, start_at))
             return cursor.fetchall()
+
+    @staticmethod
+    def _realtime_floating_is_complete(strategy_pnl_summary: Dict) -> bool:
+        if not isinstance(strategy_pnl_summary, dict):
+            return False
+        missing = int(strategy_pnl_summary.get('missing_realtime_rows') or 0)
+        pnl_rows = int(strategy_pnl_summary.get('pnl_rows') or 0)
+        position_count = int(strategy_pnl_summary.get('position_count') or 0)
+        return position_count > 0 and pnl_rows >= position_count and missing <= 0
+
+    def _load_strategy_floating_pnl_summary(self, positions: List[Dict]) -> Dict:
+        holding_positions = [
+            pos for pos in positions
+            if str(pos.get('status') or '').lower() == 'holding'
+        ]
+        binance_spot_floating = self._fallback_binance_spot_floating_pnl(holding_positions)
+        gate_future_floating = self._fallback_gate_future_floating_pnl(holding_positions)
+        return {
+            'binance_spot_floating_pnl': round(binance_spot_floating, 8),
+            'gate_future_floating_pnl': round(gate_future_floating, 8),
+            'floating_pnl': round(binance_spot_floating + gate_future_floating, 8),
+            'floating_pnl_source': 'exchange_price_fallback',
+        }
+
+    def _fallback_binance_spot_floating_pnl(self, positions: List[Dict]) -> float:
+        assets = sorted({
+            str(pos.get('base_asset') or '').upper()
+            for pos in positions
+            if _float(pos.get('spot_open_qty')) > 0
+        })
+        if not assets:
+            return 0.0
+        try:
+            prices = self.executor.fetch_binance_ticker_prices(assets)
+        except Exception as exc:
+            logger.warning("Binance spot 浮盈兜底价格读取失败: %s", exc, exc_info=True)
+            return 0.0
+
+        floating = 0.0
+        for pos in positions:
+            asset = str(pos.get('base_asset') or '').upper()
+            qty = _float(pos.get('spot_open_qty'))
+            open_price = _float(pos.get('spot_open_price'))
+            current_price = _float(prices.get(asset))
+            if qty <= 0 or open_price <= 0 or current_price <= 0:
+                continue
+            floating += (current_price - open_price) * qty
+        return floating
+
+    def _fallback_gate_future_floating_pnl(self, positions: List[Dict]) -> float:
+        if not positions:
+            return 0.0
+        try:
+            gate_positions = self.executor.fetch_gate_futures_positions()
+        except Exception as exc:
+            logger.warning("Gate future 浮盈兜底持仓读取失败: %s", exc, exc_info=True)
+            return 0.0
+        mark_by_contract = {}
+        for item in gate_positions or []:
+            contract = str(
+                item.get('contract')
+                or item.get('future_contract')
+                or item.get('name')
+                or ''
+            ).upper()
+            if contract:
+                mark_by_contract[contract] = _float(
+                    item.get('mark_price')
+                    or item.get('mark')
+                    or item.get('last_price')
+                )
+
+        floating = 0.0
+        for pos in positions:
+            contract = str(
+                pos.get('future_contract')
+                or f"{pos.get('base_asset')}_USDT"
+            ).upper()
+            qty = _float(pos.get('future_open_qty'))
+            open_price = _float(pos.get('future_open_price'))
+            mark_price = mark_by_contract.get(contract, 0.0)
+            if qty <= 0 or open_price <= 0 or mark_price <= 0:
+                continue
+            floating += (open_price - mark_price) * qty
+        return floating
 
     def _load_strategy_order_fee_summary(self, position_ids: List[int]) -> Dict:
         if not position_ids:

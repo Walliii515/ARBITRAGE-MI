@@ -678,6 +678,126 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertEqual(summary['fee_cost'], -2.0)
         self.assertEqual(summary['total_pnl'], -18.0)
 
+    def test_strategy_summary_falls_back_to_exchange_prices_for_binance_floating_pnl(self):
+        snapshotter = AccountCapitalSnapshotter(
+            FakeCapitalExecutor(
+                binance_prices={'BICO': 0.12, 'AI': 0.03},
+                gate_positions=[],
+            ),
+            AccountCapitalConfig(),
+        )
+        snapshotter._load_strategy_positions = lambda start, end: [
+            {
+                'id': 1,
+                'status': 'holding',
+                'base_asset': 'BICO',
+                'spot_open_qty': 1000,
+                'spot_open_price': 0.10,
+                'spot_open_amount': 100,
+                'funding_total_pnl': 0,
+            },
+            {
+                'id': 2,
+                'status': 'holding',
+                'base_asset': 'AI',
+                'spot_open_qty': 500,
+                'spot_open_price': 0.02,
+                'spot_open_amount': 10,
+                'funding_total_pnl': 0,
+            },
+        ]
+        snapshotter._load_strategy_order_fee_summary = lambda position_ids: {
+            'binance_fee_cost': 0.0,
+            'gate_fee_cost': 0.0,
+            'fee_cost': 0.0,
+        }
+
+        summary = snapshotter._load_strategy_pnl_summary(
+            datetime(2026, 8, 9, 0, 0, 0),
+            datetime(2026, 8, 9, 1, 0, 0),
+        )
+
+        self.assertAlmostEqual(summary['binance_spot_floating_pnl'], 25.0)
+        self.assertAlmostEqual(summary['floating_pnl'], 25.0)
+
+    def test_incomplete_realtime_floating_does_not_overwrite_exchange_fallback(self):
+        snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
+        snapshotter._load_strategy_pnl_summary = lambda start, end: {
+            'realized_pnl': 0.0,
+            'gate_realized_pnl': 0.0,
+            'funding_pnl': 0.0,
+            'binance_fee_cost': 0.0,
+            'gate_fee_cost': 0.0,
+            'fee_cost': 0.0,
+            'binance_spot_floating_pnl': 12.34,
+            'gate_future_floating_pnl': -2.0,
+            'floating_pnl': 10.34,
+            'binance_spot_realized': {
+                'closed_count': 0,
+                'open_amount': 0.0,
+                'close_amount': 0.0,
+                'realized_pnl': 0.0,
+            },
+            'gate_strategy_realized': {
+                'realized_pnl': 0.0,
+                'derived_from': 'strategy_realized_pnl - binance_spot_realized_pnl',
+            },
+        }
+
+        summary = snapshotter._load_exchange_pnl_summary(
+            datetime(2026, 8, 9, 1, 0, 0),
+            {
+                'position_count': 5,
+                'pnl_rows': 0,
+                'missing_realtime_rows': 5,
+                'binance_spot_floating_pnl': 0.0,
+                'gate_future_floating_pnl': 0.0,
+                'floating_pnl': 0.0,
+            },
+        )
+
+        self.assertEqual(summary['binance_spot_floating_pnl'], 12.34)
+        self.assertEqual(summary['floating_pnl'], 10.34)
+
+    def test_complete_realtime_floating_overwrites_exchange_fallback(self):
+        snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
+        snapshotter._load_strategy_pnl_summary = lambda start, end: {
+            'realized_pnl': 0.0,
+            'gate_realized_pnl': 0.0,
+            'funding_pnl': 0.0,
+            'binance_fee_cost': 0.0,
+            'gate_fee_cost': 0.0,
+            'fee_cost': 0.0,
+            'binance_spot_floating_pnl': 12.34,
+            'gate_future_floating_pnl': -2.0,
+            'floating_pnl': 10.34,
+            'binance_spot_realized': {
+                'closed_count': 0,
+                'open_amount': 0.0,
+                'close_amount': 0.0,
+                'realized_pnl': 0.0,
+            },
+            'gate_strategy_realized': {
+                'realized_pnl': 0.0,
+                'derived_from': 'strategy_realized_pnl - binance_spot_realized_pnl',
+            },
+        }
+
+        summary = snapshotter._load_exchange_pnl_summary(
+            datetime(2026, 8, 9, 1, 0, 0),
+            {
+                'position_count': 5,
+                'pnl_rows': 5,
+                'missing_realtime_rows': 0,
+                'binance_spot_floating_pnl': 1.5,
+                'gate_future_floating_pnl': -0.5,
+                'floating_pnl': 1.0,
+            },
+        )
+
+        self.assertEqual(summary['binance_spot_floating_pnl'], 1.5)
+        self.assertEqual(summary['floating_pnl'], 1.0)
+
     def test_position_strategy_realized_pnl_uses_basis_and_actual_open_amount(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
         pnl = snapshotter._position_strategy_realized_pnl({
