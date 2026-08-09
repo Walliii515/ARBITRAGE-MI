@@ -564,6 +564,15 @@ class ClosingExecutor:
                 result.setdefault('position_id', pos.get('id'))
                 result.setdefault('margin_risk_stage', stage)
                 results.append(result)
+                if result.get('low_notional_residual'):
+                    logger.warning(
+                        "Gate全仓危险平仓跳过低名义残仓，继续选择下一持仓 | "
+                        "%s | position_id=%s | %s",
+                        base_asset,
+                        pos.get('id'),
+                        result.get('message'),
+                    )
+                    continue
                 gate_reduction_consumed = bool(result.get('gate_reduction_consumed'))
                 execution_reduction_consumed = bool(
                     result.get('execution_reduction_consumed')
@@ -1001,23 +1010,6 @@ class ClosingExecutor:
                 else:
                     logger.warning(f"平仓条件触发但无盘口数据: {ba} | reason={close_reason}")
                     continue
-            if close_reason == 'take_profit':
-                notional_ok, notional_reason = self._check_spot_close_min_notional(pos, orderbook_row)
-                if not notional_ok:
-                    self._mark_low_notional_residual(pos, notional_reason)
-                    self._clear_position_close_state(ba, pos)
-                    self._close_cooldown[ba] = datetime.now()
-                    logger.warning(
-                        "低名义残仓跳过普通止盈平仓 | %s | position_id=%s | %s",
-                        ba, pos.get('id'), notional_reason,
-                    )
-                    results.append({
-                        'base_asset': ba,
-                        'success': False,
-                        'close_reason': close_reason,
-                        'message': notional_reason,
-                    })
-                    continue
             future_protective_price = None
             protective_close = (
                 close_reason == 'take_profit'
@@ -1062,6 +1054,18 @@ class ClosingExecutor:
                             result,
                         )
                 else:
+                    if result.get('low_notional_residual'):
+                        self._clear_position_close_state(ba, pos)
+                        self._close_cooldown.pop(ba, None)
+                        logger.warning(
+                            "低名义残仓保留双腿，跳过本次平仓 | %s | "
+                            "position_id=%s | reason=%s | %s",
+                            ba,
+                            pos.get('id'),
+                            close_reason,
+                            result.get('message'),
+                        )
+                        continue
                     # 平仓失败，进入冷却期
                     self._close_cooldown[ba] = datetime.now()
                     # 超时触发的谷底状态也需清除，避免下次继续超时重试
@@ -1138,7 +1142,7 @@ class ClosingExecutor:
         )
 
     def _check_spot_close_min_notional(self, pos: Dict, orderbook_row: Dict) -> tuple[bool, str]:
-        """普通止盈前确认 Binance spot 腿不低于最小名义金额。"""
+        """确认 Binance spot 腿达到最小名义金额，避免任何平仓制造断腿。"""
         base_asset = str(pos.get('base_asset') or '').upper()
         meta = self.spot_meta.get(base_asset) or {}
         min_notional = _float_or_none(meta.get('min_notional'))
@@ -2475,6 +2479,24 @@ class ClosingExecutor:
     ) -> Dict:
         """构建平仓订单组 → 调用成交引擎 → 持久化"""
         ba = str(pos.get('base_asset') or '').upper()
+        notional_ok, notional_reason = self._check_spot_close_min_notional(pos, orderbook_row)
+        if not notional_ok:
+            self._mark_low_notional_residual(pos, notional_reason)
+            return {
+                'base_asset': ba,
+                'success': False,
+                'order_uuid': None,
+                'close_reason': close_reason,
+                'message': notional_reason,
+                'low_notional_residual': True,
+                'future_exec_qty': 0.0,
+                'spot_exec_qty': 0.0,
+                'gate_reduction_consumed': False,
+                'execution_reduction_consumed': False,
+                'pre_gate_basis_bps': pre_gate_basis_bps,
+                'actual_close_basis_bps': None,
+                'close_basis_slip_bps': None,
+            }
         guard_owner = f"closing:{close_reason}:{pos.get('id') or 'unknown'}:{uuid.uuid4().hex[:8]}"
         with asset_reduction_guard.claim(ba, guard_owner) as acquired:
             if not acquired:

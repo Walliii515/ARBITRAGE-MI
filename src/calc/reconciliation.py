@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set
 from calc.exchange_desync_remediator import (
     ExchangeDesyncRemediationConfig,
     ExchangeDesyncRemediator,
+    POST_CLOSE_SPOT_DUST_PENDING,
 )
 from calc.real_executor import ExchangeConfig, GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
 from common.config import config
@@ -208,8 +209,13 @@ class Reconciler:
                     gate_risks,
                     gate_results,
                 )
-                remediation_results.extend(
-                    self._auto_remediate_post_close_spot_dust(binance_rows, gate_rows)
+                dust_results = self._auto_cleanup_completed_asset_dust(
+                    binance_balances,
+                    gate_positions,
+                )
+                remediation_results.extend(dust_results)
+                gate_remediation_owned_assets.update(
+                    self._dust_cleanup_owned_assets(dust_results)
                 )
             rows.extend(gate_rows)
         except Exception as e:
@@ -336,13 +342,39 @@ class Reconciler:
 
     def _load_local_spot_positions(self) -> Dict[str, float]:
         sql = """
-            SELECT UPPER(base_asset) AS base_asset, COALESCE(SUM(spot_open_qty), 0) AS local_qty
-            FROM mi_trade_position
-            WHERE status = 'holding'
-            GROUP BY UPPER(base_asset)
+            SELECT base_asset, COALESCE(SUM(local_qty), 0) AS local_qty
+            FROM (
+                SELECT p.id,
+                       UPPER(p.base_asset) AS base_asset,
+                       CASE
+                           WHEN p.status = 'holding' THEN COALESCE(p.spot_open_qty, 0)
+                           ELSE GREATEST(
+                               COALESCE(SUM(CASE
+                                   WHEN o.status = 'executed'
+                                    AND o.order_side = 'open'
+                                    AND o.market_type = 'spot'
+                                   THEN ABS(o.exec_qty) ELSE 0 END), 0)
+                               - COALESCE(SUM(CASE
+                                   WHEN o.status = 'executed'
+                                    AND o.order_side = 'close'
+                                    AND o.market_type = 'spot'
+                                   THEN ABS(o.exec_qty) ELSE 0 END), 0),
+                               0
+                           )
+                       END AS local_qty
+                FROM mi_trade_position p
+                LEFT JOIN mi_trade_order o ON o.position_id = p.id
+                WHERE p.status = 'holding'
+                   OR (
+                       p.status = 'closed'
+                       AND p.exchange_risk_type = %s
+                   )
+                GROUP BY p.id, p.base_asset, p.status, p.spot_open_qty
+            ) position_exposure
+            GROUP BY base_asset
         """
         with db_manager.get_cursor() as cursor:
-            cursor.execute(sql)
+            cursor.execute(sql, (POST_CLOSE_SPOT_DUST_PENDING,))
             rows = cursor.fetchall()
         return {r['base_asset']: float(r.get('local_qty') or 0) for r in rows}
 
@@ -967,48 +999,29 @@ class Reconciler:
             results.append(result)
         return results
 
-    def _auto_remediate_post_close_spot_dust(
+    def _auto_cleanup_completed_asset_dust(
         self,
-        binance_rows: List[Dict],
-        gate_rows: List[Dict],
+        binance_balances: List[Dict],
+        gate_positions: List[Dict],
     ) -> List[Dict]:
-        """Retire matched spot dust only after both local and exchange Gate positions are zero."""
-        gate_by_asset = {
-            str(row.get('base_asset') or '').upper(): row
-            for row in gate_rows
-            if row.get('exchange') == 'gate' and row.get('dimension') == 'position'
-        }
-        results: List[Dict] = []
-        candidates: List[Dict] = []
-        for spot_row in binance_rows:
-            if spot_row.get('exchange') != 'binance' or spot_row.get('dimension') != 'position':
-                continue
-            if not spot_row.get('is_match'):
-                continue
-            local_spot_qty = float(spot_row.get('local_value') or 0)
-            exchange_spot_qty = float(spot_row.get('exchange_value') or 0)
-            if local_spot_qty <= BINANCE_SPOT_TOLERANCE or exchange_spot_qty <= BINANCE_SPOT_TOLERANCE:
-                continue
+        """Clean dust only when the shared remediator proves an asset has no active position."""
+        result = self.remediator.cleanup_post_close_dust(
+            binance_balances,
+            gate_positions,
+        )
+        return [result] if result.get('attempted') else []
 
-            base_asset = str(spot_row.get('base_asset') or '').upper()
-            gate_row = gate_by_asset.get(base_asset)
-            if not gate_row or not gate_row.get('is_match'):
-                continue
-            if abs(float(gate_row.get('local_value') or 0)) > 1e-9:
-                continue
-            if abs(float(gate_row.get('exchange_value') or 0)) > 1e-9:
-                continue
-
-            candidates.append({
-                'base_asset': base_asset,
-                'local_spot_qty': local_spot_qty,
-                'exchange_spot_qty': exchange_spot_qty,
-            })
-        if candidates:
-            result = self.remediator.remediate_post_close_spot_dust_batch(candidates)
-            if result.get('attempted'):
-                results.append(result)
-        return results
+    @staticmethod
+    def _dust_cleanup_owned_assets(results: List[Dict]) -> Set[str]:
+        assets: Set[str] = set()
+        for result in results or []:
+            values = list(result.get('base_assets') or [])
+            if result.get('base_asset'):
+                values.append(result['base_asset'])
+            for item in result.get('settled_pending_positions') or []:
+                values.append(item.get('base_asset'))
+            assets.update(str(value or '').upper() for value in values if value)
+        return assets
 
     def _auto_remediate_binance_spot_for_gate_extra(
         self,

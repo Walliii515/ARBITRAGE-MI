@@ -26,6 +26,8 @@ from common.logger import get_logger
 
 logger = get_logger(__name__)
 
+POST_CLOSE_SPOT_DUST_PENDING = 'post_close_spot_dust_pending'
+
 
 @dataclass
 class ExchangeDesyncRemediationConfig:
@@ -252,17 +254,25 @@ class ExchangeDesyncRemediator:
         """Manually close a fully reconstructed tiny hedge and convert its spot dust."""
         if not self.cfg.enabled:
             return {'success': False, 'attempted': False, 'reason': 'disabled'}
-        positions = self._load_holding_positions_with_execution_remainders()
-        grouped: Dict[str, List[Dict]] = {}
-        for pos in positions:
-            grouped.setdefault(str(pos.get('base_asset') or '').upper(), []).append(pos)
-
         balances_by_asset = {
             str(row.get('asset') or '').upper(): row for row in (binance_balances or [])
         }
         gate_by_asset = {
             str(row.get('base_asset') or '').upper(): row for row in (gate_positions or [])
         }
+        positions = self._load_holding_positions_with_execution_remainders()
+        settled = self._settle_spot_only_dust_positions(
+            positions,
+            balances_by_asset,
+            gate_by_asset,
+        )
+        if settled:
+            positions = self._load_holding_positions_with_execution_remainders()
+
+        grouped: Dict[str, List[Dict]] = {}
+        for pos in positions:
+            grouped.setdefault(str(pos.get('base_asset') or '').upper(), []).append(pos)
+
         recovered = self._recover_completed_dust_cleanup(
             grouped,
             balances_by_asset,
@@ -273,6 +283,18 @@ class ExchangeDesyncRemediator:
 
         cooldown_remaining = self._dust_conversion_cooldown_remaining_sec()
         if cooldown_remaining > 0:
+            if settled:
+                return {
+                    'success': True,
+                    'attempted': True,
+                    'action': 'settle_spot_only_dust_pending',
+                    'positions': len(settled),
+                    'base_assets': sorted({item['base_asset'] for item in settled}),
+                    'settled_pending_positions': settled,
+                    'conversion_deferred_reason': 'binance_dust_conversion_cooldown',
+                    'cooldown_remaining_sec': round(cooldown_remaining, 1),
+                    'message': '低名义现货残差已结算，小额兑换等待 Binance 冷却结束',
+                }
             return {
                 'success': False,
                 'attempted': False,
@@ -302,7 +324,20 @@ class ExchangeDesyncRemediator:
         if prepared_items:
             result = self._execute_dust_cleanup_batch(prepared_items)
             result['skipped'] = skipped
+            result['settled_pending_positions'] = settled
             return result
+
+        if settled:
+            return {
+                'success': True,
+                'attempted': True,
+                'action': 'settle_spot_only_dust_pending',
+                'positions': len(settled),
+                'base_assets': sorted({item['base_asset'] for item in settled}),
+                'settled_pending_positions': settled,
+                'message': '低名义现货残差已从持仓中结算，等待整币种最终兑换',
+                'skipped': skipped,
+            }
 
         return {
             'success': True,
@@ -311,6 +346,142 @@ class ExchangeDesyncRemediator:
             'message': '未发现可安全兑换的小额残余',
             'skipped': skipped,
         }
+
+    def _settle_spot_only_dust_positions(
+        self,
+        positions: List[Dict],
+        balances_by_asset: Dict[str, Dict],
+        gate_by_asset: Dict[str, Dict],
+    ) -> List[Dict]:
+        """Close economic history while retaining an unsellable spot remainder in exposure."""
+        grouped: Dict[str, List[Dict]] = {}
+        for pos in positions:
+            grouped.setdefault(str(pos.get('base_asset') or '').upper(), []).append(pos)
+
+        settled: List[Dict] = []
+        for base_asset, asset_positions in grouped.items():
+            spot_meta = (getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {}
+            min_notional = _float(spot_meta.get('min_notional'))
+            step_size = _float(spot_meta.get('step_size'))
+            qty_tolerance = max(step_size * 1e-6, 1e-8)
+            if min_notional <= 0:
+                continue
+
+            ledger_spot = sum(_float(pos.get('_spot_remaining_qty')) for pos in asset_positions)
+            exchange_spot = _float((balances_by_asset.get(base_asset) or {}).get('total'))
+            multiplier = self._quanto_multiplier(base_asset)
+            ledger_gate_contracts = sum(
+                _float(pos.get('_future_remaining_qty')) / multiplier
+                for pos in asset_positions
+                if multiplier > 0
+            )
+            exchange_gate_contracts = abs(
+                _float((gate_by_asset.get(base_asset) or {}).get('size'))
+            )
+            if abs(ledger_spot - exchange_spot) > qty_tolerance:
+                continue
+            if abs(ledger_gate_contracts - exchange_gate_contracts) > 1e-6:
+                continue
+
+            price = self._estimate_binance_spot_price(base_asset, {})
+            if price <= 0:
+                price = max(
+                    (_float(pos.get('spot_open_price')) for pos in asset_positions),
+                    default=0.0,
+                )
+            if price <= 0:
+                continue
+
+            for pos in asset_positions:
+                if str(pos.get('status') or '').lower() != 'holding':
+                    continue
+                if not self._is_low_notional_residual_position(pos):
+                    continue
+                spot_remaining = _float(pos.get('_spot_remaining_qty'))
+                future_remaining = _float(pos.get('_future_remaining_qty'))
+                if spot_remaining <= qty_tolerance or future_remaining > 1e-8:
+                    continue
+                if abs(_float(pos.get('spot_open_qty')) - spot_remaining) > qty_tolerance:
+                    continue
+                if spot_remaining * price + 1e-9 >= min_notional:
+                    continue
+                if not self._mark_spot_dust_pending(pos, spot_remaining, price):
+                    continue
+                settled.append({
+                    'position_id': int(pos['id']),
+                    'base_asset': base_asset,
+                    'spot_qty': spot_remaining,
+                    'spot_notional': spot_remaining * price,
+                })
+        return settled
+
+    def _mark_spot_dust_pending(self, pos: Dict, spot_qty: float, price: float) -> bool:
+        position_id = int(pos['id'])
+        orders = fetch_executed_position_orders(position_id)
+        close_values = self._close_execution_values(
+            orders,
+            str(pos.get('base_asset') or ''),
+        )
+        pnl_values = compute_closed_position_pnl(pos, orders)
+        closed_at = next((
+            order.get('executed_at')
+            for order in reversed(orders)
+            if str(order.get('order_side') or '').lower() == 'close'
+            and order.get('executed_at') is not None
+        ), datetime.now())
+        close_funding_rate_24h = next((
+            order.get('funding_rate_24h')
+            for order in reversed(orders)
+            if str(order.get('order_side') or '').lower() == 'close'
+            and order.get('funding_rate_24h') is not None
+        ), None)
+        reason = (
+            f'低名义现货残差待兑换|qty={spot_qty:g}|price={price:g}|'
+            f'notional={spot_qty * price:.4f}USDT|暂按0回收价值结算'
+        )
+        sql = """
+            UPDATE mi_trade_position SET
+                status = 'closed',
+                closed_at = %(closed_at)s,
+                close_reason = CONCAT(COALESCE(close_reason, ''), '|', %(reason)s),
+                spot_open_qty = %(spot_open_qty)s,
+                future_open_qty = %(future_open_qty)s,
+                future_open_contracts = %(future_open_contracts)s,
+                spot_open_price = %(spot_open_price)s,
+                future_open_price = %(future_open_price)s,
+                spot_open_amount = %(spot_open_amount)s,
+                spot_close_price = %(spot_close_price)s,
+                future_close_price = %(future_close_price)s,
+                spot_close_amount = %(spot_close_amount)s,
+                future_close_amount = %(future_close_amount)s,
+                close_spread_bps = %(close_spread_bps)s,
+                close_funding_rate_24h = %(close_funding_rate_24h)s,
+                exchange_risk_status = 'normal',
+                exchange_risk_type = %(pending_type)s,
+                exchange_risk_detail = CONCAT(COALESCE(exchange_risk_detail, ''), '|', %(reason)s)
+            WHERE id = %(position_id)s
+              AND status = 'holding'
+              AND COALESCE(ABS(future_open_qty), 0) <= 1e-8
+              AND COALESCE(ABS(future_open_contracts), 0) <= 1e-8
+        """
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, {
+                'closed_at': closed_at,
+                'reason': reason,
+                'position_id': position_id,
+                'pending_type': POST_CLOSE_SPOT_DUST_PENDING,
+                'close_funding_rate_24h': close_funding_rate_24h,
+                **close_values,
+            })
+            updated = int(getattr(cursor, 'rowcount', 0) or 0)
+            if updated and pnl_values:
+                update_closed_position_pnl(
+                    cursor,
+                    position_id,
+                    pnl_values,
+                    self._position_columns(),
+                )
+        return bool(updated)
 
     def _recover_completed_dust_cleanup(
         self,
@@ -322,7 +493,7 @@ class ExchangeDesyncRemediator:
         for base_asset in sorted(grouped):
             positions = grouped[base_asset]
             if not positions or any(
-                '部分平仓保留剩余' not in str(pos.get('close_reason') or '')
+                not self._is_low_notional_residual_position(pos)
                 for pos in positions
             ):
                 continue
@@ -365,7 +536,7 @@ class ExchangeDesyncRemediator:
         gate_position: Optional[Dict],
     ) -> Dict:
         if not positions or any(
-            '部分平仓保留剩余' not in str(pos.get('close_reason') or '')
+            not self._is_low_notional_residual_position(pos)
             for pos in positions
         ):
             return {'eligible': False, 'candidate': False, 'reason': 'contains_active_position'}
@@ -377,8 +548,8 @@ class ExchangeDesyncRemediator:
         if min_notional <= 0:
             return {'eligible': False, 'candidate': True, 'reason': 'missing_spot_min_notional'}
 
-        local_spot_qty = sum(max(0.0, _float(pos.get('spot_open_qty'))) for pos in positions)
         ledger_spot_qty = sum(max(0.0, _float(pos.get('_spot_remaining_qty'))) for pos in positions)
+        local_spot_qty = ledger_spot_qty
         exchange_spot_qty = _float((balance or {}).get('total'))
         free_spot_qty = _float((balance or {}).get('free'), exchange_spot_qty)
         if abs(local_spot_qty - ledger_spot_qty) > qty_tolerance:
@@ -822,7 +993,7 @@ class ExchangeDesyncRemediator:
             sql = """
                 UPDATE mi_trade_position SET
                     status = 'closed',
-                    closed_at = %(closed_at)s,
+                    closed_at = COALESCE(closed_at, %(closed_at)s),
                     close_reason = CONCAT(COALESCE(close_reason, ''), '|', %(reason)s),
                     spot_open_qty = %(spot_open_qty)s,
                     future_open_qty = %(future_open_qty)s,
@@ -839,15 +1010,20 @@ class ExchangeDesyncRemediator:
                     exchange_risk_status = CASE
                         WHEN exchange_risk_status = 'desynced' THEN 'resolved'
                         ELSE exchange_risk_status
-                    END
+                    END,
+                    exchange_risk_type = NULL
                 WHERE id = %(position_id)s
-                  AND status = 'holding'
+                  AND (
+                      status = 'holding'
+                      OR (status = 'closed' AND exchange_risk_type = %(pending_type)s)
+                  )
             """
             with db_manager.get_cursor() as cursor:
                 cursor.execute(sql, {
                     'closed_at': now,
                     'reason': reason,
                     'position_id': position_id,
+                    'pending_type': POST_CLOSE_SPOT_DUST_PENDING,
                     'close_funding_rate_24h': close_funding_rate_24h,
                     **close_values,
                 })
@@ -1023,8 +1199,16 @@ class ExchangeDesyncRemediator:
         return [
             pos for pos in self._load_holding_positions_with_execution_remainders(base_asset)
             if _float(pos.get('_future_remaining_qty')) <= 1e-8
-            and '部分平仓保留剩余' in str(pos.get('close_reason') or '')
+            and self._is_low_notional_residual_position(pos)
         ]
+
+    @staticmethod
+    def _is_low_notional_residual_position(pos: Dict) -> bool:
+        reason = str(pos.get('close_reason') or '')
+        return (
+            '部分平仓保留剩余' in reason
+            or '低名义残仓跳过平仓' in reason
+        )
 
     @staticmethod
     def _load_holding_positions_with_execution_remainders(
@@ -1050,12 +1234,22 @@ class ExchangeDesyncRemediator:
                        AS dust_cleanup_order_count
             FROM mi_trade_position p
             LEFT JOIN mi_trade_order o ON o.position_id = p.id
-            WHERE p.status = 'holding'
+            WHERE (
+                    p.status = 'holding'
+                    OR (
+                        p.status = 'closed'
+                        AND p.exchange_risk_type = %s
+                    )
+                  )
               {asset_clause}
             GROUP BY p.id
             ORDER BY UPPER(p.base_asset), p.opened_at, p.id
         """
-        params = (base_asset,) if base_asset else None
+        params = (
+            (POST_CLOSE_SPOT_DUST_PENDING, base_asset)
+            if base_asset
+            else (POST_CLOSE_SPOT_DUST_PENDING,)
+        )
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql, params)
             rows = list(cursor.fetchall())

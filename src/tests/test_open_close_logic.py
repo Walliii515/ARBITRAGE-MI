@@ -5511,27 +5511,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertFalse(any('close_funding_rate_24h' in sql for sql, _ in cursor.calls))
         self.assertEqual(triggered, [])
 
-    def test_take_profit_low_notional_residual_skips_execution(self):
-        class FakeCursor:
-            rowcount = 1
-
-            def __init__(self):
-                self.calls = []
-
-            def execute(self, sql, params=None):
-                self.calls.append((sql, params))
-
-        class FakeCtx:
-            def __init__(self, cursor):
-                self.cursor = cursor
-
-            def __enter__(self):
-                return self.cursor
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        cursor = FakeCursor()
+    def test_all_close_reasons_keep_low_notional_residual_balanced(self):
         self.ce.spot_meta = {'AI': {'min_notional': 5.0}}
         pos = {
             'id': 293,
@@ -5553,28 +5533,31 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             'future_close_vwap': 0.01983,
             'close_vwap_basis_bps': 66.0,
         }
-        execute_mock = MagicMock(return_value={'success': True})
+        self.ce.executor_client.execute = MagicMock()
+        self.ce._mark_low_notional_residual = MagicMock()
 
-        with (
-            patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
-            patch.object(self.ce, '_check_funding_count', return_value=False),
-            patch.object(self.ce, '_check_take_profit', return_value=True),
-            patch.object(self.ce, '_pass_valley_check', return_value=True),
-            patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
-            patch.object(self.ce, '_pre_execution_gate', return_value=(True, row, 66.0, '')),
-            patch.object(self.ce, '_build_take_profit_detail', return_value='动态止盈'),
-            patch.object(self.ce, '_execute_close', execute_mock),
-            patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)),
+        for close_reason in (
+            'take_profit',
+            'negative_funding_exit',
+            'margin_close',
+            'delist_risk_exit',
+            'manual_close',
         ):
-            results = self.ce.check_and_close([pos], {}, {'AI': row})
+            with self.subTest(close_reason=close_reason):
+                result = self.ce._execute_close(
+                    pos,
+                    close_reason,
+                    '测试低名义平仓',
+                    row,
+                )
+                self.assertFalse(result['success'])
+                self.assertTrue(result['low_notional_residual'])
+                self.assertFalse(result['gate_reduction_consumed'])
+                self.assertFalse(result['execution_reduction_consumed'])
+                self.assertIn('notional=0.2167<min_notional=5USDT', result['message'])
 
-        execute_mock.assert_not_called()
-        self.assertEqual(len(results), 1)
-        self.assertFalse(results[0]['success'])
-        self.assertIn('低名义残仓跳过平仓', results[0]['message'])
-        update_calls = [params for sql, params in cursor.calls if 'UPDATE mi_trade_position' in sql]
-        self.assertEqual(len(update_calls), 1)
-        self.assertIn('notional=0.2167<min_notional=5USDT', update_calls[0]['reason'])
+        self.assertEqual(self.ce._mark_low_notional_residual.call_count, 5)
+        self.ce.executor_client.execute.assert_not_called()
 
     def test_fixed_net_take_profit_uses_fee_adjusted_profit(self):
         self.assertTrue(self.ce._check_take_profit(self.pos, 40.0))
@@ -6620,6 +6603,47 @@ class TestMarginDangerPath(unittest.TestCase):
         self.assertEqual(args[1], 'margin_close')
         self.assertIn('保证金危险路径', args[2])
         self.assertIn('全仓风险触发', args[2])
+
+    def test_margin_recovery_skips_dust_and_closes_next_meaningful_position(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(status='danger', account_mmr_pct=250.0),
+        }
+        dust = self._risk_position(id=11, base_asset='BICO', future_contract='BICO_USDT')
+        meaningful = self._risk_position(id=12, base_asset='TUT', future_contract='TUT_USDT')
+        ce._sort_controlled_recovery_positions = MagicMock(return_value=[dust, meaningful])
+        ce._mark_incomplete_holding_desync = MagicMock(return_value=False)
+        ce._execute_close = MagicMock(side_effect=[
+            {
+                'base_asset': 'BICO',
+                'success': False,
+                'close_reason': 'margin_close',
+                'low_notional_residual': True,
+                'gate_reduction_consumed': False,
+                'execution_reduction_consumed': False,
+                'message': '低名义残仓跳过平仓',
+            },
+            {
+                'base_asset': 'TUT',
+                'success': True,
+                'close_reason': 'margin_close',
+                'gate_reduction_consumed': True,
+                'execution_reduction_consumed': True,
+            },
+        ])
+
+        results = ce.check_and_close_margin_danger(
+            [dust, meaningful],
+            {'BICO': {'base_asset': 'BICO'}, 'TUT': {'base_asset': 'TUT'}},
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[0]['low_notional_residual'])
+        self.assertTrue(results[1]['success'])
+        self.assertEqual(ce._execute_close.call_count, 2)
+        self.assertEqual(ce._execute_close.call_args_list[0].args[0]['id'], 11)
+        self.assertEqual(ce._execute_close.call_args_list[1].args[0]['id'], 12)
 
     def test_danger_margin_close_uses_minimal_row_when_orderbook_missing(self):
         ce = make_closing_executor()
