@@ -154,6 +154,18 @@ def test_order_management_uses_compact_single_row_toolbar_and_tab_actions():
     assert 'height: calc(100vh - 156px)' in source
 
 
+def test_close_grid_keeps_open_and_close_basis_context():
+    source = (
+        Path(__file__).parents[2] / 'frontend' / 'src' / 'views' / 'OrderManagement.vue'
+    ).read_text(encoding='utf-8')
+    close_columns = source.split('const closeColumnIds = new Set([', 1)[1].split('])', 1)[0]
+
+    assert "'open_spread_bps'" in close_columns
+    assert "'open_vwap_threshold_bps'" in close_columns
+    assert "'close_spread_bps'" in close_columns
+    assert "'close_vwap_threshold_bps'" in close_columns
+
+
 def test_funding_snapshot_migration_backfills_both_sides_and_adds_query_indexes():
     migration = (
         Path(__file__).parents[1] / 'migrations' / '035_add_forward_position_funding_snapshots.sql'

@@ -473,8 +473,9 @@ const openColumnDefs = computed((): ColDef[] => (
 
 const closeColumnIds = new Set([
   'closed_at', 'opened_at', 'base_asset', 'market_profile', 'exchange_risk_type',
-  'channel', 'gate_leverage', 'spot_close_amount', 'close_vwap', 'close_spread_bps',
-  'close_vwap_threshold_bps', 'close_funding_rate_24h', 'close_reason', 'action',
+  'channel', 'gate_leverage', 'spot_close_amount', 'close_vwap', 'open_spread_bps',
+  'open_vwap_threshold_bps', 'close_spread_bps', 'close_vwap_threshold_bps',
+  'close_funding_rate_24h', 'close_reason', 'action',
 ])
 
 const closeColumnDefs = computed((): ColDef[] => {
