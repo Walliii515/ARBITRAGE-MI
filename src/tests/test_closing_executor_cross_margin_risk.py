@@ -903,6 +903,289 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
         self.assertEqual(ce._execute_close.call_count, 2)
         self.assertNotIn('TUT', ce._close_cooldown)
 
+    def test_gate_fill_with_spot_failure_consumes_current_risk_snapshot(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(status='danger', account_mmr_pct=250.0)
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': False,
+            'close_reason': 'margin_close',
+            'future_exec_qty': 10.0,
+            'spot_exec_qty': 0.0,
+            'gate_reduction_consumed': True,
+            'message': 'Gate已成交，Binance拒单',
+        })
+        positions = [
+            _risk_position(gate_liq_price=2.0, gate_mark_price=1.0),
+            _risk_position(
+                id=12,
+                base_asset='AI',
+                future_contract='AI_USDT',
+                spot_symbol='AIUSDT',
+                gate_liq_price=2.0,
+                gate_mark_price=1.0,
+            ),
+        ]
+
+        first = ce.check_and_close_margin_danger(positions, {})
+        same_snapshot = ce.check_and_close_margin_danger(positions, {})
+
+        self.assertEqual(len(first), 1)
+        self.assertFalse(first[0]['success'])
+        self.assertEqual(same_snapshot, [])
+        self.assertEqual(ce._execute_close.call_count, 1)
+        self.assertEqual(
+            ce._margin_recovery_last_close_snapshot_ts,
+            risk['account_fetched_at_ts'],
+        )
+
+    def test_desynced_asset_quarantines_all_its_rows_during_mmr_recovery(self):
+        ce = make_closing_executor()
+        ce._gate_cross_risk_cache = {
+            'ts': time.time(),
+            'risk': make_gate_cross_risk(
+                status='danger',
+                account_mmr_pct=250.0,
+                close_priority=[
+                    {'contract': 'TUT_USDT'},
+                    {'contract': 'AI_USDT'},
+                ],
+            ),
+        }
+        positions = [
+            _risk_position(exchange_risk_status='desynced'),
+            _risk_position(id=13, gate_liq_price=2.0, gate_mark_price=1.0),
+            _risk_position(
+                id=12,
+                base_asset='AI',
+                future_contract='AI_USDT',
+                spot_symbol='AIUSDT',
+                gate_liq_price=2.0,
+                gate_mark_price=1.0,
+            ),
+        ]
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'AI',
+            'success': True,
+            'close_reason': 'margin_close',
+        })
+
+        results = ce.check_and_close_margin_danger(positions, {})
+
+        self.assertEqual([item['position_id'] for item in results], [12])
+        ce._execute_close.assert_called_once()
+        self.assertEqual(ce._execute_close.call_args.args[0]['base_asset'], 'AI')
+
+    def test_desynced_asset_quarantines_sibling_from_ordinary_close(self):
+        ce = make_closing_executor()
+        execute = MagicMock()
+        positions = [
+            _risk_position(exchange_risk_status='desynced'),
+            _risk_position(id=13),
+        ]
+
+        with patch.object(ce, '_execute_close', execute):
+            results = ce.check_and_close(
+                positions,
+                {},
+                {'TUT': {'base_asset': 'TUT'}},
+            )
+
+        self.assertEqual(results, [])
+        execute.assert_not_called()
+
+    def test_execute_close_reports_each_leg_fill_and_gate_consumption(self):
+        ce = make_closing_executor()
+        ce._build_close_order_group = MagicMock(return_value={
+            'order_uuid': 'risk-close-1',
+            'spot_order': {},
+            'future_order': {},
+        })
+        ce.executor_client.execute = MagicMock(return_value={
+            'success': False,
+            'message': 'Binance拒单',
+            'future_order': {'exec_qty': 10.0},
+            'spot_order': {'exec_qty': 0.0},
+        })
+        ce._save_close = MagicMock(return_value=None)
+
+        result = ce._execute_close(
+            _risk_position(),
+            'margin_close',
+            '保证金危险路径',
+            {'base_asset': 'TUT'},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['future_exec_qty'], 10.0)
+        self.assertEqual(result['spot_exec_qty'], 0.0)
+        self.assertTrue(result['gate_reduction_consumed'])
+        self.assertTrue(result['execution_reduction_consumed'])
+
+    def test_liquidation_distance_waits_for_fresh_snapshot_after_success(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(status='danger', account_mmr_pct=800.0)
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': True,
+            'execution_reduction_consumed': True,
+            'close_reason': 'margin_close',
+        })
+        position = _risk_position(gate_liq_price=1.02, gate_mark_price=1.0)
+
+        first = ce.check_and_close_margin_danger([position], {})
+        same_snapshot = ce.check_and_close_margin_danger([position], {})
+        risk['account_fetched_at_ts'] += 1.0
+        fresh_snapshot = ce.check_and_close_margin_danger([position], {})
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(same_snapshot, [])
+        self.assertEqual(len(fresh_snapshot), 1)
+        self.assertEqual(ce._execute_close.call_count, 2)
+
+    def test_spot_only_fill_consumes_margin_snapshot(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(status='danger', account_mmr_pct=250.0)
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': False,
+            'future_exec_qty': 0.0,
+            'spot_exec_qty': 2.0,
+            'gate_reduction_consumed': False,
+            'execution_reduction_consumed': True,
+            'message': 'Gate未成交但Binance出现成交',
+        })
+
+        first = ce.check_and_close_margin_danger([_risk_position()], {})
+        same_snapshot = ce.check_and_close_margin_danger([_risk_position()], {})
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(same_snapshot, [])
+        self.assertEqual(
+            ce._margin_execution_last_snapshot_ts,
+            risk['account_fetched_at_ts'],
+        )
+        ce._execute_close.assert_called_once()
+
+    def test_execute_close_preserves_fills_when_local_persistence_fails(self):
+        ce = make_closing_executor()
+        ce._build_close_order_group = MagicMock(return_value={
+            'order_uuid': 'risk-close-persistence',
+            'spot_order': {},
+            'future_order': {},
+        })
+        ce.executor_client.execute = MagicMock(return_value={
+            'success': True,
+            'message': '两腿成交',
+            'future_order': {'exec_qty': 10.0},
+            'spot_order': {'exec_qty': 10.0},
+        })
+        ce._save_close = MagicMock(side_effect=RuntimeError('database unavailable'))
+        ce._trigger_reconciliation = MagicMock()
+        position = _risk_position()
+
+        result = ce._execute_close(
+            position,
+            'margin_close',
+            '保证金危险路径',
+            {'base_asset': 'TUT'},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['future_exec_qty'], 10.0)
+        self.assertEqual(result['spot_exec_qty'], 10.0)
+        self.assertTrue(result['gate_reduction_consumed'])
+        self.assertTrue(result['execution_reduction_consumed'])
+        self.assertEqual(position['exchange_risk_status'], 'desynced')
+        self.assertIn('database unavailable', result['persistence_error'])
+        ce._trigger_reconciliation.assert_called_once_with(
+            'close_persistence_failed', 'TUT',
+        )
+
+    def test_execute_close_persistence_failure_without_fill_can_retry(self):
+        ce = make_closing_executor()
+        ce._build_close_order_group = MagicMock(return_value={
+            'order_uuid': 'risk-close-no-fill',
+            'spot_order': {},
+            'future_order': {},
+        })
+        ce.executor_client.execute = MagicMock(return_value={
+            'success': False,
+            'message': '明确拒单',
+            'future_order': {'exec_qty': 0.0},
+            'spot_order': {'exec_qty': 0.0},
+        })
+        ce._save_close = MagicMock(side_effect=RuntimeError('database unavailable'))
+        ce._trigger_reconciliation = MagicMock()
+        position = _risk_position()
+
+        result = ce._execute_close(
+            position,
+            'margin_close',
+            '保证金危险路径',
+            {'base_asset': 'TUT'},
+        )
+
+        self.assertFalse(result['execution_reduction_consumed'])
+        self.assertFalse(result['gate_reduction_consumed'])
+        self.assertNotIn('exchange_risk_status', position)
+        ce._trigger_reconciliation.assert_not_called()
+
+    def test_persistence_failure_after_gate_fill_blocks_same_margin_snapshot(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(status='danger', account_mmr_pct=250.0)
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._build_close_order_group = MagicMock(return_value={
+            'order_uuid': 'risk-close-integrated',
+            'spot_order': {},
+            'future_order': {},
+        })
+        ce.executor_client.execute = MagicMock(return_value={
+            'success': False,
+            'message': 'Gate成交，现货失败',
+            'future_order': {'exec_qty': 10.0},
+            'spot_order': {'exec_qty': 0.0},
+        })
+        ce._save_close = MagicMock(side_effect=RuntimeError('write failed'))
+        ce._trigger_reconciliation = MagicMock()
+        position = _risk_position()
+
+        first = ce.check_and_close_margin_danger([position], {})
+        same_snapshot = ce.check_and_close_margin_danger([position], {})
+        risk['account_fetched_at_ts'] += 1.0
+        fresh_snapshot = ce.check_and_close_margin_danger([position], {})
+
+        self.assertEqual(len(first), 1)
+        self.assertTrue(first[0]['execution_reduction_consumed'])
+        self.assertEqual(same_snapshot, [])
+        self.assertEqual(fresh_snapshot, [])
+        ce.executor_client.execute.assert_called_once()
+
+    def test_liquidation_distance_zero_fill_retries_same_snapshot(self):
+        ce = make_closing_executor()
+        risk = make_gate_cross_risk(status='danger', account_mmr_pct=800.0)
+        ce._gate_cross_risk_cache = {'ts': time.time(), 'risk': risk}
+        ce._execute_close = MagicMock(return_value={
+            'base_asset': 'TUT',
+            'success': False,
+            'future_exec_qty': 0.0,
+            'spot_exec_qty': 0.0,
+            'gate_reduction_consumed': False,
+            'execution_reduction_consumed': False,
+            'message': 'Gate明确拒单',
+        })
+        position = _risk_position(gate_liq_price=1.02, gate_mark_price=1.0)
+
+        first = ce.check_and_close_margin_danger([position], {})
+        second = ce.check_and_close_margin_danger([position], {})
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(ce._execute_close.call_count, 2)
+
     def test_ordinary_close_path_contains_no_margin_risk_branch(self):
         ce = make_closing_executor()
         ce._gate_cross_risk_cache = {

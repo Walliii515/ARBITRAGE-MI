@@ -228,6 +228,7 @@ class ClosingExecutor:
         self._margin_recovery_active = False
         self._margin_recovery_last_close_snapshot_ts = 0.0
         self._margin_profit_release_last_close_snapshot_ts = 0.0
+        self._margin_execution_last_snapshot_ts = 0.0
 
         # 最终风控旁路：旁路风控新鲜度硬约束（以本地 last_update_time 为准计算 lag_ms，超过阈值拒平）
         self._max_orderbook_lag_ms = config.get_float('trade.close.max_orderbook_lag_ms', 200.0)
@@ -434,6 +435,12 @@ class ClosingExecutor:
             and snapshot_ts > 0
             and snapshot_ts <= self._margin_profit_release_last_close_snapshot_ts
         )
+        execution_snapshot_already_used = (
+            snapshot_ts > 0
+            and snapshot_ts <= self._margin_execution_last_snapshot_ts
+        )
+        if execution_snapshot_already_used:
+            return []
         critical_recovery = (
             account_recovery_active
             and account_mmr is not None
@@ -556,6 +563,11 @@ class ClosingExecutor:
                 result.setdefault('margin_risk_stage', stage)
                 results.append(result)
                 gate_reduction_consumed = bool(result.get('gate_reduction_consumed'))
+                execution_reduction_consumed = bool(
+                    result.get('execution_reduction_consumed')
+                )
+                if result.get('success') or execution_reduction_consumed:
+                    self._margin_execution_last_snapshot_ts = snapshot_ts
                 if result.get('success') or gate_reduction_consumed:
                     if account_recovery_active:
                         self._margin_recovery_last_close_snapshot_ts = snapshot_ts
@@ -2489,23 +2501,57 @@ class ClosingExecutor:
                 orderbook_row=orderbook_row,
             )
             exec_result = self.executor_client.execute(order_group, orderbook_row)
-            actual_close_basis_bps = self._save_close(
-                pos,
-                order_group,
-                exec_result,
-                close_reason,
-                close_reason_detail,
-                pre_gate_basis_bps=pre_gate_basis_bps,
-            )
-            close_basis_slip_bps = self._close_basis_slip_bps(
-                pre_gate_basis_bps,
-                actual_close_basis_bps,
-            )
             future_exec_qty = abs(
                 _float_or_none((exec_result.get('future_order') or {}).get('exec_qty')) or 0.0
             )
             spot_exec_qty = abs(
                 _float_or_none((exec_result.get('spot_order') or {}).get('exec_qty')) or 0.0
+            )
+            execution_reduction_consumed = (
+                future_exec_qty > CLOSE_QTY_TOLERANCE
+                or spot_exec_qty > CLOSE_QTY_TOLERANCE
+            )
+            try:
+                actual_close_basis_bps = self._save_close(
+                    pos,
+                    order_group,
+                    exec_result,
+                    close_reason,
+                    close_reason_detail,
+                    pre_gate_basis_bps=pre_gate_basis_bps,
+                )
+            except Exception as exc:
+                if execution_reduction_consumed:
+                    pos['exchange_risk_status'] = 'desynced'
+                    self._trigger_reconciliation('close_persistence_failed', ba)
+                logger.error(
+                    "平仓已执行但本地持久化失败 | %s | position_id=%s | "
+                    "future_qty=%s | spot_qty=%s | %s",
+                    ba,
+                    pos.get('id'),
+                    future_exec_qty,
+                    spot_exec_qty,
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    'base_asset': ba,
+                    'success': False,
+                    'order_uuid': order_group['order_uuid'],
+                    'close_reason': close_reason,
+                    'message': f'本地持久化失败:{exc}',
+                    'persistence_error': str(exc),
+                    'future_exec_qty': future_exec_qty,
+                    'spot_exec_qty': spot_exec_qty,
+                    'gate_reduction_consumed': future_exec_qty > CLOSE_QTY_TOLERANCE,
+                    'execution_reduction_consumed': execution_reduction_consumed,
+                    'pre_gate_basis_bps': pre_gate_basis_bps,
+                    'actual_close_basis_bps': None,
+                    'close_basis_slip_bps': None,
+                }
+            close_basis_slip_bps = self._close_basis_slip_bps(
+                pre_gate_basis_bps,
+                actual_close_basis_bps,
             )
             return {
                 'base_asset': ba,
@@ -2516,6 +2562,7 @@ class ClosingExecutor:
                 'future_exec_qty': future_exec_qty,
                 'spot_exec_qty': spot_exec_qty,
                 'gate_reduction_consumed': future_exec_qty > CLOSE_QTY_TOLERANCE,
+                'execution_reduction_consumed': execution_reduction_consumed,
                 'pre_gate_basis_bps': pre_gate_basis_bps,
                 'actual_close_basis_bps': actual_close_basis_bps,
                 'close_basis_slip_bps': close_basis_slip_bps,

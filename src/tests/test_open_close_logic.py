@@ -5096,12 +5096,13 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.ce.set_reconciliation_trigger(lambda reason, asset: triggered.append((reason, asset)))
 
         with patch('calc.closing_executor.db_manager.get_cursor', return_value=FakeCtx(cursor)):
+            pos = {
+                'id': 222,
+                'base_asset': 'BEL',
+                'future_open_qty': 493.0,
+            }
             marked = self.ce._mark_future_only_close_desync(
-                {
-                    'id': 222,
-                    'base_asset': 'BEL',
-                    'future_open_qty': 493.0,
-                },
+                pos,
                 {
                     'success': False,
                     'message': '现货拒单(期货已成交,需人工处理): Binance 请求超时',
@@ -5122,6 +5123,9 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(cursor.params['future_open_contracts'], 0.0)
         self.assertIn('Gate期货已成交但Binance现货失败', cursor.params['detail'])
         self.assertIn('close_reason=take_profit', cursor.params['detail'])
+        self.assertEqual(pos['future_open_qty'], 0.0)
+        self.assertEqual(pos['future_open_contracts'], 0.0)
+        self.assertEqual(pos['exchange_risk_status'], 'desynced')
         self.ce._trigger_reconciliation('close_future_only_desync', 'BEL')
         self.assertEqual(triggered, [('close_future_only_desync', 'BEL')])
 

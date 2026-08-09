@@ -763,7 +763,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(result['action'], 'sell_extra_binance_spot')
         remediator._insert_spot_order.assert_called_once()
 
-    def test_gate_risk_event_zero_limit_processes_all_matching_positions(self):
+    def test_gate_risk_event_legacy_limit_does_not_leave_later_positions_exposed(self):
         class FakeExecutor:
             contract_meta = {'AI': {'quanto_multiplier': 1}}
 
@@ -792,7 +792,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         ]
         remediator = ExchangeDesyncRemediator(
             FakeExecutor(),
-            ExchangeDesyncRemediationConfig(enabled=True, max_positions_per_run=0),
+            ExchangeDesyncRemediationConfig(enabled=True, max_positions_per_run=20),
         )
         remediator._risk_with_recent_liquidation = MagicMock(side_effect=lambda _asset, risk: risk)
         remediator._load_positions_to_remediate = MagicMock(return_value=positions)
@@ -1955,6 +1955,927 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(fake.order['trade_direction'], 'sell')
         self.assertEqual(fake.order['target_qty'], 52.0)
         remediator._insert_spot_order.assert_called_once()
+
+    def test_binance_spot_excess_uses_one_order_and_allocates_fill_to_rows(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def __init__(self):
+                self.orders = []
+
+            def place_binance_spot_order(self, order):
+                self.orders.append(order)
+                return {
+                    'success': True,
+                    'exec_price': 0.14,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': order['target_qty'] * 0.14,
+                    'fee_amount': 1.2,
+                    'fee_amount_usdt': None,
+                    'exchange_order_id': 'spot-aggregate',
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        positions = [
+            {
+                'id': 1,
+                'base_asset': 'TUT',
+                'spot_open_qty': 10.0,
+                'future_open_qty': 4.0,
+                '_spot_excess_qty': 6.0,
+            },
+            {
+                'id': 2,
+                'base_asset': 'TUT',
+                'spot_open_qty': 8.0,
+                'future_open_qty': 2.0,
+                '_spot_excess_qty': 6.0,
+            },
+        ]
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=18.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(
+            return_value=positions,
+        )
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock(return_value=2)
+
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT',
+                local_qty=6.0,
+                exchange_qty=18.0,
+                risk={'type': 'binance_spot_excess'},
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(executor.orders), 1)
+        self.assertEqual(result['allocated_position_count'], 2)
+        self.assertEqual(result['allocated_qty'], 12.0)
+        self.assertEqual(remediator._insert_spot_order.call_count, 2)
+        first_order, first_result = remediator._insert_spot_order.call_args_list[0].args[:2]
+        second_order, second_result = remediator._insert_spot_order.call_args_list[1].args[:2]
+        self.assertEqual((first_order['position_id'], second_order['position_id']), (1, 2))
+        self.assertEqual((first_result['exec_qty'], second_result['exec_qty']), (6.0, 6.0))
+        self.assertEqual((first_result['fee_amount'], second_result['fee_amount']), (0.6, 0.6))
+        self.assertIsNone(first_result['fee_amount_usdt'])
+        self.assertIs(
+            remediator._insert_spot_order.call_args_list[0].kwargs['cursor'],
+            connection.cursor.return_value,
+        )
+        remediator._resolve_balanced_spot_excess_positions.assert_called_once_with('TUT')
+
+    def test_partial_aggregate_spot_fill_allocates_only_actual_fill_and_retries(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': False,
+                    'exec_price': 0.14,
+                    'exec_qty': 6.0,
+                    'exec_amount': 0.84,
+                    'reason': 'price_filter_retry_exhausted',
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        positions = [
+            {'id': 1, 'base_asset': 'TUT', '_spot_excess_qty': 6.0},
+            {'id': 2, 'base_asset': 'TUT', '_spot_excess_qty': 6.0},
+        ]
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=18.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(
+            return_value=positions,
+        )
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock()
+
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT',
+                local_qty=6.0,
+                exchange_qty=18.0,
+                risk={'type': 'binance_spot_excess'},
+            )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(result['allocated_position_count'], 1)
+        self.assertEqual(result['allocated_qty'], 6.0)
+        self.assertEqual(result['remaining_qty'], 6.0)
+        remediator._apply_allocated_spot_reduction.assert_called_once()
+        remediator._resolve_balanced_spot_excess_positions.assert_not_called()
+
+    def test_allocation_transaction_failure_keeps_desync_and_audits_exchange_fill(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_price': 0.14,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': order['target_qty'] * 0.14,
+                    'exchange_order_id': 'spot-aggregate',
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        positions = [
+            {'id': 1, 'base_asset': 'TUT', '_spot_excess_qty': 6.0},
+            {'id': 2, 'base_asset': 'TUT', '_spot_excess_qty': 6.0},
+        ]
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=18.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(
+            return_value=positions,
+        )
+        remediator._insert_spot_order = MagicMock(side_effect=[
+            None,
+            RuntimeError('db write failed'),
+            None,
+        ])
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock()
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT',
+                local_qty=6.0,
+                exchange_qty=18.0,
+                risk={'type': 'binance_spot_excess'},
+            )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['exchange_success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertIn('local_spot_allocation_failed', result['reason'])
+        self.assertEqual(remediator._insert_spot_order.call_count, 3)
+        fallback_order = remediator._insert_spot_order.call_args_list[-1].args[0]
+        self.assertIsNone(fallback_order['position_id'])
+        remediator._resolve_balanced_spot_excess_positions.assert_not_called()
+
+    def test_post_allocation_risk_cleanup_failure_does_not_duplicate_fill_order(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_price': 0.14,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': order['target_qty'] * 0.14,
+                    'exchange_order_id': 'spot-aggregate',
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=12.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[{
+            'id': 1,
+            'base_asset': 'TUT',
+            '_spot_excess_qty': 6.0,
+        }])
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock(
+            side_effect=RuntimeError('cleanup failed'),
+        )
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT',
+                local_qty=6.0,
+                exchange_qty=12.0,
+                risk={'type': 'binance_spot_excess'},
+            )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['exchange_success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertIn('local_spot_risk_cleanup_failed', result['reason'])
+        self.assertEqual(remediator._insert_spot_order.call_count, 1)
+
+    def test_allocated_spot_fill_closes_row_when_both_legs_are_zero(self):
+        remediator = ExchangeDesyncRemediator(
+            MagicMock(spot_meta={'TUT': {'step_size': 1}}),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._risk_with_prior_future_fill = MagicMock(return_value={
+            'type': 'binance_spot_excess',
+            'future_close_price': 0.15,
+        })
+        remediator._close_position = MagicMock()
+        pos = {
+            'id': 1,
+            'base_asset': 'TUT',
+            'spot_open_qty': 6.0,
+            'spot_open_price': 0.13,
+            'future_open_qty': 0.0,
+        }
+
+        state = remediator._apply_allocated_spot_reduction(
+            pos,
+            6.0,
+            {'exec_qty': 6.0, 'exec_price': 0.14},
+            {'type': 'binance_spot_excess'},
+            '对账兜底',
+            datetime(2026, 8, 9, 10, 0, 0),
+        )
+
+        self.assertEqual(state, 'closed')
+        self.assertEqual(pos['spot_open_qty'], 0.0)
+        self.assertEqual(pos['exchange_risk_status'], 'resolved')
+        remediator._close_position.assert_called_once()
+
+    def test_allocated_spot_fill_keeps_balanced_remainder_holding_and_resolved(self):
+        executor = MagicMock()
+        executor.spot_meta = {'TUT': {'step_size': 1}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        cursor = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+        pos = {
+            'id': 1,
+            'base_asset': 'TUT',
+            'spot_open_qty': 10.0,
+            'spot_open_price': 0.13,
+            'future_open_qty': 6.0,
+        }
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_cursor',
+            return_value=context,
+        ):
+            state = remediator._apply_allocated_spot_reduction(
+                pos,
+                4.0,
+                {'exec_qty': 4.0, 'exec_price': 0.14},
+                {'type': 'binance_spot_excess'},
+                '对账兜底',
+                datetime(2026, 8, 9, 10, 0, 0),
+            )
+
+        self.assertEqual(state, 'balanced')
+        self.assertEqual(pos['spot_open_qty'], 6.0)
+        self.assertEqual(pos['spot_open_amount'], 0.78)
+        self.assertEqual(pos['exchange_risk_status'], 'resolved')
+        params = cursor.execute.call_args.args[1]
+        self.assertEqual(params['risk_status'], 'resolved')
+        self.assertIsNone(params['risk_type'])
+
+    def test_exactly_one_spot_step_difference_remains_desynced(self):
+        executor = MagicMock()
+        executor.spot_meta = {'TUT': {'step_size': 1}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        cursor = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+        pos = {
+            'id': 1,
+            'base_asset': 'TUT',
+            'spot_open_qty': 10.0,
+            'spot_open_price': 0.13,
+            'future_open_qty': 5.0,
+        }
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_cursor',
+            return_value=context,
+        ):
+            state = remediator._apply_allocated_spot_reduction(
+                pos,
+                4.0,
+                {'exec_qty': 4.0, 'exec_price': 0.14},
+                {'type': 'binance_spot_excess'},
+                '对账兜底',
+                datetime(2026, 8, 9, 10, 0, 0),
+            )
+
+        self.assertEqual(state, 'desynced')
+        self.assertEqual(pos['spot_open_qty'], 6.0)
+        self.assertEqual(pos['future_open_qty'], 5.0)
+        self.assertEqual(pos['exchange_risk_status'], 'desynced')
+
+    def test_successful_aggregate_reduction_clears_balanced_sibling_marks(self):
+        executor = MagicMock()
+        executor.spot_meta = {'TUT': {'step_size': 1}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        cursor = MagicMock()
+        cursor.rowcount = 3
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_cursor',
+            return_value=context,
+        ):
+            updated = remediator._resolve_balanced_spot_excess_positions('tut')
+
+        self.assertEqual(updated, 3)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("exchange_risk_type = 'binance_spot_excess'", sql)
+        self.assertIn('ABS(', sql)
+        self.assertEqual(params['base_asset'], 'TUT')
+        self.assertLess(params['tolerance'], 1.0)
+
+    def test_sub_step_binance_spot_difference_is_ignored(self):
+        executor = MagicMock()
+        executor.spot_meta = {'TUT': {'step_size': 1}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock()
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT',
+            local_qty=10.0,
+            exchange_qty=10.5,
+            risk={'type': 'binance_spot_excess'},
+        )
+
+        self.assertFalse(result['attempted'])
+        self.assertEqual(result['reason'], 'binance_spot_diff<=tolerance')
+        remediator._load_binance_available_qty.assert_not_called()
+
+    def test_exactly_one_spot_step_difference_is_reduced(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def __init__(self):
+                self.order = None
+
+            def place_binance_spot_order(self, order):
+                self.order = order
+                return {
+                    'success': True,
+                    'exec_price': 0.14,
+                    'exec_qty': order['target_qty'],
+                    'exec_amount': order['target_qty'] * 0.14,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=11.0)
+        remediator._insert_spot_order = MagicMock()
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT',
+            local_qty=10.0,
+            exchange_qty=11.0,
+            risk={'type': 'extra_gate_position'},
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor.order['target_qty'], 1.0)
+
+    def test_executor_success_with_zero_fill_is_incomplete_and_retried(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, _order):
+                return {'success': True, 'exec_qty': 0.0, 'exec_price': 0.14}
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._insert_spot_order = MagicMock()
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT', 10.0, 20.0, {'type': 'extra_gate_position'},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertFalse(result['exchange_success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(result['remaining_qty'], 10.0)
+        self.assertIn('spot_reduction_incomplete', result['reason'])
+
+    def test_executor_success_with_partial_fill_allocates_only_fill_and_retries(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, _order):
+                return {
+                    'success': True,
+                    'exec_qty': 4.0,
+                    'exec_price': 0.14,
+                    'exec_amount': 0.56,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[{
+            'id': 1,
+            'base_asset': 'TUT',
+            '_spot_excess_qty': 10.0,
+        }])
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='desynced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock()
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT', 10.0, 20.0, {'type': 'binance_spot_excess'},
+            )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(result['allocated_qty'], 4.0)
+        self.assertEqual(result['remaining_qty'], 6.0)
+        allocated_result = remediator._insert_spot_order.call_args.args[1]
+        self.assertEqual(allocated_result['exec_qty'], 4.0)
+        remediator._resolve_balanced_spot_excess_positions.assert_not_called()
+
+    def test_overreported_spot_fill_is_clamped_and_forces_fresh_reconciliation(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, _order):
+                return {
+                    'success': True,
+                    'exec_qty': 12.0,
+                    'exec_price': 0.14,
+                    'exec_amount': 1.68,
+                    'fee_amount': 0.12,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._insert_spot_order = MagicMock()
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT', 10.0, 20.0, {'type': 'extra_gate_position'},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(result['spot_result']['exec_qty'], 10.0)
+        self.assertAlmostEqual(result['spot_result']['exec_amount'], 1.4)
+        self.assertAlmostEqual(result['spot_result']['fee_amount'], 0.1)
+        self.assertIn('spot_fill_exceeds_target', result['reason'])
+
+    def test_missing_exec_amount_falls_back_to_price_times_quantity(self):
+        remediator = ExchangeDesyncRemediator(
+            MagicMock(spot_meta={'TUT': {'step_size': 1}}),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator._allocate_spot_reduction_to_positions(
+                order={'base_asset': 'TUT', 'target_qty': 6.0},
+                result={'success': True, 'exec_qty': 6.0, 'exec_price': 0.14},
+                positions=[{'id': 1, '_spot_excess_qty': 6.0}],
+                risk={'type': 'binance_spot_excess'},
+                reason='对账兜底',
+                now=datetime(2026, 8, 9, 10, 0, 0),
+            )
+
+        self.assertEqual(result['allocated_qty'], 6.0)
+        allocated_order, allocated_result = remediator._insert_spot_order.call_args.args[:2]
+        self.assertAlmostEqual(allocated_order['target_amount'], 0.84)
+        self.assertAlmostEqual(allocated_result['exec_amount'], 0.84)
+
+    def test_sub_step_unallocated_fill_gets_asset_level_audit_record(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, _order):
+                return {
+                    'success': True,
+                    'exec_qty': 10.0,
+                    'exec_price': 0.14,
+                    'fee_amount': 0.1,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[{
+            'id': 1,
+            'base_asset': 'TUT',
+            '_spot_excess_qty': 9.5,
+        }])
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock(return_value=1)
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT', 10.0, 20.0, {'type': 'binance_spot_excess'},
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['allocated_qty'], 9.5)
+        self.assertEqual(remediator._insert_spot_order.call_count, 2)
+        audit_order, audit_result, audit_reason = (
+            remediator._insert_spot_order.call_args_list[-1].args[:3]
+        )
+        self.assertIsNone(audit_order['position_id'])
+        self.assertEqual(audit_result['exec_qty'], 0.5)
+        self.assertAlmostEqual(audit_result['exec_amount'], 0.07)
+        self.assertAlmostEqual(audit_result['fee_amount'], 0.005)
+        self.assertIn('本地未分配成交=0.5', audit_reason)
+
+    def test_closed_position_pnl_refresh_failure_does_not_undo_allocation(self):
+        remediator = ExchangeDesyncRemediator(
+            MagicMock(spot_meta={'TUT': {'step_size': 1}}),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._insert_spot_order = MagicMock()
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='closed')
+        remediator._refresh_closed_position_pnl = MagicMock(
+            side_effect=RuntimeError('pnl refresh failed'),
+        )
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+        position = {'id': 1, 'base_asset': 'TUT', '_spot_excess_qty': 6.0}
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator._allocate_spot_reduction_to_positions(
+                order={'base_asset': 'TUT', 'target_qty': 6.0},
+                result={
+                    'success': True,
+                    'exec_qty': 6.0,
+                    'exec_price': 0.14,
+                    'exec_amount': 0.84,
+                },
+                positions=[position],
+                risk={'type': 'binance_spot_excess'},
+                reason='对账兜底',
+                now=datetime(2026, 8, 9, 10, 0, 0),
+            )
+
+        self.assertEqual(result['allocated_qty'], 6.0)
+        remediator._refresh_closed_position_pnl.assert_called_once_with(position)
+
+    def test_unallocated_fill_audit_failure_returns_fast_retry(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, _order):
+                return {
+                    'success': True,
+                    'exec_qty': 10.0,
+                    'exec_price': 0.14,
+                    'exec_amount': 1.4,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[{
+            'id': 1,
+            'base_asset': 'TUT',
+            '_spot_excess_qty': 9.5,
+        }])
+        remediator._insert_spot_order = MagicMock(side_effect=[None, RuntimeError('audit down')])
+        remediator._apply_allocated_spot_reduction = MagicMock(return_value='balanced')
+        remediator._resolve_balanced_spot_excess_positions = MagicMock()
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT', 10.0, 20.0, {'type': 'binance_spot_excess'},
+            )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertIn('unallocated_spot_audit_failed', result['reason'])
+        remediator._resolve_balanced_spot_excess_positions.assert_not_called()
+
+    def test_direct_spot_fill_persistence_failure_returns_fast_retry(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': 0.14,
+                    'exec_amount': order['target_qty'] * 0.14,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._insert_spot_order = MagicMock(side_effect=RuntimeError('db down'))
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT', 10.0, 20.0, {'type': 'extra_gate_position'},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['exchange_success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertIn('spot_order_persistence_failed', result['reason'])
+
+    def test_allocation_and_fallback_audit_failure_do_not_escape_reconciler(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': 0.14,
+                    'exec_amount': order['target_qty'] * 0.14,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[{
+            'id': 1,
+            'base_asset': 'TUT',
+            '_spot_excess_qty': 10.0,
+        }])
+        remediator._insert_spot_order = MagicMock(side_effect=[
+            RuntimeError('allocation write failed'),
+            RuntimeError('fallback audit failed'),
+        ])
+        connection = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator.remediate_binance_spot_desync(
+                'TUT', 10.0, 20.0, {'type': 'binance_spot_excess'},
+            )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['exchange_success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertIn('aggregate_spot_audit_failed', result['reason'])
+
+    def test_external_spot_surplus_clears_broad_balanced_risk_marks(self):
+        class FakeExecutor:
+            spot_meta = {'TUT': {'step_size': 1}}
+
+            def place_binance_spot_order(self, order):
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': 0.14,
+                    'exec_amount': order['target_qty'] * 0.14,
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.14
+
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=20.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[])
+        remediator._insert_spot_order = MagicMock()
+        remediator._resolve_balanced_spot_excess_positions = MagicMock(return_value=3)
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT', 10.0, 20.0, {'type': 'binance_spot_excess'},
+        )
+
+        self.assertTrue(result['success'])
+        remediator._resolve_balanced_spot_excess_positions.assert_called_once_with('TUT')
+
+    def test_insufficient_available_spot_requests_fast_retry_without_order(self):
+        executor = MagicMock()
+        executor.spot_meta = {'TUT': {'step_size': 1}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=9.0)
+
+        result = remediator.remediate_binance_spot_desync(
+            'TUT', 10.0, 20.0, {'type': 'binance_spot_excess'},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(result['reason'], 'spot_available_qty_insufficient')
+        executor.place_binance_spot_order.assert_not_called()
+
+    def test_fast_confirmation_detects_nested_available_qty_shortage(self):
+        self.assertTrue(Reconciler._remediation_needs_fast_retry({
+            'results': [{
+                'paired_binance_spot_result': {
+                    'attempted': True,
+                    'success': False,
+                    'reason': 'spot_available_qty_insufficient',
+                },
+            }],
+        }))
+
+    def test_fast_confirmation_retries_reduction_lock_collision(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_fast_confirm_delay_sec=3.0),
+        )
+        first = {
+            'success': True,
+            'snapshot_at': '2026-08-09 10:00:00',
+            'confirmation_pending_count': 0,
+            'remediation_retry_pending_count': 1,
+        }
+        second = {
+            'success': True,
+            'snapshot_at': '2026-08-09 10:00:03',
+            'confirmation_pending_count': 0,
+            'remediation_retry_pending_count': 0,
+            'remediation_success_count': 1,
+        }
+
+        with (
+            patch.object(reconciler, 'run_once', side_effect=[first, second]) as run_once,
+            patch('calc.reconciliation.time.sleep') as sleep,
+        ):
+            result = reconciler.run_with_fast_confirmation()
+
+        self.assertEqual(run_once.call_count, 2)
+        sleep.assert_called_once_with(3.0)
+        self.assertEqual(result['fast_confirmation_rounds'], 1)
+        self.assertEqual(result['remediation_success_count'], 1)
+
+    def test_fast_confirmation_detects_nested_asset_reduction_inflight(self):
+        self.assertTrue(Reconciler._remediation_needs_fast_retry({
+            'results': [{
+                'paired_binance_spot_result': {
+                    'attempted': False,
+                    'reason': 'asset_reduction_inflight',
+                },
+            }],
+        }))
+
+    def test_fast_confirmation_is_bounded_to_two_follow_up_rounds(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_fast_confirm_delay_sec=1.0),
+        )
+        pending = {
+            'success': True,
+            'snapshot_at': '2026-08-09 10:00:00',
+            'confirmation_pending_count': 0,
+            'remediation_retry_pending_count': 1,
+        }
+
+        with (
+            patch.object(reconciler, 'run_once', side_effect=[
+                dict(pending), dict(pending), dict(pending),
+            ]) as run_once,
+            patch('calc.reconciliation.time.sleep') as sleep,
+        ):
+            result = reconciler.run_with_fast_confirmation()
+
+        self.assertEqual(run_once.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(result['fast_confirmation_rounds'], 2)
 
 
 if __name__ == '__main__':

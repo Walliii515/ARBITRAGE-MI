@@ -42,7 +42,7 @@ class ReconciliationConfig:
     auto_remediate_confirm_runs: int = 2
     auto_remediate_confirm_window_sec: int = 15
     auto_remediate_fast_confirm_delay_sec: float = 3.0
-    auto_remediate_max_positions_per_run: int = 20
+    auto_remediate_max_positions_per_run: int = 0
     auto_remediate_min_spot_qty: float = 0.0
     auto_remediate_close_extra_gate_position: bool = True
     auto_remediate_binance_spot_position: bool = True
@@ -134,7 +134,7 @@ def build_default_reconciler() -> 'Reconciler':
         auto_remediate_fast_confirm_delay_sec=config.get_float(
             'reconciliation.auto_remediate.fast_confirm_delay_sec', 3.0
         ),
-        auto_remediate_max_positions_per_run=config.get_int('reconciliation.auto_remediate.max_positions_per_run', 20),
+        auto_remediate_max_positions_per_run=config.get_int('reconciliation.auto_remediate.max_positions_per_run', 0),
         auto_remediate_min_spot_qty=config.get_float('reconciliation.auto_remediate.min_spot_qty', 0.0),
         auto_remediate_close_extra_gate_position=config.get_bool(
             'reconciliation.auto_remediate.close_extra_gate_position', True
@@ -258,6 +258,9 @@ class Reconciler:
                 for result in remediation_results
                 if result.get('reason') == 'waiting_for_reconciliation_confirmation'
             ),
+            'remediation_retry_pending_count': sum(
+                1 for result in remediation_results if self._remediation_needs_fast_retry(result)
+            ),
         }
 
     def cleanup_post_close_dust(self) -> Dict:
@@ -269,23 +272,56 @@ class Reconciler:
     def run_with_fast_confirmation(self) -> Dict:
         """Run a second fresh reconciliation shortly after an unconfirmed mismatch."""
         first = self.run_once()
-        pending = int(first.get('confirmation_pending_count') or 0)
         delay_sec = max(float(self.cfg.auto_remediate_fast_confirm_delay_sec or 0.0), 0.0)
+        pending = (
+            int(first.get('confirmation_pending_count') or 0)
+            + int(first.get('remediation_retry_pending_count') or 0)
+        )
         if pending <= 0 or delay_sec <= 0:
             return first
 
-        logger.warning(
-            "对账发现待确认差异，%.1f秒后快速复核 | pending=%s | snapshot_at=%s",
-            delay_sec,
-            pending,
-            first.get('snapshot_at'),
-        )
-        time.sleep(delay_sec)
-        second = self.run_once()
-        second['fast_confirmation'] = True
-        second['fast_confirmation_delay_sec'] = delay_sec
-        second['initial_snapshot_at'] = first.get('snapshot_at')
-        return second
+        current = first
+        rounds = 0
+        while pending > 0 and rounds < 2:
+            logger.warning(
+                "对账发现待确认或待续处置差异，%.1f秒后快速复核 | pending=%s | snapshot_at=%s",
+                delay_sec,
+                pending,
+                current.get('snapshot_at'),
+            )
+            time.sleep(delay_sec)
+            current = self.run_once()
+            rounds += 1
+            pending = (
+                int(current.get('confirmation_pending_count') or 0)
+                + int(current.get('remediation_retry_pending_count') or 0)
+            )
+        current['fast_confirmation'] = True
+        current['fast_confirmation_rounds'] = rounds
+        current['fast_confirmation_delay_sec'] = delay_sec
+        current['initial_snapshot_at'] = first.get('snapshot_at')
+        return current
+
+    @classmethod
+    def _remediation_needs_fast_retry(cls, result: Dict) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if result.get('retry_needed'):
+            return True
+        if result.get('reason') in {
+            'asset_reduction_inflight',
+            'spot_available_qty_insufficient',
+        }:
+            return True
+        nested = []
+        for key in ('results',):
+            value = result.get(key)
+            if isinstance(value, list):
+                nested.extend(item for item in value if isinstance(item, dict))
+        paired = result.get('paired_binance_spot_result')
+        if isinstance(paired, dict):
+            nested.append(paired)
+        return any(cls._remediation_needs_fast_retry(item) for item in nested)
 
     def cleanup_old_snapshots(self):
         """按配置清理历史快照；历史不一致记录保留用于风险追溯。"""
