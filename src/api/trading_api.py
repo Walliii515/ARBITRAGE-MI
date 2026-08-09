@@ -9,6 +9,7 @@
 """
 import asyncio
 import json
+import math
 import threading
 import time
 from decimal import Decimal
@@ -1570,6 +1571,34 @@ async def run_reconciliation_now():
             _recon_running = False
 
 
+def _format_dust_cleanup_message(cleanup: Dict[str, Any]) -> str:
+    if cleanup.get('message'):
+        return str(cleanup['message'])
+
+    if cleanup.get('success'):
+        return '小额残余清理完成'
+
+    reason = str(cleanup.get('reason') or 'unknown')
+    if reason == 'binance_dust_conversion_cooldown':
+        remaining = cleanup.get('cooldown_remaining_sec')
+        if remaining is not None:
+            seconds = max(0, int(math.ceil(float(remaining))))
+            return f'小额残余清理失败: Binance 小额兑换冷却中，剩余 {seconds} 秒'
+        return '小额残余清理失败: Binance 小额兑换冷却中'
+
+    skipped = cleanup.get('skipped')
+    if reason == 'no_safe_dust_found' and isinstance(skipped, list) and skipped:
+        summary = '；'.join(
+            f"{item.get('base_asset') or '-'}={item.get('reason') or 'unknown'}"
+            for item in skipped[:5]
+            if isinstance(item, dict)
+        )
+        if summary:
+            return f'未发现可安全兑换的小额残余，已跳过: {summary}'
+
+    return f'小额残余清理失败: {reason}'
+
+
 @router.post(
     '/reconciliation/dust/cleanup',
     dependencies=[Depends(verify_token_dependency)],
@@ -1595,11 +1624,7 @@ async def cleanup_reconciliation_dust():
             return cleanup, reconciliation
 
         cleanup, reconciliation = await asyncio.to_thread(_cleanup_and_reconcile)
-        message = cleanup.get('message') or (
-            '小额残余清理完成'
-            if cleanup.get('success')
-            else f"小额残余清理失败: {cleanup.get('reason') or 'unknown'}"
-        )
+        message = _format_dust_cleanup_message(cleanup)
         return {
             **cleanup,
             'message': message,

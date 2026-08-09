@@ -16,6 +16,7 @@ from api.trading_api import (
     _build_forward_signal_filters,
     _filter_capital_transfer_transient_rows,
     _format_reconciliation_notification,
+    _format_dust_cleanup_message,
     _reconciliation_latest_sql,
     _should_emit_reconciliation_notification,
     get_capital_annualized_return,
@@ -125,6 +126,19 @@ class ManualDustCleanupTests(unittest.TestCase):
         reconciler.cleanup_post_close_dust.assert_called_once_with()
         reconciler.run_once.assert_called_once_with()
         self.assertFalse(trading_api._recon_running)
+
+    def test_cleanup_cooldown_message_includes_remaining_seconds(self):
+        message = _format_dust_cleanup_message({
+            'success': False,
+            'attempted': False,
+            'reason': 'binance_dust_conversion_cooldown',
+            'cooldown_remaining_sec': 110.1,
+        })
+
+        self.assertEqual(
+            message,
+            '小额残余清理失败: Binance 小额兑换冷却中，剩余 111 秒',
+        )
 
 
 class CapitalLatestAccountAggregationTests(unittest.TestCase):

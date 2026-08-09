@@ -459,10 +459,11 @@ const exchangeRiskFormatter = (params: ValueFormatterParams) => {
     (!row.exchange_risk_status || ['normal', 'resolved'].includes(row.exchange_risk_status))
     && !hasDelistRisk
   ) return ''
+  const postCloseDustRisk = isPostCloseDustRisk(row)
   const typeMap: Record<string, string> = {
     adl: 'ADL自动减仓',
     delist_risk: '下架风险',
-    missing_gate_position: 'Gate缺腿',
+    missing_gate_position: postCloseDustRisk ? '尘埃待清理' : 'Gate缺腿',
     qty_mismatch: '数量不匹配',
     unknown: '交易所风险',
   }
@@ -471,9 +472,19 @@ const exchangeRiskFormatter = (params: ValueFormatterParams) => {
   return primary
 }
 
+const isPostCloseDustRisk = (row: PositionRow | undefined): boolean => {
+  if (!row) return false
+  return row.exchange_risk_type === 'missing_gate_position'
+    && String(row.close_reason || '').includes('部分平仓保留剩余')
+    && String(row.exchange_risk_detail || '').includes('spot_notional_below_min')
+}
+
 const exchangeRiskTooltip = (row: PositionRow | undefined): string | null => {
   if (!row) return null
-  const parts = [row.exchange_risk_detail, row.delist_risk_summary ? `下架风险: ${row.delist_risk_summary}` : null]
+  const dustHint = isPostCloseDustRisk(row)
+    ? '订单账本显示 Gate 腿已归零，仅剩 Binance 小额现货残余，等待小额兑换后核销持仓'
+    : null
+  const parts = [dustHint, row.exchange_risk_detail, row.delist_risk_summary ? `下架风险: ${row.delist_risk_summary}` : null]
     .filter(Boolean) as string[]
   return parts.length ? Array.from(new Set(parts)).join(' | ') : null
 }
