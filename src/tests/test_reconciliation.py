@@ -136,6 +136,96 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
             'extra_gate_position',
         )
 
+    def test_combined_exposure_row_compares_binance_and_gate_actuals(self):
+        executor = MagicMock()
+        executor.contract_meta = {'ABC': {'quanto_multiplier': 0.1}}
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=False),
+        )
+
+        rows = reconciler._build_combined_exposure_rows(
+            snapshot_at=datetime(2026, 8, 9, 12, 0, 0),
+            local_spot={'ABC': 10.0},
+            local_gate={'ABC': 100.0},
+            binance_balances=[{'asset': 'ABC', 'total': 10.0}],
+            gate_positions=[{'base_asset': 'ABC', 'size': '-90'}],
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row['exchange'], 'combined')
+        self.assertEqual(row['dimension'], 'exposure')
+        self.assertFalse(row['is_match'])
+        self.assertEqual(row['detail']['risk_type'], 'binance_spot_excess')
+        self.assertAlmostEqual(row['detail']['gate_qty'], 9.0)
+        self.assertAlmostEqual(row['detail']['exchange_diff'], 1.0)
+
+    def test_combined_binance_excess_uses_spot_only_reduction_when_gate_is_flat(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_binance_spot_only_exposure = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'sell_spot_only_binance_exposure',
+        })
+        reconciler._record_reconciliation_risk_event = MagicMock()
+
+        results = reconciler._auto_remediate_combined_exposure_risks(
+            datetime(2026, 8, 9, 12, 0, 0),
+            [{
+                'base_asset': 'AI',
+                'risk_type': 'binance_spot_excess',
+                'confirmed': True,
+                'risk': {'type': 'binance_spot_excess', 'contract': 'AI_USDT'},
+                'binance_qty': 11.0,
+                'gate_qty': 0.0,
+                'gate_contracts': 0.0,
+                'quanto_multiplier': 1.0,
+            }],
+        )
+
+        self.assertTrue(results[0]['success'])
+        reconciler.remediator.remediate_binance_spot_only_exposure.assert_called_once_with(
+            base_asset='AI',
+            spot_qty=11.0,
+            risk={'type': 'binance_spot_excess', 'contract': 'AI_USDT'},
+        )
+
+    def test_combined_gate_excess_uses_reduce_only_gate_close(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'close_extra_gate_future',
+        })
+        reconciler._record_reconciliation_risk_event = MagicMock()
+
+        results = reconciler._auto_remediate_combined_exposure_risks(
+            datetime(2026, 8, 9, 12, 0, 0),
+            [{
+                'base_asset': 'BICO',
+                'risk_type': 'gate_short_excess',
+                'confirmed': True,
+                'risk': {'type': 'gate_short_excess', 'contract': 'BICO_USDT'},
+                'binance_qty': 8.0,
+                'gate_qty': 10.0,
+                'gate_contracts': 100.0,
+                'quanto_multiplier': 0.1,
+            }],
+        )
+
+        self.assertTrue(results[0]['success'])
+        reconciler.remediator.remediate_gate_extra_position.assert_called_once()
+        kwargs = reconciler.remediator.remediate_gate_extra_position.call_args.kwargs
+        self.assertEqual(kwargs['base_asset'], 'BICO')
+        self.assertAlmostEqual(kwargs['extra_contracts'], 20.0)
+
     def test_detect_gate_extra_risk_keeps_exchange_size(self):
         reconciler = Reconciler(
             executor=object(),

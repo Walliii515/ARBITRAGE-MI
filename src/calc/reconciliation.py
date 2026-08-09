@@ -163,19 +163,26 @@ class Reconciler:
 
         local_spot = self._load_local_spot_positions()
         local_gate = self._load_local_gate_positions()
+        binance_rows: List[Dict] = []
+        gate_rows: List[Dict] = []
+        binance_balances: List[Dict] = []
+        gate_positions: List[Dict] = []
+        binance_ok = False
+        gate_ok = False
 
         try:
             binance_balances = self.executor.fetch_binance_spot_balances()
             binance_rows = self._compare_binance(snapshot_at, local_spot, binance_balances)
             rows.extend(binance_rows)
+            binance_ok = True
         except Exception as e:
             logger.warning(f'Binance 现货对账拉取失败: {e}', exc_info=True)
-            binance_rows = []
             rows.append(self._error_row(snapshot_at, 'binance', e))
 
         try:
             gate_positions = self.executor.fetch_gate_futures_positions()
             gate_rows = self._compare_gate(snapshot_at, local_gate, gate_positions)
+            gate_ok = True
             gate_risks: List[Dict] = []
             if self.cfg.mark_exchange_risk:
                 gate_risks = self._mark_gate_desync_risks(snapshot_at, gate_rows)
@@ -188,6 +195,21 @@ class Reconciler:
         except Exception as e:
             logger.warning(f'Gate 期货对账拉取失败: {e}', exc_info=True)
             rows.append(self._error_row(snapshot_at, 'gate', e))
+
+        if binance_ok and gate_ok:
+            combined_rows = self._build_combined_exposure_rows(
+                snapshot_at=snapshot_at,
+                local_spot=local_spot,
+                local_gate=local_gate,
+                binance_balances=binance_balances,
+                gate_positions=gate_positions,
+            )
+            combined_risks = self._mark_combined_exposure_risks(snapshot_at, combined_rows)
+            if self.cfg.auto_remediate_enabled:
+                remediation_results.extend(
+                    self._auto_remediate_combined_exposure_risks(snapshot_at, combined_risks)
+                )
+            rows.extend(combined_rows)
 
         if rows:
             self._insert_rows(rows)
@@ -310,6 +332,257 @@ class Reconciler:
             )
             for asset in assets
         ]
+
+    def _build_combined_exposure_rows(
+        self,
+        snapshot_at: datetime,
+        local_spot: Dict[str, float],
+        local_gate: Dict[str, float],
+        binance_balances: List[Dict],
+        gate_positions: List[Dict],
+    ) -> List[Dict]:
+        ignored = {asset.upper() for asset in self.cfg.ignored_binance_spot_assets}
+        binance = {
+            str(row.get('asset') or '').upper(): float(row.get('total') or 0)
+            for row in binance_balances
+        }
+        binance_detail = {str(row.get('asset') or '').upper(): row for row in binance_balances}
+        gate_contracts = {
+            str(row.get('base_asset') or '').upper(): abs(float(row.get('size') or 0))
+            for row in gate_positions
+        }
+        gate_detail = {str(row.get('base_asset') or '').upper(): row for row in gate_positions}
+        assets = sorted((set(local_spot) | set(local_gate) | set(binance) | set(gate_contracts)) - ignored)
+
+        rows: List[Dict] = []
+        for asset in assets:
+            multiplier = self._quanto_multiplier(asset)
+            local_spot_qty = float(local_spot.get(asset, 0.0) or 0.0)
+            local_gate_contracts = float(local_gate.get(asset, 0.0) or 0.0)
+            local_gate_qty = local_gate_contracts * multiplier
+            binance_qty = float(binance.get(asset, 0.0) or 0.0)
+            gate_contract_qty = float(gate_contracts.get(asset, 0.0) or 0.0)
+            gate_qty = gate_contract_qty * multiplier
+            tolerance = self._combined_exposure_tolerance(asset, multiplier)
+            local_diff = local_spot_qty - local_gate_qty
+            exchange_diff = binance_qty - gate_qty
+            local_binance_diff = binance_qty - local_spot_qty
+            local_gate_diff = gate_qty - local_gate_qty
+            local_binance_match = abs(local_binance_diff) <= tolerance
+            local_gate_match = abs(local_gate_diff) <= tolerance
+            exchange_match = abs(exchange_diff) <= tolerance
+            risk_type = self._combined_risk_type(binance_qty, gate_qty, tolerance)
+            status = self._combined_status(
+                risk_type=risk_type,
+                local_binance_match=local_binance_match,
+                local_gate_match=local_gate_match,
+            )
+            detail = {
+                'status': status,
+                'risk_type': risk_type,
+                'tolerance': tolerance,
+                'quanto_multiplier': multiplier,
+                'local_spot_qty': local_spot_qty,
+                'local_gate_contracts': local_gate_contracts,
+                'local_gate_qty': local_gate_qty,
+                'binance_qty': binance_qty,
+                'gate_contracts': gate_contract_qty,
+                'gate_qty': gate_qty,
+                'local_diff': local_diff,
+                'exchange_diff': exchange_diff,
+                'local_binance_diff': local_binance_diff,
+                'local_gate_diff': local_gate_diff,
+                'local_binance_match': local_binance_match,
+                'local_gate_match': local_gate_match,
+                'exchange_match': exchange_match,
+                'recommended_action': self._combined_recommended_action(risk_type, binance_qty, gate_qty),
+                'binance_detail': binance_detail.get(asset, {}),
+                'gate_detail': gate_detail.get(asset, {}),
+            }
+            rows.append({
+                'snapshot_at': snapshot_at,
+                'exchange': 'combined',
+                'base_asset': asset,
+                'dimension': 'exposure',
+                'local_value': local_diff,
+                'exchange_value': exchange_diff,
+                'diff_value': exchange_diff - local_diff,
+                'diff_ratio': (exchange_diff - local_diff)
+                / max(abs(local_diff), abs(exchange_diff), DIFF_RATIO_EPSILON),
+                'is_match': exchange_match and local_binance_match and local_gate_match,
+                'detail': detail,
+            })
+        return rows
+
+    def _combined_exposure_tolerance(self, base_asset: str, multiplier: float) -> float:
+        return max(BINANCE_SPOT_TOLERANCE, GATE_FUTURE_CONTRACT_TOLERANCE * max(multiplier, 1e-12), 1e-8)
+
+    def _quanto_multiplier(self, base_asset: str) -> float:
+        meta = getattr(self.executor, 'contract_meta', {}) or {}
+        try:
+            return float((meta.get(base_asset) or {}).get('quanto_multiplier') or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+
+    @staticmethod
+    def _combined_risk_type(binance_qty: float, gate_qty: float, tolerance: float) -> Optional[str]:
+        if binance_qty > gate_qty + tolerance:
+            return 'binance_spot_excess'
+        if gate_qty > binance_qty + tolerance:
+            return 'gate_short_excess'
+        return None
+
+    @staticmethod
+    def _combined_status(
+        risk_type: Optional[str],
+        local_binance_match: bool,
+        local_gate_match: bool,
+    ) -> str:
+        if risk_type == 'binance_spot_excess':
+            return 'binance_spot_excess'
+        if risk_type == 'gate_short_excess':
+            return 'gate_short_excess'
+        if not local_binance_match or not local_gate_match:
+            return 'local_desynced'
+        return 'matched'
+
+    @staticmethod
+    def _combined_recommended_action(risk_type: Optional[str], binance_qty: float, gate_qty: float) -> str:
+        if risk_type == 'binance_spot_excess':
+            return f'sell_binance_spot_to_gate_qty:{max(binance_qty - gate_qty, 0.0):g}'
+        if risk_type == 'gate_short_excess':
+            return f'close_gate_short_to_binance_qty:{max(gate_qty - binance_qty, 0.0):g}'
+        return 'sync_local_only' if risk_type is None else 'none'
+
+    def _mark_combined_exposure_risks(self, snapshot_at: datetime, rows: List[Dict]) -> List[Dict]:
+        risks: List[Dict] = []
+        for row in rows:
+            detail = row.get('detail') or {}
+            risk_type = detail.get('risk_type')
+            if risk_type not in {'binance_spot_excess', 'gate_short_excess'}:
+                continue
+            base_asset = str(row.get('base_asset') or '').upper()
+            confirmed = self._is_combined_exposure_risk_confirmed(base_asset, risk_type, snapshot_at)
+            detail['confirmed'] = confirmed
+            risk = {
+                'status': 'desynced',
+                'type': risk_type,
+                'event_at': snapshot_at,
+                'contract': f'{base_asset}_USDT',
+                'detail': (
+                    f"交易所实仓不一致|asset={base_asset}|"
+                    f"binance_qty={detail.get('binance_qty'):g}|gate_qty={detail.get('gate_qty'):g}|"
+                    f"diff={detail.get('exchange_diff'):g}"
+                ),
+                'mark_price': (detail.get('gate_detail') or {}).get('mark_price'),
+                'exchange_contracts': detail.get('gate_contracts'),
+                'local_contracts': detail.get('local_gate_contracts'),
+                'binance_qty': detail.get('binance_qty'),
+                'gate_qty': detail.get('gate_qty'),
+                'quanto_multiplier': detail.get('quanto_multiplier'),
+            }
+            detail['exchange_risk'] = risk
+            if confirmed:
+                self._mark_positions_exchange_risk(base_asset, risk)
+            else:
+                logger.warning(
+                    "三方对账发现疑似交易所敞口不一致，等待连续确认 | asset=%s | type=%s | binance=%s | gate=%s",
+                    base_asset, risk_type, detail.get('binance_qty'), detail.get('gate_qty'),
+                )
+            risks.append({
+                'base_asset': base_asset,
+                'risk': risk,
+                'risk_type': risk_type,
+                'confirmed': confirmed,
+                'local_contracts': float(detail.get('local_gate_contracts') or 0.0),
+                'exchange_contracts': float(detail.get('gate_contracts') or 0.0),
+                'missing_contracts': (
+                    max(0.0, float(detail.get('binance_qty') or 0.0) - float(detail.get('gate_qty') or 0.0))
+                    / float(detail.get('quanto_multiplier') or 1.0)
+                ),
+                'extra_contracts': (
+                    max(0.0, float(detail.get('gate_qty') or 0.0) - float(detail.get('binance_qty') or 0.0))
+                    / float(detail.get('quanto_multiplier') or 1.0)
+                ),
+                'binance_qty': float(detail.get('binance_qty') or 0.0),
+                'gate_qty': float(detail.get('gate_qty') or 0.0),
+                'gate_contracts': float(detail.get('gate_contracts') or 0.0),
+                'quanto_multiplier': float(detail.get('quanto_multiplier') or 1.0),
+            })
+        return risks
+
+    def _is_combined_exposure_risk_confirmed(self, base_asset: str, risk_type: str, snapshot_at: datetime) -> bool:
+        confirm_runs = max(int(self.cfg.auto_remediate_confirm_runs or 1), 1)
+        if confirm_runs <= 1:
+            return True
+        cutoff = snapshot_at - timedelta(
+            seconds=max(int(self.cfg.auto_remediate_confirm_window_sec or 1), 1)
+        )
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM mi_recon_snapshot
+                WHERE exchange = 'combined'
+                  AND dimension = 'exposure'
+                  AND UPPER(base_asset) = %s
+                  AND snapshot_at >= %s
+                  AND is_match = 0
+                  AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.risk_type')) = %s
+                ORDER BY snapshot_at DESC
+                LIMIT %s
+                """,
+                (base_asset.upper(), cutoff, risk_type, confirm_runs - 1),
+            )
+            rows = cursor.fetchall()
+        return len(rows) >= confirm_runs - 1
+
+    def _auto_remediate_combined_exposure_risks(self, snapshot_at: datetime, risks: List[Dict]) -> List[Dict]:
+        results: List[Dict] = []
+        for item in risks:
+            risk = item.get('risk') or {}
+            if not item.get('confirmed'):
+                result = {'attempted': False, 'reason': 'waiting_for_reconciliation_confirmation'}
+                self._record_reconciliation_risk_event(snapshot_at, item, result)
+                results.append(result)
+                continue
+
+            risk_type = str(item.get('risk_type') or '')
+            binance_qty = float(item.get('binance_qty') or 0.0)
+            gate_qty = float(item.get('gate_qty') or 0.0)
+            multiplier = float(item.get('quanto_multiplier') or 1.0)
+            if risk_type == 'binance_spot_excess':
+                excess_qty = max(0.0, binance_qty - gate_qty)
+                if gate_qty <= self._combined_exposure_tolerance(str(item.get('base_asset') or ''), multiplier):
+                    result = self.remediator.remediate_binance_spot_only_exposure(
+                        base_asset=item.get('base_asset'),
+                        spot_qty=excess_qty,
+                        risk=risk,
+                    )
+                else:
+                    result = self.remediator.remediate_binance_spot_desync(
+                        base_asset=item.get('base_asset'),
+                        local_qty=gate_qty,
+                        exchange_qty=binance_qty,
+                        risk=risk,
+                    )
+            elif risk_type == 'gate_short_excess':
+                extra_qty = max(0.0, gate_qty - binance_qty)
+                extra_contracts = extra_qty / multiplier if multiplier > 0 else 0.0
+                result = self.remediator.remediate_gate_extra_position(
+                    base_asset=item.get('base_asset'),
+                    extra_contracts=extra_contracts,
+                    risk={
+                        **risk,
+                        'exchange_size': -float(item.get('gate_contracts') or 0.0),
+                    },
+                )
+            else:
+                result = {'attempted': False, 'reason': f'unsupported_combined_risk:{risk_type}'}
+
+            self._record_reconciliation_risk_event(snapshot_at, item, result)
+            results.append(result)
+        return results
 
     def _mark_gate_desync_risks(self, snapshot_at: datetime, rows: List[Dict]) -> List[Dict]:
         """Gate 实仓不匹配时生成风险项；确认后才同步标记本地持仓。"""

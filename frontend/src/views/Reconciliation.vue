@@ -27,6 +27,8 @@ interface ReconRow {
 interface ExposureRow {
   base_asset: string
   snapshot_at: string
+  status: 'matched' | 'local_desynced' | 'binance_spot_excess' | 'gate_short_excess' | 'missing_leg'
+  risk_type: string | null
   binance_exchange_value: number | null
   gate_exchange_contracts: number | null
   gate_exchange_value: number | null
@@ -39,6 +41,10 @@ interface ExposureRow {
   local_diff: number | null
   binance_match: boolean
   gate_match: boolean
+  exchange_match: boolean
+  local_binance_diff: number | null
+  local_gate_diff: number | null
+  recommended_action: string
 }
 
 const rowData = shallowRef<ReconRow[]>([])
@@ -46,7 +52,7 @@ const latestRows = shallowRef<ReconRow[]>([])
 const loading = ref(false)
 const running = ref(false)
 const dustCleaning = ref(false)
-const activeTab = ref<'raw' | 'exposure'>('raw')
+const activeTab = ref<'raw' | 'exposure'>('exposure')
 const filterDays = ref(1)
 const mismatchesOnly = ref(false)
 const paginationPageSize = ref(50)
@@ -100,10 +106,11 @@ function matchRenderer(params: ICellRendererParams<ReconRow>) {
 }
 
 function exposureRenderer(params: ICellRendererParams<ExposureRow>) {
-  const value = params.value as ExposureRow['exposure_side']
-  if (value === 'balanced') return '<span style="color:#67c23a;font-weight:600">平衡</span>'
-  if (value === 'spot_long') return '<span style="color:#e6a23c;font-weight:600">Binance现货多余</span>'
-  if (value === 'gate_short') return '<span style="color:#f56c6c;font-weight:600">Gate空头多余</span>'
+  const value = params.data?.status || params.value as ExposureRow['status']
+  if (value === 'matched') return '<span style="color:#67c23a;font-weight:600">一致</span>'
+  if (value === 'local_desynced') return '<span style="color:#e6a23c;font-weight:600">本地账不一致</span>'
+  if (value === 'binance_spot_excess') return '<span style="color:#f56c6c;font-weight:600">Binance现货多余</span>'
+  if (value === 'gate_short_excess') return '<span style="color:#f56c6c;font-weight:600">Gate空头多余</span>'
   return '<span style="color:#f56c6c;font-weight:600">缺腿</span>'
 }
 
@@ -166,7 +173,7 @@ const rawColumnDefs = computed<ColDef<ReconRow>[]>(() => [
 const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
   { headerName: '标的', field: 'base_asset', width: 110, pinned: 'left', sort: 'asc' },
   { headerName: '对账时间', field: 'snapshot_at', width: 165 },
-  { headerName: '敞口状态', field: 'exposure_side', width: 130, cellRenderer: exposureRenderer },
+  { headerName: '综合状态', field: 'status', width: 145, cellRenderer: exposureRenderer },
   {
     headerName: 'Binance实仓',
     field: 'binance_exchange_value',
@@ -208,6 +215,7 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
     valueFormatter: (p) => formatNumber(p.value),
     cellStyle: diffStyle,
   },
+  { headerName: '交易所互对', field: 'exchange_match', width: 115, cellRenderer: matchRenderer },
   {
     headerName: 'Binance本地',
     field: 'binance_local_value',
@@ -241,8 +249,33 @@ const exposureColumnDefs = computed<ColDef<ExposureRow>[]>(() => [
     valueFormatter: (p) => formatNumber(p.value),
     cellStyle: diffStyle,
   },
-  { headerName: 'Binance对账', field: 'binance_match', width: 115, cellRenderer: matchRenderer },
-  { headerName: 'Gate对账', field: 'gate_match', width: 105, cellRenderer: matchRenderer },
+  {
+    headerName: '本地-Binance差',
+    field: 'local_binance_diff',
+    width: 145,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+    cellStyle: diffStyle,
+  },
+  {
+    headerName: '本地-Gate差',
+    field: 'local_gate_diff',
+    width: 135,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    valueFormatter: (p) => formatNumber(p.value),
+    cellStyle: diffStyle,
+  },
+  { headerName: '本地-Binance', field: 'binance_match', width: 125, cellRenderer: matchRenderer },
+  { headerName: '本地-Gate', field: 'gate_match', width: 115, cellRenderer: matchRenderer },
+  {
+    headerName: '建议动作',
+    field: 'recommended_action',
+    minWidth: 220,
+    flex: 1,
+    tooltipField: 'recommended_action',
+  },
 ])
 
 const defaultColDef: ColDef = {
@@ -256,6 +289,45 @@ const totalPages = computed(() =>
 )
 
 const exposureRows = computed<ExposureRow[]>(() => {
+  const combined = latestRows.value.filter((row) =>
+    String(row.exchange || '').toLowerCase() === 'combined' && row.dimension === 'exposure'
+  )
+  if (combined.length) {
+    return combined.map((row) => {
+      const detail = typeof row.detail === 'object' && row.detail ? row.detail as Record<string, any> : {}
+      const status = String(detail.status || 'matched') as ExposureRow['status']
+      const riskType = detail.risk_type == null ? null : String(detail.risk_type)
+      return {
+        base_asset: String(row.base_asset || '').toUpperCase(),
+        snapshot_at: row.snapshot_at,
+        status,
+        risk_type: riskType,
+        binance_exchange_value: toNumber(detail.binance_qty),
+        gate_exchange_contracts: toNumber(detail.gate_contracts),
+        gate_exchange_value: toNumber(detail.gate_qty),
+        gate_quanto_multiplier: toNumber(detail.quanto_multiplier),
+        exchange_diff: toNumber(detail.exchange_diff),
+        exposure_side: status === 'matched'
+          ? 'balanced'
+          : status === 'binance_spot_excess'
+            ? 'spot_long'
+            : status === 'gate_short_excess'
+              ? 'gate_short'
+              : 'missing_leg',
+        binance_local_value: toNumber(detail.local_spot_qty),
+        gate_local_contracts: toNumber(detail.local_gate_contracts),
+        gate_local_value: toNumber(detail.local_gate_qty),
+        local_diff: toNumber(detail.local_diff),
+        binance_match: Boolean(detail.local_binance_match),
+        gate_match: Boolean(detail.local_gate_match),
+        exchange_match: Boolean(detail.exchange_match),
+        local_binance_diff: toNumber(detail.local_binance_diff),
+        local_gate_diff: toNumber(detail.local_gate_diff),
+        recommended_action: String(detail.recommended_action || ''),
+      }
+    })
+  }
+
   const grouped = new Map<string, { binance?: ReconRow; gate?: ReconRow; snapshot_at: string }>()
   for (const row of latestRows.value) {
     if (row.dimension !== 'position') continue
@@ -306,12 +378,24 @@ const exposureRows = computed<ExposureRow[]>(() => {
       gate_quanto_multiplier: item.gate ? gateMultiplier : null,
       exchange_diff: exchangeDiff,
       exposure_side: exposureSide,
+      status: exposureSide === 'balanced'
+        ? 'matched'
+        : exposureSide === 'spot_long'
+          ? 'binance_spot_excess'
+          : exposureSide === 'gate_short'
+            ? 'gate_short_excess'
+            : 'missing_leg',
+      risk_type: exposureSide === 'balanced' ? null : exposureSide,
       binance_local_value: binanceLocal,
       gate_local_contracts: gateLocalContracts,
       gate_local_value: gateLocal,
       local_diff: localDiff,
       binance_match: item.binance ? isRowMatch(item.binance.is_match) : false,
       gate_match: item.gate ? isRowMatch(item.gate.is_match) : false,
+      exchange_match: exposureSide === 'balanced',
+      local_binance_diff: binanceExchange != null && binanceLocal != null ? binanceExchange - binanceLocal : null,
+      local_gate_diff: gateExchange != null && gateLocal != null ? gateExchange - gateLocal : null,
+      recommended_action: '',
     }
   })
 })
@@ -498,23 +582,7 @@ onMounted(async () => {
     </div>
 
     <el-tabs v-model="activeTab" class="recon-tabs">
-      <el-tab-pane label="明细" name="raw">
-        <div class="grid-container">
-          <AgGridVue
-            :theme="orderbookGridTheme"
-            :rowData="rowData"
-            :columnDefs="rawColumnDefs"
-            :defaultColDef="defaultColDef"
-            :getRowId="(params: any) => String(params.data.id)"
-            :tooltipShowDelay="300"
-            style="width: 100%; height: 100%"
-            @grid-ready="onGridReady"
-            @row-double-clicked="onRowDoubleClicked"
-          />
-        </div>
-      </el-tab-pane>
-
-      <el-tab-pane label="币种敞口" name="exposure">
+      <el-tab-pane label="合并对账" name="exposure">
         <div class="exposure-summary">
           <span>标的 {{ exposureSummary.total }}</span>
           <span class="summary-ok">平衡 {{ exposureSummary.balanced }}</span>
@@ -529,6 +597,22 @@ onMounted(async () => {
             :getRowId="(params: any) => String(params.data.base_asset)"
             style="width: 100%; height: 100%"
             @grid-ready="onExposureGridReady"
+          />
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="原始快照" name="raw">
+        <div class="grid-container">
+          <AgGridVue
+            :theme="orderbookGridTheme"
+            :rowData="rowData"
+            :columnDefs="rawColumnDefs"
+            :defaultColDef="defaultColDef"
+            :getRowId="(params: any) => String(params.data.id)"
+            :tooltipShowDelay="300"
+            style="width: 100%; height: 100%"
+            @grid-ready="onGridReady"
+            @row-double-clicked="onRowDoubleClicked"
           />
         </div>
       </el-tab-pane>
