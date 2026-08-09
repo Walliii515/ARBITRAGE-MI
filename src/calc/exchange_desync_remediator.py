@@ -809,6 +809,12 @@ class ExchangeDesyncRemediator:
         for pos in positions:
             position_id = int(pos['id'])
             orders = fetch_executed_position_orders(position_id)
+            close_funding_rate_24h = next((
+                order.get('funding_rate_24h')
+                for order in reversed(orders)
+                if str(order.get('order_side') or '').lower() == 'close'
+                and order.get('funding_rate_24h') is not None
+            ), None)
             close_values = self._close_execution_values(
                 orders,
                 str(pos.get('base_asset') or ''),
@@ -830,6 +836,7 @@ class ExchangeDesyncRemediator:
                     spot_close_amount = %(spot_close_amount)s,
                     future_close_amount = %(future_close_amount)s,
                     close_spread_bps = %(close_spread_bps)s,
+                    close_funding_rate_24h = %(close_funding_rate_24h)s,
                     exchange_risk_status = CASE
                         WHEN exchange_risk_status = 'desynced' THEN 'resolved'
                         ELSE exchange_risk_status
@@ -842,6 +849,7 @@ class ExchangeDesyncRemediator:
                     'closed_at': now,
                     'reason': reason,
                     'position_id': position_id,
+                    'close_funding_rate_24h': close_funding_rate_24h,
                     **close_values,
                 })
                 updated = int(getattr(cursor, 'rowcount', 0) or 0)
@@ -1985,6 +1993,7 @@ class ExchangeDesyncRemediator:
                 spot_close_amount = %(spot_close_amount)s,
                 future_close_amount = %(future_close_amount)s,
                 close_spread_bps = %(close_spread_bps)s,
+                close_funding_rate_24h = %(close_funding_rate_24h)s,
                 exchange_risk_status = 'resolved'
             WHERE id = %(position_id)s
         """
@@ -1997,6 +2006,11 @@ class ExchangeDesyncRemediator:
                 'spot_close_amount': spot_result.get('exec_amount'),
                 'future_close_amount': future_qty * future_price if future_price > 0 else None,
                 'close_spread_bps': round(close_spread, 2) if close_spread is not None else None,
+                'close_funding_rate_24h': (
+                    risk.get('funding_rate_24h')
+                    if risk.get('funding_rate_24h') is not None
+                    else pos.get('funding_rate_24h')
+                ),
                 'position_id': pos.get('id'),
             })
             pnl_values = self._compute_closed_position_pnl(pos)

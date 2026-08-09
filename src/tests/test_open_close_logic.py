@@ -454,6 +454,33 @@ class TestFutureMakerOpenConfig(unittest.TestCase):
 
         self.assertNotIn('execution_style', group['future_order'])
 
+    def test_create_position_persists_open_funding_snapshot(self):
+        te = make_trading_executor(contract_meta={'ASR': {'quanto_multiplier': 1}})
+        group = te._create_order_group({
+            'base_asset': 'ASR',
+            'contract': 'ASR_USDT',
+            'spot_qty': 10,
+            'open_amount_usdt': 10,
+            'funding_rate_24h': 0.00123,
+        })
+        exec_result = {
+            'spot_order': {'exec_price': 1.0, 'exec_qty': 10, 'exec_amount': 10},
+            'future_order': {'exec_price': 1.01, 'exec_qty': 10, 'exec_amount': 10.1},
+        }
+        cursor = MagicMock()
+        cursor.lastrowid = 42
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('calc.trading_executor.db_manager.get_cursor', return_value=context):
+            position_id = te._create_position(group, exec_result)
+
+        self.assertEqual(position_id, 42)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('open_funding_rate_24h', sql)
+        self.assertEqual(params['open_funding_rate_24h'], 0.00123)
+
 
 class TestRealExecutorGateParsing(unittest.TestCase):
     """Gate 成交解析：部分成交按 size-left 计算。"""
@@ -2751,6 +2778,31 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertTrue(te._pass_risk_check(row))
 
+    def test_persisted_funding_snapshots_do_not_change_open_risk_decision(self):
+        te = make_trading_executor(
+            min_funding_rate_bps=25.0,
+            min_funding_support_bps=8.0,
+            realtime_min_funding_rate_bps=5.0,
+            funding_support_min_samples=2,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 50.0, 0.0008)
+        row.update({
+            'funding_rate_24h_avg_bps': 8.5,
+            'funding_rate_24h_avg_samples': 3,
+            'funding_rate_24h_avg_window_hours': 24,
+        })
+
+        baseline = te._pass_risk_check(dict(row))
+        row.update({
+            'open_funding_rate_24h': -9.99,
+            'close_funding_rate_24h': -9.99,
+        })
+
+        self.assertTrue(baseline)
+        self.assertEqual(te._pass_risk_check(row), baseline)
+
     def test_funding_support_high_realtime_channel_bypasses_weak_history(self):
         te = make_trading_executor(
             min_funding_rate_bps=25.0,
@@ -3143,12 +3195,12 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
     def test_exchange_available_ratio_uses_split_thresholds(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.08,
+            min_binance_available_ratio=0.15,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
         te._account_summary = {
-            'binance': {'available': 200.0, 'net_value': 1000.0},
+            'binance': {'available': 251.0, 'net_value': 1000.0},
             'gate': fresh_safe_gate_summary(249.0, 1000.0),
         }
         te._account_summary_ts = time.time()
@@ -3159,14 +3211,14 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertIn('Gate下单后可用', reason)
         self.assertIn('总资金15%', reason)
 
-    def test_binance_available_ratio_blocks_below_eight_percent_reserve(self):
+    def test_binance_available_ratio_blocks_below_fifteen_percent_reserve(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.08,
+            min_binance_available_ratio=0.15,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
         te._account_summary = {
-            'binance': {'available': 179.0, 'net_value': 1000.0},
+            'binance': {'available': 249.0, 'net_value': 1000.0},
             'gate': fresh_safe_gate_summary(270.0, 1000.0),
         }
         te._account_summary_ts = time.time()
@@ -3175,16 +3227,16 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn('Binance下单后可用', reason)
-        self.assertIn('总资金8%', reason)
+        self.assertIn('总资金15%', reason)
 
-    def test_binance_available_ratio_allows_above_eight_percent_reserve(self):
+    def test_binance_available_ratio_allows_above_fifteen_percent_reserve(self):
         te = make_trading_executor(
-            min_binance_available_ratio=0.08,
+            min_binance_available_ratio=0.15,
             min_gate_available_ratio=0.15,
         )
         te.capital_required = True
         te._account_summary = {
-            'binance': {'available': 181.0, 'net_value': 1000.0},
+            'binance': {'available': 251.0, 'net_value': 1000.0},
             'gate': fresh_safe_gate_summary(270.0, 1000.0),
         }
         te._account_summary_ts = time.time()
@@ -5201,6 +5253,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(update_calls[0]['future_open_contracts'], 52.0)
         self.assertIn('部分平仓保留剩余', update_calls[0]['close_reason'])
         self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        self.assertFalse(any('close_funding_rate_24h' in sql for sql, _ in cursor.calls))
         self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
 
     def test_take_profit_partial_ioc_keeps_unequal_legs_at_same_hedge_ratio(self):
@@ -5362,13 +5415,21 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(pos['exchange_risk_type'], 'missing_gate_position')
 
     def test_take_profit_full_fill_marks_position_closed(self):
+        pos = self._bel_close_position(qty=410.0)
+        pos['funding_rate_24h'] = -0.00356
         cursor, triggered = self._record_save_close(
-            self._bel_close_position(qty=410.0),
+            pos,
             self._bel_close_order_group(qty=410.0),
             self._close_exec_result(410.0, 410.0),
         )
 
-        self.assertTrue(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        closed_updates = [
+            (sql, params) for sql, params in cursor.calls
+            if "status            = 'closed'" in sql
+        ]
+        self.assertEqual(len(closed_updates), 1)
+        self.assertIn('close_funding_rate_24h', closed_updates[0][0])
+        self.assertEqual(closed_updates[0][1]['close_funding_rate_24h'], -0.00356)
         self.assertFalse(any('spot_open_qty = %(spot_open_qty)s' in sql for sql, _ in cursor.calls))
         self.assertFalse(any('exchange_risk_status = ' in sql for sql, _ in cursor.calls))
         self.assertEqual(triggered, [])
@@ -5424,6 +5485,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(params['future_open_contracts'], 0.0)
         self.assertEqual(triggered, [('close_partial_desync', 'BEL')])
         self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        self.assertFalse(any('close_funding_rate_24h' in sql for sql, _ in cursor.calls))
 
     def test_failed_close_with_no_fills_does_not_create_false_desync(self):
         exec_result = {
@@ -5442,6 +5504,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertFalse(any(
             "exchange_risk_status = 'desynced'" in sql for sql, _ in cursor.calls
         ))
+        self.assertFalse(any('close_funding_rate_24h' in sql for sql, _ in cursor.calls))
         self.assertEqual(triggered, [])
 
     def test_take_profit_low_notional_residual_skips_execution(self):

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
+import { ref, shallowRef, reactive, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -66,6 +66,8 @@ interface PositionRow {
   future_close_price: number | null
   future_close_amount: number | null
   close_spread_bps: number | null
+  open_funding_rate_24h: number | null
+  close_funding_rate_24h: number | null
   close_reason: string | null
   exchange_risk_status: string | null
   exchange_risk_type: string | null
@@ -80,37 +82,53 @@ interface PositionRow {
   order_count: number | null
 }
 
-interface OrderSummary {
-  total: number
-  open: number
-  close: number
-  exchange_risk: number
-}
+type OrderView = 'open' | 'close'
 
 /* ───── 状态 ───── */
-const { gridContainerRef, setupGridCopy } = useGridCopy()
-void gridContainerRef
-const rowData = shallowRef<PositionRow[]>([])
-let gridApi: GridApi<PositionRow> | null = null
-const loading = ref(false)
-const orderSideFilter = ref<string>('')
+const { gridContainerRef: openGridContainerRef, setupGridCopy: setupOpenGridCopy } = useGridCopy()
+const { gridContainerRef: closeGridContainerRef, setupGridCopy: setupCloseGridCopy } = useGridCopy()
+void openGridContainerRef
+void closeGridContainerRef
+const openRowData = shallowRef<PositionRow[]>([])
+const closeRowData = shallowRef<PositionRow[]>([])
+let openGridApi: GridApi<PositionRow> | null = null
+let closeGridApi: GridApi<PositionRow> | null = null
+const activeTab = ref<OrderView>('open')
+const loadingByView = reactive<Record<OrderView, boolean>>({ open: false, close: false })
 const exchangeRiskOnly = ref<boolean>(false)
 const baseAssetFilter = ref<string>('')
 const filterDays = ref<number>(90) // 默认90天，与持仓监控一致
-const orderSummary = ref<OrderSummary>({ total: 0, open: 0, close: 0, exchange_risk: 0 })
 
 // 一键全部平仓
 const closeAllLoading = ref(false)
 
 // 分页配置
-const paginationPageSize = ref<number>(50)
 const paginationPageSizeOptions = [50, 100, 500, 1000, 5000]
-const paginationCurrentPage = ref<number>(1)
-const paginationTotal = ref<number>(0)
+const paginationByView = reactive<Record<OrderView, {
+  pageSize: number
+  currentPage: number
+  total: number
+}>>({
+  open: { pageSize: 50, currentPage: 1, total: 0 },
+  close: { pageSize: 50, currentPage: 1, total: 0 },
+})
+
+const activeLoading = computed(() => loadingByView[activeTab.value])
+const activePagination = computed(() => paginationByView[activeTab.value])
+const paginationCurrentPage = computed({
+  get: () => activePagination.value.currentPage,
+  set: (value: number) => { activePagination.value.currentPage = value },
+})
+const paginationPageSize = computed({
+  get: () => activePagination.value.pageSize,
+  set: (value: number) => { activePagination.value.pageSize = value },
+})
+const paginationTotal = computed(() => activePagination.value.total)
 
 /** 从当前数据中提取唯一标的资产列表，供下拉框选择 */
 const assetOptions = computed(() => {
-  const assets = new Set(rowData.value.map(r => r.base_asset).filter(Boolean) as string[])
+  const rows = activeTab.value === 'open' ? openRowData.value : closeRowData.value
+  const assets = new Set(rows.map(r => r.base_asset).filter(Boolean) as string[])
   return Array.from(assets).sort()
 })
 
@@ -121,7 +139,10 @@ const detailPositionId = ref<number | null>(null)
 const detailLoading = ref(false)
 
 /** 列状态持久化（数据库版） */
-const PAGE_KEY = 'order_management'
+const PAGE_KEYS: Record<OrderView, string> = {
+  open: 'order_management_open',
+  close: 'order_management_close',
+}
 
 /** 列选择面板 */
 interface ColumnVisibility {
@@ -165,6 +186,11 @@ const amountFormatter = (params: ValueFormatterParams) => {
 const bpsFormatter = (params: ValueFormatterParams) => {
   if (params.value == null) return ''
   return Number(params.value).toFixed(2) + ' bps'
+}
+
+const fundingBpsFormatter = (params: ValueFormatterParams) => {
+  if (params.value == null) return ''
+  return (Number(params.value) * 10000).toFixed(2) + ' bps'
 }
 
 const timeFormatter = (params: ValueFormatterParams) => {
@@ -229,7 +255,7 @@ const profileColorMap: Record<string, string> = {
 }
 
 /* ───── 列定义 ───── */
-const columnDefs = computed((): ColDef[] => [
+const baseColumnDefs = computed((): ColDef[] => [
   {
     headerName: '开仓时间',
     field: 'opened_at',
@@ -262,17 +288,6 @@ const columnDefs = computed((): ColDef[] => [
       const profile = params.value || 'normal'
       const color = profileColorMap[profile] || '#909399'
       return `<span style="color:${color};font-weight:700">${profile}</span>`
-    },
-  },
-  {
-    headerName: '方向',
-    field: 'status',
-    width: 80,
-    cellStyle: (params: any) => {
-      return { color: params.value === 'closed' ? '#e6a23c' : '#67c23a' }
-    },
-    cellRenderer: (params: any) => {
-      return params.value === 'closed' ? '平仓' : '开仓'
     },
   },
   {
@@ -330,6 +345,30 @@ const columnDefs = computed((): ColDef[] => [
     },
   },
   {
+    headerName: '平仓金额',
+    field: 'spot_close_amount',
+    width: 120,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: amountFormatter,
+  },
+  {
+    headerName: '平仓VWAP(S/F)',
+    colId: 'close_vwap',
+    width: 160,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    cellRenderer: (params: any) => {
+      const row = params.data as PositionRow
+      const sp = row?.spot_close_price
+      const fp = row?.future_close_price
+      const fmt = (v: number | null) => v != null ? formatDecimal(v, 4) : '-'
+      return `${fmt(sp)}/${fmt(fp)}`
+    },
+  },
+  {
     headerName: '开仓基差(bps)',
     field: 'open_spread_bps',
     width: 120,
@@ -348,6 +387,15 @@ const columnDefs = computed((): ColDef[] => [
     valueFormatter: bpsFormatter,
   },
   {
+    headerName: '开仓24h资金费率',
+    field: 'open_funding_rate_24h',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: fundingBpsFormatter,
+  },
+  {
     headerName: '平仓基差(bps)',
     field: 'close_spread_bps',
     width: 120,
@@ -364,6 +412,15 @@ const columnDefs = computed((): ColDef[] => [
     cellClass: 'ag-right-aligned-cell',
     headerClass: 'ag-right-aligned-header',
     valueFormatter: bpsFormatter,
+  },
+  {
+    headerName: '平仓24h资金费率',
+    field: 'close_funding_rate_24h',
+    width: 150,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: fundingBpsFormatter,
   },
 
   {
@@ -404,6 +461,32 @@ const columnDefs = computed((): ColDef[] => [
   },
 ])
 
+const openColumnIds = new Set([
+  'opened_at', 'base_asset', 'market_profile', 'exchange_risk_type', 'channel',
+  'gate_leverage', 'spot_open_amount', 'open_vwap', 'open_spread_bps',
+  'open_vwap_threshold_bps', 'open_funding_rate_24h', 'open_reason', 'action',
+])
+
+const openColumnDefs = computed((): ColDef[] => (
+  baseColumnDefs.value.filter((col) => openColumnIds.has(String(col.field || col.colId || '')))
+))
+
+const closeColumnIds = new Set([
+  'closed_at', 'opened_at', 'base_asset', 'market_profile', 'exchange_risk_type',
+  'channel', 'gate_leverage', 'spot_close_amount', 'close_vwap', 'close_spread_bps',
+  'close_vwap_threshold_bps', 'close_funding_rate_24h', 'close_reason', 'action',
+])
+
+const closeColumnDefs = computed((): ColDef[] => {
+  const defs = baseColumnDefs.value.filter((col) => (
+    closeColumnIds.has(String(col.field || col.colId || ''))
+  ))
+  const closeTime = defs.find((col) => col.field === 'closed_at')
+  return closeTime
+    ? [closeTime, ...defs.filter((col) => col !== closeTime)]
+    : defs
+})
+
 const defaultColDef: ColDef = {
   sortable: true,
   resizable: true,
@@ -436,35 +519,50 @@ async function openDetailDialog(positionId: number | null) {
 }
 
 /** 快捷时间过滤 */
+function resetFilterPagination() {
+  paginationByView.open.currentPage = 1
+  paginationByView.close.currentPage = 1
+}
+
 function setDaysFilter(days: number) {
   filterDays.value = days
-  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  resetFilterPagination()
   fetchOrders()
 }
 
 /** 交易所风险过滤 */
 function setExchangeRiskOnly(enabled: boolean) {
   exchangeRiskOnly.value = enabled
-  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+  resetFilterPagination()
   fetchOrders()
 }
 
-/** 快捷方向过滤 */
-function setOrderSideFilter(side: string) {
-  orderSideFilter.value = side
-  paginationCurrentPage.value = 1 // 切换筛选条件时回到第一页
+function onBaseAssetChange() {
+  resetFilterPagination()
   fetchOrders()
 }
-async function fetchOrders() {
-  loading.value = true
+
+function fetchActiveOrders() {
+  fetchOrders(activeTab.value)
+}
+
+async function onTabChange(tab: string | number) {
+  const view = String(tab) as OrderView
+  if (view !== 'open' && view !== 'close') return
+  activeTab.value = view
+  await nextTick()
+  fetchOrders(view)
+}
+
+async function fetchOrders(view: OrderView = activeTab.value) {
+  loadingByView[view] = true
   try {
+    const pagination = paginationByView[view]
     const params = new URLSearchParams()
+    params.set('view', view)
     params.set('days', String(filterDays.value))
-    params.set('page', String(paginationCurrentPage.value))
-    params.set('page_size', String(paginationPageSize.value))
-    if (orderSideFilter.value) {
-      params.set('order_side', orderSideFilter.value)
-    }
+    params.set('page', String(pagination.currentPage))
+    params.set('page_size', String(pagination.pageSize))
     if (exchangeRiskOnly.value) {
       params.set('exchange_risk', 'true')
     }
@@ -479,48 +577,52 @@ async function fetchOrders() {
       return
     }
     const data = await res.json()
-    rowData.value = data.orders || []
-    orderSummary.value = {
-      total: Number(data.summary?.total || 0),
-      open: Number(data.summary?.open || 0),
-      close: Number(data.summary?.close || 0),
-      exchange_risk: Number(data.summary?.exchange_risk || 0),
-    }
+    if (view === 'open') openRowData.value = data.orders || []
+    else closeRowData.value = data.orders || []
     
     // 更新分页信息
     if (data.pagination) {
-      paginationTotal.value = data.pagination.total || 0
+      pagination.total = data.pagination.total || 0
     }
   } catch {
     showError('请求订单数据失败')
   } finally {
-    loading.value = false
+    loadingByView[view] = false
   }
 }
 
 /** 页码变化 */
 function onPageChange(page: number) {
-  paginationCurrentPage.value = page
+  activePagination.value.currentPage = page
   fetchOrders()
 }
 
 /** 每页条数变化 */
 function onPaginationSizeChange() {
-  paginationCurrentPage.value = 1 // 切换每页条数时回到第一页
+  activePagination.value.currentPage = 1
   fetchOrders()
 }
 
 /** 计算总页数 */
 const totalPages = computed(() => {
-  return Math.ceil(paginationTotal.value / paginationPageSize.value) || 1
+  return Math.ceil(activePagination.value.total / activePagination.value.pageSize) || 1
 })
+
+function activeGridApi(): GridApi<PositionRow> | null {
+  return activeTab.value === 'open' ? openGridApi : closeGridApi
+}
+
+function activeColumnDefs(): ColDef[] {
+  return activeTab.value === 'open' ? openColumnDefs.value : closeColumnDefs.value
+}
 
 /* ───── 列选择面板 ───── */
 function refreshColumnVisibilities() {
-  if (!gridApi) return
-  const states = gridApi.getColumnState()
-  columnVisibilities.value = columnDefs.value
-    .filter((col) => col.field)
+  const api = activeGridApi()
+  if (!api) return
+  const states = api.getColumnState()
+  columnVisibilities.value = activeColumnDefs()
+    .filter((col) => col.field || col.colId)
     .map((col) => {
       const state = states.find((s) => s.colId === (col.field ?? col.colId))
       return {
@@ -532,18 +634,20 @@ function refreshColumnVisibilities() {
 }
 
 function toggleColumnVisibility(colId: string, visible: boolean) {
-  if (!gridApi) return
-  gridApi.setColumnsVisible([colId], visible)
+  const api = activeGridApi()
+  if (!api) return
+  api.setColumnsVisible([colId], visible)
   const col = columnVisibilities.value.find((c) => c.colId === colId)
   if (col) col.visible = visible
 }
 
 /** 保存列配置到数据库 */
 async function saveColumnState() {
-  if (!gridApi) return
-  const columnState = gridApi.getColumnState()
+  const api = activeGridApi()
+  if (!api) return
+  const columnState = api.getColumnState()
   try {
-    const res = await post(`/api/trading/column-config/${PAGE_KEY}`, { columnState })
+    const res = await post(`/api/trading/column-config/${PAGE_KEYS[activeTab.value]}`, { columnState })
     const data = await res.json()
     if (data?.success) {
       showSuccess('列配置已保存')
@@ -556,13 +660,12 @@ async function saveColumnState() {
 }
 
 /** 从数据库加载列配置 */
-async function loadColumnState() {
-  if (!gridApi) return
+async function loadColumnState(view: OrderView, api: GridApi<PositionRow>) {
   try {
-    const res = await get(`/api/trading/column-config/${PAGE_KEY}`)
+    const res = await get(`/api/trading/column-config/${PAGE_KEYS[view]}`)
     const data = await res.json()
     if (data?.columnState && Array.isArray(data.columnState)) {
-      gridApi.applyColumnState({ state: data.columnState, applyOrder: true })
+      api.applyColumnState({ state: data.columnState, applyOrder: true })
     }
   } catch (e) {
     console.warn('Failed to load column config from server:', e)
@@ -570,10 +673,16 @@ async function loadColumnState() {
 }
 
 /* ───── AG Grid 回调 ───── */
-function onGridReady(params: GridReadyEvent) {
-  gridApi = params.api
-  loadColumnState()
-  setupGridCopy(params.api)
+function onOpenGridReady(params: GridReadyEvent<PositionRow>) {
+  openGridApi = params.api
+  loadColumnState('open', params.api)
+  setupOpenGridCopy(params.api)
+}
+
+function onCloseGridReady(params: GridReadyEvent<PositionRow>) {
+  closeGridApi = params.api
+  loadColumnState('close', params.api)
+  setupCloseGridCopy(params.api)
 }
 
 /** 双击行打开详情弹窗 */
@@ -678,17 +787,10 @@ onUnmounted(() => {
   <div class="monitor-page">
     <el-card shadow="never" class="status-card">
       <div class="filter-row">
-        <span class="filter-label">方向：</span>
-        <el-button-group size="small">
-          <el-button :type="orderSideFilter === '' ? 'primary' : 'default'" @click="setOrderSideFilter('')">全部({{ orderSummary.total }})</el-button>
-          <el-button :type="orderSideFilter === 'open' ? 'primary' : 'default'" @click="setOrderSideFilter('open')">开仓({{ orderSummary.open }})</el-button>
-          <el-button :type="orderSideFilter === 'close' ? 'primary' : 'default'" @click="setOrderSideFilter('close')">平仓({{ orderSummary.close }})</el-button>
-        </el-button-group>
-
-        <span class="filter-label" style="margin-left: 24px;">交易所风险：</span>
+        <span class="filter-label">交易所风险：</span>
         <el-button-group size="small">
           <el-button :type="!exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(false)">全部</el-button>
-          <el-button :type="exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(true)">有风险({{ orderSummary.exchange_risk }})</el-button>
+          <el-button :type="exchangeRiskOnly ? 'primary' : 'default'" @click="setExchangeRiskOnly(true)">有风险</el-button>
         </el-button-group>
       </div>
 
@@ -710,7 +812,7 @@ onUnmounted(() => {
           filterable
           clearable
           style="width: 150px;"
-          @change="fetchOrders"
+          @change="onBaseAssetChange"
         >
           <el-option
             v-for="asset in assetOptions"
@@ -724,8 +826,8 @@ onUnmounted(() => {
           size="small"
           type="primary"
           style="margin-left: auto;"
-          :loading="loading"
-          @click="fetchOrders"
+          :loading="activeLoading"
+          @click="fetchActiveOrders"
         >
           刷新
         </el-button>
@@ -775,21 +877,42 @@ onUnmounted(() => {
           </div>
         </div>
       </template>
-      <div ref="gridContainerRef">
-      <ag-grid-vue
-        class="orderbook-grid"
-        :theme="orderbookGridTheme"
-        :columnDefs="columnDefs"
-        :rowData="rowData"
-        :defaultColDef="defaultColDef"
-        :getRowId="getRowId"
-        :header-height="32"
-        :row-height="32"
-        :tooltipShowDelay="300"
-        @grid-ready="onGridReady"
-        @row-double-clicked="onRowDoubleClicked"
-      />
-      </div>
+      <el-tabs v-model="activeTab" class="order-tabs" @tab-change="onTabChange">
+        <el-tab-pane label="开仓" name="open">
+          <div ref="openGridContainerRef">
+            <ag-grid-vue
+              class="orderbook-grid"
+              :theme="orderbookGridTheme"
+              :columnDefs="openColumnDefs"
+              :rowData="openRowData"
+              :defaultColDef="defaultColDef"
+              :getRowId="getRowId"
+              :header-height="32"
+              :row-height="32"
+              :tooltipShowDelay="300"
+              @grid-ready="onOpenGridReady"
+              @row-double-clicked="onRowDoubleClicked"
+            />
+          </div>
+        </el-tab-pane>
+        <el-tab-pane label="平仓" name="close" lazy>
+          <div ref="closeGridContainerRef">
+            <ag-grid-vue
+              class="orderbook-grid"
+              :theme="orderbookGridTheme"
+              :columnDefs="closeColumnDefs"
+              :rowData="closeRowData"
+              :defaultColDef="defaultColDef"
+              :getRowId="getRowId"
+              :header-height="32"
+              :row-height="32"
+              :tooltipShowDelay="300"
+              @grid-ready="onCloseGridReady"
+              @row-double-clicked="onRowDoubleClicked"
+            />
+          </div>
+        </el-tab-pane>
+      </el-tabs>
     </el-card>
 
     <!-- 底部分页控件 -->

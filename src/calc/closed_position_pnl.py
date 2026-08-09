@@ -123,11 +123,12 @@ def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[D
 
 def fetch_executed_position_orders(position_id: int) -> list[Dict]:
     sql = """
-        SELECT order_side, market_type, status, exec_price, exec_qty, exec_amount, target_amount,
-               fee_rate, fee_amount_usdt
+        SELECT id, order_side, market_type, status, exec_price, exec_qty, exec_amount, target_amount,
+               fee_rate, fee_amount_usdt, funding_rate_24h, executed_at
         FROM mi_trade_order
         WHERE position_id = %s
           AND status = 'executed'
+        ORDER BY id ASC
     """
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, (position_id,))

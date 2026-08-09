@@ -374,9 +374,8 @@ def _attach_delist_risks(rows: List[Dict[str, Any]]) -> None:
 
 @router.get('/orders')
 async def get_orders(
-    status: Optional[str] = Query(None, description="持仓状态(holding/closed)"),
+    view: str = Query('open', pattern='^(open|close)$', description="订单视图(open/close)"),
     channel: Optional[str] = Query(None, description="渠道过滤"),
-    order_side: Optional[str] = Query(None, description="方向过滤(open=持仓中/close=已平仓)"),
     exchange_risk: bool = Query(False, description="仅展示交易所风险持仓"),
     position_id: Optional[int] = Query(None, description="持仓ID过滤"),
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
@@ -384,7 +383,7 @@ async def get_orders(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页持仓数"),
 ):
-    """查询持仓列表（直接查 mi_trade_position，按持仓分页）"""
+    """按当前持仓状态查询开仓或平仓视图，过滤、排序与分页全部在后端完成。"""
     close_threshold_col = config.get_str(
         'trade.vwap.close_threshold_percentile',
         'close_basis_p20',
@@ -393,20 +392,17 @@ async def get_orders(
         logger.warning(f'无效平仓VWAP阈值字段 {close_threshold_col}，回退 close_basis_p20')
         close_threshold_col = 'close_basis_p20'
 
-    # ─── 构建 WHERE 条件 ───
-    base_where_clauses = ["p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
-    base_params: list = [days]
+    normalized_view = str(view or '').strip().lower()
+    if normalized_view not in {'open', 'close'}:
+        raise HTTPException(status_code=400, detail='view 必须为 open 或 close')
 
-    legacy_status_clause = None
-    if status in ('holding', 'closed'):
-        legacy_status_clause = status
-    elif status in ('pending', 'rejected', 'failed'):
-        # 这些状态不适用于持仓级别，返回空。保留兼容旧前端/旧书签。
-        return {
-            'orders': [],
-            'pagination': {'page': page, 'page_size': page_size, 'total': 0, 'total_pages': 0},
-            'summary': {'total': 0, 'open': 0, 'close': 0, 'exchange_risk': 0},
-        }
+    status_value = 'holding' if normalized_view == 'open' else 'closed'
+    time_column = 'p.opened_at' if normalized_view == 'open' else 'p.closed_at'
+    base_where_clauses = [
+        "p.status = %s",
+        f"{time_column} >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+    ]
+    base_params: list = [status_value, days]
 
     if base_asset:
         base_where_clauses.append("p.base_asset = %s")
@@ -433,51 +429,8 @@ async def get_orders(
         else:
             base_where_clauses.append("p.exchange_risk_status = 'desynced'")
 
-    where_clauses = list(base_where_clauses)
+    where_sql = " AND ".join(base_where_clauses)
     params = list(base_params)
-
-    # 方向过滤 → 映射为持仓状态
-    if order_side == 'open':
-        where_clauses.append("p.status = 'holding'")
-    elif order_side == 'close':
-        where_clauses.append("p.status = 'closed'")
-    elif legacy_status_clause:
-        where_clauses.append("p.status = %s")
-        params.append(legacy_status_clause)
-
-    where_sql = " AND ".join(where_clauses)
-    summary_where_sql = " AND ".join(base_where_clauses)
-
-    if delist_risk_assets:
-        risk_placeholders = ','.join(['%s'] * len(delist_risk_assets))
-        summary_risk_expr = (
-            "p.exchange_risk_status = 'desynced' "
-            f"OR UPPER(TRIM(p.base_asset)) IN ({risk_placeholders})"
-        )
-        # SELECT 中的 risk_expr 占位符会先于 WHERE 被绑定。
-        summary_params = list(delist_risk_assets) + list(base_params)
-    else:
-        summary_risk_expr = "p.exchange_risk_status = 'desynced'"
-        summary_params = list(base_params)
-
-    summary_sql = f"""
-        SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN p.status = 'holding' THEN 1 ELSE 0 END) AS open_count,
-            SUM(CASE WHEN p.status = 'closed' THEN 1 ELSE 0 END) AS close_count,
-            SUM(CASE WHEN {summary_risk_expr} THEN 1 ELSE 0 END) AS exchange_risk_count
-        FROM mi_trade_position p
-        WHERE {summary_where_sql}
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(summary_sql, summary_params)
-        summary_row = cursor.fetchone() or {}
-        summary = {
-            'total': int(summary_row.get('total') or 0),
-            'open': int(summary_row.get('open_count') or 0),
-            'close': int(summary_row.get('close_count') or 0),
-            'exchange_risk': int(summary_row.get('exchange_risk_count') or 0),
-        }
 
     # ─── 统计持仓总数 ───
     count_sql = f"SELECT COUNT(*) AS total FROM mi_trade_position p WHERE {where_sql}"
@@ -520,7 +473,7 @@ async def get_orders(
                AND latest.calc_date = v.calc_date
         ) t ON t.base_asset = p.base_asset
         WHERE {where_sql}
-        ORDER BY p.id DESC
+        ORDER BY {time_column} DESC, p.id DESC
         LIMIT %s OFFSET %s
     """
     with db_manager.get_cursor() as cursor:
@@ -536,7 +489,7 @@ async def get_orders(
             'total': total,
             'total_pages': (total + page_size - 1) // page_size if total else 0,
         },
-        'summary': summary,
+        'view': normalized_view,
     }
 
 

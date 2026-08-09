@@ -903,6 +903,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
                     'base_asset': 'AI',
                     'future_open_qty': 2927.0,
                     'future_open_price': 0.0212,
+                    'funding_rate_24h': 0.0017,
                 },
                 {'exec_price': 0.025, 'exec_amount': 73.175},
                 {'type': 'missing_gate_position'},
@@ -913,6 +914,41 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertIsNone(cursor.params['future_close_price'])
         self.assertIsNone(cursor.params['future_close_amount'])
         self.assertIsNone(cursor.params['close_spread_bps'])
+        self.assertEqual(cursor.params['close_funding_rate_24h'], 0.0017)
+
+    def test_close_position_prefers_risk_funding_snapshot_over_position_value(self):
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1}}
+
+        cursor = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+        remediator = ExchangeDesyncRemediator(
+            FakeExecutor(),
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+
+        with (
+            patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=context),
+            patch.object(remediator, '_compute_closed_position_pnl', return_value=None),
+        ):
+            remediator._close_position(
+                {
+                    'id': 438,
+                    'base_asset': 'AI',
+                    'future_open_qty': 10.0,
+                    'funding_rate_24h': 0.0017,
+                },
+                {'exec_price': 0.025, 'exec_amount': 0.25},
+                {'type': 'missing_gate_position', 'funding_rate_24h': -0.0021},
+                '交易所断腿自动处置|missing_gate_position',
+                datetime(2026, 6, 30, 11, 2, 20),
+            )
+
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('close_funding_rate_24h', sql)
+        self.assertEqual(params['close_funding_rate_24h'], -0.0021)
 
     def test_close_position_updates_order_level_pnl_when_available(self):
         class FakeExecutor:
@@ -1649,8 +1685,14 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         orders = [
             {'order_side': 'open', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10},
             {'order_side': 'open', 'market_type': 'future', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10.1},
-            {'order_side': 'close', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10.2},
-            {'order_side': 'close', 'market_type': 'future', 'status': 'executed', 'exec_qty': 1, 'exec_amount': 10},
+            {
+                'order_side': 'close', 'market_type': 'spot', 'status': 'executed',
+                'exec_qty': 1, 'exec_amount': 10.2, 'funding_rate_24h': 0.0011,
+            },
+            {
+                'order_side': 'close', 'market_type': 'future', 'status': 'executed',
+                'exec_qty': 1, 'exec_amount': 10, 'funding_rate_24h': 0.0013,
+            },
         ]
         cursor = MagicMock()
         context = MagicMock()
@@ -1681,6 +1723,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(status_params['future_open_qty'], 1.0)
         self.assertEqual(status_params['future_open_contracts'], 10.0)
         self.assertEqual(status_params['spot_open_amount'], 10.0)
+        self.assertEqual(status_params['close_funding_rate_24h'], 0.0013)
         self.assertNotIn('future_open_amount', status_sql)
         pnl = update_pnl.call_args.args[2]
         self.assertAlmostEqual(pnl['realized_pnl'], 0.3)

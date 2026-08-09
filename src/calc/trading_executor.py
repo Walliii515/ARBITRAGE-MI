@@ -3582,6 +3582,7 @@ class TradingExecutor:
                 spot_open_qty, spot_open_price, spot_open_amount,
                 future_open_qty, future_open_price, future_open_contracts,
                 open_spread_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps, open_reason,
+                open_funding_rate_24h,
                 funding_rate_sum_bps, funding_payments_count, funding_total_pnl
             ) VALUES (
                 %(order_uuid)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
@@ -3589,6 +3590,7 @@ class TradingExecutor:
                 %(spot_open_qty)s, %(spot_open_price)s, %(spot_open_amount)s,
                 %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s,
                 %(open_spread_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s, %(open_reason)s,
+                %(open_funding_rate_24h)s,
                 0, 0, 0
             )
         """
@@ -3614,6 +3616,7 @@ class TradingExecutor:
             'pre_gate_basis_bps': order_group.get('pre_gate_basis_bps'),
             'actual_basis_bps': order_group.get('actual_basis_bps'),
             'open_reason': order_group.get('open_reason'),
+            'open_funding_rate_24h': order_group.get('funding_rate_24h'),
         }
         
         with db_manager.get_cursor() as cursor:

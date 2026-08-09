@@ -70,13 +70,13 @@ class PositionTracker:
                 order_uuid, base_asset, spot_symbol, future_contract, status, opened_at,
                 spot_open_qty, spot_open_price, spot_open_amount,
                 future_open_qty, future_open_price, future_open_contracts,
-                open_spread_bps, next_funding_time
+                open_spread_bps, open_funding_rate_24h, next_funding_time
             ) VALUES (
                 %(order_uuid)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 'holding', NOW(),
                 %(spot_open_qty)s, %(spot_open_price)s, %(spot_open_amount)s,
                 %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s,
-                %(open_spread_bps)s, %(next_funding_time)s
+                %(open_spread_bps)s, %(open_funding_rate_24h)s, %(next_funding_time)s
             )
         """
         
@@ -92,6 +92,7 @@ class PositionTracker:
             'future_open_price': future_exec['exec_price'],
             'future_open_contracts': future_contracts,
             'open_spread_bps': round(open_spread_bps, 2),
+            'open_funding_rate_24h': order_group.get('funding_rate_24h'),
             'next_funding_time': next_funding_time,
         }
         

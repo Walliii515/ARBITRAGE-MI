@@ -2516,7 +2516,8 @@ class ClosingExecutor:
                     future_close_price= %(future_close_price)s,
                     spot_close_amount = %(spot_close_amount)s,
                     future_close_amount = %(future_close_amount)s,
-                    close_spread_bps  = %(close_spread_bps)s
+                    close_spread_bps  = %(close_spread_bps)s,
+                    close_funding_rate_24h = %(close_funding_rate_24h)s
                 WHERE id = %(position_id)s
             """
             with db_manager.get_cursor() as cursor:
@@ -2528,6 +2529,7 @@ class ClosingExecutor:
                     'spot_close_amount':    spot_close_amount,
                     'future_close_amount':  future_close_amount,
                     'close_spread_bps':     close_spread_bps,
+                    'close_funding_rate_24h': pos.get('funding_rate_24h'),
                     'position_id':          position_id,
                 })
                 if pnl_values:
