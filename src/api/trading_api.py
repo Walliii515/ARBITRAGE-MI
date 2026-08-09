@@ -481,6 +481,21 @@ async def get_orders(
         rows = cursor.fetchall()
     _attach_delist_risks(rows)
 
+    tab_summary_sql = """
+        SELECT
+            (SELECT COUNT(*)
+             FROM mi_trade_position
+             WHERE status = 'holding') AS current_open,
+            (SELECT COUNT(*)
+             FROM mi_trade_position
+             WHERE status = 'closed'
+               AND closed_at >= CURDATE()
+               AND closed_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)) AS today_closed
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(tab_summary_sql)
+        tab_summary_row = cursor.fetchone() or {}
+
     return {
         'orders': _serialize_rows(rows),
         'pagination': {
@@ -490,6 +505,10 @@ async def get_orders(
             'total_pages': (total + page_size - 1) // page_size if total else 0,
         },
         'view': normalized_view,
+        'summary': {
+            'current_open': int(tab_summary_row.get('current_open') or 0),
+            'today_closed': int(tab_summary_row.get('today_closed') or 0),
+        },
     }
 
 

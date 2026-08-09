@@ -20,7 +20,10 @@ def _query_orders(
     page_size=50,
 ):
     cursor = MagicMock()
-    cursor.fetchone.return_value = {'total': 1}
+    cursor.fetchone.side_effect = [
+        {'total': 1},
+        {'current_open': 12, 'today_closed': 7},
+    ]
     cursor.fetchall.return_value = [{
         'id': 7,
         'base_asset': 'AI',
@@ -107,6 +110,19 @@ def test_order_views_are_read_only_and_do_not_touch_execution_state():
         assert not any(word in sql for word in ('UPDATE ', 'INSERT ', 'DELETE '))
 
 
+def test_order_views_return_unfiltered_current_open_and_today_closed_tab_counts():
+    result, calls = _query_orders('close', base_asset='AI', days=90)
+
+    summary_sql = calls[2].args[0]
+    assert "status = 'holding'" in summary_sql
+    assert "status = 'closed'" in summary_sql
+    assert 'closed_at >= CURDATE()' in summary_sql
+    assert 'closed_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)' in summary_sql
+    assert 'base_asset' not in summary_sql
+    assert len(calls[2].args) == 1
+    assert result['summary'] == {'current_open': 12, 'today_closed': 7}
+
+
 def test_order_view_rejects_unknown_scope_before_querying_database():
     with patch('api.trading_api.db_manager.get_cursor') as get_cursor:
         with pytest.raises(HTTPException) as raised:
@@ -139,6 +155,10 @@ def test_order_management_uses_two_grids_and_independent_column_configs():
     assert 'paginationByView.open.currentPage = 1' in source
     assert 'paginationByView.close.currentPage = 1' in source
     assert 'autoRefreshTimer = setInterval(fetchOrders, 2000)' in source
+    assert ':label="`开仓：${orderSummary.currentOpen}条`"' in source
+    assert ':label="`今日平仓：${orderSummary.todayClosed}条`"' in source
+    assert 'data.summary.current_open' in source
+    assert 'data.summary.today_closed' in source
 
 
 def test_order_management_uses_compact_single_row_toolbar_and_tab_actions():

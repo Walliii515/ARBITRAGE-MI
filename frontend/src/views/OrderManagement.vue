@@ -95,6 +95,7 @@ let openGridApi: GridApi<PositionRow> | null = null
 let closeGridApi: GridApi<PositionRow> | null = null
 const activeTab = ref<OrderView>('open')
 const loadingByView = reactive<Record<OrderView, boolean>>({ open: false, close: false })
+const orderSummary = reactive({ currentOpen: 0, todayClosed: 0 })
 const exchangeRiskOnly = ref<boolean>(false)
 const baseAssetFilter = ref<string>('')
 const filterDays = ref<number>(90) // 默认90天，与持仓监控一致
@@ -580,6 +581,11 @@ async function fetchOrders(view: OrderView = activeTab.value) {
     const data = await res.json()
     if (view === 'open') openRowData.value = data.orders || []
     else closeRowData.value = data.orders || []
+
+    if (data.summary) {
+      orderSummary.currentOpen = Number(data.summary.current_open) || 0
+      orderSummary.todayClosed = Number(data.summary.today_closed) || 0
+    }
     
     // 更新分页信息
     if (data.pagination) {
@@ -873,7 +879,7 @@ onUnmounted(() => {
         </el-button>
       </div>
       <el-tabs v-model="activeTab" class="order-tabs" @tab-change="onTabChange">
-        <el-tab-pane label="开仓" name="open">
+        <el-tab-pane :label="`开仓：${orderSummary.currentOpen}条`" name="open">
           <div ref="openGridContainerRef">
             <ag-grid-vue
               class="orderbook-grid"
@@ -890,7 +896,7 @@ onUnmounted(() => {
             />
           </div>
         </el-tab-pane>
-        <el-tab-pane label="平仓" name="close" lazy>
+        <el-tab-pane :label="`今日平仓：${orderSummary.todayClosed}条`" name="close" lazy>
           <div ref="closeGridContainerRef">
             <ag-grid-vue
               class="orderbook-grid"
