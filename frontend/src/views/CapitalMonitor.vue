@@ -756,7 +756,7 @@ function gatePriorityReasonText(): string {
   if (Number.isFinite(mmr) && mmr <= 300) {
     return `${reason}；当前处于300%分步风险减仓`
   }
-  return `${reason}；350%先释放盈利仓，降至300%后按风险候选减仓`
+  return `${reason}；350%且自动划转资金不足时先释放盈利仓，降至300%后按风险候选减仓`
 }
 
 function formatTooltipTime(value: unknown): string {
@@ -1665,7 +1665,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="mmr-help-row">
                   <strong class="risk-warning">350%</strong>
-                  <span>每个新的 Gate 官方风险快照最多平一笔预计整组套利净收益为正的仓位，释放 Binance 资金后再次尝试自动划转；没有可确认的盈利仓位时不会为了该档位强行平仓。</span>
+                  <span>仅当最近一次自动划转评估明确为“可划资金不足”时，才平一笔预计整组套利净收益为正的仓位。成功释放 Binance 资金后立即重新评估划转，在得到新的“仍然不足”结论前不会继续释放下一笔；活动划转、失败锁、陈旧资金摘要或异常输入均禁止该档位平仓。</span>
                 </div>
                 <div class="mmr-help-row">
                   <strong class="risk-danger">300%</strong>

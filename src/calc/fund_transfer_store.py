@@ -173,6 +173,20 @@ class FundTransferStore:
                 for row in (cursor.fetchall() or [])
             ]
 
+    def get_latest_by_initiator(self, initiator: str) -> Optional[Dict[str, Any]]:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM mi_fund_transfer_task
+                WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.initiator')) = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(initiator or ''),),
+            )
+            return _normalize_row(cursor.fetchone())
+
     def get_unnotified_terminal(self) -> Optional[Dict[str, Any]]:
         statuses = sorted(TERMINAL_STATUSES)
         placeholders = ', '.join(['%s'] * len(statuses))

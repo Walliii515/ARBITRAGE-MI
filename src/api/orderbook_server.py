@@ -1587,10 +1587,16 @@ def _evaluate_auto_fund_transfer(snapshot: Dict) -> Dict:
     if not config.get_bool(
         'account_capital.gate_cross_risk.auto_fund_transfer.enabled', True
     ):
+        if _auto_fund_transfer_coordinator is not None:
+            _auto_fund_transfer_coordinator.suspend_profit_release()
         return {'action': 'disabled_by_config'}
     if _open_paused:
+        if _auto_fund_transfer_coordinator is not None:
+            _auto_fund_transfer_coordinator.suspend_profit_release()
         return {'action': 'disabled_with_forward_open'}
     if str((snapshot or {}).get('health_status') or '') != 'healthy':
+        if _auto_fund_transfer_coordinator is not None:
+            _auto_fund_transfer_coordinator.suspend_profit_release()
         return {'action': 'risk_snapshot_not_healthy'}
     if _auto_fund_transfer_coordinator is None:
         _auto_fund_transfer_coordinator = AutoFundTransferCoordinator(
@@ -1613,6 +1619,20 @@ def _evaluate_auto_fund_transfer(snapshot: Dict) -> Dict:
     except Exception as exc:
         logger.error('Gate全仓MMR自动补资评估失败: %s', exc, exc_info=True)
         return {'action': 'error', 'error': str(exc)[:300]}
+
+
+def _auto_fund_profit_release_allowed() -> bool:
+    coordinator = _auto_fund_transfer_coordinator
+    return bool(
+        coordinator is not None
+        and not _open_paused
+        and not fund_transfer_open_locked()
+        and config.get_bool(
+            'account_capital.gate_cross_risk.auto_fund_transfer.enabled',
+            True,
+        )
+        and coordinator.is_profit_release_allowed()
+    )
 
 
 def _record_gate_cross_risk_collection_failure(exc: Exception) -> int:
@@ -1662,13 +1682,7 @@ def _configure_closing_executor(executor):
         executor.set_gate_cross_risk_provider(_get_live_gate_cross_risk_snapshot)
     if hasattr(executor, 'set_auto_fund_transfer_enabled_provider'):
         executor.set_auto_fund_transfer_enabled_provider(
-            lambda: (
-                not _open_paused
-                and config.get_bool(
-                    'account_capital.gate_cross_risk.auto_fund_transfer.enabled',
-                    True,
-                )
-            )
+            _auto_fund_profit_release_allowed
         )
     return executor
 
@@ -2359,6 +2373,15 @@ async def _position_funding_loop():
 def _publish_close_position_results(results: List[Dict]) -> None:
     if not results:
         return
+    if (
+        _auto_fund_transfer_coordinator is not None
+        and any(
+            result.get('success')
+            and result.get('margin_risk_stage') == 'profit_release_350'
+            for result in results
+        )
+    ):
+        _auto_fund_transfer_coordinator.notify_binance_funds_released()
     _record_auto_risk_close_notifications(results, event_at=datetime.now())
     if not any(result.get('success') for result in results):
         return

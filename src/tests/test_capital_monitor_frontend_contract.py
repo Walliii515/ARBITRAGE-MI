@@ -91,6 +91,9 @@ def test_gate_mmr_help_describes_auto_funding_and_tiered_close_rules():
         'max(100 USDT, Gate维持保证金 × 50%, 交易所最低额)',
         '一次只退出一个本地完整套利仓位',
         '关闭正向开仓只停止新自动任务',
+        '最近一次自动划转评估明确为“可划资金不足”',
+        '在得到新的“仍然不足”结论前不会继续释放下一笔',
+        '活动划转、失败锁、陈旧资金摘要或异常输入均禁止该档位平仓',
     ):
         assert rule in help_content
     assert 'max-height: min(70vh, 560px);' in CAPITAL_MONITOR_SOURCE

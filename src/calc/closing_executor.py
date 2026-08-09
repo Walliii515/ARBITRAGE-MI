@@ -537,6 +537,8 @@ class ClosingExecutor:
                 cross_risk=cross_risk,
             )
             self._clear_position_close_state(base_asset, pos)
+            if profit_release_active:
+                self._margin_profit_release_last_close_snapshot_ts = snapshot_ts
             try:
                 result = self._execute_close(
                     pos,
@@ -552,8 +554,6 @@ class ClosingExecutor:
                 if result.get('success') or gate_reduction_consumed:
                     if account_recovery_active:
                         self._margin_recovery_last_close_snapshot_ts = snapshot_ts
-                    if profit_release_active:
-                        self._margin_profit_release_last_close_snapshot_ts = snapshot_ts
                 if result.get('success'):
                     logger.critical(
                         "Gate全仓危险平仓成功 | %s | position_id=%s | %s",

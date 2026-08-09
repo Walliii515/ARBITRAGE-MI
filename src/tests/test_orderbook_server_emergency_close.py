@@ -10,6 +10,102 @@ from api import orderbook_server
 
 
 class TestOrderbookServerEmergencyClose(unittest.TestCase):
+    def test_profit_release_requires_insufficient_auto_funding_and_no_active_task(self):
+        coordinator = MagicMock()
+        coordinator.is_profit_release_allowed.return_value = True
+
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_open_paused', False),
+            patch.object(orderbook_server.config, 'get_bool', return_value=True),
+            patch.object(orderbook_server, 'fund_transfer_open_locked', return_value=False),
+        ):
+            self.assertTrue(orderbook_server._auto_fund_profit_release_allowed())
+
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_open_paused', False),
+            patch.object(orderbook_server.config, 'get_bool', return_value=True),
+            patch.object(orderbook_server, 'fund_transfer_open_locked', return_value=True),
+        ):
+            self.assertFalse(orderbook_server._auto_fund_profit_release_allowed())
+
+    def test_paused_auto_funding_revokes_stale_profit_release_permission(self):
+        coordinator = MagicMock()
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_open_paused', True),
+            patch.object(orderbook_server.config, 'get_bool', return_value=True),
+        ):
+            result = orderbook_server._evaluate_auto_fund_transfer({
+                'health_status': 'healthy',
+            })
+
+        self.assertEqual(result['action'], 'disabled_with_forward_open')
+        coordinator.suspend_profit_release.assert_called_once_with()
+        coordinator.evaluate.assert_not_called()
+
+    def test_successful_350_release_wakes_auto_transfer_before_broadcast(self):
+        coordinator = MagicMock()
+        results = [{
+            'position_id': 7,
+            'base_asset': 'AI',
+            'success': True,
+            'close_reason': 'margin_close',
+            'margin_risk_stage': 'profit_release_350',
+        }]
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
+            patch.object(orderbook_server, 'event_loop', None),
+            patch.object(orderbook_server, 'broadcast_queue', None),
+        ):
+            orderbook_server._publish_close_position_results(results)
+
+        coordinator.notify_binance_funds_released.assert_called_once_with()
+
+    def test_notification_store_failure_cannot_prevent_350_transfer_wakeup(self):
+        coordinator = MagicMock()
+        results = [{
+            'success': True,
+            'margin_risk_stage': 'profit_release_350',
+        }]
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(
+                orderbook_server,
+                '_record_auto_risk_close_notifications',
+                side_effect=RuntimeError('notification db unavailable'),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'notification db unavailable'):
+                orderbook_server._publish_close_position_results(results)
+
+        coordinator.notify_binance_funds_released.assert_called_once_with()
+
+    def test_failed_or_non_350_close_does_not_wake_auto_transfer(self):
+        coordinator = MagicMock()
+        cases = [
+            [{
+                'success': False,
+                'margin_risk_stage': 'profit_release_350',
+            }],
+            [{
+                'success': True,
+                'margin_risk_stage': 'controlled_300',
+            }],
+        ]
+        with (
+            patch.object(orderbook_server, '_auto_fund_transfer_coordinator', coordinator),
+            patch.object(orderbook_server, '_record_auto_risk_close_notifications'),
+            patch.object(orderbook_server, 'event_loop', None),
+            patch.object(orderbook_server, 'broadcast_queue', None),
+        ):
+            for results in cases:
+                orderbook_server._publish_close_position_results(results)
+
+        coordinator.notify_binance_funds_released.assert_not_called()
+
     def test_live_gate_cross_risk_payload_recomputes_staleness(self):
         payload = orderbook_server._build_live_gate_cross_risk_payload(
             {

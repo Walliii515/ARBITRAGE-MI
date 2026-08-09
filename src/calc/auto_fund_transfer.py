@@ -2,6 +2,7 @@
 """Automatic Binance-to-Gate funding driven by fresh Gate account MMR."""
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -19,6 +20,15 @@ logger = get_logger(__name__)
 
 def _decimal(value: Any) -> Decimal:
     return Decimal(str(value or '0'))
+
+
+def _finite_decimal(value: Any, field: str) -> Decimal:
+    if value is None or value == '':
+        raise ValueError(f'{field}缺失')
+    result = Decimal(str(value))
+    if not result.is_finite():
+        raise ValueError(f'{field}不是有限数值')
+    return result
 
 
 def _datetime(value: Any) -> Optional[datetime]:
@@ -145,6 +155,23 @@ class AutoFundTransferCoordinator:
         self._lock = threading.Lock()
         self._last_external_attempt_monotonic = 0.0
         self._target_recovery_checked = False
+        self._profit_release_allowed = False
+
+    def is_profit_release_allowed(self) -> bool:
+        """Allow the 350% stage only after a confirmed insufficient-funds result."""
+        with self._lock:
+            return self._profit_release_allowed
+
+    def suspend_profit_release(self) -> None:
+        """Stop proactive releases while automation is paused or input is unhealthy."""
+        with self._lock:
+            self._profit_release_allowed = False
+
+    def notify_binance_funds_released(self) -> None:
+        """Wake transfer evaluation after a profitable close frees Binance funds."""
+        with self._lock:
+            self._profit_release_allowed = False
+            self._last_external_attempt_monotonic = 0.0
 
     def evaluate(
         self,
@@ -174,32 +201,66 @@ class AutoFundTransferCoordinator:
         binance_equity_usdt: Any,
         account_summary_age_sec: Optional[float],
     ) -> Dict[str, Any]:
-        mmr = _decimal((risk or {}).get('account_mmr_pct'))
+        try:
+            mmr = _finite_decimal((risk or {}).get('account_mmr_pct'), 'Gate MMR')
+        except Exception as exc:
+            return self._evaluation_error_result(Decimal('0'), exc)
         if str((risk or {}).get('health_status') or '') != 'healthy':
+            self._profit_release_allowed = False
             return {'action': 'risk_snapshot_not_healthy', 'mmr_pct': mmr}
         if mmr >= self.policy.target_mmr_pct:
+            self._profit_release_allowed = False
             if not self._target_recovery_checked:
                 self._clear_failure_latch(self._latest_auto_task())
                 self._target_recovery_checked = True
             return {'action': 'target_recovered', 'mmr_pct': mmr}
         self._target_recovery_checked = False
         if not forward_open_enabled:
+            self._profit_release_allowed = False
             return {'action': 'disabled_with_forward_open', 'mmr_pct': mmr}
         if mmr <= 0 or mmr > self.policy.trigger_mmr_pct:
+            self._profit_release_allowed = False
             return {'action': 'not_triggered', 'mmr_pct': mmr}
-        if account_summary_age_sec is None or (
-            account_summary_age_sec < -5
-            or account_summary_age_sec > self.policy.account_summary_max_age_sec
+        try:
+            summary_age = float(account_summary_age_sec)
+        except (TypeError, ValueError):
+            summary_age = float('nan')
+        if not math.isfinite(summary_age) or (
+            summary_age < -5
+            or summary_age > self.policy.account_summary_max_age_sec
         ):
+            self._profit_release_allowed = False
             return {'action': 'binance_equity_stale', 'mmr_pct': mmr}
         active = self.service.store.get_active()
         if active:
+            self._profit_release_allowed = False
             return {'action': 'task_active', 'task_id': active.get('id'), 'mmr_pct': mmr}
         latest_auto = self._latest_auto_task()
         if self._auto_failure_blocks(latest_auto):
+            self._profit_release_allowed = False
             return {'action': 'blocked_by_previous_failure', 'task_id': latest_auto.get('id')}
         if self._completed_cooldown_active(latest_auto):
+            self._profit_release_allowed = False
             return {'action': 'completed_cooldown', 'task_id': latest_auto.get('id')}
+        try:
+            gate_equity = _finite_decimal(
+                risk.get('account_equity_usdt'),
+                'Gate账户权益',
+            )
+            gate_maintenance = _finite_decimal(
+                risk.get('maintenance_margin_usdt'),
+                'Gate维持保证金',
+            )
+            binance_equity = _finite_decimal(
+                binance_equity_usdt,
+                'Binance总资产',
+            )
+            if gate_maintenance <= 0:
+                raise ValueError('Gate维持保证金必须大于0')
+            if binance_equity <= 0:
+                raise ValueError('Binance总资产必须大于0')
+        except Exception as exc:
+            return self._evaluation_error_result(mmr, exc)
 
         now_monotonic = self.monotonic_fn()
         if (
@@ -211,19 +272,30 @@ class AutoFundTransferCoordinator:
         self._last_external_attempt_monotonic = now_monotonic
         try:
             limits = self.service.limits()
+            binance_forward_free = _finite_decimal(
+                limits.get('binance_forward_free'),
+                'Binance Forward可用余额',
+            )
+            exchange_minimum = _finite_decimal(
+                limits.get('minimum_transfer_amount'),
+                '交易所最低划转额',
+            )
+            if binance_forward_free < 0:
+                raise ValueError('Binance Forward可用余额不能小于0')
+            if exchange_minimum < 0:
+                raise ValueError('交易所最低划转额不能小于0')
             decision = calculate_auto_transfer_amount(
-                gate_margin_balance=_decimal(risk.get('account_equity_usdt')),
-                gate_maintenance_margin=_decimal(risk.get('maintenance_margin_usdt')),
-                binance_forward_free=_decimal(limits.get('binance_forward_free')),
-                binance_equity=_decimal(binance_equity_usdt),
-                exchange_minimum=_decimal(limits.get('minimum_transfer_amount')),
+                gate_margin_balance=gate_equity,
+                gate_maintenance_margin=gate_maintenance,
+                binance_forward_free=binance_forward_free,
+                binance_equity=binance_equity,
+                exchange_minimum=exchange_minimum,
                 policy=self.policy,
             )
         except Exception as exc:
-            self._notify_evaluation_failure(mmr, exc)
-            logger.error('Gate自动补资前置核验失败: %s', exc, exc_info=True)
-            return {'action': 'evaluation_error', 'mmr_pct': mmr, 'error': str(exc)[:300]}
+            return self._evaluation_error_result(mmr, exc)
         if not decision['executable']:
+            self._profit_release_allowed = True
             self._notify_insufficient(risk, decision)
             return {'action': 'insufficient', 'mmr_pct': mmr, 'decision': decision}
 
@@ -251,9 +323,11 @@ class AutoFundTransferCoordinator:
                 context_detail=context,
             )
         except Exception as exc:
+            self._profit_release_allowed = False
             self._notify_evaluation_failure(mmr, exc)
             logger.error('Gate自动补资任务创建失败: %s', exc, exc_info=True)
             return {'action': 'task_create_error', 'mmr_pct': mmr, 'error': str(exc)[:300]}
+        self._profit_release_allowed = False
         self.notifier(
             title='Gate全仓MMR自动补资',
             message=(
@@ -274,6 +348,9 @@ class AutoFundTransferCoordinator:
         return {'action': 'created', 'task': task, 'decision': decision}
 
     def _latest_auto_task(self) -> Optional[Dict[str, Any]]:
+        getter = getattr(self.service.store, 'get_latest_by_initiator', None)
+        if callable(getter):
+            return getter('auto_mmr')
         for task in self.service.store.list(limit=30):
             if str((task.get('detail') or {}).get('initiator') or '') == 'auto_mmr':
                 return task
@@ -334,3 +411,12 @@ class AutoFundTransferCoordinator:
             payload={'trigger_mmr_pct': str(mmr), 'error': str(exc)[:300]},
             user_id='default',
         )
+
+    def _evaluation_error_result(self, mmr: Decimal, exc: Exception) -> Dict[str, Any]:
+        self._profit_release_allowed = False
+        try:
+            self._notify_evaluation_failure(mmr, exc)
+        except Exception as notify_exc:
+            logger.error('Gate自动补资异常通知失败: %s', notify_exc, exc_info=True)
+        logger.error('Gate自动补资前置核验失败: %s', exc, exc_info=True)
+        return {'action': 'evaluation_error', 'mmr_pct': mmr, 'error': str(exc)[:300]}
