@@ -12,7 +12,6 @@ TradingExecutor 通过 ExecutorClient 调用本服务完成成交计算。
 本服务不会对实盘产生任何影响。
 """
 import argparse
-import json
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -28,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from calc.virtual_executor import VirtualExecutor
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+from common.market_meta_safety import retain_healthy_contract_meta, retain_healthy_spot_meta
 from common.logger import get_logger, setup_logging
 
 setup_logging()
@@ -43,9 +43,18 @@ _meta_load_time: str = ''
 def _load_meta_and_init():
     """加载元数据并初始化/刷新 VirtualExecutor"""
     global _executor, _contract_meta, _spot_meta, _meta_load_time
-    _contract_meta = fetch_contract_meta()
-    _spot_meta = fetch_spot_meta()
-    _meta_load_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    contract_candidate = fetch_contract_meta()
+    spot_candidate = fetch_spot_meta()
+    next_contract_meta = retain_healthy_contract_meta(contract_candidate, _contract_meta)
+    next_spot_meta = retain_healthy_spot_meta(spot_candidate, _spot_meta)
+    refresh_accepted = (
+        next_contract_meta is contract_candidate
+        and next_spot_meta is spot_candidate
+    )
+    _contract_meta = next_contract_meta
+    _spot_meta = next_spot_meta
+    if refresh_accepted:
+        _meta_load_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if _executor is None:
         _executor = VirtualExecutor(_contract_meta, _spot_meta)

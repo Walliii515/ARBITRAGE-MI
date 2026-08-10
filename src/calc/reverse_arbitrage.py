@@ -139,14 +139,17 @@ def enrich_reverse_opportunities(
         c_meta = contract_meta.get(base_asset, {})
         b_meta = borrow_meta.get(base_asset, {})
         threshold_meta = reverse_threshold_meta.get(base_asset, {})
-        quanto_multiplier = float(c_meta.get('quanto_multiplier', 1.0) or 1.0)
+        try:
+            quanto_multiplier = float(c_meta.get('quanto_multiplier'))
+        except (TypeError, ValueError):
+            quanto_multiplier = 0.0
 
         spot_qty = _as_float(row.get('spot_qty'))
         future_qty = _as_float(row.get('future_qty'))
         hedge_qty = spot_qty if spot_qty is not None else future_qty
 
-        open_data_missing = hedge_qty is None
-        if hedge_qty is None:
+        open_data_missing = hedge_qty is None or quanto_multiplier <= 0
+        if hedge_qty is None or quanto_multiplier <= 0:
             row.update({
                 'reverse_spot_open_vwap': None,
                 'reverse_future_open_vwap': None,

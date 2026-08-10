@@ -270,10 +270,14 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         row['market_profile_updated_at'] = profile.get('market_profile_updated_at')
 
         # --- 从 contract_meta 注入 ---
-        quanto_multiplier = 1.0
+        quanto_multiplier = None
         if base_asset in contract_meta:
             c_meta = contract_meta[base_asset]
-            quanto_multiplier = c_meta.get('quanto_multiplier', 1.0)
+            try:
+                parsed_multiplier = float(c_meta.get('quanto_multiplier'))
+                quanto_multiplier = parsed_multiplier if parsed_multiplier > 0 else None
+            except (TypeError, ValueError):
+                quanto_multiplier = None
             row['funding_rate_24h'] = c_meta.get('funding_rate_24h')
             row['volume_24h_settle'] = c_meta.get('volume_24h_settle')
             fna = c_meta.get('funding_next_apply')
@@ -326,20 +330,32 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         for i in range(1, LEVEL + 1):
             price = row.get(f'future_price_bid_{i}')
             vol = row.get(f'future_volume_bid_{i}')
-            usdt = round(float(price) * float(vol) * quanto_multiplier, 2) if price is not None and vol is not None else None
+            usdt = (
+                round(float(price) * float(vol) * quanto_multiplier, 2)
+                if price is not None and vol is not None and quanto_multiplier is not None
+                else None
+            )
             row[f'future_usdt_bid_{i}'] = usdt
             if usdt:
                 future_bid_total += usdt
 
             price = row.get(f'future_price_ask_{i}')
             vol = row.get(f'future_volume_ask_{i}')
-            usdt = round(float(price) * float(vol) * quanto_multiplier, 2) if price is not None and vol is not None else None
+            usdt = (
+                round(float(price) * float(vol) * quanto_multiplier, 2)
+                if price is not None and vol is not None and quanto_multiplier is not None
+                else None
+            )
             row[f'future_usdt_ask_{i}'] = usdt
             if usdt:
                 future_ask_total += usdt
 
-        row['future_usdt_bid_total'] = round(future_bid_total, 2)
-        row['future_usdt_ask_total'] = round(future_ask_total, 2)
+        row['future_usdt_bid_total'] = (
+            round(future_bid_total, 2) if quanto_multiplier is not None else None
+        )
+        row['future_usdt_ask_total'] = (
+            round(future_ask_total, 2) if quanto_multiplier is not None else None
+        )
 
         # --- 现货每档 USDT ---
         spot_bid_total = 0.0

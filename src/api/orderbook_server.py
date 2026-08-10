@@ -14,7 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
+
+if TYPE_CHECKING:
+    from calc.closing_executor import ClosingExecutor
 
 try:
     import orjson
@@ -38,6 +41,7 @@ from common.meta_loader import (
     fetch_contract_meta,
     fetch_spot_meta,
 )
+from common.market_meta_safety import retain_healthy_contract_meta, retain_healthy_spot_meta
 from common.strategy_accounts import get_binance_credentials
 
 from api.trading_api import (
@@ -997,8 +1001,10 @@ async def lifespan(app: FastAPI):
     global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
     global _funding_support_meta
     global _asset_tier_meta, _asset_profile_meta, _meta_update_time
-    _contract_meta = fetch_contract_meta()
-    _spot_meta = fetch_spot_meta()
+    contract_candidate = fetch_contract_meta()
+    spot_candidate = fetch_spot_meta()
+    _contract_meta = retain_healthy_contract_meta(contract_candidate, _contract_meta)
+    _spot_meta = retain_healthy_spot_meta(spot_candidate, _spot_meta)
     _asset_tier_meta = fetch_asset_tier_meta()
     _asset_profile_meta = fetch_asset_market_profile_meta()
     _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
@@ -1006,7 +1012,8 @@ async def lifespan(app: FastAPI):
     _vwap_threshold_meta = fetch_vwap_threshold_meta()
     _close_vwap_threshold_meta = fetch_close_vwap_threshold_meta()
     _reverse_vwap_threshold_meta = fetch_reverse_vwap_threshold_meta()
-    _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if _contract_meta is contract_candidate and _spot_meta is spot_candidate:
+        _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_print(
         f'已加载合约元数据 {len(_contract_meta)} 条，现货元数据 {len(_spot_meta)} 条，'
         f'标的分层 {len(_asset_tier_meta)} 条，行情画像 {len(_asset_profile_meta)} 条，'
@@ -1037,11 +1044,27 @@ async def lifespan(app: FastAPI):
                 global _close_vwap_threshold_meta, _reverse_vwap_threshold_meta, _funding_rate_p40_meta
                 global _funding_support_meta
                 global _asset_tier_meta, _asset_profile_meta, _meta_update_time
-                _contract_meta = fetch_contract_meta()
-                _spot_meta = fetch_spot_meta()
+                contract_candidate = fetch_contract_meta()
+                spot_candidate = fetch_spot_meta()
+                next_contract_meta = retain_healthy_contract_meta(contract_candidate, _contract_meta)
+                next_spot_meta = retain_healthy_spot_meta(spot_candidate, _spot_meta)
+                refresh_accepted = (
+                    next_contract_meta is contract_candidate
+                    and next_spot_meta is spot_candidate
+                )
+                _contract_meta = next_contract_meta
+                _spot_meta = next_spot_meta
                 _asset_tier_meta = fetch_asset_tier_meta()
                 _asset_profile_meta = fetch_asset_market_profile_meta()
-                _threshold_meta, _funding_rate_p40_meta = fetch_threshold_meta()
+                new_threshold_meta, new_funding_rate_p40_meta = fetch_threshold_meta()
+                if new_threshold_meta:
+                    _threshold_meta = new_threshold_meta
+                    _funding_rate_p40_meta = new_funding_rate_p40_meta
+                else:
+                    logger.warning(
+                        '资金费率阈值刷新结果为空，保留旧缓存（%s 条）',
+                        len(_threshold_meta),
+                    )
                 _funding_support_meta = fetch_funding_support_meta(FUNDING_SUPPORT_WINDOW_HOURS)
                 _vwap_threshold_meta = fetch_vwap_threshold_meta()
                 new_close_meta = fetch_close_vwap_threshold_meta()
@@ -1054,7 +1077,8 @@ async def lifespan(app: FastAPI):
                     _reverse_vwap_threshold_meta = new_reverse_meta
                 else:
                     logger.warning(f'反向VWAP基差阈值刷新结果为空，保留旧缓存（{len(_reverse_vwap_threshold_meta)} 条）')
-                _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                if refresh_accepted:
+                    _meta_update_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 logger.info(
                     f'内存缓存刷新完成: 合约 {len(_contract_meta)} 条, 现货 {len(_spot_meta)} 条, '
                     f'标的分层 {len(_asset_tier_meta)} 条, 行情画像 {len(_asset_profile_meta)} 条, '
@@ -1828,7 +1852,7 @@ async def close_all_positions():
         ba = pos.get('base_asset', '')
         orderbook_row = orderbook_map.get(ba)
         if not orderbook_row:
-            results.append({'base_asset': ba, 'success': False, 'message': f'无盘口数据'})
+            results.append({'base_asset': ba, 'success': False, 'message': '无盘口数据'})
             continue
         try:
             def _manual_close_one(pos=pos, orderbook_row=orderbook_row):

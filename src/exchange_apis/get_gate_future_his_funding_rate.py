@@ -127,7 +127,7 @@ if __name__ == '__main__':
             
             if history_data:
                 # 显示最新的 3 条记录
-                log_print(f"   最新 3 条历史记录:")
+                log_print("   最新 3 条历史记录:")
                 for j, record in enumerate(history_data[:3], 1):
                     rate = record.get('r', 'N/A')
                     timestamp = record.get('t', 'N/A')

@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Tuple
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
+from common.market_meta_safety import require_quanto_multiplier
 from calc.orderbook_enricher import calc_vwap_basis_bps
 from calc.position_order_fees import attach_position_order_fee_summary
 
@@ -47,8 +48,12 @@ class PositionTracker:
         
         # 计算期货张数
         base_asset = order_group['base_asset']
-        quanto = self._get_quanto_multiplier(base_asset)
-        future_contracts = int(float(future_exec['exec_qty']) / quanto) if quanto > 0 else 0
+        exec_contracts = future_exec.get('exec_contracts')
+        if exec_contracts not in (None, ''):
+            future_contracts = int(round(abs(float(exec_contracts))))
+        else:
+            quanto = require_quanto_multiplier(self.contract_meta, base_asset)
+            future_contracts = int(float(future_exec['exec_qty']) / quanto)
         
         # 获取交易所下次资金费结算时间，用于初始化 next_funding_time
         next_funding_time = None
@@ -622,9 +627,10 @@ class PositionTracker:
     
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         """获取合约面值"""
-        if base_asset in self.contract_meta:
-            return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
-        return 1.0
+        try:
+            return require_quanto_multiplier(self.contract_meta, base_asset)
+        except ValueError:
+            return 0.0
 
 
 def _float(value) -> float:

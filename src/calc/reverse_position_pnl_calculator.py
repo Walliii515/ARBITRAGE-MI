@@ -116,7 +116,9 @@ def _reverse_close_vwap(pos: Dict, orderbook_row: Optional[Dict], contract_meta:
     if not qty:
         return None, None
     base_asset = str(pos.get('base_asset') or '').upper()
-    quanto_multiplier = _as_float((contract_meta.get(base_asset) or {}).get('quanto_multiplier'), 1.0) or 1.0
+    quanto_multiplier = _as_float((contract_meta.get(base_asset) or {}).get('quanto_multiplier'))
+    if quanto_multiplier is None or quanto_multiplier <= 0:
+        return None, None
     spot_ask_prices, spot_ask_volumes = _side_prices_and_volumes(orderbook_row, 'spot', 'ask')
     future_bid_prices, future_bid_volumes = _side_prices_and_volumes(orderbook_row, 'future', 'bid')
     spot_close = calc_vwap(spot_ask_prices, spot_ask_volumes, qty, 1.0)

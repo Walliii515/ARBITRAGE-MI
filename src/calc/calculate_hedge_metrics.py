@@ -4,7 +4,6 @@
 为合并后的跨交易所订单簿行计算：对冲数量对齐、VWAP、盘口深度
 """
 from functools import lru_cache
-from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from math import gcd
 from typing import Any, Dict, List, Optional
@@ -147,8 +146,17 @@ def calculate_hedge_metrics(
         c_info = contract_info[base_asset]
         s_info = spot_info[base_asset]
 
-        quanto_multiplier = float(c_info.get('quanto_multiplier', 1.0))
-        step_size = float(s_info.get('step_size', 1.0))
+        try:
+            quanto_multiplier = float(c_info.get('quanto_multiplier'))
+            step_size = float(s_info.get('step_size'))
+        except (TypeError, ValueError):
+            row.update(_null_fields())
+            result.append(row)
+            continue
+        if quanto_multiplier <= 0 or step_size <= 0:
+            row.update(_null_fields())
+            result.append(row)
+            continue
 
         # ---------- 1. 对冲数量对齐 ----------
         aligned_step = _calc_aligned_step(step_size, quanto_multiplier)

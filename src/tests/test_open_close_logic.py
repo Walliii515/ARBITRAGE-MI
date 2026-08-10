@@ -485,6 +485,137 @@ class TestFutureMakerOpenConfig(unittest.TestCase):
 class TestRealExecutorGateParsing(unittest.TestCase):
     """Gate 成交解析：部分成交按 size-left 计算。"""
 
+    def test_forward_open_missing_multiplier_rejects_before_spot_order(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        executor._place_binance_spot_order = MagicMock()
+        executor._place_gate_futures_order = MagicMock()
+
+        result = executor.execute({
+            'spot_order': {
+                'base_asset': 'TUT',
+                'trade_direction': 'buy',
+                'target_qty': 1000,
+            },
+            'future_order': {
+                'base_asset': 'TUT',
+                'future_contract': 'TUT_USDT',
+                'order_side': 'open',
+                'trade_direction': 'sell',
+                'target_qty': 1000,
+            },
+        }, {})
+
+        self.assertFalse(result['success'])
+        self.assertIn('缺少有效Gate合约乘数', result['message'])
+        executor._place_binance_spot_order.assert_not_called()
+        executor._place_gate_futures_order.assert_not_called()
+
+    def test_gate_close_uses_explicit_contracts_without_metadata(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        class FakeResponse:
+            status_code = 200
+            text = '{}'
+
+            @staticmethod
+            def json():
+                return {
+                    'id': 'close-tut',
+                    'status': 'finished',
+                    'size': '2',
+                    'left': '0',
+                    'fill_price': '0.10',
+                    'finish_as': 'filled',
+                }
+
+        executor = RealExecutor(
+            ExchangeConfig(gate_base_url='https://gate.test'),
+            contract_meta={},
+            spot_meta={},
+        )
+        executor._gate_sign = MagicMock(return_value={})
+        executor._session = MagicMock()
+        executor._session.post.return_value = FakeResponse()
+
+        result = executor._place_gate_futures_order({
+            'order_uuid': 'close-tut',
+            'base_asset': 'TUT',
+            'future_contract': 'TUT_USDT',
+            'order_side': 'close',
+            'trade_direction': 'buy',
+            'target_qty': 200.0,
+            'target_contracts': 2,
+        })
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['exec_contracts'], 2)
+        self.assertEqual(result['exec_qty'], 200.0)
+        body = json.loads(executor._session.post.call_args.kwargs['data'])
+        self.assertEqual(body['size'], 2)
+        self.assertTrue(body['reduce_only'])
+
+    def test_gate_order_rejects_fractional_explicit_contracts(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        result = executor._place_gate_futures_order({
+            'base_asset': 'TUT',
+            'future_contract': 'TUT_USDT',
+            'order_side': 'close',
+            'trade_direction': 'buy',
+            'target_qty': 250,
+            'target_contracts': 2.5,
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('目标合约张数无效', result['reason'])
+
+    def test_gate_open_with_explicit_contracts_still_requires_metadata(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
+        result = executor._place_gate_futures_order({
+            'base_asset': 'TUT',
+            'future_contract': 'TUT_USDT',
+            'order_side': 'open',
+            'trade_direction': 'sell',
+            'target_qty': 205,
+            'target_contracts': 2,
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('缺少有效Gate合约乘数', result['reason'])
+
+    def test_real_executor_defaults_to_gate_cross_margin(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(ExchangeConfig())
+
+        self.assertEqual(executor.leverage, 0)
+        self.assertEqual(executor._gate_margin_mode_label(), '全仓')
+
+    def test_gate_open_with_explicit_contracts_uses_metadata_multiplier(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(),
+            contract_meta={'TUT': {'quanto_multiplier': 100}},
+            spot_meta={},
+        )
+
+        multiplier, contracts, reason = executor._resolve_gate_order_sizing({
+            'base_asset': 'TUT',
+            'order_side': 'open',
+            'target_qty': 205,
+            'target_contracts': 2,
+        })
+
+        self.assertIsNone(reason)
+        self.assertEqual(multiplier, 100)
+        self.assertEqual(contracts, 2)
+
     def test_partial_fill_uses_size_minus_left(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
@@ -503,6 +634,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
 
         self.assertTrue(parsed['success'])
         self.assertEqual(parsed['exec_qty'], 12)
+        self.assertEqual(parsed['exec_contracts'], 6)
         self.assertEqual(parsed['exec_amount'], 15.0)
 
     def test_binance_dust_conversion_returns_auditable_execution_value(self):
@@ -772,6 +904,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertEqual(executor._place_gate_futures_order.call_count, 2)
         fallback_order = executor._place_gate_futures_order.call_args_list[1].args[0]
         self.assertEqual(fallback_order['target_qty'], 1600)
+        self.assertEqual(fallback_order['target_contracts'], 16)
         self.assertAlmostEqual(fallback_order['target_amount'], 48.612 * 16 / 26)
         hedge_order = executor._place_binance_spot_order.call_args.args[0]
         self.assertEqual(hedge_order['target_qty'], 2600)
@@ -817,7 +950,11 @@ class TestRealExecutorGateParsing(unittest.TestCase):
     def test_forward_execute_rejects_before_spot_when_existing_leverage_differs(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
-        executor = RealExecutor(ExchangeConfig(gate_base_url='https://gate.test'), leverage=10)
+        executor = RealExecutor(
+            ExchangeConfig(gate_base_url='https://gate.test'),
+            contract_meta={'AI': {'quanto_multiplier': 1}},
+            leverage=10,
+        )
         executor.fetch_gate_futures_positions = MagicMock(return_value=[
             {'contract': 'AI_USDT', 'size': -10, 'leverage': '5'},
         ])
@@ -6139,6 +6276,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             'base_asset': 'BTC',
             'spot_open_qty': 1.0,
             'future_open_qty': 1.0,
+            'future_open_contracts': 10,
             'future_contract': 'BTC_USDT',
         }, close_reason='take_profit')
 
@@ -6147,6 +6285,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertNotIn('execution_style', group['future_order'])
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
         self.assertEqual(group['execution_reason'], 'take_profit')
+        self.assertEqual(group['future_order']['target_contracts'], 10)
 
     def test_negative_funding_opportunistic_order_group_keeps_protective_price(self):
         group = self.ce._build_close_order_group({

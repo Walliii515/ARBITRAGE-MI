@@ -2440,7 +2440,6 @@ class ClosingExecutor:
         """
         close_reason = 'manual'
         # 构建详情：携带当前基差/开仓基差/资金费收益等关键判定数据，便于复盘
-        ba = pos.get('base_asset', '')
         open_spread = pos.get('open_spread_bps')
         current_spread = pos.get('current_spread_bps')
         funding_pnl_bps = pos.get('funding_pnl_bps')
@@ -2654,6 +2653,9 @@ class ClosingExecutor:
             'target_qty': future_target_qty,
             'target_amount': future_target_amount,
         }
+        future_open_contracts = abs(_float_or_none(pos.get('future_open_contracts')) or 0.0)
+        if future_open_contracts > 0:
+            future_order['target_contracts'] = future_open_contracts
         if future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
         order_group = {
@@ -2695,9 +2697,11 @@ class ClosingExecutor:
         return target_qty * reference_price
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
-        if base_asset in self.contract_meta:
-            return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
-        return 1.0
+        try:
+            multiplier = float((self.contract_meta.get(base_asset) or {}).get('quanto_multiplier'))
+            return multiplier if multiplier > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     # ──────────────────────────────────────────────────────────────────
     # 持久化
@@ -2974,7 +2978,6 @@ class ClosingExecutor:
         future_remaining = max(0.0, float(state.get('future_remaining') or 0))
         future_contracts_remaining = max(0.0, float(state.get('future_contracts_remaining') or 0))
         spot_open_price = _float_or_none(pos.get('spot_open_price')) or 0.0
-        future_open_price = _float_or_none(pos.get('future_open_price')) or 0.0
         partial_note = (
             f"部分平仓保留剩余|spot={state.get('spot_exec'):g}/{state.get('spot_target'):g}|"
             f"future={state.get('future_exec'):g}/{state.get('future_target'):g}|"

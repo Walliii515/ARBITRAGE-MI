@@ -595,9 +595,6 @@ class ExchangeDesyncRemediator:
             'gate_position': gate_position or {},
         }
 
-    def _execute_dust_cleanup(self, prepared: Dict) -> Dict:
-        return self._execute_dust_cleanup_batch([prepared])
-
     def _execute_dust_cleanup_batch(self, prepared_items: List[Dict]) -> Dict:
         ready: List[Dict] = []
         results: List[Dict] = []
@@ -1329,6 +1326,7 @@ class ExchangeDesyncRemediator:
             'trade_direction': 'buy',
             'status': 'pending',
             'target_qty': target_qty,
+            'target_contracts': extra_contracts,
             'target_amount': target_qty * _float(risk.get('mark_price') or risk.get('future_close_price')),
         }
         result = self.executor.place_gate_futures_order(order)
@@ -1345,6 +1343,7 @@ class ExchangeDesyncRemediator:
             )
         return {
             'attempted': True,
+            'exchange_order_submitted': True,
             'success': success,
             'action': 'close_extra_gate_future',
             'base_asset': base_asset,
@@ -1618,6 +1617,7 @@ class ExchangeDesyncRemediator:
             )
         return {
             'attempted': True,
+            'exchange_order_submitted': True,
             'success': success,
             'action': action,
             'base_asset': base_asset,
@@ -2133,6 +2133,7 @@ class ExchangeDesyncRemediator:
             )
             return {
                 'attempted': True,
+                'exchange_order_submitted': True,
                 'success': False,
                 'position_id': position_id,
                 'spot_exec_qty': spot_exec_qty,
@@ -2145,6 +2146,7 @@ class ExchangeDesyncRemediator:
             self._keep_spot_only_remainder(pos, spot_exec_qty, spot_result, risk)
             return {
                 'attempted': True,
+                'exchange_order_submitted': True,
                 'success': False,
                 'position_id': position_id,
                 'spot_exec_qty': spot_exec_qty,
@@ -2161,6 +2163,7 @@ class ExchangeDesyncRemediator:
             self._keep_spot_only_remainder(pos, spot_exec_qty, spot_result, risk)
             return {
                 'attempted': True,
+                'exchange_order_submitted': True,
                 'success': False,
                 'position_id': position_id,
                 'spot_exec_qty': spot_exec_qty,
@@ -2178,6 +2181,7 @@ class ExchangeDesyncRemediator:
         )
         return {
             'attempted': True,
+            'exchange_order_submitted': True,
             'success': True,
             'position_id': position_id,
             'spot_exec_qty': spot_result.get('exec_qty'),

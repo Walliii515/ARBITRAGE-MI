@@ -2601,14 +2601,6 @@ async def get_signals(
         prefix="s.",
     )
 
-    # 查询总数
-    count_sql = f"SELECT COUNT(*) as total FROM mi_trade_signal WHERE {where_sql}"
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(count_sql, where_params)
-        total_row = cursor.fetchone()
-        total = total_row['total'] if total_row else 0
-
     # 查询分页数据
     offset = (page - 1) * page_size
     sql = f"""

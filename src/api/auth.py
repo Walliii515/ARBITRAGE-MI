@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 
-from fastapi import APIRouter, HTTPException, Depends, Header, Query
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 
 from common.config import config

@@ -76,7 +76,7 @@ def analyze_open_trades():
         position = cursor.fetchone()
 
         if not position:
-            print(f"  ⚠️ 未找到持仓记录")
+            print("  ⚠️ 未找到持仓记录")
             continue
 
         print(f"\n  📌 持仓记录 (position_id={position['id']}):")
@@ -100,7 +100,7 @@ def analyze_open_trades():
         """, (position['id'],))
         orders = cursor.fetchall()
 
-        print(f"\n  📋 订单记录:")
+        print("\n  📋 订单记录:")
         for order in orders:
             print(f"     [{order['market_type']}] {order['trade_direction']} | "
                   f"exec_price={order['exec_price']} | qty={order['exec_qty']} | "
@@ -121,7 +121,7 @@ def analyze_open_trades():
         """, (base_asset, snap_start, snap_end))
         snapshots = cursor.fetchall()
 
-        print(f"\n  📊 VWAP快照(开仓前后±2min):")
+        print("\n  📊 VWAP快照(开仓前后±2min):")
         if snapshots:
             print(f"     {'时间':<22} {'spot_open_vwap':<16} {'future_open_vwap':<16} {'open_basis_bps':<14} {'coverage'}")
             for snap in snapshots:
@@ -131,10 +131,10 @@ def analyze_open_trades():
                       f"{snap['open_vwap_basis_bps'] or 'N/A':<14} "
                       f"{snap['open_coverage'] or 'N/A'}")
         else:
-            print(f"     无快照数据")
+            print("     无快照数据")
 
         # 4. 分析差异
-        print(f"\n  🔍 差异分析:")
+        print("\n  🔍 差异分析:")
         if orders:
             # 从开仓原因中提取决策时基差
             reason = position['open_reason'] or ''
@@ -151,7 +151,7 @@ def analyze_open_trades():
                 print()
                 print(f"     ⚠️ 决策时盘口数据显示期货升水{decision_basis:.1f}bps")
                 print(f"        但实际成交显示期货贴水{abs(actual_basis):.1f}bps")
-                print(f"        说明本地订单簿中的Gate期货bid价格严重高估!")
+                print("        说明本地订单簿中的Gate期货bid价格严重高估!")
                 print()
 
                 # 反推决策时的预期价格
@@ -160,7 +160,7 @@ def analyze_open_trades():
                 actual_future_price = float(position['future_open_price'])
                 price_diff_pct = (expected_future_bid - actual_future_price) / actual_future_price * 100
 
-                print(f"     按决策时基差反推:")
+                print("     按决策时基差反推:")
                 print(f"       预期期货bid价: {expected_future_bid:.10f}")
                 print(f"       实际期货成交价: {actual_future_price:.10f}")
                 print(f"       价格偏差: {price_diff_pct:.3f}%")
@@ -204,25 +204,25 @@ def analyze_close_trades():
         position = cursor.fetchone()
 
         if not position:
-            print(f"  ⚠️ 未找到已平仓记录")
+            print("  ⚠️ 未找到已平仓记录")
             continue
 
         print(f"\n  📌 持仓记录 (position_id={position['id']}):")
         print(f"     开仓时间: {position['opened_at']}")
         print(f"     平仓时间: {position['closed_at']}")
-        print(f"     --- 开仓侧 ---")
+        print("     --- 开仓侧 ---")
         print(f"     现货开仓价: {position['spot_open_price']}")
         print(f"     期货开仓价: {position['future_open_price']}")
         print(f"     开仓基差(DB): {position['open_spread_bps']} bps")
         actual_open_basis = calc_basis_bps(position['spot_open_price'], position['future_open_price'])
         print(f"     开仓基差(验算): {actual_open_basis:.2f} bps" if actual_open_basis else "")
-        print(f"     --- 平仓侧 ---")
+        print("     --- 平仓侧 ---")
         print(f"     现货平仓价: {position['spot_close_price']}")
         print(f"     期货平仓价: {position['future_close_price']}")
         print(f"     平仓基差(DB): {position['close_spread_bps']} bps")
         actual_close_basis = calc_basis_bps(position['spot_close_price'], position['future_close_price'])
         print(f"     平仓基差(验算): {actual_close_basis:.2f} bps" if actual_close_basis else "")
-        print(f"     --- 盈亏 ---")
+        print("     --- 盈亏 ---")
         if actual_open_basis is not None and actual_close_basis is not None:
             convergence_pnl = actual_open_basis - actual_close_basis
             print(f"     实际基差收敛盈亏: {convergence_pnl:.2f} bps ({'盈利' if convergence_pnl > 0 else '亏损'}!)")
@@ -238,7 +238,7 @@ def analyze_close_trades():
         """, (position['id'],))
         close_orders = cursor.fetchall()
 
-        print(f"\n  📋 平仓订单:")
+        print("\n  📋 平仓订单:")
         for order in close_orders:
             print(f"     [{order['market_type']}] {order['trade_direction']} | "
                   f"exec_price={order['exec_price']} | qty={order['exec_qty']}")
@@ -257,7 +257,7 @@ def analyze_close_trades():
             """, (base_asset, snap_start, snap_end))
             snapshots = cursor.fetchall()
 
-            print(f"\n  📊 VWAP快照(平仓前后±2min):")
+            print("\n  📊 VWAP快照(平仓前后±2min):")
             if snapshots:
                 print(f"     {'时间':<22} {'spot_close_vwap':<16} {'future_close_vwap':<16} {'close_basis_bps':<14}")
                 for snap in snapshots:
@@ -266,10 +266,10 @@ def analyze_close_trades():
                           f"{snap['future_close_vwap'] or 'N/A':<16} "
                           f"{snap['close_vwap_basis_bps'] or 'N/A':<14}")
             else:
-                print(f"     无快照数据")
+                print("     无快照数据")
 
         # 4. 分析
-        print(f"\n  🔍 差异分析:")
+        print("\n  🔍 差异分析:")
         reason = position['close_reason'] or ''
         # 从 close_reason 提取止盈时判断的总盈亏
         import re
@@ -282,9 +282,9 @@ def analyze_close_trades():
             print(f"     实际基差收敛: {actual_convergence:.2f} bps")
             print(f"     差异: {signal_pnl - actual_convergence:.1f} bps !!!")
             print()
-            print(f"     ⚠️ 平仓信号使用的 current_spread_bps 来自实时盘口，")
-            print(f"        该值认为基差已大幅收敛（负向），但实际成交价格显示并非如此。")
-            print(f"        说明本地订单簿中的「平仓侧VWAP基差」与真实市场严重偏离！")
+            print("     ⚠️ 平仓信号使用的 current_spread_bps 来自实时盘口，")
+            print("        该值认为基差已大幅收敛（负向），但实际成交价格显示并非如此。")
+            print("        说明本地订单簿中的「平仓侧VWAP基差」与真实市场严重偏离！")
 
     cursor.close()
     conn.close()
@@ -327,7 +327,7 @@ def analyze_orderbook_quality():
             if len(snapshots) > 20:
                 print(f"     ... 还有 {len(snapshots) - 20} 条")
         else:
-            print(f"     无数据")
+            print("     无数据")
 
     cursor.close()
     conn.close()

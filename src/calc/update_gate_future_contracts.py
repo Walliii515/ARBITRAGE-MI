@@ -1,7 +1,7 @@
 # coding: utf-8
 """
 更新 Gate.io 永续合约数据到数据库，包含永续合约基本信息和当期费率。
-全量替换必须在同一事务中完成，避免交易热路径读到空表。
+完整快照校验通过后在同一事务中全量替换，避免交易热路径读到空表。
 """
 import sys
 import os
@@ -14,6 +14,7 @@ from common.database import db_manager
 from exchange_apis.get_gate_future_contracts import get_futures_contracts, parse_base_asset
 from exchange_apis.get_gate_future_tickers import get_futures_tickers
 from common.logger import get_logger, log_print
+from common.market_meta_safety import validate_contract_records
 
 logger = get_logger(__name__)
 
@@ -154,21 +155,13 @@ def _insert_contracts(cursor, contracts):
     return success_count
 
 
-def insert_contracts(contracts):
-    """插入合约数据到数据库。"""
-    try:
-        with db_manager.get_cursor() as cursor:
-            success_count = _insert_contracts(cursor, contracts)
-        log_print(f"✓ 成功插入 {success_count} 条合约数据")
-    except Exception as e:
-        logger.exception(f"✗ 插入数据失败: {e}")
-        raise
-
-
 def replace_contracts(contracts):
     """在同一事务中替换整张合约元数据表。"""
     try:
         with db_manager.get_cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS cnt FROM mi_gate_future_contracts")
+            previous_count = int((cursor.fetchone() or {}).get('cnt') or 0)
+            validate_contract_records(contracts, previous_count=previous_count)
             cursor.execute("DELETE FROM mi_gate_future_contracts")
             success_count = _insert_contracts(cursor, contracts)
         log_print(f"✓ 原子替换 {success_count} 条合约数据")

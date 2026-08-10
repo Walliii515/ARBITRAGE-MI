@@ -16,7 +16,7 @@ import hashlib
 import hmac
 import json
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -24,6 +24,7 @@ from urllib.parse import urlencode
 import requests
 
 from common.logger import get_logger
+from common.market_meta_safety import require_quanto_multiplier
 from common.tools import truncate_to_precision
 
 logger = get_logger(__name__)
@@ -60,13 +61,13 @@ class RealExecutor:
     """
 
     def __init__(self, exchange_config: ExchangeConfig, contract_meta: Dict = None,
-                 spot_meta: Dict = None, leverage: int = 2):
+                 spot_meta: Dict = None, leverage: int = GATE_CROSS_MARGIN_LEVERAGE):
         """
         Args:
             exchange_config: 交易所 API 配置
             contract_meta: base_asset -> {quanto_multiplier, ...} 用于期货张数换算
             spot_meta: base_asset -> {step_size, min_qty, ...} 用于现货精度截断
-            leverage: 期货杠杆倍数（>0 为逐仓模式，0 为全仓模式）
+            leverage: 期货杠杆倍数（默认 0，即正向策略全仓；反向策略显式注入）
         """
         self.config = exchange_config
         self.contract_meta = contract_meta or {}
@@ -115,6 +116,16 @@ class RealExecutor:
 
             if self._is_future_maker_order(future_order):
                 return self._execute_future_maker_then_spot(order_group, orderbook_row)
+
+            _, _, sizing_reason = self._resolve_gate_order_sizing(future_order)
+            if sizing_reason:
+                result['message'] = f'真实开仓预检失败: {sizing_reason}'
+                logger.warning(
+                    '真实开仓预检失败 | %s | %s',
+                    future_order.get('future_contract'),
+                    sizing_reason,
+                )
+                return result
 
             leverage_ok, leverage_reason = self._ensure_open_leverage(future_order)
             if not leverage_ok:
@@ -300,6 +311,11 @@ class RealExecutor:
         target_qty = float(spot_order.get('target_qty') or future_order.get('target_qty') or 0)
         if not base_asset or target_qty <= 0:
             result['message'] = f'反向开仓参数无效(base={base_asset}, qty={target_qty})'
+            return result
+
+        _, _, sizing_reason = self._resolve_gate_order_sizing(future_order)
+        if sizing_reason:
+            result['message'] = f'反向开仓预检失败: {sizing_reason}'
             return result
 
         leverage_ok, leverage_reason = self._ensure_open_leverage(future_order)
@@ -738,6 +754,7 @@ class RealExecutor:
         ratio = remaining_contracts / requested_contracts if requested_contracts > 0 else 0
         remaining_order['target_qty'] = float(maker_order.get('target_qty') or 0) * ratio
         remaining_order['target_amount'] = float(maker_order.get('target_amount') or 0) * ratio
+        remaining_order['target_contracts'] = remaining_contracts
         return remaining_order
 
     def _unwind_filled_future_leg(self, future_order: Dict, future_result: Dict) -> Dict:
@@ -761,6 +778,8 @@ class RealExecutor:
         unwind_order['trade_direction'] = reverse_direction
         unwind_order['order_side'] = reverse_order_side
         unwind_order['target_qty'] = exec_qty
+        if future_result.get('exec_contracts'):
+            unwind_order['target_contracts'] = future_result['exec_contracts']
         unwind_order['target_amount'] = future_result.get('exec_amount')
         return self._place_gate_futures_order(unwind_order)
 
@@ -1827,14 +1846,14 @@ class RealExecutor:
         contract = order.get('future_contract') or f"{base_asset}_USDT"
         target_qty = float(order.get('target_qty', 0))
 
+        quanto_multiplier, contracts_size, sizing_reason = self._resolve_gate_order_sizing(order)
+        if sizing_reason:
+            return {'success': False, 'reason': sizing_reason}
+
         # 开仓前确保 Gate 保证金模式；平仓/reduce-only 不修改已有仓位。
         leverage_ok, leverage_reason = self._ensure_open_leverage(order)
         if not leverage_ok:
             return {'success': False, 'reason': leverage_reason}
-
-        # 计算期货张数（空头为负数）
-        quanto_multiplier = self._get_quanto_multiplier(base_asset)
-        contracts_size = int(target_qty / quanto_multiplier) if quanto_multiplier > 0 else 0
 
         if contracts_size == 0:
             return {'success': False, 'reason': f'合约张数为0(数量{target_qty}/乘数{quanto_multiplier}), 无法下单'}
@@ -2168,6 +2187,7 @@ class RealExecutor:
             'success': True,
             'exec_price': exec_price,
             'exec_qty': exec_qty,
+            'exec_contracts': size,
             'exec_amount': exec_amount,
             'coverage_ratio': 0,
             'exchange_order_id': str(data.get('id', '')),
@@ -2398,9 +2418,43 @@ class RealExecutor:
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         """获取合约面值乘数"""
-        if base_asset in self.contract_meta:
-            return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
-        return 1.0
+        return require_quanto_multiplier(self.contract_meta, base_asset)
+
+    def _resolve_gate_order_sizing(self, order: Dict) -> Tuple[float, int, Optional[str]]:
+        """Resolve a Gate order without side effects so concurrent opens can preflight."""
+        base_asset = str(order.get('base_asset') or '').upper()
+        try:
+            target_qty = float(order.get('target_qty') or 0)
+        except (TypeError, ValueError):
+            return 0.0, 0, f'Gate目标标的数量无效({order.get("target_qty")})'
+
+        explicit_contracts = order.get('target_contracts')
+        if explicit_contracts not in (None, ''):
+            try:
+                raw_contracts = abs(float(explicit_contracts))
+            except (TypeError, ValueError):
+                return 0.0, 0, f'Gate目标合约张数无效({explicit_contracts})'
+            rounded_contracts = int(round(raw_contracts))
+            if rounded_contracts <= 0 or abs(raw_contracts - rounded_contracts) > 1e-8:
+                return 0.0, 0, f'Gate目标合约张数无效({explicit_contracts})'
+            if target_qty <= 0:
+                return 0.0, 0, f'Gate目标标的数量无效({target_qty})'
+            if order.get('order_side') == 'open':
+                try:
+                    multiplier = self._get_quanto_multiplier(base_asset)
+                except ValueError as exc:
+                    return 0.0, 0, str(exc)
+                return multiplier, rounded_contracts, None
+            return target_qty / rounded_contracts, rounded_contracts, None
+
+        try:
+            multiplier = self._get_quanto_multiplier(base_asset)
+        except ValueError as exc:
+            return 0.0, 0, str(exc)
+        contracts = int(target_qty / multiplier) if target_qty > 0 else 0
+        if contracts <= 0:
+            return multiplier, 0, f'合约张数为0(数量{target_qty}/乘数{multiplier}), 无法下单'
+        return multiplier, contracts, None
 
     def _format_gate_price(self, base_asset: str, price: float) -> str:
         """按 Gate 合约价格最小变动单位格式化保护限价。"""

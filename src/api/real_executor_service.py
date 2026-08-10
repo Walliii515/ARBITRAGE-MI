@@ -35,6 +35,7 @@ load_dotenv()
 
 from calc.real_executor import ExchangeConfig, GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+from common.market_meta_safety import retain_healthy_contract_meta, retain_healthy_spot_meta
 from common.config import config
 from common.logger import get_logger, setup_logging
 from common.strategy_accounts import get_binance_credentials, get_gate_futures_credentials
@@ -107,9 +108,18 @@ def _load_meta_and_init():
     global _executor, _reverse_executor, _contract_meta, _spot_meta, _meta_load_time
     global _exchange_config, _reverse_exchange_config
 
-    _contract_meta = fetch_contract_meta()
-    _spot_meta = fetch_spot_meta()
-    _meta_load_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    contract_candidate = fetch_contract_meta()
+    spot_candidate = fetch_spot_meta()
+    next_contract_meta = retain_healthy_contract_meta(contract_candidate, _contract_meta)
+    next_spot_meta = retain_healthy_spot_meta(spot_candidate, _spot_meta)
+    refresh_accepted = (
+        next_contract_meta is contract_candidate
+        and next_spot_meta is spot_candidate
+    )
+    _contract_meta = next_contract_meta
+    _spot_meta = next_spot_meta
+    if refresh_accepted:
+        _meta_load_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if _executor is None:
         _exchange_config = _build_exchange_config('forward')

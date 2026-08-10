@@ -348,10 +348,10 @@ class BinanceSpotOrderBookWS:
                 # 等待连接建立
                 if self._connected_event.wait(timeout=self._connect_timeout):
                     logger.info(f'Binance WS 重连成功（第 {attempt} 次尝试）')
-                    log_print(f'✓ Binance WS 自动重连成功')
+                    log_print('✓ Binance WS 自动重连成功')
                     return
                 else:
-                    logger.warning(f'Binance WS 重连超时，将继续重试...')
+                    logger.warning('Binance WS 重连超时，将继续重试...')
                     self.is_running = False
 
             except Exception as e:

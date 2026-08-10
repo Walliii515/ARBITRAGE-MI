@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from common.tools import timestamp_to_datetime, calculate_24h_funding_rate
 from common.logger import get_logger, log_print
 
 logger = get_logger(__name__)

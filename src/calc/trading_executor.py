@@ -13,6 +13,7 @@ from typing import List, Dict, Optional, Set
 
 from common.database import db_manager
 from common.logger import get_logger
+from common.market_meta_safety import require_quanto_multiplier
 
 logger = get_logger(__name__)
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps, calc_open_fee_bps
@@ -2728,7 +2729,6 @@ class TradingExecutor:
         state = self._peak_state.get(base_asset)
         row = row or {}
         contract = row.get('contract', '')
-        symbol = row.get('symbol', '')
 
         if state is None:
             # 首次进入监控：实时费率校验 + 记录峰值 + 创建信号
@@ -3326,9 +3326,6 @@ class TradingExecutor:
         target_qty = row['spot_qty']  # 已对齐的对冲数量
         target_amount = row.get('open_amount_usdt', self.open_amount_usdt)
         
-        # 获取精度配置
-        quanto_multiplier = self._get_quanto_multiplier(base_asset)
-        
         # 现货订单
         spot_order = {
             'order_uuid': order_uuid,
@@ -3609,8 +3606,6 @@ class TradingExecutor:
 
     def _create_position(self, order_group: Dict, exec_result: Dict) -> int:
         """创建持仓记录，返回 position_id"""
-        spot_order = order_group['spot_order']
-        future_order = order_group['future_order']
         spot_exec = exec_result['spot_order']
         future_exec = exec_result['future_order']
         
@@ -3640,8 +3635,15 @@ class TradingExecutor:
         """
         
         # 计算期货张数
-        quanto_multiplier = self._get_quanto_multiplier(order_group['base_asset'])
-        future_contracts = int(float(future_exec['exec_qty']) / quanto_multiplier)
+        exec_contracts = future_exec.get('exec_contracts')
+        if exec_contracts not in (None, ''):
+            future_contracts = int(round(abs(float(exec_contracts))))
+        else:
+            quanto_multiplier = require_quanto_multiplier(
+                self.contract_meta,
+                order_group['base_asset'],
+            )
+            future_contracts = int(float(future_exec['exec_qty']) / quanto_multiplier)
         
         params = {
             'order_uuid': order_group['order_uuid'],
@@ -3676,6 +3678,7 @@ class TradingExecutor:
         return 5
     
     def _get_quanto_multiplier(self, base_asset: str) -> float:
-        if base_asset in self.contract_meta:
-            return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
-        return 1.0
+        try:
+            return require_quanto_multiplier(self.contract_meta, base_asset)
+        except ValueError:
+            return 0.0

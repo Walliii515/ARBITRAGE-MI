@@ -208,9 +208,11 @@ class VirtualExecutor:
             return 0
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
-        if base_asset in self.contract_meta:
-            return float(self.contract_meta[base_asset].get('quanto_multiplier', 1.0))
-        return 1.0
+        try:
+            multiplier = float((self.contract_meta.get(base_asset) or {}).get('quanto_multiplier'))
+            return multiplier if multiplier > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def reload_meta(self, contract_meta: Dict, spot_meta: Dict):
         """热更新元数据（由服务层的 /api/reload 端点调用）"""

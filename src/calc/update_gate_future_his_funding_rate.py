@@ -79,7 +79,7 @@ def batch_fetch_funding_rates(contracts, batch_size=10):
             all_funding_rates.extend(funding_rates)
             log_print(f"  ✓ 本批次获取 {len(funding_rates)} 个合约的历史数据")
         else:
-            log_print(f"  ✗ 本批次获取失败")
+            log_print("  ✗ 本批次获取失败")
     
     log_print(f"\n✓ 总共获取 {len(all_funding_rates)} 个合约的历史资金费率数据")
     return all_funding_rates
@@ -159,7 +159,7 @@ def insert_funding_rates_incremental(funding_rates_data, contracts_info):
                 total_inserted += inserted
                 total_ignored += (len(batch_data) - inserted)
             
-            log_print(f"\n✓ 数据插入完成:")
+            log_print("\n✓ 数据插入完成:")
             log_print(f"  - 新增: {total_inserted} 条")
             log_print(f"  - 跳过（已存在）: {total_ignored} 条")
             

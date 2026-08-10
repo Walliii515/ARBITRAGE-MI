@@ -22,6 +22,38 @@ from calc.exchange_desync_remediator import (
 
 
 class TestReconciliationIgnoreAssets(unittest.TestCase):
+    def test_gate_post_processing_failure_does_not_skip_combined_exposure_check(self):
+        executor = MagicMock()
+        executor.fetch_binance_spot_balances.return_value = []
+        executor.fetch_gate_futures_positions.return_value = []
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler._load_local_spot_positions = MagicMock(return_value={})
+        reconciler._load_local_gate_positions = MagicMock(return_value={})
+        reconciler._compare_binance = MagicMock(return_value=[])
+        reconciler._compare_gate = MagicMock(return_value=[])
+        reconciler._mark_gate_desync_risks = MagicMock(side_effect=RuntimeError('db unavailable'))
+        reconciler._auto_cleanup_completed_asset_dust = MagicMock(
+            side_effect=RuntimeError('dust cleanup unavailable')
+        )
+        reconciler._build_combined_exposure_rows = MagicMock(return_value=[])
+        reconciler._mark_combined_exposure_risks = MagicMock(return_value=[])
+        reconciler._auto_remediate_combined_exposure_risks = MagicMock(return_value=[])
+        reconciler._insert_rows = MagicMock()
+        reconciler.cleanup_old_snapshots = MagicMock()
+
+        result = reconciler.run_once()
+
+        self.assertTrue(result['success'])
+        reconciler._build_combined_exposure_rows.assert_called_once()
+        reconciler._mark_combined_exposure_risks.assert_called_once_with(
+            unittest.mock.ANY,
+            [],
+        )
+        reconciler._auto_remediate_combined_exposure_risks.assert_called_once()
+
     def test_default_reconciler_uses_cross_margin(self):
         with patch('calc.reconciliation.fetch_contract_meta', return_value={}), \
                 patch('calc.reconciliation.fetch_spot_meta', return_value={}), \
@@ -439,21 +471,172 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
             'TUT',
         )
 
-    def test_confirmed_gate_risk_owns_asset_even_when_remediation_skips(self):
+    def test_gate_risk_does_not_own_asset_until_exchange_order_is_submitted(self):
         owned = Reconciler._gate_remediation_owned_assets(
             [
                 {'base_asset': 'BEL', 'confirmed': True},
                 {'base_asset': 'TUT', 'confirmed': False},
                 {'base_asset': 'AI', 'confirmed': False},
+                {'base_asset': 'BICO', 'confirmed': True},
             ],
             [
                 {'attempted': False, 'reason': 'no_matching_holding_positions'},
                 {'attempted': False, 'reason': 'waiting_for_reconciliation_confirmation'},
-                {'attempted': True, 'success': False},
+                {
+                    'attempted': True,
+                    'success': False,
+                    'reason': 'spot_available_qty_insufficient',
+                },
+                {
+                    'attempted': True,
+                    'success': False,
+                    'exchange_order_submitted': True,
+                    'future_result': {'success': False, 'reason': 'exchange_rejected'},
+                },
             ],
         )
 
-        self.assertEqual(owned, {'BEL', 'AI'})
+        self.assertEqual(owned, {'BICO'})
+
+    def test_gate_noop_does_not_block_combined_gate_short_recovery(self):
+        reconciler = Reconciler(
+            executor=object(),
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
+            'attempted': True,
+            'success': True,
+            'action': 'close_extra_gate_future',
+            'future_result': {'success': True, 'exec_contracts': 2.0},
+        })
+        reconciler._record_reconciliation_risk_event = MagicMock()
+        gate_risks = [{'base_asset': 'TUT', 'confirmed': True}]
+        gate_results = [{
+            'attempted': False,
+            'reason': 'exchange_legs_balanced_local_ledger_stale',
+        }]
+
+        results = reconciler._auto_remediate_combined_exposure_risks(
+            datetime(2026, 8, 10, 9, 30, 0),
+            [{
+                'base_asset': 'TUT',
+                'risk_type': 'gate_short_excess',
+                'confirmed': True,
+                'risk': {'type': 'gate_short_excess', 'contract': 'TUT_USDT'},
+                'binance_qty': 0.0,
+                'gate_qty': 200.0,
+                'gate_contracts': 2.0,
+                'quanto_multiplier': 100.0,
+            }],
+            skip_assets=Reconciler._gate_remediation_owned_assets(
+                gate_risks,
+                gate_results,
+            ),
+        )
+
+        self.assertTrue(results[0]['success'])
+        reconciler.remediator.remediate_gate_extra_position.assert_called_once()
+        self.assertEqual(
+            reconciler.remediator.remediate_gate_extra_position.call_args.kwargs['extra_contracts'],
+            2.0,
+        )
+
+    def test_rejected_gate_order_blocks_same_snapshot_combined_retry(self):
+        owned = Reconciler._gate_remediation_owned_assets(
+            [{'base_asset': 'TUT', 'confirmed': True}],
+            [{
+                'attempted': True,
+                'success': False,
+                'exchange_order_submitted': True,
+                'future_result': {'success': False, 'reason': 'exchange_rejected'},
+            }],
+        )
+
+        self.assertEqual(owned, {'TUT'})
+
+    def test_nested_spot_execution_blocks_same_snapshot_combined_retry(self):
+        owned = Reconciler._gate_remediation_owned_assets(
+            [{'base_asset': 'BEL', 'confirmed': True}],
+            [{
+                'attempted': True,
+                'success': False,
+                'results': [{
+                    'attempted': True,
+                    'exchange_order_submitted': True,
+                    'success': False,
+                    'reason': 'spot_close_partial_after_retry',
+                }],
+            }],
+        )
+
+        self.assertEqual(owned, {'BEL'})
+
+    def test_gate_remediation_exception_isolated_and_reserves_only_failed_asset(self):
+        executor = MagicMock()
+        executor.contract_meta = {
+            'TUT': {'quanto_multiplier': 100.0},
+            'BEL': {'quanto_multiplier': 1.0},
+        }
+        reconciler = Reconciler(
+            executor=executor,
+            cfg=ReconciliationConfig(auto_remediate_enabled=True),
+        )
+        reconciler.remediator.remediate_gate_extra_position = MagicMock(side_effect=[
+            RuntimeError('timeout_after_submit'),
+            {
+                'attempted': True,
+                'exchange_order_submitted': True,
+                'success': True,
+                'future_result': {'success': True, 'exec_contracts': 2.0},
+            },
+        ])
+        reconciler._record_reconciliation_risk_event = MagicMock()
+        risks = [
+            {
+                'base_asset': 'TUT',
+                'confirmed': True,
+                'risk': {'type': 'qty_mismatch', 'contract': 'TUT_USDT'},
+                'local_contracts': 10.0,
+                'exchange_contracts': 2.0,
+            },
+            {
+                'base_asset': 'BEL',
+                'confirmed': True,
+                'risk': {'type': 'qty_mismatch', 'contract': 'BEL_USDT'},
+                'local_contracts': 10.0,
+                'exchange_contracts': 2.0,
+            },
+        ]
+        binance_rows = [
+            {
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'TUT',
+                'exchange_value': 0.0,
+            },
+            {
+                'exchange': 'binance',
+                'dimension': 'position',
+                'base_asset': 'BEL',
+                'exchange_value': 0.0,
+            },
+        ]
+
+        results = reconciler._auto_remediate_gate_risks(
+            datetime(2026, 8, 10, 10, 0, 0),
+            risks,
+            binance_rows,
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[0]['exchange_order_state_unknown'])
+        self.assertTrue(results[0]['retry_needed'])
+        self.assertTrue(results[1]['success'])
+        self.assertEqual(
+            Reconciler._gate_remediation_owned_assets(risks, results),
+            {'TUT', 'BEL'},
+        )
+        self.assertEqual(reconciler.remediator.remediate_gate_extra_position.call_count, 2)
 
     def test_missing_binance_spot_is_not_bought_by_reduce_only_remediation(self):
         executor = MagicMock()
@@ -1540,6 +1723,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(fake.order['trade_direction'], 'buy')
         self.assertEqual(fake.order['future_contract'], 'EPIC_USDT')
         self.assertEqual(fake.order['target_qty'], 12)
+        self.assertEqual(fake.order['target_contracts'], 12)
 
     def test_extra_gate_long_is_not_forward_short_remediated(self):
         class FakeExecutor:

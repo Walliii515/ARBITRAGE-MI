@@ -17,7 +17,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List
 
 import yaml
 
@@ -264,7 +264,7 @@ ETL_TASKS: List[ETLTask] = [
     # ── interval 类型：固定间隔执行 ──
     ETLTask(
         name='update_gate_contracts',
-        description='Gate.io 永续合约信息 → mi_gate_future_contracts（全删全进）',
+        description='Gate.io 永续合约信息 → mi_gate_future_contracts（原子全量替换）',
         runner=_run_update_gate_future_contracts,
         schedule='interval',
         interval_minutes=_etl_config.get('tasks', {}).get('update_gate_contracts', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
@@ -273,7 +273,7 @@ ETL_TASKS: List[ETLTask] = [
     ),
     ETLTask(
         name='update_binance_spot',
-        description='Binance 现货交易对信息 → mi_binance_spot_info（全删全进）',
+        description='Binance 现货交易对信息 → mi_binance_spot_info（原子全量替换）',
         runner=_run_update_binance_spot_info,
         schedule='interval',
         interval_minutes=_etl_config.get('tasks', {}).get('update_binance_spot', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),
@@ -291,7 +291,7 @@ ETL_TASKS: List[ETLTask] = [
     ),
     ETLTask(
         name='calc_funding_rate_threshold',
-        description='资金费率分位阈値 → mi_gate_future_funding_rate_threshold（UPSERT）',
+        description='资金费率分位阈値 → mi_gate_future_funding_rate_threshold（原子全量替换）',
         runner=_run_calculate_funding_rate_threshold,
         schedule='interval',
         interval_minutes=_etl_config.get('tasks', {}).get('calc_funding_rate_threshold', {}).get('interval_minutes', _etl_config.get('default_interval_minutes', 15)),

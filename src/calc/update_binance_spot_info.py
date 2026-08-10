@@ -1,7 +1,7 @@
 # coding: utf-8
 """
-更新 Binance 现货交易对数据到数据库
-全删全进 mi_binance_spot_info
+更新 Binance 现货交易对数据到数据库。
+校验完整快照后原子替换 mi_binance_spot_info。
 合并 exchangeInfo 基本信息 + 24h Ticker 的 quoteVolume
 """
 import sys
@@ -15,6 +15,7 @@ from common.database import db_manager
 from exchange_apis.get_binance_spot_info import get_binance_spot_info
 from exchange_apis.get_binance_spot_tickers import get_spot_tickers_usdt
 from common.logger import get_logger, log_print
+from common.market_meta_safety import validate_spot_records
 
 logger = get_logger(__name__)
 
@@ -49,19 +50,8 @@ def merge_spot_info_with_tickers(spot_info_list, tickers):
     return merged_data
 
 
-def clear_table():
-    """清空表数据"""
-    try:
-        with db_manager.get_cursor() as cursor:
-            cursor.execute("DELETE FROM mi_binance_spot_info")
-            log_print("✓ 已清空表数据")
-    except Exception as e:
-        logger.exception(f"✗ 清空表失败: {e}")
-        raise
-
-
-def insert_spot_info(spot_info_list):
-    """插入交易对数据到数据库"""
+def _insert_spot_info(cursor, spot_info_list):
+    """使用调用方事务插入交易对数据。"""
     insert_sql = """
     INSERT INTO mi_binance_spot_info (
         symbol, base_asset, quote_asset, status,
@@ -87,10 +77,8 @@ def insert_spot_info(spot_info_list):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     success_count = 0
     
-    try:
-        with db_manager.get_cursor() as cursor:
-            for item in spot_info_list:
-                data = {
+    for item in spot_info_list:
+        data = {
                     'symbol': item.get('symbol'),
                     'base_asset': item.get('base_asset'),
                     'quote_asset': item.get('quote_asset'),
@@ -111,15 +99,25 @@ def insert_spot_info(spot_info_list):
                     'is_spot_trading_allowed': 1 if item.get('is_spot_trading_allowed') else 0,
                     'is_margin_trading_allowed': 1 if item.get('is_margin_trading_allowed') else 0,
                     'updated_at': now
-                }
-                
-                cursor.execute(insert_sql, data)
-                success_count += 1
-            
-            log_print(f"✓ 成功插入 {success_count} 条交易对数据")
-            
+        }
+        cursor.execute(insert_sql, data)
+        success_count += 1
+    return success_count
+
+
+def replace_spot_info(spot_info_list):
+    """校验并在同一事务中替换整张 Binance 现货元数据表。"""
+    try:
+        with db_manager.get_cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS cnt FROM mi_binance_spot_info")
+            previous_count = int((cursor.fetchone() or {}).get('cnt') or 0)
+            validate_spot_records(spot_info_list, previous_count=previous_count)
+            cursor.execute("DELETE FROM mi_binance_spot_info")
+            success_count = _insert_spot_info(cursor, spot_info_list)
+        log_print(f"✓ 原子替换 {success_count} 条交易对数据")
+        return success_count
     except Exception as e:
-        logger.exception(f"✗ 插入数据失败: {e}")
+        logger.exception(f"✗ 原子替换现货元数据失败: {e}")
         raise
 
 
@@ -155,15 +153,11 @@ def update_binance_spot_info():
         merged_data = merge_spot_info_with_tickers(spot_info, tickers)
         log_print(f"✓ 成功合并 {len(merged_data)} 条数据")
         
-        # 4. 清空表
-        log_print("\n[3/4] 正在清空表数据...")
-        clear_table()
+        # 4. 原子替换表数据
+        log_print("\n[3/4] 正在校验并原子替换表数据...")
+        replace_spot_info(merged_data)
         
-        # 5. 插入新数据
-        log_print("\n[4/4] 正在插入新数据...")
-        insert_spot_info(merged_data)
-        
-        # 6. 完成
+        # 5. 完成
         log_print("\n" + "=" * 60)
         log_print(f"✓ 数据更新完成！更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log_print(f"✓ 共更新 {len(merged_data)} 个交易对")

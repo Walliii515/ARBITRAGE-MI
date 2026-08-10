@@ -83,7 +83,7 @@ class ExecutorClient:
             error_msg = f'成交引擎服务请求超时({self.timeout}s): {e}'
             logger.error(error_msg)
             return self._error_result(error_msg)
-        except requests.exceptions.HTTPError as e:
+        except requests.exceptions.HTTPError:
             error_msg = f'成交引擎服务返回错误: {resp.status_code} {resp.text}'
             logger.error(error_msg)
             return self._error_result(error_msg)

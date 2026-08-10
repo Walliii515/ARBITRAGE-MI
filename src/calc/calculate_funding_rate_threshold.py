@@ -4,7 +4,6 @@
 """
 import sys
 import os
-from datetime import datetime
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -13,6 +12,35 @@ from common.database import db_manager
 from common.logger import get_logger, log_print
 
 logger = get_logger(__name__)
+
+
+def replace_funding_thresholds(cursor, stats_results) -> int:
+    """Replace derived thresholds inside the caller's transaction."""
+    if not stats_results:
+        return 0
+    insert_sql = """
+        INSERT INTO mi_gate_future_funding_rate_threshold (
+            contract, total_records, positive_count,
+            percentile_20, percentile_30, percentile_40,
+            min_rate, max_rate,
+            update_time
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+        )
+    """
+    insert_data = [(
+        data['contract'],
+        data['total_records'],
+        data['positive_count'],
+        data['percentile_20'],
+        data['percentile_30'],
+        data['percentile_40'],
+        data['min_rate'],
+        data['max_rate'],
+    ) for data in stats_results]
+    cursor.execute("DELETE FROM mi_gate_future_funding_rate_threshold")
+    cursor.executemany(insert_sql, insert_data)
+    return len(insert_data)
 
 
 def count_positive_funding_rates(
@@ -30,7 +58,7 @@ def count_positive_funding_rates(
     log_print("=" * 100)
     log_print("资金费率正负统计")
     log_print("=" * 100)
-    log_print(f"\n参数设置:")
+    log_print("\n参数设置:")
     log_print(f"  - 最大历史天数: {max_days} 天\n")
 
     try:
@@ -121,12 +149,6 @@ def count_positive_funding_rates(
                 min_rate = positive_rates[0]
                 max_rate = positive_rates[-1]
                 
-                # 获取最新数据
-                latest_record = records[-1]
-                current_rate = latest_record['funding_rate']
-                current_rate_24h = latest_record['funding_rate_24h']
-                latest_time = latest_record['timestamp']
-                
                 stats_results.append({
                     'contract': contract,
                     'positive_count': n,
@@ -141,104 +163,17 @@ def count_positive_funding_rates(
             # 4. 排序（按30%分位数从高到低）
             stats_results.sort(key=lambda x: x['percentile_30'], reverse=True)
             
-            # 6. 清空表数据
-            log_print("清空表数据...")
-            cursor.execute("TRUNCATE TABLE mi_gate_future_funding_rate_threshold")
-            log_print("✓ 表数据已清空")
+            if not stats_results:
+                log_print("没有可用统计结果，保留上一版资金费率阈值")
+                return
+
+            # DELETE 与后续 INSERT 共用当前事务，读方不会看到空表。
+            log_print("原子替换阈值表数据...")
+            inserted = replace_funding_thresholds(cursor, stats_results)
+            log_print(f"✓ 成功插入 {inserted} 条数据")
             
-            # 7. 插入数据
-            log_print(f"插入 {len(stats_results)} 条数据...")
-            
-            insert_sql = """
-            INSERT INTO mi_gate_future_funding_rate_threshold (
-                contract, total_records, positive_count,
-                percentile_20, percentile_30, percentile_40,
-                min_rate, max_rate,
-                update_time
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-            )
-            """
-            
-            insert_data = []
-            for data in stats_results:
-                insert_data.append((
-                    data['contract'],
-                    data['total_records'],
-                    data['positive_count'],
-                    data['percentile_20'],
-                    data['percentile_30'],
-                    data['percentile_40'],
-                    data['min_rate'],
-                    data['max_rate']
-                ))
-            
-            cursor.executemany(insert_sql, insert_data)
-            log_print(f"✓ 成功插入 {len(insert_data)} 条数据")
-            
-            # 8. 输出结果
             log_print("=" * 140)
             log_print(f"✓ 统计完成，共 {len(stats_results)} 个合约有正的24h资金费率\n")
-            
-            if not stats_results:
-                log_print("没有找到符合条件的合约")
-                return
-            
-            # 打印表头
-            # print(f"{'排名':<5} {'合约':<25} {'正费率次数':<10} {'20%分位数':<12} "
-            #       f"{'30%分位数':<12} {'40%分位数':<12} "
-            #       f"{'最小值':<12} {'最大值':<12} {'当前24h费率':<12}")
-            # print("-" * 140)
-            #
-            # for i, data in enumerate(stats_results, 1):
-            #     print(f"{i:<5} {data['contract']:<25} "
-            #           f"{data['positive_count']:>8} "
-            #           f"{data['percentile_20']*100:>10.4f}% "
-            #           f"{data['percentile_30']*100:>10.4f}% "
-            #           f"{data['percentile_40']*100:>10.4f}% "
-            #           f"{data['min_rate']*100:>10.4f}% "
-            #           f"{data['max_rate']*100:>10.4f}% "
-            #           f"{data['current_rate_24h']*100:>10.4f}%")
-            #
-            # print("-" * 140)
-            
-            # 9. 导出到CSV文件
-            import csv
-            
-            # 项目根目录
-            # project_root = os.path.join(os.path.dirname(__file__), '..', '..')
-            # output_file = os.path.join(project_root, 'funding_rate_24h_percentile_stats.csv')
-            #
-            # with open(output_file, 'w', encoding='utf-8-sig', newline='') as f:
-            #     writer = csv.writer(f)
-            #
-            #     # 写入表头
-            #     writer.writerow([
-            #         '排名', '合约', '总记录数', '正24h费率次数',
-            #         '20%分位数', '30%分位数', '40%分位数',
-            #         '最小值', '最大值', '当前24h费率', '最新时间'
-            #     ])
-            #
-            #     # 写入数据
-            #     for i, data in enumerate(stats_results, 1):
-            #         latest_time_str = datetime.fromtimestamp(data['latest_time']).strftime('%Y-%m-%d %H:%M:%S')
-            #
-            #         writer.writerow([
-            #             i,
-            #             data['contract'],
-            #             data['total_records'],
-            #             data['positive_count'],
-            #             f"{data['percentile_20']*100:.4f}%",
-            #             f"{data['percentile_30']*100:.4f}%",
-            #             f"{data['percentile_40']*100:.4f}%",
-            #             f"{data['min_rate']*100:.4f}%",
-            #             f"{data['max_rate']*100:.4f}%",
-            #             f"{data['current_rate_24h']*100:.4f}%",
-            #             latest_time_str
-            #         ])
-            #
-            # print(f"\n✓ 完整结果已导出到: {output_file}")
-            # print(f"✓ 共导出 {len(stats_results)} 个合约的数据")
             
     except Exception as e:
         logger.exception(f"\n✗ 分析失败: {e}")
