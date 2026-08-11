@@ -1396,6 +1396,10 @@ function setWindow(window: TimeWindowKey) {
   void fetchHistory()
 }
 
+function handleWindowChange(value: TimeWindowKey) {
+  setWindow(value)
+}
+
 async function refreshCapital() {
   await fetchCapital(true)
 }
@@ -1587,85 +1591,126 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="gate-risk-panel">
-      <div class="gate-risk-review-header">
-        <span>重点摘要</span>
-      </div>
       <div class="gate-risk-review-grid">
-        <div class="gate-risk-review-item gate-current-mmr">
-        <div class="gate-current-mmr-copy">
-          <span class="metric-label-with-help">
-            <span>当前全仓MMR</span>
-            <el-popover
-              trigger="click"
-              placement="right-start"
-              :width="640"
-              popper-class="mmr-help-popper"
-              :popper-options="mmrHelpPopperOptions"
-            >
-              <template #reference>
-                <el-button
-                  class="help-icon-button"
-                  text
-                  circle
-                  size="small"
-                  aria-label="全仓MMR风控说明"
-                >
-                  <el-icon><QuestionFilled /></el-icon>
-                </el-button>
-              </template>
-              <div class="mmr-help">
-                <div class="mmr-help-row">
-                  <strong class="risk-warning">500%</strong>
-                  <span>停止新的正向开仓并写入铃铛告警；正向开仓开关开启时，同时创建 Binance → Gate 自动划转任务，目标 MMR 为 700%。关闭正向开仓只停止新自动任务，已经创建的划转任务会继续执行到完成或异常。</span>
+        <div class="gate-risk-review-item gate-risk-overview">
+          <div class="gate-risk-card-heading">
+            <span class="metric-label-with-help">
+              <span>当前全仓MMR</span>
+              <el-popover
+                trigger="click"
+                placement="right-start"
+                :width="640"
+                popper-class="mmr-help-popper"
+                :popper-options="mmrHelpPopperOptions"
+              >
+                <template #reference>
+                  <el-button
+                    class="help-icon-button"
+                    text
+                    circle
+                    size="small"
+                    aria-label="全仓MMR风控说明"
+                  >
+                    <el-icon><QuestionFilled /></el-icon>
+                  </el-button>
+                </template>
+                <div class="mmr-help">
+                  <div class="mmr-help-row">
+                    <strong class="risk-warning">500%</strong>
+                    <span>停止新的正向开仓并写入铃铛告警；正向开仓开关开启时，同时创建 Binance → Gate 自动划转任务，目标 MMR 为 700%。关闭正向开仓只停止新自动任务，已经创建的划转任务会继续执行到完成或异常。</span>
+                  </div>
+                  <div class="mmr-help-formula">
+                    <strong>自动划转金额</strong>
+                    <span>所需额 = max(0, Gate维持保证金 × 7 - Gate账户权益) × 1.15；单次最多使用 Binance Forward 可用资金的 70%，且 Binance 至少保留 max(总资产 × 2%, 50 USDT)。最低有效额 = max(100 USDT, Gate维持保证金 × 50%, 交易所最低额)；不足最低有效额时不提现，并写入铃铛通知人工处理。</span>
+                  </div>
+                  <div class="mmr-help-row">
+                    <strong class="risk-warning">350%</strong>
+                    <span>最近一次自动划转评估明确为“可划资金不足”时，只生成一张一次性许可；找到净收益为正的候选并取得币种执行权后才领取。领取期间人工/自动划转均被阻止；拒单或异常会释放预约但不立即重算，真实卖出 Binance 现货后立即重新评估。在得到新的“仍然不足”结论前不会继续释放；失败锁、陈旧资金摘要、异常或非有限经济数据均禁止该档位平仓。</span>
+                  </div>
+                  <div class="mmr-help-row">
+                    <strong class="risk-danger">300%</strong>
+                    <span>进入分步风险减仓，每个新的官方风险快照最多平一笔。在能够有效释放维持保证金的候选中优先预计损失较小的完整套利仓位，并持续处理到 MMR 恢复至 500%；任一腿平仓失败即停止本轮，交由下一轮和持仓对账继续处理。真实卖出 Binance 现货后立即重算自动划转，已有任务时不会重复创建。</span>
+                  </div>
+                  <div class="mmr-help-row">
+                    <strong class="risk-danger">200%</strong>
+                    <span>进入最高级安全路径，不再按盈亏选择，先处理距强平价不超过 300bps 的合约，再按维持保证金释放能力排序；仍然一次只退出一个本地完整套利仓位，不提交跨仓位聚合全平。释放 Binance 资金后同样立即重算自动划转。</span>
+                  </div>
+                  <div class="mmr-help-row">
+                    <strong>100%</strong>
+                    <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在到达该线前完成主动处置。</span>
+                  </div>
+                  <div class="mmr-help-note">
+                    独立危险条件：任一正向空头距强平价不超过 300bps 时，不等待账户 MMR 降至 300%，立即市价平掉该合约对应的完整套利仓位。
+                  </div>
                 </div>
-                <div class="mmr-help-formula">
-                  <strong>自动划转金额</strong>
-                  <span>所需额 = max(0, Gate维持保证金 × 7 - Gate账户权益) × 1.15；单次最多使用 Binance Forward 可用资金的 70%，且 Binance 至少保留 max(总资产 × 2%, 50 USDT)。最低有效额 = max(100 USDT, Gate维持保证金 × 50%, 交易所最低额)；不足最低有效额时不提现，并写入铃铛通知人工处理。</span>
+              </el-popover>
+            </span>
+            <span>{{ gateCrossRisk.status_label || '实时官方账户风险' }}</span>
+          </div>
+          <strong class="gate-current-mmr-value" :class="gateRiskStatusClass(gateCrossRisk.status)">
+            {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
+          </strong>
+          <div class="gate-risk-combined">
+            <div class="gate-risk-combined-heading">
+              <span class="gate-risk-review-label">Gate风险摘要</span>
+              <el-popover
+                trigger="hover"
+                placement="top"
+                :width="420"
+                popper-class="risk-summary-help-popper"
+              >
+                <template #reference>
+                  <el-button
+                    class="help-icon-button"
+                    text
+                    circle
+                    size="small"
+                    aria-label="Gate风险摘要说明"
+                  >
+                    <el-icon><QuestionFilled /></el-icon>
+                  </el-button>
+                </template>
+                <div class="risk-summary-help">
+                  <div>MMR历史仅统计有效官方快照。</div>
+                  <div>近7天最低全仓MMR: {{ recentMinimumGateRisk?.snapshot_at || '暂无有效历史快照' }}</div>
+                  <div v-if="recentMinimumGateRisk?.primary_risk_asset">
+                    主要风险币: {{ recentMinimumGateRisk.primary_risk_asset }}
+                  </div>
+                  <div>300%风险首平候选: {{ gatePriorityReasonText() }}</div>
                 </div>
-                <div class="mmr-help-row">
-                  <strong class="risk-warning">350%</strong>
-                  <span>最近一次自动划转评估明确为“可划资金不足”时，只生成一张一次性许可；找到净收益为正的候选并取得币种执行权后才领取。领取期间人工/自动划转均被阻止；拒单或异常会释放预约但不立即重算，真实卖出 Binance 现货后立即重新评估。在得到新的“仍然不足”结论前不会继续释放；失败锁、陈旧资金摘要、异常或非有限经济数据均禁止该档位平仓。</span>
-                </div>
-                <div class="mmr-help-row">
-                  <strong class="risk-danger">300%</strong>
-                  <span>进入分步风险减仓，每个新的官方风险快照最多平一笔。在能够有效释放维持保证金的候选中优先预计损失较小的完整套利仓位，并持续处理到 MMR 恢复至 500%；任一腿平仓失败即停止本轮，交由下一轮和持仓对账继续处理。真实卖出 Binance 现货后立即重算自动划转，已有任务时不会重复创建。</span>
-                </div>
-                <div class="mmr-help-row">
-                  <strong class="risk-danger">200%</strong>
-                  <span>进入最高级安全路径，不再按盈亏选择，先处理距强平价不超过 300bps 的合约，再按维持保证金释放能力排序；仍然一次只退出一个本地完整套利仓位，不提交跨仓位聚合全平。释放 Binance 资金后同样立即重算自动划转。</span>
-                </div>
-                <div class="mmr-help-row">
-                  <strong>100%</strong>
-                  <span>Gate 交易所强平基准线，最终以 Gate 返回的强平价和交易所风控结果为准；系统目标是在到达该线前完成主动处置。</span>
-                </div>
-                <div class="mmr-help-note">
-                  独立危险条件：任一正向空头距强平价不超过 300bps 时，不等待账户 MMR 降至 300%，立即市价平掉该合约对应的完整套利仓位。
-                </div>
+              </el-popover>
+            </div>
+            <div class="gate-risk-combined-values">
+              <div>
+                <span>近7天最低全仓MMR</span>
+                <strong :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
+                  {{ formatPercent(recentMinimumGateRisk?.account_mmr_pct) }}
+                </strong>
               </div>
-            </el-popover>
-          </span>
-          <span>{{ gateCrossRisk.status_label || '实时官方账户风险' }}</span>
-        </div>
-        <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
-          {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
-        </strong>
+              <div>
+                <span>300%风险首平候选</span>
+                <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
+                  {{ gatePriorityAsset }}
+                </strong>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="gate-risk-review-item annualized-summary">
           <div class="annualized-summary-heading">
             <span class="gate-risk-review-label">策略年化收益率</span>
-            <el-radio-group
+            <el-select
               v-model="selectedAnnualizedPeriod"
               size="small"
-              class="annualized-period-selector"
+              class="annualized-period-select"
             >
-              <el-radio-button
+              <el-option
                 v-for="option in annualizedPeriodOptions"
                 :key="option.value"
-                :label="option.value"
-              >
-                {{ option.label }}
-              </el-radio-button>
-            </el-radio-group>
+                :label="option.label"
+                :value="option.value"
+              />
+            </el-select>
           </div>
           <div class="annualized-values">
             <div class="annualized-value-block">
@@ -1729,51 +1774,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
-        <div class="gate-risk-review-item gate-risk-combined">
-          <div class="gate-risk-combined-heading">
-            <span class="gate-risk-review-label">Gate风险摘要</span>
-            <el-popover
-              trigger="hover"
-              placement="top"
-              :width="420"
-              popper-class="risk-summary-help-popper"
-            >
-              <template #reference>
-                <el-button
-                  class="help-icon-button"
-                  text
-                  circle
-                  size="small"
-                  aria-label="Gate风险摘要说明"
-                >
-                  <el-icon><QuestionFilled /></el-icon>
-                </el-button>
-              </template>
-              <div class="risk-summary-help">
-                <div>MMR历史仅统计有效官方快照。</div>
-                <div>近7天最低全仓MMR: {{ recentMinimumGateRisk?.snapshot_at || '暂无有效历史快照' }}</div>
-                <div v-if="recentMinimumGateRisk?.primary_risk_asset">
-                  主要风险币: {{ recentMinimumGateRisk.primary_risk_asset }}
-                </div>
-                <div>300%风险首平候选: {{ gatePriorityReasonText() }}</div>
-              </div>
-            </el-popover>
-          </div>
-          <div class="gate-risk-combined-values">
-            <div>
-              <span>近7天最低全仓MMR</span>
-              <strong :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
-                {{ formatPercent(recentMinimumGateRisk?.account_mmr_pct) }}
-              </strong>
-            </div>
-            <div>
-              <span>300%风险首平候选</span>
-              <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
-                {{ gatePriorityAsset }}
-              </strong>
-            </div>
-          </div>
-        </div>
       </div>
       <div v-if="gateRiskPanelError" class="risk-health-error">
         {{ gateRiskPanelError }}
@@ -1783,18 +1783,21 @@ onBeforeUnmount(() => {
     <div ref="chartPanelRef" class="chart-panel">
       <div class="chart-filter-bar">
         <span>资金趋势</span>
-        <el-button-group size="small" class="chart-window-selector">
-          <el-button
-            v-for="window in timeWindowOptions"
-            :key="window.key"
-            :type="selectedWindow === window.key ? 'primary' : 'default'"
-            @click="setWindow(window.key)"
-          >
-            {{ window.label }}
-          </el-button>
-        </el-button-group>
       </div>
       <div class="metric-selector-row">
+        <el-select
+          v-model="selectedWindow"
+          size="small"
+          class="chart-window-select"
+          @change="handleWindowChange"
+        >
+          <el-option
+            v-for="window in timeWindowOptions"
+            :key="window.key"
+            :label="window.label"
+            :value="window.key"
+          />
+        </el-select>
         <el-radio-group
           v-model="selectedChartMode"
           size="small"
@@ -2066,49 +2069,36 @@ onBeforeUnmount(() => {
   padding: 12px 14px;
 }
 
-.gate-risk-review-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
-  color: var(--app-text);
-  font-size: 15px;
-  font-weight: 700;
+.gate-risk-overview {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 10px;
 }
 
-.gate-risk-review-header span + span {
+.gate-risk-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.gate-risk-card-heading > span:last-child {
   color: var(--app-text-muted);
   font-size: 11px;
   font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  text-align: right;
 }
 
-.gate-current-mmr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  min-height: 70px;
-  padding: 10px 12px;
-}
-
-.gate-current-mmr-copy {
-  display: grid;
-  gap: 5px;
+.gate-risk-card-heading .metric-label-with-help {
+  min-width: 0;
   color: var(--app-text);
   font-size: 14px;
   font-weight: 650;
 }
 
-.gate-current-mmr-copy > span:last-child {
-  color: var(--app-text-muted);
-  font-size: 11px;
-  font-weight: 500;
-}
-
-.gate-current-mmr > strong {
+.gate-current-mmr-value {
+  display: block;
   font-size: 28px;
   font-variant-numeric: tabular-nums;
   line-height: 1;
@@ -2133,8 +2123,7 @@ onBeforeUnmount(() => {
 
 .gate-risk-review-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  border-top: 1px solid var(--app-border);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .gate-risk-review-item {
@@ -2191,10 +2180,9 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
-.annualized-period-selector {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+.annualized-period-select {
+  width: 96px;
+  flex: 0 0 auto;
 }
 
 .annualized-values {
@@ -2239,6 +2227,8 @@ onBeforeUnmount(() => {
 .gate-risk-combined {
   grid-template-columns: minmax(0, 1fr);
   align-content: start;
+  border-top: 1px solid var(--app-border);
+  padding-top: 10px;
   gap: 8px;
 }
 
@@ -2495,17 +2485,17 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
 }
 
-.chart-window-selector {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
 .metric-selector-row {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+
+.chart-window-select {
+  width: 104px;
+  flex: 0 0 auto;
 }
 
 .metric-selector {
@@ -2759,13 +2749,6 @@ onBeforeUnmount(() => {
     max-width: 100%;
   }
 
-  .gate-risk-review-header {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .gate-risk-review-header span + span,
   .gate-risk-review-label {
     white-space: normal;
     overflow-wrap: anywhere;
@@ -2800,11 +2783,7 @@ onBeforeUnmount(() => {
     overflow-wrap: anywhere;
   }
 
-  .gate-current-mmr {
-    align-items: flex-start;
-  }
-
-  .gate-current-mmr > strong {
+  .gate-current-mmr-value {
     font-size: 24px;
   }
 
@@ -2814,8 +2793,8 @@ onBeforeUnmount(() => {
     gap: 8px;
   }
 
-  .annualized-period-selector {
-    justify-content: flex-start;
+  .annualized-period-select {
+    width: 100%;
   }
 
   .annualized-values {

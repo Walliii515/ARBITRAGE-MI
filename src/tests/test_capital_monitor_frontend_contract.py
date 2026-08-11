@@ -38,7 +38,7 @@ def test_chart_selection_changes_do_not_reload_capital_overview():
 
 
 def test_gate_summary_prioritizes_current_mmr_outside_exchange_card():
-    assert '<span>重点摘要</span>' in CAPITAL_MONITOR_SOURCE
+    assert '<span>重点摘要</span>' not in CAPITAL_MONITOR_SOURCE
     assert 'Gate 风险重点' not in CAPITAL_MONITOR_SOURCE
     assert '<span>当前全仓MMR</span>' in CAPITAL_MONITOR_SOURCE
     current_mmr = CAPITAL_MONITOR_SOURCE.index('<span>当前全仓MMR</span>')
@@ -64,7 +64,7 @@ def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
     assert '当日已实现' in CAPITAL_MONITOR_SOURCE
 
 
-def test_mmr_annualized_return_and_gate_risk_share_one_three_column_row():
+def test_mmr_and_gate_risk_share_card_beside_annualized_card():
     grid_start = CAPITAL_MONITOR_SOURCE.index('<div class="gate-risk-review-grid">')
     grid_end = CAPITAL_MONITOR_SOURCE.index(
         '<div v-if="gateRiskPanelError"',
@@ -77,9 +77,11 @@ def test_mmr_annualized_return_and_gate_risk_share_one_three_column_row():
     risk_summary = summary_grid.index('Gate风险摘要')
     minimum_mmr = summary_grid.index('近7天最低全仓MMR')
     priority_asset = summary_grid.index('300%风险首平候选')
-    assert current_mmr < annualized < risk_summary
-    assert risk_summary < minimum_mmr < priority_asset
-    assert 'grid-template-columns: repeat(3, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
+    assert current_mmr < risk_summary < minimum_mmr < priority_asset < annualized
+    assert 'grid-template-columns: repeat(2, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
+    assert 'class="gate-risk-review-item gate-risk-overview"' in summary_grid
+    assert 'class="gate-risk-review-item annualized-summary"' in summary_grid
+    assert 'annualized-period-select' in summary_grid
 
 
 def test_capital_trend_uses_total_only_and_removes_deprecated_chart_tabs():
@@ -87,7 +89,8 @@ def test_capital_trend_uses_total_only_and_removes_deprecated_chart_tabs():
     chart_end = CAPITAL_MONITOR_SOURCE.index('<el-dialog', chart_start)
     chart_panel = CAPITAL_MONITOR_SOURCE[chart_start:chart_end]
 
-    assert 'chart-window-selector' in chart_panel
+    assert 'chart-window-select' in chart_panel
+    assert chart_panel.index('class="chart-window-select"') < chart_panel.index('class="metric-selector"')
     assert "label: '1小时'" not in CAPITAL_MONITOR_SOURCE
     assert "label: '3小时'" not in CAPITAL_MONITOR_SOURCE
     assert "label: '12小时'" not in CAPITAL_MONITOR_SOURCE
