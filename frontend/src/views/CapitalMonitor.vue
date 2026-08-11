@@ -1467,6 +1467,22 @@ onBeforeUnmount(() => {
       <el-button size="small" @click="showSummaryDetails = !showSummaryDetails">
         {{ showSummaryDetails ? '收起详情' : '详细' }}
       </el-button>
+      <div class="toolbar-spacer"></div>
+      <div class="toolbar-bnb">
+        <span>BNB可用</span>
+        <strong>
+          <span>{{ formatAmount(latestByExchange.binance?.bnb_available_usdt) }}</span>
+          <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
+        </strong>
+        <el-button
+          size="small"
+          type="primary"
+          :loading="bnbBuying"
+          @click="buyBnbFeeAsset"
+        >
+          买BNB
+        </el-button>
+      </div>
     </div>
 
     <div class="summary-grid">
@@ -1477,15 +1493,6 @@ onBeforeUnmount(() => {
       >
         <div class="card-header">
           <div class="card-title">{{ exchange === 'total' ? '合计' : exchange }}</div>
-          <el-button
-            v-if="exchange === 'binance'"
-            size="small"
-            type="primary"
-            :loading="bnbBuying"
-            @click="buyBnbFeeAsset"
-          >
-            买BNB
-          </el-button>
         </div>
         <div class="metric-row">
           <span>总资产</span>
@@ -1533,7 +1540,7 @@ onBeforeUnmount(() => {
             </span>
           </strong>
         </div>
-        <div v-if="exchange !== 'gate'" class="metric-row">
+        <div v-if="exchange !== 'gate'" class="metric-row usage-row">
           <span>占用</span>
           <strong>
             <span>{{ formatAmount(occupiedAmount(latestByExchange[exchange], exchange)) }}</span>
@@ -1548,16 +1555,6 @@ onBeforeUnmount(() => {
               <span v-if="hasAmount(gateCrossRisk.maintenance_margin_usdt)" class="metric-unit">USDT</span>
             </strong>
           </div>
-        </div>
-        <div v-if="exchange === 'binance'" class="metric-row bnb-metric-row">
-          <span>BNB可用</span>
-          <strong class="bnb-value">
-            <span>{{ formatToken(latestByExchange.binance?.bnb_available, 6) }}</span>
-            <span v-if="hasAmount(latestByExchange.binance?.bnb_available)" class="metric-unit">BNB</span>
-            <span class="metric-separator">/ ≈</span>
-            <span>{{ formatAmount(latestByExchange.binance?.bnb_available_usdt) }}</span>
-            <span v-if="hasAmount(latestByExchange.binance?.bnb_available_usdt)" class="metric-unit">USDT</span>
-          </strong>
         </div>
         <div v-if="showSummaryDetails" class="metric-row">
           <span>资金费收益</span>
@@ -2049,6 +2046,34 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.toolbar-bnb {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  margin-left: auto;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  padding: 3px 4px 3px 10px;
+  background: var(--app-surface);
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.toolbar-bnb strong {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--app-text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(220px, 1fr));
@@ -2059,14 +2084,11 @@ onBeforeUnmount(() => {
   border: 1px solid var(--app-border);
   background: var(--app-surface);
   border-radius: 6px;
-  padding: 12px 14px;
+  padding: 10px 12px;
 }
 
 .gate-risk-panel {
-  border: 1px solid var(--app-border);
-  background: var(--app-surface);
-  border-radius: 6px;
-  padding: 12px 14px;
+  background: transparent;
 }
 
 .gate-risk-overview {
@@ -2077,10 +2099,12 @@ onBeforeUnmount(() => {
 
 .gate-risk-card-heading {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   min-width: 0;
+  border-bottom: 1px solid var(--app-border);
+  padding-bottom: 10px;
 }
 
 .gate-risk-card-heading > span:last-child {
@@ -2093,12 +2117,13 @@ onBeforeUnmount(() => {
 .gate-risk-card-heading .metric-label-with-help {
   min-width: 0;
   color: var(--app-text);
-  font-size: 14px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .gate-current-mmr-value {
   display: block;
+  margin-top: 2px;
   font-size: 28px;
   font-variant-numeric: tabular-nums;
   line-height: 1;
@@ -2124,6 +2149,7 @@ onBeforeUnmount(() => {
 .gate-risk-review-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .gate-risk-review-item {
@@ -2133,12 +2159,10 @@ onBeforeUnmount(() => {
   column-gap: 14px;
   row-gap: 4px;
   min-height: 58px;
-  padding: 8px 12px;
-  border-left: 1px solid var(--app-border);
-}
-
-.gate-risk-review-item:first-child {
-  border-left: 0;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  padding: 14px;
+  background: var(--app-surface);
 }
 
 .gate-risk-review-label {
@@ -2169,7 +2193,7 @@ onBeforeUnmount(() => {
 .annualized-summary {
   grid-template-columns: minmax(0, 1fr);
   align-content: start;
-  gap: 8px;
+  gap: 12px;
 }
 
 .annualized-summary-heading {
@@ -2178,6 +2202,14 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  border-bottom: 1px solid var(--app-border);
+  padding-bottom: 10px;
+}
+
+.annualized-summary-heading .gate-risk-review-label {
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .annualized-period-select {
@@ -2189,14 +2221,16 @@ onBeforeUnmount(() => {
   grid-column: 1 / -1;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px 14px;
+  gap: 12px;
 }
 
 .annualized-value-block {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 4px;
+  gap: 6px;
   min-width: 0;
+  border-left: 2px solid color-mix(in srgb, var(--app-primary, #409eff) 32%, var(--app-border));
+  padding-left: 10px;
 }
 
 .annualized-value-label {
@@ -2214,6 +2248,7 @@ onBeforeUnmount(() => {
 }
 
 .annualized-value-block > strong {
+  font-size: 18px;
   text-align: left;
 }
 
@@ -2228,7 +2263,7 @@ onBeforeUnmount(() => {
   grid-template-columns: minmax(0, 1fr);
   align-content: start;
   border-top: 1px solid var(--app-border);
-  padding-top: 10px;
+  padding-top: 12px;
   gap: 8px;
 }
 
@@ -2248,6 +2283,14 @@ onBeforeUnmount(() => {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  min-height: 30px;
+  border-top: 1px solid color-mix(in srgb, var(--app-border) 70%, transparent);
+  padding-top: 8px;
+}
+
+.gate-risk-combined-values > div:first-child {
+  border-top: 0;
+  padding-top: 0;
 }
 
 .gate-risk-combined-values span {
@@ -2285,15 +2328,22 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 8px;
-  min-height: 28px;
+  margin-bottom: 6px;
+  min-height: 22px;
 }
 
 .card-title {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid color-mix(in srgb, var(--app-primary, #409eff) 36%, var(--app-border));
+  border-radius: 999px;
+  padding: 0 9px;
+  background: color-mix(in srgb, var(--app-primary, #409eff) 10%, transparent);
   color: var(--app-text);
-  font-size: 15px;
-  font-weight: 600;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
 .metric-row {
@@ -2348,6 +2398,12 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--app-border);
   margin-top: 5px;
   padding-top: 3px;
+}
+
+.usage-row {
+  border-top: 1px solid var(--app-border);
+  margin-top: 5px;
+  padding-top: 8px;
 }
 
 .metric-label-with-help {
@@ -2415,14 +2471,6 @@ onBeforeUnmount(() => {
   color: var(--app-text-muted) !important;
   font-size: 11px;
   font-weight: 500;
-}
-
-.bnb-metric-row {
-  align-items: center;
-}
-
-.bnb-value {
-  max-width: 72%;
 }
 
 .available-row {
@@ -2744,9 +2792,18 @@ onBeforeUnmount(() => {
     text-align: left;
   }
 
-  .available-value,
-  .bnb-value {
+  .available-value {
     max-width: 100%;
+  }
+
+  .toolbar-spacer {
+    display: none;
+  }
+
+  .toolbar-bnb {
+    width: 100%;
+    justify-content: space-between;
+    margin-left: 0;
   }
 
   .gate-risk-review-label {
@@ -2760,12 +2817,6 @@ onBeforeUnmount(() => {
 
   .gate-risk-review-item {
     grid-template-columns: minmax(0, 1fr);
-    border-top: 1px solid var(--app-border);
-    border-left: 0;
-  }
-
-  .gate-risk-review-item:first-child {
-    border-top: 0;
   }
 
   .gate-risk-review-item strong {

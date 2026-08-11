@@ -47,12 +47,25 @@ def test_gate_summary_prioritizes_current_mmr_outside_exchange_card():
 
     gate_card_start = CAPITAL_MONITOR_SOURCE.index('<div v-else class="gate-summary-risk">')
     gate_card_end = CAPITAL_MONITOR_SOURCE.index(
-        '<div v-if="exchange === \'binance\'"',
+        '<div v-if="showSummaryDetails" class="metric-row">',
         gate_card_start,
     )
     gate_card = CAPITAL_MONITOR_SOURCE[gate_card_start:gate_card_end]
     assert '维持保证金' in gate_card
     assert '全仓MMR' not in gate_card
+
+
+def test_bnb_balance_lives_in_toolbar_and_top_cards_share_available_separator():
+    toolbar_start = CAPITAL_MONITOR_SOURCE.index('<div class="toolbar">')
+    toolbar_end = CAPITAL_MONITOR_SOURCE.index('</div>\n\n    <div class="summary-grid">', toolbar_start)
+    toolbar = CAPITAL_MONITOR_SOURCE[toolbar_start:toolbar_end]
+
+    assert 'class="toolbar-bnb"' in toolbar
+    assert 'latestByExchange.binance?.bnb_available_usdt' in toolbar
+    assert 'latestByExchange.binance?.bnb_available,' not in toolbar
+    assert '买BNB' in toolbar
+    assert 'class="metric-row usage-row"' in CAPITAL_MONITOR_SOURCE
+    assert '.usage-row {' in CAPITAL_MONITOR_SOURCE
 
 
 def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
