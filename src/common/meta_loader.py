@@ -24,7 +24,7 @@ def fetch_contract_meta() -> Dict[str, Dict]:
     sql = """
         SELECT base_asset, quanto_multiplier, order_price_round, order_size_min,
                enable_decimal, funding_rate, funding_rate_24h, funding_interval,
-               volume_24h_settle, funding_next_apply, maintenance_rate,
+               volume_24h_settle, range_24h_pct, funding_next_apply, maintenance_rate,
                maker_fee_rate, taker_fee_rate
         FROM mi_gate_future_contracts
     """
@@ -50,6 +50,7 @@ def fetch_contract_meta() -> Dict[str, Dict]:
                     'funding_rate_24h': float(row['funding_rate_24h']) if row.get('funding_rate_24h') is not None else None,
                     'funding_interval': funding_interval,
                     'volume_24h_settle': float(row['volume_24h_settle']) if row.get('volume_24h_settle') is not None else None,
+                    'range_24h_pct': float(row['range_24h_pct']) if row.get('range_24h_pct') is not None else None,
                     'funding_next_apply': funding_next_apply,
                     'funding_last_apply': funding_last_apply,
                     'maintenance_rate': float(row['maintenance_rate']) if row.get('maintenance_rate') is not None else None,

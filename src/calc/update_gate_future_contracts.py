@@ -5,6 +5,7 @@
 """
 import sys
 import os
+import math
 from datetime import datetime
 
 # 添加项目根目录到路径
@@ -17,6 +18,30 @@ from common.logger import get_logger, log_print
 from common.market_meta_safety import validate_contract_records
 
 logger = get_logger(__name__)
+
+
+def _finite_float(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def calculate_24h_range_metrics(high_24h, low_24h, last_price):
+    """Return Gate contract 24h amplitude (%) and the last price position in that range."""
+    high = _finite_float(high_24h)
+    low = _finite_float(low_24h)
+    last = _finite_float(last_price)
+    if high is None or low is None or last is None or low <= 0 or high < low:
+        return None, None
+
+    amplitude_pct = (high / low - 1.0) * 100.0
+    if high == low:
+        range_position = 0.0
+    else:
+        range_position = (last - low) / (high - low)
+    return amplitude_pct, range_position
 
 def merge_contracts_with_tickers(contracts, tickers):
     """
@@ -42,8 +67,24 @@ def merge_contracts_with_tickers(contracts, tickers):
         if ticker:
             # 添加 24h 成交量（结算币）
             merged_contract['volume_24h_settle'] = float(ticker.get('volume_24h_settle', 0))
+            merged_contract['high_24h'] = _finite_float(ticker.get('high_24h'))
+            merged_contract['low_24h'] = _finite_float(ticker.get('low_24h'))
+            merged_contract['last_price'] = _finite_float(ticker.get('last'))
+            (
+                merged_contract['range_24h_pct'],
+                merged_contract['range_position_24h'],
+            ) = calculate_24h_range_metrics(
+                merged_contract['high_24h'],
+                merged_contract['low_24h'],
+                merged_contract['last_price'],
+            )
         else:
             merged_contract['volume_24h_settle'] = 0
+            merged_contract['high_24h'] = None
+            merged_contract['low_24h'] = None
+            merged_contract['last_price'] = None
+            merged_contract['range_24h_pct'] = None
+            merged_contract['range_position_24h'] = None
         
         merged_data.append(merged_contract)
     
@@ -101,14 +142,16 @@ def _insert_contracts(cursor, contracts):
         enable_decimal, leverage_min, leverage_max, maker_fee_rate, 
         taker_fee_rate, maintenance_rate, funding_rate, funding_rate_24h, funding_interval,
         funding_next_apply, status, funding_rate_limit, 
-        volume_24h_settle,
+        volume_24h_settle, high_24h, low_24h, last_price,
+        range_24h_pct, range_position_24h,
         updated_at
     ) VALUES (
         %(name)s, %(base_asset)s, %(type)s, %(quanto_multiplier)s, %(order_price_round)s, %(order_size_min)s, %(order_size_max)s,
         %(enable_decimal)s, %(leverage_min)s, %(leverage_max)s, %(maker_fee_rate)s,
         %(taker_fee_rate)s, %(maintenance_rate)s, %(funding_rate)s, %(funding_rate_24h)s, %(funding_interval)s,
         %(funding_next_apply)s, %(status)s, %(funding_rate_limit)s,
-        %(volume_24h_settle)s,
+        %(volume_24h_settle)s, %(high_24h)s, %(low_24h)s, %(last_price)s,
+        %(range_24h_pct)s, %(range_position_24h)s,
         %(updated_at)s
     )
     """
@@ -148,6 +191,11 @@ def _insert_contracts(cursor, contracts):
             'status': contract.get('status'),
             'funding_rate_limit': float(contract.get('funding_rate_limit', 0)),
             'volume_24h_settle': contract.get('volume_24h_settle', 0),
+            'high_24h': contract.get('high_24h'),
+            'low_24h': contract.get('low_24h'),
+            'last_price': contract.get('last_price'),
+            'range_24h_pct': contract.get('range_24h_pct'),
+            'range_position_24h': contract.get('range_position_24h'),
             'updated_at': now,
         }
         cursor.execute(insert_sql, data)
@@ -184,7 +232,7 @@ def update_gate_future_contracts():
         
         if not filtered_contracts:
             log_print("✗ 未获取到合约数据")
-            return
+            return None
         
         log_print(f"✓ 获取到 {len(filtered_contracts)} 个符合条件的合约")
         
@@ -194,7 +242,7 @@ def update_gate_future_contracts():
         
         if not tickers:
             log_print("✗ 未获取到 Ticker 数据")
-            return
+            return None
         
         log_print(f"✓ 获取到 {len(tickers)} 个合约的 Ticker 数据")
         
@@ -215,6 +263,7 @@ def update_gate_future_contracts():
         log_print(f"✓ 数据更新完成！更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log_print(f"✓ 共更新 {len(merged_contracts)} 个合约")
         log_print("=" * 60)
+        return merged_contracts
         
     except Exception as e:
         logger.exception(f"\n✗ 更新失败: {e}")

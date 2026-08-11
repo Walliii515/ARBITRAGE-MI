@@ -128,11 +128,36 @@ CREATE TABLE `mi_gate_future_contracts` (
   `funding_rate_limit` decimal(10,8) DEFAULT NULL COMMENT '资金费率上限',
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   `volume_24h_settle` decimal(20,2) DEFAULT NULL COMMENT '24小时成交量USDT',
+  `high_24h` decimal(28,12) DEFAULT NULL COMMENT 'Gate合约24h最高价',
+  `low_24h` decimal(28,12) DEFAULT NULL COMMENT 'Gate合约24h最低价',
+  `last_price` decimal(28,12) DEFAULT NULL COMMENT 'Gate合约最新价',
+  `range_24h_pct` decimal(18,8) DEFAULT NULL COMMENT '24h振幅百分比=(high/low-1)*100',
+  `range_position_24h` decimal(18,8) DEFAULT NULL COMMENT '最新价在24h高低区间的位置',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_name` (`name`),
   KEY `idx_status` (`status`),
   KEY `idx_funding_rate` (`funding_rate_24h`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='Gate.io永续合约详情表';
+/*!40101 SET character_set_client = @saved_cs_client */;
+DROP TABLE IF EXISTS `mi_holding_volatility_alert_state`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `mi_holding_volatility_alert_state` (
+  `base_asset` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `active` tinyint(1) NOT NULL DEFAULT '0',
+  `episode_id` bigint NOT NULL DEFAULT '0',
+  `notification_sent_at` datetime DEFAULT NULL,
+  `triggered_at` datetime DEFAULT NULL,
+  `recovered_at` datetime DEFAULT NULL,
+  `last_amplitude_pct` decimal(18,8) DEFAULT NULL,
+  `last_range_position` decimal(18,8) DEFAULT NULL,
+  `last_price` decimal(28,12) DEFAULT NULL,
+  `high_24h` decimal(28,12) DEFAULT NULL,
+  `low_24h` decimal(28,12) DEFAULT NULL,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`base_asset`),
+  KEY `idx_holding_volatility_active` (`active`,`updated_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 DROP TABLE IF EXISTS `mi_gate_future_funding_rate_threshold`;
 /*!40101 SET @saved_cs_client     = @@character_set_client */;

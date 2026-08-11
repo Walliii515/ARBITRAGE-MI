@@ -22,6 +22,7 @@ export interface OrderBookRow {
   percentile_30?: number | null
   meta_update_time?: string | null
   volume_24h_settle?: number | null
+  future_range_24h_pct?: number | null
   quote_volume?: number | null
   open_fee_bps?: number | null
   close_fee_bps?: number | null

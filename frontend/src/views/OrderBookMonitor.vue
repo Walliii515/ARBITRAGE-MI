@@ -572,6 +572,15 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
     },
   },
   {
+    headerName: '合约24h振幅',
+    field: 'future_range_24h_pct',
+    width: 125,
+    type: 'numericColumn',
+    cellClass: 'ag-right-aligned-cell',
+    headerClass: 'ag-right-aligned-header',
+    valueFormatter: (p) => p.value == null ? '—' : `${Number(p.value).toFixed(2)}%`,
+  },
+  {
     headerName: '现货24h成交额',
     field: 'quote_volume',
     width: 130,

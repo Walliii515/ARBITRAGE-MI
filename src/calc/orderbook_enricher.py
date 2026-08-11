@@ -280,6 +280,7 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
                 quanto_multiplier = None
             row['funding_rate_24h'] = c_meta.get('funding_rate_24h')
             row['volume_24h_settle'] = c_meta.get('volume_24h_settle')
+            row['future_range_24h_pct'] = c_meta.get('range_24h_pct')
             fna = c_meta.get('funding_next_apply')
             row['funding_next_apply'] = (
                 fna.strftime('%Y-%m-%d %H:%M:%S') if hasattr(fna, 'strftime')
@@ -288,6 +289,7 @@ def enrich_snapshot_fields(rows: List[Dict], contract_meta: Dict[str, Dict],
         else:
             row['funding_rate_24h'] = None
             row['volume_24h_settle'] = None
+            row['future_range_24h_pct'] = None
             row['funding_next_apply'] = None
         _attach_funding_support_fields(row, base_asset, funding_support_meta)
 

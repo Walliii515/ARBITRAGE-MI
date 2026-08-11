@@ -6,10 +6,48 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from calc.update_gate_future_contracts import replace_contracts
+from calc.update_gate_future_contracts import (
+    calculate_24h_range_metrics,
+    merge_contracts_with_tickers,
+    replace_contracts,
+)
 
 
 class TestGateFutureContractRefresh(unittest.TestCase):
+    def test_merge_contracts_adds_24h_range_metrics(self):
+        merged = merge_contracts_with_tickers(
+            [{'name': 'TUT_USDT', 'base_asset': 'TUT'}],
+            [{
+                'contract': 'TUT_USDT',
+                'volume_24h_settle': '1234.5',
+                'high_24h': '1.5',
+                'low_24h': '1.0',
+                'last': '1.4',
+            }],
+        )
+
+        self.assertEqual(merged[0]['volume_24h_settle'], 1234.5)
+        self.assertAlmostEqual(merged[0]['range_24h_pct'], 50.0)
+        self.assertAlmostEqual(merged[0]['range_position_24h'], 0.8)
+        self.assertEqual(merged[0]['last_price'], 1.4)
+
+    def test_merge_contracts_keeps_missing_range_unknown(self):
+        merged = merge_contracts_with_tickers(
+            [{'name': 'TUT_USDT', 'base_asset': 'TUT'}],
+            [],
+        )
+
+        self.assertIsNone(merged[0]['range_24h_pct'])
+        self.assertIsNone(merged[0]['range_position_24h'])
+
+    def test_range_metrics_reject_invalid_prices(self):
+        self.assertEqual(calculate_24h_range_metrics(0.9, 1.0, 0.95), (None, None))
+        self.assertEqual(calculate_24h_range_metrics('nan', 1.0, 1.0), (None, None))
+        self.assertEqual(calculate_24h_range_metrics(1.0, 0.0, 1.0), (None, None))
+
+    def test_flat_range_is_zero_amplitude_and_position(self):
+        self.assertEqual(calculate_24h_range_metrics(1.0, 1.0, 1.0), (0.0, 0.0))
+
     def test_replace_contracts_deletes_and_inserts_in_one_transaction(self):
         cursor = MagicMock()
         context = MagicMock()

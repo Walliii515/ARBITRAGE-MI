@@ -482,6 +482,14 @@ exchange_risk_monitor:
     action: sell_spot                       # ADL/强平导致 Gate short 缺腿后，自动卖出裸 Binance spot
     max_positions_per_event: 0              # 0=不按仓位数截断；实时交易所风险必须覆盖整笔缺腿数量
 
+# 持仓合约24h异常波动提醒。仅发铃铛，不参与开仓或平仓决策。
+holding_volatility_alert:
+  enabled: true
+  trigger_amplitude_pct: 50
+  trigger_range_position: 0.80
+  recover_amplitude_pct: 40
+  recover_range_position: 0.60
+
 # ECS 服务器状态采样：用于“设置 / 服务器状态”页面。
 server_metrics:
   enabled: true

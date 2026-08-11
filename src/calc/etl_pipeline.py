@@ -100,12 +100,15 @@ def _run_update_gate_future_contracts():
     目标表：mi_gate_future_contracts
     更新策略：全删全进
     写入内容：合约基本信息（quanto_multiplier, order_price_round 等）
-              + 24h 成交额（volume_24h_settle）
+              + 24h 成交额、振幅与价格区间位置
               + 当期资金费率（funding_rate, funding_rate_24h）
               + 下次支付时间（funding_next_apply）
     """
+    from calc.holding_volatility_monitor import refresh_holding_volatility_alerts
     from calc.update_gate_future_contracts import update_gate_future_contracts
-    update_gate_future_contracts()
+    contracts = update_gate_future_contracts()
+    if contracts:
+        refresh_holding_volatility_alerts(contracts)
 
 
 def _run_update_binance_spot_info():
