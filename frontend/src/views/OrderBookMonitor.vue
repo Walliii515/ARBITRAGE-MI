@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, shallowRef, onMounted, onUnmounted, computed, watch, defineComponent, h } from 'vue'
 import { AgGridVue } from 'ag-grid-vue3'
 import type {
   ColDef,
@@ -10,7 +10,7 @@ import type {
   ValueFormatterParams,
 } from 'ag-grid-community'
 import { ElDrawer } from 'element-plus'
-import { Search, Refresh } from '@element-plus/icons-vue'
+import { Search, Refresh, Grid } from '@element-plus/icons-vue'
 import { orderbookGridTheme } from '../ag-grid/orderbookGridTheme'
 import { showError, showSuccess } from '../utils/message'
 import { useGridCopy } from '../ag-grid/useGridCopy'
@@ -399,42 +399,49 @@ function openOrderbookDrawer(row: OrderBookRow) {
   drawerVisible.value = true
 }
 
-function createMarketLink(label: string, href: string, className: string): HTMLAnchorElement {
-  const link = document.createElement('a')
-  link.textContent = label
-  link.href = href
-  link.target = '_blank'
-  link.rel = 'noopener noreferrer'
-  link.className = `ob-market-link ${className}`
-  return link
-}
+const OrderbookActionsCell = defineComponent({
+  name: 'OrderbookActionsCell',
+  props: ['params'],
+  setup(props) {
+    return () => {
+      const row = (props.params as { data: OrderBookRow }).data
+      const asset = String(row.base_asset || '').trim().toUpperCase()
+      const pair = encodeURIComponent(`${asset}_USDT`)
+      const actions = [
+        h('button', {
+          type: 'button',
+          class: 'ob-icon-button ob-icon-button--depth',
+          title: '查看5档盘口',
+          'aria-label': '查看5档盘口',
+          onClick: () => openOrderbookDrawer(row),
+        }, [h(Grid)]),
+      ]
 
-function renderOrderbookActions(row: OrderBookRow): HTMLDivElement {
-  const actions = document.createElement('div')
-  actions.className = 'ob-action-group'
+      if (asset) {
+        actions.push(
+          h('a', {
+            class: 'ob-icon-button ob-icon-button--binance',
+            href: `https://www.binance.com/zh-CN/trade/${pair}?_from=markets&type=spot`,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+            title: `打开 Binance ${asset}/USDT 现货行情`,
+            'aria-label': `打开 Binance ${asset}/USDT 现货行情`,
+          }, 'B'),
+          h('a', {
+            class: 'ob-icon-button ob-icon-button--gate',
+            href: `https://www.gate.com/zh/futures/USDT/${pair}`,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+            title: `打开 Gate ${asset}/USDT 永续行情`,
+            'aria-label': `打开 Gate ${asset}/USDT 永续行情`,
+          }, 'G'),
+        )
+      }
 
-  const depthButton = document.createElement('button')
-  depthButton.textContent = '5档盘口'
-  depthButton.className = 'ob-drawer-btn'
-  depthButton.addEventListener('click', () => openOrderbookDrawer(row))
-  actions.appendChild(depthButton)
-
-  const asset = String(row.base_asset || '').trim().toUpperCase()
-  if (asset) {
-    const pair = encodeURIComponent(`${asset}_USDT`)
-    actions.appendChild(createMarketLink(
-      'Binance',
-      `https://www.binance.com/zh-CN/trade/${pair}?_from=markets&type=spot`,
-      'ob-market-link--binance',
-    ))
-    actions.appendChild(createMarketLink(
-      'Gate',
-      `https://www.gate.com/zh/futures/USDT/${pair}`,
-      'ob-market-link--gate',
-    ))
-  }
-  return actions
-}
+      return h('div', { class: 'ob-action-group' }, actions)
+    }
+  },
+})
 
 function getOrderbookLevels(row: OrderBookRow, exchange: 'future' | 'spot', side: 'bid' | 'ask') {
   const levels = []
@@ -924,12 +931,12 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
     headerName: '操作',
     field: 'actions',
     pinned: 'right',
-    width: 220,
-    minWidth: 220,
-    maxWidth: 220,
+    width: 116,
+    minWidth: 116,
+    maxWidth: 116,
     sortable: false,
     filter: false,
-    cellRenderer: (params: { data: OrderBookRow }) => renderOrderbookActions(params.data),
+    cellRenderer: OrderbookActionsCell,
   },
   ]
 })
@@ -1757,45 +1764,56 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   white-space: nowrap;
 }
 
-:global(.ob-drawer-btn),
-:global(.ob-market-link) {
-  padding: 2px 10px;
-  font-size: 12px;
+:global(.ob-icon-button) {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-weight: 700;
   background: transparent;
   border-radius: 3px;
   cursor: pointer;
-  white-space: nowrap;
-  line-height: 20px;
+  line-height: 1;
   text-decoration: none;
   transition: background 0.15s, color 0.15s;
 }
 
-:global(.ob-drawer-btn) {
+:global(.ob-icon-button svg) {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+}
+
+:global(.ob-icon-button--depth) {
   color: #7eb8f7;
   border: 1px solid #3a5a8a;
 }
 
-:global(.ob-drawer-btn:hover) {
+:global(.ob-icon-button--depth:hover) {
   background: #1e3a5a;
   color: #a8d0f8;
 }
 
-:global(.ob-market-link--binance) {
+:global(.ob-icon-button--binance) {
   color: #e8b923;
   border: 1px solid #7a641d;
 }
 
-:global(.ob-market-link--binance:hover) {
+:global(.ob-icon-button--binance:hover) {
   color: #f3d15b;
   background: #3a3218;
 }
 
-:global(.ob-market-link--gate) {
+:global(.ob-icon-button--gate) {
   color: #2ac7ad;
   border: 1px solid #287b70;
 }
 
-:global(.ob-market-link--gate:hover) {
+:global(.ob-icon-button--gate:hover) {
   color: #65dfca;
   background: #183a35;
 }

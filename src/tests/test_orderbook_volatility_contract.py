@@ -46,11 +46,14 @@ class TestOrderbookVolatilityContract(unittest.TestCase):
             Path(__file__).parents[2] / 'frontend/src/views/OrderBookMonitor.vue'
         ).read_text(encoding='utf-8')
 
-        self.assertIn('renderOrderbookActions(params.data)', view_source)
+        self.assertIn('cellRenderer: OrderbookActionsCell', view_source)
         self.assertIn('https://www.binance.com/zh-CN/trade/${pair}?_from=markets&type=spot', view_source)
         self.assertIn('https://www.gate.com/zh/futures/USDT/${pair}', view_source)
-        self.assertIn("link.target = '_blank'", view_source)
-        self.assertIn("link.rel = 'noopener noreferrer'", view_source)
+        self.assertIn("target: '_blank'", view_source)
+        self.assertIn("rel: 'noopener noreferrer'", view_source)
+        self.assertIn("title: '查看5档盘口'", view_source)
+        self.assertIn("'aria-label': '查看5档盘口'", view_source)
+        self.assertIn('width: 116', view_source)
 
 
 if __name__ == '__main__':
