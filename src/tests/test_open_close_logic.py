@@ -88,6 +88,9 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           min_funding_support_bps=None,
                           funding_support_min_samples=2,
                           realtime_min_funding_rate_bps=None,
+                          positive_funding_guard_enabled=True,
+                          positive_funding_enhanced_max_24h_bps=100.0,
+                          positive_funding_max_open_24h_bps=300.0,
                           max_orderbook_lag_ms=200.0,
                           vwap_threshold_meta=None,
                           close_vwap_threshold_meta=None,
@@ -133,6 +136,9 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         min_funding_support_bps=min_funding_support_bps,
         funding_support_min_samples=funding_support_min_samples,
         realtime_min_funding_rate_bps=realtime_min_funding_rate_bps,
+        positive_funding_guard_enabled=positive_funding_guard_enabled,
+        positive_funding_enhanced_max_24h_bps=positive_funding_enhanced_max_24h_bps,
+        positive_funding_max_open_24h_bps=positive_funding_max_open_24h_bps,
         max_orderbook_lag_ms=max_orderbook_lag_ms,
         reduced_open_amount_multiplier=0.6,
         momentum_enabled=momentum_enabled,
@@ -2864,6 +2870,60 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
             30.0,
         )
 
+    def test_live_pre_gate_rechecks_enhanced_exposure_after_realtime_funding_refresh(self):
+        self.te.funding_entry_enabled = True
+        self.te.executor_client.channel = 'Live'
+        self.te.capital_required = True
+        self.te.max_asset_exposure_ratio = 0.15
+        self.te.quality_scale_in_enabled = True
+        self.te.quality_scale_in_enhanced_ratio = 0.25
+        self.te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': fresh_safe_gate_summary(80.0, 100.0),
+        }
+        self.te._account_summary_ts = time.time()
+        self.te._holding_spot_amount_by_asset['BTC'] = 19.0
+        self.te._holding_weighted_basis_by_asset['BTC'] = 20.0
+        self.te.contract_meta = {
+            'BTC': {
+                'funding_rate': 0.002,
+                'funding_rate_24h': 0.008,
+                'funding_interval': 28800,
+            }
+        }
+        self.te.vwap_threshold_meta = {'BTC': {'p20': 10.0}}
+        self.te._peak_state['BTC'] = {
+            'peak_bps': 60.0,
+            'start_time': datetime.now(),
+            'signal_id': 1,
+            'signal_basis_bps': 60.0,
+        }
+        self._setup_books()
+        m_merge, m_hedge, m_vwap = self._patch_gate_chain(
+            vwap_basis_bps=50,
+            open_coverage=0.5,
+        )
+        realtime_info = {
+            'funding_rate': 0.005,
+            'funding_rate_24h': 0.015,  # 24h +150bps：普通仓可开，增强额度禁止
+            'funding_interval': 28800,
+            'funding_next_apply': '2026-06-07 20:00:00',
+            'funding_last_apply': '2026-06-07 12:00:00',
+        }
+
+        with m_merge, m_hedge, m_vwap, patch(
+            'calc.trading_executor.get_single_contract_funding_info',
+            return_value=realtime_info,
+        ):
+            passed, _, _, reason = self.te._pre_execution_gate(
+                'BTC',
+                'BTC_USDT',
+                'BTCUSDT',
+            )
+
+        self.assertFalse(passed)
+        self.assertIn('正资金费过热150.0>=100.0bps', reason)
+
 
 # ══════════════════════════════════════════════════════════════════
 # Funding-adjusted entry 测试
@@ -2896,6 +2956,51 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertAlmostEqual(snapshot['entry_floor_bps'], 16.9, places=1)
         self.assertFalse(te._pass_risk_check(self._row('ALLO', 10.0, 0.008646)))
         self.assertTrue(te._pass_risk_check(self._row('ALLO', 20.0, 0.008646)))
+
+    def test_extreme_positive_funding_blocks_every_open_channel(self):
+        te = make_trading_executor(
+            high_basis_enabled=True,
+            asset_tier_meta={'ALLO': 'A'},
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        row = self._row('ALLO', 500.0, 0.03)  # 24h +300bps
+
+        self.assertFalse(te._pass_risk_check(row))
+        self.assertIn('极端正资金费禁止开仓', te._get_risk_fail_reason(row))
+
+    def test_positive_funding_just_below_hard_cap_can_use_normal_open_path(self):
+        te = make_trading_executor(
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+
+        self.assertTrue(te._pass_risk_check(self._row('ALLO', 50.0, 0.02999)))
+
+    def test_realtime_positive_funding_guard_blocks_stale_safe_snapshot(self):
+        te = make_trading_executor()
+        with patch(
+            'calc.trading_executor.get_single_contract_funding_info',
+            return_value={'funding_rate_24h': 0.03},
+        ):
+            self.assertFalse(te._verify_realtime_funding_rate('ALLO', 'ALLO_USDT'))
+
+    def test_realtime_positive_funding_guard_allows_just_below_300bps(self):
+        te = make_trading_executor()
+        with patch(
+            'calc.trading_executor.get_single_contract_funding_info',
+            return_value={'funding_rate_24h': 0.02999},
+        ):
+            self.assertTrue(te._verify_realtime_funding_rate('ALLO', 'ALLO_USDT'))
+
+    def test_positive_funding_guard_can_be_disabled_explicitly(self):
+        te = make_trading_executor(
+            positive_funding_guard_enabled=False,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+
+        self.assertTrue(te._pass_risk_check(self._row('ALLO', 50.0, 0.03)))
 
     def test_funding_support_stable_channel_requires_avg_and_current(self):
         te = make_trading_executor(
@@ -3660,6 +3765,30 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertTrue(te._pass_risk_check(row))
         self.assertTrue(row.get('_quality_scale_in_used'))
         self.assertIn('15%->25%', row.get('_quality_scale_in_reason', ''))
+
+    def test_elevated_positive_funding_blocks_enhanced_scale_in_only(self):
+        te = make_trading_executor(
+            max_asset_exposure_ratio=0.15,
+            quality_scale_in_enabled=True,
+            quality_scale_in_enhanced_ratio=0.25,
+            vwap_threshold_meta={'ALLO': {'p20': 0.0}},
+            close_vwap_threshold_meta={'ALLO': {'close_basis_p20': -100}},
+        )
+        te.capital_required = True
+        te._account_summary = {
+            'binance': {'available': 80.0, 'net_value': 100.0},
+            'gate': fresh_safe_gate_summary(80.0, 100.0),
+        }
+        te._account_summary_ts = time.time()
+        te._holding_spot_amount_by_asset['ALLO'] = 19.0
+        te._holding_weighted_basis_by_asset['ALLO'] = 20.0
+        row = self._row('ALLO', 50.0, 0.01)  # 24h +100bps
+        row['open_amount_usdt'] = 2.0
+
+        self.assertFalse(te._pass_risk_check(row))
+        reason = te._get_risk_fail_reason(row)
+        self.assertIn('正资金费过热100.0>=100.0bps', reason)
+        self.assertNotIn('_quality_scale_in_used', row)
 
     def test_quality_scale_in_rejects_above_25_percent_limit(self):
         te = make_trading_executor(
@@ -5827,7 +5956,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertEqual(self.ce._projected_net_bps(self.pos, 50.0), 20.0)
+        self.assertEqual(self.ce._negative_funding_price_net_bps(self.pos, 50.0), 28.0)
         self.assertEqual(
             self.ce._negative_funding_exit_mode(self.pos, 50.0),
             'opportunistic',
@@ -5837,7 +5966,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     def test_negative_funding_opportunistic_exit_remains_watch_below_min_net_profit(self):
         self.pos.update({
             'open_spread_bps': 100.0,
-            'current_spread_bps': 50.1,
+            'current_spread_bps': 58.1,
             'funding_pnl_bps': -8.0,
             'funding_rate_24h': -0.0018,
             'funding_rate_sum_bps': 7.0,
@@ -5846,9 +5975,9 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertAlmostEqual(self.ce._projected_net_bps(self.pos, 50.1), 19.9)
-        self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 50.1))
-        self.assertEqual(self.ce._negative_funding_state(self.pos, 50.1), 'watch')
+        self.assertAlmostEqual(self.ce._negative_funding_price_net_bps(self.pos, 58.1), 19.9)
+        self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 58.1))
+        self.assertEqual(self.ce._negative_funding_state(self.pos, 58.1), 'watch')
 
     def test_negative_funding_opportunistic_exit_waits_for_60_minute_window(self):
         self.pos.update({
@@ -5862,7 +5991,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertAlmostEqual(self.ce._projected_net_bps(self.pos, 40.0), 30.0)
+        self.assertAlmostEqual(self.ce._negative_funding_price_net_bps(self.pos, 40.0), 38.0)
         self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 40.0))
         self.assertEqual(self.ce._negative_funding_state(self.pos, 40.0), 'watch')
 
@@ -5880,37 +6009,63 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertAlmostEqual(self.ce._projected_exit_loss_bps(pos, 94.3), 41.7)
+        self.assertAlmostEqual(self.ce._projected_net_bps(pos, 94.3), -41.7)
         self.assertEqual(self.ce._negative_funding_state(pos, 94.3), 'none')
         self.assertFalse(self.ce._check_negative_funding_exit(pos, 94.3))
 
-    def test_negative_funding_budget_force_uses_paid_plus_next_cost(self):
+    def test_negative_funding_paid_cost_never_forces_bad_basis_exit(self):
         self.pos.update({
-            'funding_rate_24h': -0.0021,
-            'funding_rate_sum_bps': 18.0,
+            'open_spread_bps': 60.0,
+            'current_spread_bps': 8888.0,
+            'funding_rate_24h': -0.03,  # 24h -300bps，下一次约-100bps
+            'funding_rate_sum_bps': 1000.0,
+            'funding_next_apply': (
+                datetime.now() + timedelta(minutes=5)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertTrue(self.ce._negative_funding_budget_force(self.pos))
-        self.assertEqual(self.ce._negative_funding_exit_mode(self.pos), 'funding_budget')
+        self.assertFalse(self.ce._negative_funding_economic_exit(self.pos, 8888.0))
+        self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 8888.0))
+        self.assertEqual(self.ce._negative_funding_state(self.pos, 8888.0), 'watch')
 
-    def test_negative_funding_budget_does_not_force_when_next_rate_recovers(self):
+    def test_negative_funding_economic_exit_requires_basis_loss_below_next_fee(self):
         self.pos.update({
-            'funding_rate_24h': -0.0018,
-            'funding_rate_sum_bps': 8.0,
-            'current_spread_bps': 170.0,
+            'open_spread_bps': 60.0,
+            'funding_rate_24h': -0.0024,  # 下一次约-8bps
+            'funding_rate_sum_bps': 7.0,
+            'funding_pnl_bps': -50.0,
+            'funding_next_apply': (
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertFalse(self.ce._negative_funding_budget_force(self.pos))
-        self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 170.0))
+        self.assertTrue(self.ce._negative_funding_economic_exit(self.pos, 68.0))
+        self.assertEqual(self.ce._negative_funding_exit_mode(self.pos, 68.0), 'economic')
+        self.assertFalse(self.ce._negative_funding_economic_exit(self.pos, 68.1))
+        self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 68.1))
 
-    def test_negative_funding_master_switch_disables_budget_force(self):
+    def test_negative_funding_economic_exit_honors_absolute_basis_loss_cap(self):
+        self.pos.update({
+            'open_spread_bps': 60.0,
+            'funding_rate_24h': -0.03,  # 下一次约-100bps
+            'funding_rate_sum_bps': 7.0,
+            'funding_pnl_bps': -200.0,
+            'funding_next_apply': (
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
+        })
+
+        self.assertTrue(self.ce._negative_funding_economic_exit(self.pos, 120.0))
+        self.assertFalse(self.ce._negative_funding_economic_exit(self.pos, 120.1))
+
+    def test_negative_funding_master_switch_disables_economic_exit(self):
         self.ce.negative_funding_exit_enabled = False
         self.pos.update({
             'funding_rate_24h': -0.0030,
             'funding_rate_sum_bps': 20.0,
         })
 
-        self.assertFalse(self.ce._negative_funding_budget_force(self.pos))
+        self.assertFalse(self.ce._negative_funding_economic_exit(self.pos, 120.0))
         self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos))
 
     def test_negative_funding_opportunistic_exit_stops_for_recovered_positive_rate(self):
@@ -5922,21 +6077,28 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             'funding_rate_sum_bps': 7.0,
         })
 
-        self.assertEqual(self.ce._projected_exit_loss_bps(self.pos, 90.0), 60.0)
+        self.assertEqual(self.ce._projected_net_bps(self.pos, 90.0), -60.0)
         self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 90.0))
         self.assertEqual(self.ce._negative_funding_state(self.pos, 90.0), 'watch')
 
-    def test_negative_funding_opportunistic_exit_uses_net_funding_pnl(self):
+    def test_negative_funding_opportunistic_exit_ignores_historical_funding_pnl(self):
         self.pos.update({
-            'open_spread_bps': 60.0,
-            'current_spread_bps': 75.0,
-            'funding_pnl_bps': 10.0,
+            'open_spread_bps': 100.0,
+            'current_spread_bps': 50.0,
+            'funding_pnl_bps': -100.0,
             'funding_rate_24h': -0.0018,
             'funding_rate_sum_bps': 7.0,
+            'funding_next_apply': (
+                datetime.now() + timedelta(minutes=30)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
         })
 
-        self.assertEqual(self.ce._projected_exit_loss_bps(self.pos, 75.0), 27.0)
-        self.assertIsNone(self.ce._negative_funding_exit_mode(self.pos, 75.0))
+        self.assertEqual(self.ce._projected_net_bps(self.pos, 50.0), -72.0)
+        self.assertEqual(self.ce._negative_funding_price_net_bps(self.pos, 50.0), 28.0)
+        self.assertEqual(
+            self.ce._negative_funding_exit_mode(self.pos, 50.0),
+            'opportunistic',
+        )
 
     def test_negative_funding_projected_loss_uses_position_fee_estimate(self):
         self.pos.update({
@@ -5956,7 +6118,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         )
         self.assertNotEqual(comps['fee_full_bps'], self.ce.fee_full_bps)
 
-    def test_negative_funding_exit_detail_exposes_budget_and_loss_composition(self):
+    def test_negative_funding_exit_detail_exposes_next_fee_and_basis_loss(self):
         self.pos.update({
             'open_spread_bps': 60.0,
             'current_spread_bps': 75.0,
@@ -5972,8 +6134,10 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         )
 
         self.assertIn('mode=opportunistic', detail)
-        self.assertIn('负费预算14.0/25.0bps', detail)
-        self.assertIn('预计净收益-45.0<20.0bps', detail)
+        self.assertIn('本次负费7.0bps', detail)
+        self.assertIn('基差损失15.0bps', detail)
+        self.assertIn('基差损失≤本次负费且≤60.0', detail)
+        self.assertIn('价格净空间-37.0<20.0bps', detail)
         self.assertIn('组成(价差-15.0+净资金费-8.0-22.0费)', detail)
 
     def test_negative_funding_opportunistic_recheck_cancels_after_vwap_worsens(self):
@@ -5998,7 +6162,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             patch.object(
                 self.ce,
                 '_pre_execution_gate',
-                return_value=(True, {'fresh': 'row'}, 50.1, ''),
+                return_value=(True, {'fresh': 'row'}, 58.1, ''),
             ),
             patch.object(self.ce, '_execute_close', execute_mock),
         ):
@@ -6044,9 +6208,80 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(len(results), 1)
         detail = execute_mock.call_args.args[2]
         self.assertIn('mode=opportunistic', detail)
-        self.assertIn('预计净收益21.0>=20.0bps', detail)
+        self.assertIn('价格净空间29.0>=20.0bps', detail)
         self.assertIn('旁路✓(gate=49.0bps', detail)
         self.assertIsNotNone(execute_mock.call_args.kwargs['future_protective_price'])
+
+    def test_negative_funding_economic_exit_rechecks_vwap_and_uses_protective_ioc(self):
+        pos = dict(
+            self.pos,
+            status='holding',
+            future_contract='BTC_USDT',
+            spot_symbol='BTCUSDT',
+            open_spread_bps=60.0,
+            current_spread_bps=68.0,
+            funding_pnl_bps=-50.0,
+            funding_rate_24h=-0.0024,
+            funding_rate_sum_bps=7.0,
+            funding_next_apply=(
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
+        )
+        execute_mock = MagicMock(return_value={
+            'base_asset': 'BTC',
+            'success': True,
+            'order_uuid': 'economic-close',
+            'close_reason': 'negative_funding_exit',
+            'message': None,
+        })
+
+        with (
+            patch.object(self.ce, '_check_delist_risk_exit', return_value=False),
+            patch.object(
+                self.ce,
+                '_pre_execution_gate',
+                return_value=(True, {'future_close_vwap': 1.0}, 67.0, ''),
+            ),
+            patch.object(self.ce, '_execute_close', execute_mock),
+        ):
+            results = self.ce.check_and_close([pos], {}, {'BTC': {'old': 'row'}})
+
+        self.assertEqual(len(results), 1)
+        detail = execute_mock.call_args.args[2]
+        self.assertIn('mode=economic', detail)
+        self.assertIn('基差损失7.0bps', detail)
+        self.assertIsNotNone(execute_mock.call_args.kwargs['future_protective_price'])
+
+    def test_negative_funding_economic_exit_cancels_when_fresh_basis_worsens(self):
+        pos = dict(
+            self.pos,
+            status='holding',
+            future_contract='BTC_USDT',
+            spot_symbol='BTCUSDT',
+            open_spread_bps=60.0,
+            current_spread_bps=68.0,
+            funding_pnl_bps=-50.0,
+            funding_rate_24h=-0.0024,
+            funding_rate_sum_bps=7.0,
+            funding_next_apply=(
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
+        )
+        execute_mock = MagicMock()
+
+        with (
+            patch.object(self.ce, '_check_delist_risk_exit', return_value=False),
+            patch.object(
+                self.ce,
+                '_pre_execution_gate',
+                return_value=(True, {'future_close_vwap': 1.0}, 68.1, ''),
+            ),
+            patch.object(self.ce, '_execute_close', execute_mock),
+        ):
+            results = self.ce.check_and_close([pos], {}, {'BTC': {'old': 'row'}})
+
+        self.assertEqual(results, [])
+        execute_mock.assert_not_called()
 
     def test_negative_funding_opportunistic_exit_requires_fresh_vwap(self):
         pos = dict(self.pos)
@@ -6122,47 +6357,44 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(gate_mock.call_count, 1)
         self.assertTrue(self.ce._is_close_quality_guard_blocked(
             'BTC',
-            'negative_funding_opportunistic',
+            'negative_funding_exit',
         ))
 
-    def test_negative_funding_budget_force_ignores_opportunistic_quality_guard(self):
+    def test_negative_funding_economic_exit_respects_quality_guard(self):
         pos = dict(
             self.pos,
             status='holding',
             future_contract='BTC_USDT',
             spot_symbol='BTCUSDT',
             open_spread_bps=60.0,
-            current_spread_bps=90.0,
-            funding_rate_24h=-0.0021,
-            funding_rate_sum_bps=18.0,
+            current_spread_bps=68.0,
+            funding_pnl_bps=-50.0,
+            funding_rate_24h=-0.0024,
+            funding_rate_sum_bps=7.0,
+            funding_next_apply=(
+                datetime.now() + timedelta(minutes=20)
+            ).strftime('%Y-%m-%d %H:%M:%S'),
         )
         self.ce._close_quality_guard_cooldown[
-            ('BTC', 'negative_funding_opportunistic')
+            ('BTC', 'negative_funding_exit')
         ] = datetime.now() + timedelta(seconds=60)
-        execute_mock = MagicMock(return_value={
-            'base_asset': 'BTC',
-            'success': True,
-            'order_uuid': 'budget-close',
-            'close_reason': 'negative_funding_exit',
-            'message': None,
-        })
+        execute_mock = MagicMock()
 
         with (
             patch.object(self.ce, '_check_delist_risk_exit', return_value=False),
             patch.object(
                 self.ce,
                 '_pre_execution_gate',
-                return_value=(True, {'fresh': 'row'}, 90.0, ''),
+                return_value=(True, {'fresh': 'row'}, 68.0, ''),
             ),
             patch.object(self.ce, '_execute_close', execute_mock),
         ):
             results = self.ce.check_and_close([pos], {}, {'BTC': {'old': 'row'}})
 
-        self.assertEqual(len(results), 1)
-        self.assertIn('mode=funding_budget', execute_mock.call_args.args[2])
-        self.assertIsNone(execute_mock.call_args.kwargs['future_protective_price'])
+        self.assertEqual(results, [])
+        execute_mock.assert_not_called()
 
-    def test_negative_funding_settlement_force_does_not_require_fresh_vwap(self):
+    def test_negative_funding_exit_requires_fresh_vwap_even_near_settlement(self):
         pos = dict(self.pos)
         pos.update({
             'status': 'holding',
@@ -6176,13 +6408,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
                 datetime.now() + timedelta(minutes=4)
             ).strftime('%Y-%m-%d %H:%M:%S'),
         })
-        execute_mock = MagicMock(return_value={
-            'base_asset': 'BTC',
-            'success': True,
-            'order_uuid': 'settlement-close',
-            'close_reason': 'negative_funding_exit',
-            'message': None,
-        })
+        execute_mock = MagicMock()
 
         with (
             patch.object(self.ce, '_check_delist_risk_exit', return_value=False),
@@ -6195,9 +6421,8 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         ):
             results = self.ce.check_and_close([pos], {}, {})
 
-        self.assertEqual(len(results), 1)
-        self.assertIn('mode=settlement', execute_mock.call_args.args[2])
-        self.assertIsNone(execute_mock.call_args.kwargs['future_protective_price'])
+        self.assertEqual(results, [])
+        execute_mock.assert_not_called()
 
     def test_delist_risk_exit_triggers_inside_two_day_window(self):
         self.ce.set_delist_risk_report({

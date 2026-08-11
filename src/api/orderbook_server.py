@@ -2001,6 +2001,15 @@ def _run_open_position_check_once():
                 realtime_min_funding_rate_bps=config.get_float(
                     'trade.open.realtime_min_funding_rate_bps', 5.0
                 ),
+                positive_funding_guard_enabled=config.get_bool(
+                    'trade.open.positive_funding_guard.enabled', True
+                ),
+                positive_funding_enhanced_max_24h_bps=config.get_float(
+                    'trade.open.positive_funding_guard.enhanced_max_24h_bps', 100.0
+                ),
+                positive_funding_max_open_24h_bps=config.get_float(
+                    'trade.open.positive_funding_guard.max_open_24h_bps', 300.0
+                ),
                 open_amount_usdt=config.get_float('trade.open.amount_usdt', 5),
                 reduced_open_amount_multiplier=config.get_float(
                     'trade.open.reduced_amount_multiplier',

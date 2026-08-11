@@ -46,6 +46,9 @@ class TradingExecutorConfig:
     min_funding_support_bps: Optional[float] = None
     funding_support_min_samples: int = 2
     realtime_min_funding_rate_bps: Optional[float] = None
+    positive_funding_guard_enabled: bool = True
+    positive_funding_enhanced_max_24h_bps: float = 100.0
+    positive_funding_max_open_24h_bps: float = 300.0
     open_amount_usdt: float = 5.0
     reduced_open_amount_multiplier: float = 0.6
     min_available_ratio: float = 0.10
@@ -246,6 +249,15 @@ class TradingExecutor:
             cfg.realtime_min_funding_rate_bps
             if cfg.realtime_min_funding_rate_bps is not None
             else cfg.min_funding_rate_bps
+        )
+        self.positive_funding_guard_enabled = bool(cfg.positive_funding_guard_enabled)
+        self.positive_funding_enhanced_max_24h_bps = max(
+            float(cfg.positive_funding_enhanced_max_24h_bps or 0),
+            0.0,
+        )
+        self.positive_funding_max_open_24h_bps = max(
+            float(cfg.positive_funding_max_open_24h_bps or 0),
+            self.positive_funding_enhanced_max_24h_bps,
         )
 
         # 手续费率（用于 entry_floor / 旧盈利性守卫计算）
@@ -1027,6 +1039,23 @@ class TradingExecutor:
             'window_hours': self._float_or_none(row.get('funding_rate_24h_avg_window_hours')),
             'has_current': row.get('funding_rate_24h') is not None,
         }
+
+    def _check_positive_funding_open_guard(self, row: Dict) -> tuple[bool, str]:
+        """极端正 funding 只限制新开仓，不改变已有仓位的退出决策。"""
+        if not self.positive_funding_guard_enabled:
+            return True, ''
+        base_asset = str(row.get('base_asset') or '').strip().upper()
+        funding_bps = self._funding_24h_bps(base_asset, row)
+        if (
+            self.positive_funding_max_open_24h_bps > 0
+            and funding_bps >= self.positive_funding_max_open_24h_bps
+        ):
+            return (
+                False,
+                f"极端正资金费禁止开仓(实时24h {funding_bps:.1f}>="
+                f"{self.positive_funding_max_open_24h_bps:.1f}bps)",
+            )
+        return True, ''
 
     def _check_funding_support(self, row: Dict) -> tuple[bool, str]:
         ctx = self._funding_support_context(row)
@@ -2019,6 +2048,10 @@ class TradingExecutor:
         if not delist_ok:
             return False
 
+        funding_guard_ok, _funding_guard_reason = self._check_positive_funding_open_guard(row)
+        if not funding_guard_ok:
+            return False
+
         channel_ok, _channel_reason = self._check_open_channel_support(row)
         if not channel_ok:
             return False
@@ -2347,6 +2380,16 @@ class TradingExecutor:
             return False, '缺少当前基差'
 
         funding_bps = self._funding_24h_bps(base_asset, row)
+        if (
+            self.positive_funding_guard_enabled
+            and self.positive_funding_enhanced_max_24h_bps > 0
+            and funding_bps >= self.positive_funding_enhanced_max_24h_bps
+        ):
+            return (
+                False,
+                f"正资金费过热{funding_bps:.1f}>="
+                f"{self.positive_funding_enhanced_max_24h_bps:.1f}bps，禁止增强额度",
+            )
         funding_scale_in = funding_bps >= self.quality_scale_in_min_funding_24h_bps
         high_basis_scale_in = False
         high_basis_snapshot: Dict = {}
@@ -2471,6 +2514,17 @@ class TradingExecutor:
             
             # 普通风控已判定 funding 通道；最终校验只确认实时费率仍满足对应通道下限。
             rate_bps = float(info['funding_rate_24h']) * 10000
+            if (
+                self.positive_funding_guard_enabled
+                and self.positive_funding_max_open_24h_bps > 0
+                and rate_bps >= self.positive_funding_max_open_24h_bps
+            ):
+                logger.info(
+                    f"实时费率校验拦截 | {base_asset} | "
+                    f"极端正资金费={rate_bps:.2f}bps >= "
+                    f"上限{self.positive_funding_max_open_24h_bps:.1f}bps"
+                )
+                return False
             if min_floor_bps is None:
                 realtime_floor, floor_label = self._realtime_funding_floor_bps(base_asset)
             else:
@@ -2600,6 +2654,7 @@ class TradingExecutor:
             if gate_basis_bps is None:
                 return False, None, None, 'VWAP基差计算失败(盘口深度不足)'
             gate_basis_bps = round(gate_basis_bps, 2)
+            row['open_vwap_basis_bps'] = gate_basis_bps
 
             # ── 4.5 实时资金费刷新：实盘最终旁路用下单前最新 funding 重算门槛 ──
             if self.executor_client.channel == 'Live':
@@ -2612,6 +2667,16 @@ class TradingExecutor:
                 ):
                     return False, row, gate_basis_bps, '实时资金费率低于下限'
                 self._apply_realtime_funding_info(base_asset, row)
+                funding_guard_ok, funding_guard_reason = self._check_positive_funding_open_guard(row)
+                if not funding_guard_ok:
+                    return False, row, gate_basis_bps, funding_guard_reason
+                exposure_ok, exposure_reason = self._check_asset_exposure(
+                    base_asset,
+                    target_amount_usdt,
+                    row,
+                )
+                if not exposure_ok:
+                    return False, row, gate_basis_bps, exposure_reason
 
             # ── 5. 统一入场门槛校验 ──
             if state and state.get('trigger') == 'funding_carry':
@@ -2970,6 +3035,7 @@ class TradingExecutor:
             '保证金风控',
             '交易所仓位风险',
             '下架风险禁止开仓',
+            '极端正资金费禁止开仓',
             '开仓金额低于最小名义值',
         ))
 
@@ -2996,6 +3062,10 @@ class TradingExecutor:
         delist_ok, delist_reason = self._check_delist_open_block(base_asset)
         if not delist_ok:
             return delist_reason
+
+        funding_guard_ok, funding_guard_reason = self._check_positive_funding_open_guard(row)
+        if not funding_guard_ok:
+            return funding_guard_reason
 
         channel_ok, channel_reason = self._check_open_channel_support(row)
         if not channel_ok:

@@ -72,6 +72,10 @@ trade:
     funding_support_window_hours: 24       # 已结算资金费率均值统计窗口（小时）
     funding_support_min_samples: 2         # 均值判断至少需要的已结算样本数
     realtime_min_funding_rate_bps: 5       # 稳定资金费通道的当前实时24h资金费率下限(bps)
+    positive_funding_guard:
+      enabled: true                         # 极端正funding只限制新开仓，不触发已有仓位平仓
+      enhanced_max_24h_bps: 100             # 达到该值后禁止使用优质加仓增强额度
+      max_open_24h_bps: 300                 # 达到该值后禁止所有正向新开仓通道
     max_orderbook_lag_ms: 500             # 本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 开仓过滤 ───
@@ -268,17 +272,15 @@ trade:
     positive_funding_hold_enabled: true     # 若下一期正资金费仍厚，止盈达标也可暂缓到结算后
     positive_funding_hold_window_min: 30    # 距下一次资金费结算多少分钟内启用暂缓
     positive_funding_hold_min_bps: 5        # 下一期预计资金费 >= 此值时暂缓止盈
-    negative_funding_exit_enabled: true     # 当前负24h费率临近结算且下一期仍明显为负时风险平仓
-    negative_funding_exit_current_24h_bps: 21 # 当前24h负资金费率达到该阈值且临近结算才进入平仓
-    negative_funding_exit_current_window_min: 5 # 距下一次资金费结算5分钟内才允许强制负费平仓
-    negative_funding_exit_next_bps: 7       # 下一期预计资金费 <= -7bps 才强制退出
+    negative_funding_exit_enabled: true     # 负funding进入监控后只按经济性择机退出，不无视基差强平
+    negative_funding_exit_next_bps: 7       # 下一期预计资金费 <= -7bps 才进入单次费用比较
     negative_funding_exit_extreme_24h_bps: 45 # 当前24h负资金费率达到极端阈值时等待连续确认后进入监控
     negative_funding_exit_extreme_confirmations: 2 # 极端负费至少连续出现2轮，过滤单次抖动
     negative_funding_exit_paid_bps: 7       # 历史实际已支付负资金费累计达到该阈值进入监控
     negative_funding_exit_watch_window_min: 30 # 下一期明显负费且距结算30分钟内时提前进入监控
-    negative_funding_exit_opportunistic_min_net_profit_bps: 20 # 监控仓仅在最新VWAP预计净收益达到该值时择机退出
+    negative_funding_exit_opportunistic_min_net_profit_bps: 20 # 监控仓仅在最新VWAP价格净空间达到该值时择机退出
     negative_funding_exit_opportunistic_window_min: 60 # 择机退出只允许在距下一次资金费结算60分钟内触发
-    negative_funding_exit_hard_budget_bps: 25 # 已付负费+下一期预计负费达到该预算时直接退出
+    negative_funding_exit_max_basis_loss_bps: 60 # 避免费用退出可接受的最大基差损失；再高则宁可支付本次funding
     delist_risk_exit_enabled: true          # 标的临近下架窗口时走风险平仓，不等待止盈/正资金费
     delist_risk_exit_days: 2                # 距下架时间小于等于该天数时触发下架风险平仓
     delist_risk_refresh_interval_sec: 60    # 每分钟刷新Gate/Binance下架计划；平仓关键路径只读内存缓存
