@@ -102,6 +102,12 @@ def test_mmr_and_gate_risk_share_card_beside_annualized_card():
     assert '.priority-candidate-list {' in CAPITAL_MONITOR_SOURCE
 
 
+def test_mmr_summary_values_are_rendered_without_decimal_places():
+    assert 'function formatWholePercent' in CAPITAL_MONITOR_SOURCE
+    assert '{{ formatWholePercent(gateCrossRisk.account_mmr_pct) }}' in CAPITAL_MONITOR_SOURCE
+    assert '{{ formatWholePercent(recentMinimumGateRisk?.account_mmr_pct) }}' in CAPITAL_MONITOR_SOURCE
+
+
 def test_capital_trend_uses_total_only_and_removes_deprecated_chart_tabs():
     chart_start = CAPITAL_MONITOR_SOURCE.index('<div ref="chartPanelRef" class="chart-panel">')
     chart_end = CAPITAL_MONITOR_SOURCE.index('<el-dialog', chart_start)

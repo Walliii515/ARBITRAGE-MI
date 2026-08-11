@@ -553,6 +553,11 @@ function formatPercent(value: number | null | undefined): string {
   return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
 }
 
+function formatWholePercent(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return `${Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 })}%`
+}
+
 function annualizedValueClass(value: number | null | undefined): string {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return 'risk-idle'
@@ -1654,7 +1659,7 @@ onBeforeUnmount(() => {
                 </el-popover>
               </span>
               <strong class="insight-value" :class="gateRiskStatusClass(gateCrossRisk.status)">
-                {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
+                {{ formatWholePercent(gateCrossRisk.account_mmr_pct) }}
               </strong>
             </div>
             <div class="insight-metric">
@@ -1678,7 +1683,7 @@ onBeforeUnmount(() => {
                 </el-popover>
               </span>
               <strong class="insight-value" :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
-                {{ formatPercent(recentMinimumGateRisk?.account_mmr_pct) }}
+                {{ formatWholePercent(recentMinimumGateRisk?.account_mmr_pct) }}
               </strong>
             </div>
             <div class="insight-metric">
