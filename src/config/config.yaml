@@ -74,7 +74,6 @@ trade:
     realtime_min_funding_rate_bps: 5       # 稳定资金费通道的当前实时24h资金费率下限(bps)
     positive_funding_guard:
       enabled: true                         # 极端正funding只限制新开仓，不触发已有仓位平仓
-      enhanced_max_24h_bps: 100             # 达到该值后禁止使用优质加仓增强额度
       max_open_24h_bps: 300                 # 达到该值后禁止所有正向新开仓通道
     max_orderbook_lag_ms: 500             # 本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 

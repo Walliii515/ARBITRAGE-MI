@@ -47,7 +47,6 @@ class TradingExecutorConfig:
     funding_support_min_samples: int = 2
     realtime_min_funding_rate_bps: Optional[float] = None
     positive_funding_guard_enabled: bool = True
-    positive_funding_enhanced_max_24h_bps: float = 100.0
     positive_funding_max_open_24h_bps: float = 300.0
     open_amount_usdt: float = 5.0
     reduced_open_amount_multiplier: float = 0.6
@@ -251,13 +250,9 @@ class TradingExecutor:
             else cfg.min_funding_rate_bps
         )
         self.positive_funding_guard_enabled = bool(cfg.positive_funding_guard_enabled)
-        self.positive_funding_enhanced_max_24h_bps = max(
-            float(cfg.positive_funding_enhanced_max_24h_bps or 0),
-            0.0,
-        )
         self.positive_funding_max_open_24h_bps = max(
             float(cfg.positive_funding_max_open_24h_bps or 0),
-            self.positive_funding_enhanced_max_24h_bps,
+            0.0,
         )
 
         # 手续费率（用于 entry_floor / 旧盈利性守卫计算）
@@ -2380,16 +2375,6 @@ class TradingExecutor:
             return False, '缺少当前基差'
 
         funding_bps = self._funding_24h_bps(base_asset, row)
-        if (
-            self.positive_funding_guard_enabled
-            and self.positive_funding_enhanced_max_24h_bps > 0
-            and funding_bps >= self.positive_funding_enhanced_max_24h_bps
-        ):
-            return (
-                False,
-                f"正资金费过热{funding_bps:.1f}>="
-                f"{self.positive_funding_enhanced_max_24h_bps:.1f}bps，禁止增强额度",
-            )
         funding_scale_in = funding_bps >= self.quality_scale_in_min_funding_24h_bps
         high_basis_scale_in = False
         high_basis_snapshot: Dict = {}

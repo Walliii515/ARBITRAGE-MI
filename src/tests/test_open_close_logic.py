@@ -89,7 +89,6 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
                           funding_support_min_samples=2,
                           realtime_min_funding_rate_bps=None,
                           positive_funding_guard_enabled=True,
-                          positive_funding_enhanced_max_24h_bps=100.0,
                           positive_funding_max_open_24h_bps=300.0,
                           max_orderbook_lag_ms=200.0,
                           vwap_threshold_meta=None,
@@ -137,7 +136,6 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         funding_support_min_samples=funding_support_min_samples,
         realtime_min_funding_rate_bps=realtime_min_funding_rate_bps,
         positive_funding_guard_enabled=positive_funding_guard_enabled,
-        positive_funding_enhanced_max_24h_bps=positive_funding_enhanced_max_24h_bps,
         positive_funding_max_open_24h_bps=positive_funding_max_open_24h_bps,
         max_orderbook_lag_ms=max_orderbook_lag_ms,
         reduced_open_amount_multiplier=0.6,
@@ -2870,7 +2868,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
             30.0,
         )
 
-    def test_live_pre_gate_rechecks_enhanced_exposure_after_realtime_funding_refresh(self):
+    def test_live_pre_gate_allows_enhanced_exposure_below_global_funding_cap(self):
         self.te.funding_entry_enabled = True
         self.te.executor_client.channel = 'Live'
         self.te.capital_required = True
@@ -2882,7 +2880,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
             'gate': fresh_safe_gate_summary(80.0, 100.0),
         }
         self.te._account_summary_ts = time.time()
-        self.te._holding_spot_amount_by_asset['BTC'] = 19.0
+        self.te._holding_spot_amount_by_asset['BTC'] = 14.0
         self.te._holding_weighted_basis_by_asset['BTC'] = 20.0
         self.te.contract_meta = {
             'BTC': {
@@ -2905,7 +2903,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         )
         realtime_info = {
             'funding_rate': 0.005,
-            'funding_rate_24h': 0.015,  # 24h +150bps：普通仓可开，增强额度禁止
+            'funding_rate_24h': 0.015,  # 24h +150bps：低于全局禁开线
             'funding_interval': 28800,
             'funding_next_apply': '2026-06-07 20:00:00',
             'funding_last_apply': '2026-06-07 12:00:00',
@@ -2915,14 +2913,15 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
             'calc.trading_executor.get_single_contract_funding_info',
             return_value=realtime_info,
         ):
-            passed, _, _, reason = self.te._pre_execution_gate(
+            passed, row, _, reason = self.te._pre_execution_gate(
                 'BTC',
                 'BTC_USDT',
                 'BTCUSDT',
             )
 
-        self.assertFalse(passed)
-        self.assertIn('正资金费过热150.0>=100.0bps', reason)
+        self.assertTrue(passed)
+        self.assertEqual(reason, '')
+        self.assertTrue(row.get('_quality_scale_in_used'))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -3766,7 +3765,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         self.assertTrue(row.get('_quality_scale_in_used'))
         self.assertIn('15%->25%', row.get('_quality_scale_in_reason', ''))
 
-    def test_elevated_positive_funding_blocks_enhanced_scale_in_only(self):
+    def test_elevated_positive_funding_allows_qualified_enhanced_scale_in(self):
         te = make_trading_executor(
             max_asset_exposure_ratio=0.15,
             quality_scale_in_enabled=True,
@@ -3785,10 +3784,8 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
         row = self._row('ALLO', 50.0, 0.01)  # 24h +100bps
         row['open_amount_usdt'] = 2.0
 
-        self.assertFalse(te._pass_risk_check(row))
-        reason = te._get_risk_fail_reason(row)
-        self.assertIn('正资金费过热100.0>=100.0bps', reason)
-        self.assertNotIn('_quality_scale_in_used', row)
+        self.assertTrue(te._pass_risk_check(row))
+        self.assertTrue(row.get('_quality_scale_in_used'))
 
     def test_quality_scale_in_rejects_above_25_percent_limit(self):
         te = make_trading_executor(

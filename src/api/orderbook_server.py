@@ -2004,9 +2004,6 @@ def _run_open_position_check_once():
                 positive_funding_guard_enabled=config.get_bool(
                     'trade.open.positive_funding_guard.enabled', True
                 ),
-                positive_funding_enhanced_max_24h_bps=config.get_float(
-                    'trade.open.positive_funding_guard.enhanced_max_24h_bps', 100.0
-                ),
                 positive_funding_max_open_24h_bps=config.get_float(
                     'trade.open.positive_funding_guard.max_open_24h_bps', 300.0
                 ),
