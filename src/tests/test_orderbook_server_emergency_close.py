@@ -221,6 +221,10 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
         self.assertTrue(payload['stale'])
 
     def test_live_gate_cross_risk_payload_keeps_close_priority_contract(self):
+        profit_candidate = {
+            'base_asset': 'AI',
+            'floating_pnl_usdt': 12.34,
+        }
         payload = orderbook_server._build_live_gate_cross_risk_payload(
             {
                 'status': 'warning',
@@ -229,12 +233,41 @@ class TestOrderbookServerEmergencyClose(unittest.TestCase):
                 'account_fetched_at_ts': 100.0,
                 'positions_fetched_at_ts': 100.0,
             },
+            profit_release_candidate=profit_candidate,
             now_ts=101.0,
         )
 
         self.assertEqual(payload['priority_close_contract'], 'BANK_USDT')
         self.assertEqual(payload['priority_close_reason'], 'maintenance_margin')
+        self.assertEqual(payload['profit_release_candidate'], profit_candidate)
         self.assertEqual(payload['health_status'], 'healthy')
+
+    def test_profit_release_candidate_uses_largest_positive_floating_pnl(self):
+        candidate = orderbook_server._build_profit_release_candidate_from_positions([
+            {'id': 1, 'status': 'holding', 'base_asset': 'BANK', 'floating_pnl_total': -1},
+            {'id': 2, 'status': 'closed', 'base_asset': 'AI', 'floating_pnl_total': 99},
+            {
+                'id': 3,
+                'status': 'holding',
+                'base_asset': 'TUT',
+                'floating_pnl_total': 2.5,
+                'floating_pnl_bps': 12.3,
+                'spot_open_amount': 50,
+            },
+            {
+                'id': 4,
+                'status': 'holding',
+                'base_asset': 'HEI',
+                'floating_pnl_total': 7.5,
+                'floating_pnl_bps': 21.0,
+                'spot_open_amount': 10,
+            },
+        ])
+
+        self.assertEqual(candidate['base_asset'], 'HEI')
+        self.assertEqual(candidate['position_id'], 4)
+        self.assertEqual(candidate['floating_pnl_usdt'], 7.5)
+        self.assertEqual(candidate['floating_pnl_bps'], 21.0)
 
     def test_live_gate_cross_risk_payload_is_unknown_before_first_snapshot(self):
         payload = orderbook_server._build_live_gate_cross_risk_payload(None, now_ts=100.0)

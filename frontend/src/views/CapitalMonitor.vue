@@ -53,6 +53,12 @@ interface GateCrossRiskSnapshot {
   nearest_liq_distance_bps?: number | null
   priority_close_contract?: string | null
   priority_close_reason?: string | null
+  profit_release_candidate?: {
+    base_asset?: string | null
+    position_id?: number | null
+    floating_pnl_usdt?: number | null
+    floating_pnl_bps?: number | null
+  } | null
   error?: string | null
   fetched_at?: string | null
 }
@@ -366,6 +372,10 @@ const gateRiskHealthError = computed(() => (
 const recentMinimumGateRisk = computed(() => gateRiskSummary.value?.minimum || null)
 const gatePriorityAsset = computed(() => (
   formatRiskContract(gateCrossRisk.value.priority_close_contract)
+))
+const gateProfitReleaseCandidate = computed(() => gateCrossRisk.value.profit_release_candidate || null)
+const gateProfitReleaseAsset = computed(() => (
+  formatRiskContract(gateProfitReleaseCandidate.value?.base_asset)
 ))
 const gateRiskPanelError = computed(() => (
   gateRiskSummaryRequestError.value || gateRiskHealthError.value
@@ -1663,6 +1673,7 @@ onBeforeUnmount(() => {
                       主要风险币: {{ recentMinimumGateRisk.primary_risk_asset }}
                     </div>
                     <div>300%风险首平候选: {{ gatePriorityReasonText() }}</div>
+                    <div>盈利平仓首选: 当前 holding 持仓中实时浮动盈亏最大的币；无正浮盈时显示暂无。</div>
                   </div>
                 </el-popover>
               </span>
@@ -1671,10 +1682,24 @@ onBeforeUnmount(() => {
               </strong>
             </div>
             <div class="insight-metric">
-              <span class="insight-metric-label">300%首平候选</span>
-              <strong class="insight-value" :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
-                {{ gatePriorityAsset }}
-              </strong>
+              <span class="insight-metric-label">首平候选</span>
+              <div class="priority-candidate-list">
+                <div class="priority-candidate-row">
+                  <span>风险</span>
+                  <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
+                    {{ gatePriorityAsset }}
+                  </strong>
+                </div>
+                <div class="priority-candidate-row">
+                  <span>盈利</span>
+                  <strong :class="Number(gateProfitReleaseCandidate?.floating_pnl_usdt || 0) > 0 ? 'pnl-positive' : 'risk-idle'">
+                    {{ gateProfitReleaseAsset }}
+                  </strong>
+                  <em v-if="gateProfitReleaseCandidate?.floating_pnl_usdt != null">
+                    {{ formatAmount(gateProfitReleaseCandidate.floating_pnl_usdt) }} USDT
+                  </em>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -2186,6 +2211,59 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
   text-align: left;
+  white-space: nowrap;
+}
+
+.priority-candidate-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.priority-candidate-row {
+  display: grid;
+  grid-template-columns: 34px minmax(42px, max-content) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.priority-candidate-row strong {
+  color: var(--app-text);
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.priority-candidate-row strong.pnl-positive,
+.priority-candidate-row strong.risk-safe {
+  color: #67c23a;
+}
+
+.priority-candidate-row strong.risk-warning {
+  color: #e6a23c;
+}
+
+.priority-candidate-row strong.risk-danger {
+  color: #f56c6c;
+}
+
+.priority-candidate-row strong.risk-idle {
+  color: var(--app-text-muted);
+}
+
+.priority-candidate-row em {
+  min-width: 0;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

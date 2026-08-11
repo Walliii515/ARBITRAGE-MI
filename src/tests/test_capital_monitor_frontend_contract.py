@@ -88,7 +88,7 @@ def test_mmr_and_gate_risk_share_card_beside_annualized_card():
     current_mmr = summary_grid.index('当前全仓MMR')
     annualized = summary_grid.index('策略年化收益率')
     minimum_mmr = summary_grid.index('近7天最低MMR')
-    priority_asset = summary_grid.index('300%首平候选')
+    priority_asset = summary_grid.index('首平候选')
     assert current_mmr < minimum_mmr < priority_asset < annualized
     assert 'grid-template-columns: repeat(2, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
     assert 'class="insight-card gate-risk-overview"' in summary_grid
@@ -96,6 +96,10 @@ def test_mmr_and_gate_risk_share_card_beside_annualized_card():
     assert 'class="insight-metric-grid"' in summary_grid
     assert summary_grid.count('class="insight-metric"') >= 6
     assert 'annualized-period-select' in summary_grid
+    assert 'gatePriorityAsset' in summary_grid
+    assert 'gateProfitReleaseAsset' in summary_grid
+    assert 'gateProfitReleaseCandidate.floating_pnl_usdt' in summary_grid
+    assert '.priority-candidate-list {' in CAPITAL_MONITOR_SOURCE
 
 
 def test_capital_trend_uses_total_only_and_removes_deprecated_chart_tabs():

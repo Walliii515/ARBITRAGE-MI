@@ -6,6 +6,7 @@
 """
 import asyncio
 import json
+import math
 import os
 import sys
 import threading
@@ -1569,6 +1570,7 @@ def _get_live_gate_cross_risk_snapshot() -> Optional[Dict]:
 def _build_live_gate_cross_risk_payload(
     snapshot: Optional[Dict],
     *,
+    profit_release_candidate: Optional[Dict] = None,
     now_ts: Optional[float] = None,
 ) -> Dict:
     risk = dict(snapshot) if isinstance(snapshot, dict) else {
@@ -1585,7 +1587,56 @@ def _build_live_gate_cross_risk_payload(
         now_ts=now_ts,
         max_age_sec=config.get_float('account_capital.gate_cross_risk.max_age_sec', 5.0),
     ))
+    risk['profit_release_candidate'] = profit_release_candidate
     return risk
+
+
+def _build_profit_release_candidate_from_positions(
+    positions: List[Dict],
+) -> Optional[Dict]:
+    """Return the holding asset with the largest positive current floating PnL."""
+    candidates = []
+    for pos in positions or []:
+        if pos.get('status') != 'holding':
+            continue
+        asset = str(pos.get('base_asset') or '').strip().upper()
+        if not asset:
+            continue
+        try:
+            floating_pnl = float(pos.get('floating_pnl_total'))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(floating_pnl) or floating_pnl <= 0:
+            continue
+        try:
+            spot_amount = float(pos.get('spot_open_amount') or 0.0)
+        except (TypeError, ValueError):
+            spot_amount = 0.0
+        candidates.append((floating_pnl, spot_amount, asset, pos))
+    if not candidates:
+        return None
+    floating_pnl, _, asset, pos = max(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    return {
+        'base_asset': asset,
+        'position_id': pos.get('id'),
+        'floating_pnl_usdt': round(floating_pnl, 8),
+        'floating_pnl_bps': pos.get('floating_pnl_bps'),
+    }
+
+
+def _build_current_profit_release_candidate() -> Optional[Dict]:
+    try:
+        positions = PositionTracker(_contract_meta).get_holding_positions()
+        if not positions:
+            return None
+        calculate_realtime_pnl(positions, _build_position_close_vwaps(), _contract_meta, _pnl_cfg)
+        return _build_profit_release_candidate_from_positions(positions)
+    except Exception as exc:
+        logger.warning('计算盈利平仓首选候选失败: %s', exc, exc_info=True)
+        return None
 
 
 def _get_gate_cross_risk_notifier() -> GateCrossRiskNotifier:
@@ -1679,7 +1730,12 @@ def _record_gate_cross_risk_collection_failure(exc: Exception) -> int:
 )
 async def get_live_gate_cross_risk():
     """Return the second-level Gate cross-risk snapshot and input health."""
-    return {'risk': _build_live_gate_cross_risk_payload(_get_live_gate_cross_risk_snapshot())}
+    return {
+        'risk': _build_live_gate_cross_risk_payload(
+            _get_live_gate_cross_risk_snapshot(),
+            profit_release_candidate=_build_current_profit_release_candidate(),
+        )
+    }
 
 
 def _account_summary_with_live_gate_cross_risk() -> Optional[Dict]:
