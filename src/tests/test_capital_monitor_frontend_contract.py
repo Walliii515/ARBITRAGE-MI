@@ -31,9 +31,10 @@ def test_history_requests_are_cancelled_and_cached_by_query():
 
 
 def test_chart_selection_changes_do_not_reload_capital_overview():
-    watcher = "watch([selectedExchange, selectedChartMode], () => {\n  void fetchHistory()\n})"
+    watcher = "watch(selectedChartMode, () => {\n  void fetchHistory()\n})"
     assert watcher in CAPITAL_MONITOR_SOURCE
     assert 'selectedWindow.value = window\n  void fetchHistory()' in CAPITAL_MONITOR_SOURCE
+    assert 'selectedExchange' not in CAPITAL_MONITOR_SOURCE
 
 
 def test_gate_summary_prioritizes_current_mmr_outside_exchange_card():
@@ -57,12 +58,13 @@ def test_gate_summary_prioritizes_current_mmr_outside_exchange_card():
 def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
     assert 'selectedAnnualizedPeriod = ref<AnnualizedPeriod>(7)' in CAPITAL_MONITOR_SOURCE
     assert '/api/trading/capital/annualized-return?days=${period}' in CAPITAL_MONITOR_SOURCE
-    for label in ('7天', '1个月', '3个月', '半年', '1年'):
+    for label in ('1天', '3天', '7天', '1个月', '3个月', '半年', '1年'):
         assert f"label: '{label}'" in CAPITAL_MONITOR_SOURCE
     assert '已有 ${summary.available_days} / ${summary.period_days} 天有效数据' in CAPITAL_MONITOR_SOURCE
+    assert '当日已实现' in CAPITAL_MONITOR_SOURCE
 
 
-def test_annualized_return_and_gate_risk_details_share_one_three_column_row():
+def test_mmr_annualized_return_and_gate_risk_share_one_three_column_row():
     grid_start = CAPITAL_MONITOR_SOURCE.index('<div class="gate-risk-review-grid">')
     grid_end = CAPITAL_MONITOR_SOURCE.index(
         '<div v-if="gateRiskPanelError"',
@@ -70,11 +72,31 @@ def test_annualized_return_and_gate_risk_details_share_one_three_column_row():
     )
     summary_grid = CAPITAL_MONITOR_SOURCE[grid_start:grid_end]
 
+    current_mmr = summary_grid.index('当前全仓MMR')
     annualized = summary_grid.index('策略年化收益率')
+    risk_summary = summary_grid.index('Gate风险摘要')
     minimum_mmr = summary_grid.index('近7天最低全仓MMR')
     priority_asset = summary_grid.index('300%风险首平候选')
-    assert annualized < minimum_mmr < priority_asset
+    assert current_mmr < annualized < risk_summary
+    assert risk_summary < minimum_mmr < priority_asset
     assert 'grid-template-columns: repeat(3, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
+
+
+def test_capital_trend_uses_total_only_and_removes_deprecated_chart_tabs():
+    chart_start = CAPITAL_MONITOR_SOURCE.index('<div ref="chartPanelRef" class="chart-panel">')
+    chart_end = CAPITAL_MONITOR_SOURCE.index('<el-dialog', chart_start)
+    chart_panel = CAPITAL_MONITOR_SOURCE[chart_start:chart_end]
+
+    assert 'chart-window-selector' in chart_panel
+    assert "label: '1小时'" not in CAPITAL_MONITOR_SOURCE
+    assert "label: '3小时'" not in CAPITAL_MONITOR_SOURCE
+    assert "label: '12小时'" not in CAPITAL_MONITOR_SOURCE
+    assert "label: '3天'" in CAPITAL_MONITOR_SOURCE
+    assert 'exchange-selector' not in chart_panel
+    assert "selectedChartMode.value === 'gate_cross_risk' ? 'gate' : 'total'" in CAPITAL_MONITOR_SOURCE
+    assert "{ key: 'unrealized_pnl_usdt', label: '未实现盈亏' }" not in CAPITAL_MONITOR_SOURCE
+    assert "{ key: 'gross_total_pnl_usdt', label: '总盈亏' }" not in CAPITAL_MONITOR_SOURCE
+    assert "const gateCrossRiskMetrics: ChartMetric[] = [\n  'gate_cross_mmr_pct',\n]" in CAPITAL_MONITOR_SOURCE
 
 
 def test_gate_mmr_help_describes_auto_funding_and_tiered_close_rules():

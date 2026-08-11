@@ -793,24 +793,9 @@ _CAPITAL_HISTORY_METRIC_COLUMNS = {
             "s.detail, '$.gate_cross_risk.account_mmr_pct')), 'null') "
             "AS DECIMAL(28,12)) AS gate_cross_mmr_pct"
         ),
-        (
-            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
-            "s.detail, '$.gate_cross_risk.available_ratio_pct')), 'null') "
-            "AS DECIMAL(28,12)) AS gate_cross_available_ratio_pct"
-        ),
-        (
-            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
-            "s.detail, '$.gate_cross_risk.margin_usage_pct')), 'null') "
-            "AS DECIMAL(28,12)) AS gate_cross_margin_usage_pct"
-        ),
-        (
-            "CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT("
-            "s.detail, '$.gate_cross_risk.nearest_liq_distance_bps')), 'null') "
-            "AS DECIMAL(28,12)) AS gate_cross_nearest_liq_distance_bps"
-        ),
     ),
 }
-_CAPITAL_ANNUALIZED_PERIODS = {7, 30, 90, 180, 365}
+_CAPITAL_ANNUALIZED_PERIODS = {1, 3, 7, 30, 90, 180, 365}
 _CAPITAL_TRANSFER_OUTLIER_RELATIVE_CHANGE = 0.05
 _CAPITAL_TRANSFER_RECOVERY_TOLERANCE = 0.015
 _CAPITAL_TRANSFER_MAX_RECOVERY_SECONDS = 30 * 60
@@ -973,6 +958,62 @@ def _calculate_capital_annualized_return(
         'realized_formula_supported': realized_supported,
         'formula': 'daily_gross_pnl_delta_over_daily_average_equity_compounded',
         'realized_formula': 'daily_realized_pnl_delta_over_daily_average_equity_compounded',
+    }
+
+
+def _empty_today_realized_pnl_summary() -> Dict[str, Any]:
+    return {
+        'today_realized_pnl_usdt': None,
+        'today_return_pct': None,
+        'today_first_snapshot_at': None,
+        'today_last_snapshot_at': None,
+    }
+
+
+def _load_today_realized_pnl_summary() -> Dict[str, Any]:
+    sql = """
+        SELECT
+            first_row.snapshot_at AS first_snapshot_at,
+            last_row.snapshot_at AS last_snapshot_at,
+            first_row.equity_usdt AS first_equity_usdt,
+            first_row.total_pnl_usdt AS first_total_pnl_usdt,
+            last_row.total_pnl_usdt AS last_total_pnl_usdt
+        FROM (
+            SELECT MIN(id) AS first_id, MAX(id) AS last_id
+            FROM mi_capital_snapshot
+            WHERE exchange = 'total'
+              AND snapshot_at >= CURDATE()
+              AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
+              AND total_pnl_usdt IS NOT NULL
+        ) ids
+        INNER JOIN mi_capital_snapshot first_row ON first_row.id = ids.first_id
+        INNER JOIN mi_capital_snapshot last_row ON last_row.id = ids.last_id
+        LIMIT 1
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone()
+    if not isinstance(row, dict):
+        return _empty_today_realized_pnl_summary()
+    first_pnl = row.get('first_total_pnl_usdt')
+    last_pnl = row.get('last_total_pnl_usdt')
+    if first_pnl is None or last_pnl is None:
+        return _empty_today_realized_pnl_summary()
+    pnl_delta = float(last_pnl) - float(first_pnl)
+    first_equity = float(row.get('first_equity_usdt') or 0)
+    return {
+        'today_realized_pnl_usdt': pnl_delta,
+        'today_return_pct': (
+            pnl_delta / first_equity * 100
+            if abs(first_equity) > 0.000000001
+            else None
+        ),
+        'today_first_snapshot_at': (
+            str(row.get('first_snapshot_at')) if row.get('first_snapshot_at') else None
+        ),
+        'today_last_snapshot_at': (
+            str(row.get('last_snapshot_at')) if row.get('last_snapshot_at') else None
+        ),
     }
 
 
@@ -1755,7 +1796,7 @@ async def get_capital_latest():
 
 @router.get('/capital/annualized-return')
 async def get_capital_annualized_return(
-    days: int = Query(7, description="统计周期(7/30/90/180/365天)"),
+    days: int = Query(7, description="统计周期(1/3/7/30/90/180/365天)"),
 ):
     """Return compounded annualized strategy return from daily capital summaries."""
     if days not in _CAPITAL_ANNUALIZED_PERIODS:
@@ -1793,7 +1834,9 @@ async def get_capital_annualized_return(
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql, (days,))
         rows = cursor.fetchall()
-    return _calculate_capital_annualized_return(rows, days)
+    result = _calculate_capital_annualized_return(rows, days)
+    result.update(_load_today_realized_pnl_summary())
+    return result
 
 
 @router.get('/capital/history')

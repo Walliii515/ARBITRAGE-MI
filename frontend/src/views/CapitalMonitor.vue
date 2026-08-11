@@ -88,6 +88,10 @@ interface AnnualizedReturnSummary {
   realized_period_return_pct?: number | null
   realized_period_pnl_usdt?: number | null
   average_equity_usdt?: number | null
+  today_realized_pnl_usdt?: number | null
+  today_return_pct?: number | null
+  today_first_snapshot_at?: string | null
+  today_last_snapshot_at?: string | null
   start_date?: string | null
   end_date?: string | null
   window_end_policy?: string | null
@@ -142,8 +146,8 @@ interface FundTransferLimits {
 }
 
 type ExchangeKey = 'binance' | 'gate' | 'total'
-type TimeWindowKey = '1h' | '3h' | '6h' | '12h' | '1d' | '7d' | '30d' | '90d'
-type AnnualizedPeriod = 7 | 30 | 90 | 180 | 365
+type TimeWindowKey = '6h' | '1d' | '3d' | '7d' | '30d' | '90d'
+type AnnualizedPeriod = 1 | 3 | 7 | 30 | 90 | 180 | 365
 type ChartMetric =
   | 'equity_usdt'
   | 'unrealized_pnl_usdt'
@@ -159,9 +163,7 @@ type ChartMetric =
   | 'gate_cross_nearest_liq_distance_bps'
 type ChartModeKey =
   | 'equity_usdt'
-  | 'unrealized_pnl_usdt'
   | 'realized_breakdown'
-  | 'gross_total_pnl_usdt'
   | 'daily_return'
   | 'gate_cross_risk'
 type ChartSeriesGroup = 'asset' | 'pnl' | 'ratio' | 'bps'
@@ -201,7 +203,6 @@ const chartActivated = ref(false)
 const running = ref(false)
 const selectedWindow = ref<TimeWindowKey>('7d')
 const selectedChartMode = ref<ChartModeKey>('equity_usdt')
-const selectedExchange = ref<ExchangeKey>('total')
 const showSummaryDetails = ref(false)
 const bnbBuying = ref(false)
 const clearDialogVisible = ref(false)
@@ -259,6 +260,8 @@ let fundTransferTimer: ReturnType<typeof setInterval> | null = null
 const historyCache = new Map<string, { rows: CapitalRow[]; cachedAt: number }>()
 const HISTORY_CACHE_TTL_MS = 60_000
 const annualizedPeriodOptions: Array<{ value: AnnualizedPeriod; label: string }> = [
+  { value: 1, label: '1天' },
+  { value: 3, label: '3天' },
   { value: 7, label: '7天' },
   { value: 30, label: '1个月' },
   { value: 90, label: '3个月' },
@@ -283,9 +286,7 @@ const metricOptions: ChartMetricOption[] = [
 
 const chartModeOptions: ChartModeOption[] = [
   { key: 'equity_usdt', label: '总资产' },
-  { key: 'unrealized_pnl_usdt', label: '未实现盈亏' },
   { key: 'realized_breakdown', label: '收益趋势' },
-  { key: 'gross_total_pnl_usdt', label: '总盈亏' },
   { key: 'daily_return', label: '每日收益' },
   { key: 'gate_cross_risk', label: '全仓风险' },
 ]
@@ -298,17 +299,12 @@ const realizedBreakdownMetrics: ChartMetric[] = [
 
 const gateCrossRiskMetrics: ChartMetric[] = [
   'gate_cross_mmr_pct',
-  'gate_cross_available_ratio_pct',
-  'gate_cross_margin_usage_pct',
-  'gate_cross_nearest_liq_distance_bps',
 ]
 
 const timeWindowOptions: Array<{ key: TimeWindowKey; label: string; hours?: number; days?: number }> = [
-  { key: '1h', label: '1小时', hours: 1 },
-  { key: '3h', label: '3小时', hours: 3 },
   { key: '6h', label: '6小时', hours: 6 },
-  { key: '12h', label: '12小时', hours: 12 },
   { key: '1d', label: '24小时', days: 1 },
+  { key: '3d', label: '3天', days: 3 },
   { key: '7d', label: '7天', days: 7 },
   { key: '30d', label: '30天', days: 30 },
   { key: '90d', label: '90天', days: 90 },
@@ -375,7 +371,7 @@ const gateRiskPanelError = computed(() => (
   gateRiskSummaryRequestError.value || gateRiskHealthError.value
 ))
 const chartExchange = computed<ExchangeKey>(() => (
-  selectedChartMode.value === 'gate_cross_risk' ? 'gate' : selectedExchange.value
+  selectedChartMode.value === 'gate_cross_risk' ? 'gate' : 'total'
 ))
 const displayedFundTransfer = computed<FundTransferTask | null>(() => (
   activeFundTransfer.value || fundTransferHistory.value[0] || null
@@ -443,18 +439,6 @@ const chartSeries = computed<ChartSeries[]>(() => {
       seriesType: 'line' as const,
     }
   })
-  if (selectedChartMode.value === 'gross_total_pnl_usdt' && series[0]?.points.length > 1) {
-    series.push({
-      exchange: chartExchange.value,
-      metric: 'gross_total_pnl_usdt',
-      label: `${exchangeLabel(chartExchange.value)} 总盈亏趋势`,
-      color: '#ff8f1f',
-      group: 'pnl',
-      points: buildTrendPoints(series[0].points),
-      lineType: 'dashed' as const,
-      seriesType: 'line' as const,
-    })
-  }
   return series
 })
 
@@ -547,41 +531,6 @@ function dayStartKey(value: string): string | null {
   const month = String(date.getMonth() + 1).padStart(2, '0')
   const day = String(date.getDate()).padStart(2, '0')
   return `${year}-${month}-${day} 00:00:00`
-}
-
-function buildTrendPoints(points: Array<{ time: string; value: number }>): Array<{ time: string; value: number }> {
-  const samples = points
-    .map((point) => ({
-      time: point.time,
-      x: new Date(point.time).getTime(),
-      y: point.value,
-    }))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
-  if (samples.length < 2) return []
-
-  const firstX = samples[0].x
-  const normalized = samples.map((point) => ({
-    time: point.time,
-    x: point.x - firstX,
-    y: point.y,
-  }))
-  const count = normalized.length
-  const sumX = normalized.reduce((sum, point) => sum + point.x, 0)
-  const sumY = normalized.reduce((sum, point) => sum + point.y, 0)
-  const sumXX = normalized.reduce((sum, point) => sum + point.x * point.x, 0)
-  const sumXY = normalized.reduce((sum, point) => sum + point.x * point.y, 0)
-  const denominator = count * sumXX - sumX * sumX
-  if (denominator === 0) {
-    const average = sumY / count
-    return normalized.map((point) => ({ time: point.time, value: average }))
-  }
-
-  const slope = (count * sumXY - sumX * sumY) / denominator
-  const intercept = (sumY - slope * sumX) / count
-  return normalized.map((point) => ({
-    time: point.time,
-    value: intercept + slope * point.x,
-  }))
 }
 
 function formatAmount(value: number | null | undefined): string {
@@ -1471,7 +1420,7 @@ watch(historyRows, () => {
   updateChart()
 })
 
-watch([selectedExchange, selectedChartMode], () => {
+watch(selectedChartMode, () => {
   void fetchHistory()
 })
 
@@ -1509,16 +1458,6 @@ onBeforeUnmount(() => {
       >
         {{ activeFundTransfer ? `划转中 #${activeFundTransfer.id}` : '资金划转' }}
       </el-button>
-      <el-button-group size="small">
-        <el-button
-          v-for="window in timeWindowOptions"
-          :key="window.key"
-          :type="selectedWindow === window.key ? 'primary' : 'default'"
-          @click="setWindow(window.key)"
-        >
-          {{ window.label }}
-        </el-button>
-      </el-button-group>
       <el-button size="small" :loading="loading" @click="refreshCapital">刷新</el-button>
       <el-button size="small" type="danger" plain @click="openClearDialog">清理时间段</el-button>
       <el-button size="small" @click="showSummaryDetails = !showSummaryDetails">
@@ -1650,9 +1589,9 @@ onBeforeUnmount(() => {
     <div class="gate-risk-panel">
       <div class="gate-risk-review-header">
         <span>重点摘要</span>
-        <span>MMR历史仅统计有效官方快照</span>
       </div>
-      <div class="gate-current-mmr">
+      <div class="gate-risk-review-grid">
+        <div class="gate-risk-review-item gate-current-mmr">
         <div class="gate-current-mmr-copy">
           <span class="metric-label-with-help">
             <span>当前全仓MMR</span>
@@ -1710,8 +1649,7 @@ onBeforeUnmount(() => {
         <strong :class="gateRiskStatusClass(gateCrossRisk.status)">
           {{ formatPercent(gateCrossRisk.account_mmr_pct) }}
         </strong>
-      </div>
-      <div class="gate-risk-review-grid">
+        </div>
         <div class="gate-risk-review-item annualized-summary">
           <div class="annualized-summary-heading">
             <span class="gate-risk-review-label">策略年化收益率</span>
@@ -1782,27 +1720,58 @@ onBeforeUnmount(() => {
                 {{ formatAnnualizedReturnValue(annualizedReturn?.realized_annualized_return_pct, annualizedReturn?.realized_sufficient_data) }}
               </strong>
             </div>
+            <div class="annualized-value-block">
+              <span class="annualized-value-label">当日已实现</span>
+              <strong :class="annualizedValueClass(annualizedReturn?.today_realized_pnl_usdt)">
+                <span>{{ formatAmount(annualizedReturn?.today_realized_pnl_usdt) }}</span>
+                <span v-if="hasAmount(annualizedReturn?.today_realized_pnl_usdt)" class="metric-unit">USDT</span>
+              </strong>
+            </div>
           </div>
         </div>
-        <div class="gate-risk-review-item">
-          <span class="gate-risk-review-label">近7天最低全仓MMR</span>
-          <strong :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
-            {{ formatPercent(recentMinimumGateRisk?.account_mmr_pct) }}
-          </strong>
-          <div class="gate-risk-review-meta">
-            <span>{{ recentMinimumGateRisk?.snapshot_at || '暂无有效历史快照' }}</span>
-            <span v-if="recentMinimumGateRisk?.primary_risk_asset">
-              主要风险币 {{ recentMinimumGateRisk.primary_risk_asset }}
-            </span>
+        <div class="gate-risk-review-item gate-risk-combined">
+          <div class="gate-risk-combined-heading">
+            <span class="gate-risk-review-label">Gate风险摘要</span>
+            <el-popover
+              trigger="hover"
+              placement="top"
+              :width="420"
+              popper-class="risk-summary-help-popper"
+            >
+              <template #reference>
+                <el-button
+                  class="help-icon-button"
+                  text
+                  circle
+                  size="small"
+                  aria-label="Gate风险摘要说明"
+                >
+                  <el-icon><QuestionFilled /></el-icon>
+                </el-button>
+              </template>
+              <div class="risk-summary-help">
+                <div>MMR历史仅统计有效官方快照。</div>
+                <div>近7天最低全仓MMR: {{ recentMinimumGateRisk?.snapshot_at || '暂无有效历史快照' }}</div>
+                <div v-if="recentMinimumGateRisk?.primary_risk_asset">
+                  主要风险币: {{ recentMinimumGateRisk.primary_risk_asset }}
+                </div>
+                <div>300%风险首平候选: {{ gatePriorityReasonText() }}</div>
+              </div>
+            </el-popover>
           </div>
-        </div>
-        <div class="gate-risk-review-item">
-          <span class="gate-risk-review-label">300%风险首平候选</span>
-          <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
-            {{ gatePriorityAsset }}
-          </strong>
-          <div class="gate-risk-review-meta">
-            <span>{{ gatePriorityReasonText() }}</span>
+          <div class="gate-risk-combined-values">
+            <div>
+              <span>近7天最低全仓MMR</span>
+              <strong :class="gateMmrValueClass(recentMinimumGateRisk?.account_mmr_pct)">
+                {{ formatPercent(recentMinimumGateRisk?.account_mmr_pct) }}
+              </strong>
+            </div>
+            <div>
+              <span>300%风险首平候选</span>
+              <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
+                {{ gatePriorityAsset }}
+              </strong>
+            </div>
           </div>
         </div>
       </div>
@@ -1812,18 +1781,18 @@ onBeforeUnmount(() => {
     </div>
 
     <div ref="chartPanelRef" class="chart-panel">
-      <div class="chart-header">
-        <span>{{ selectedChartMode === 'gate_cross_risk' ? 'Gate 全仓风险趋势' : '资金趋势' }}</span>
-        <el-radio-group
-          v-model="selectedExchange"
-          size="small"
-          class="exchange-selector"
-          :disabled="selectedChartMode === 'gate_cross_risk'"
-        >
-          <el-radio-button label="binance">binance</el-radio-button>
-          <el-radio-button label="gate">gate</el-radio-button>
-          <el-radio-button label="total">合计</el-radio-button>
-        </el-radio-group>
+      <div class="chart-filter-bar">
+        <span>资金趋势</span>
+        <el-button-group size="small" class="chart-window-selector">
+          <el-button
+            v-for="window in timeWindowOptions"
+            :key="window.key"
+            :type="selectedWindow === window.key ? 'primary' : 'default'"
+            @click="setWindow(window.key)"
+          >
+            {{ window.label }}
+          </el-button>
+        </el-button-group>
       </div>
       <div class="metric-selector-row">
         <el-radio-group
@@ -2108,7 +2077,7 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
-.gate-risk-review-header span:last-child {
+.gate-risk-review-header span + span {
   color: var(--app-text-muted);
   font-size: 11px;
   font-weight: 500;
@@ -2122,8 +2091,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 18px;
   min-height: 70px;
-  padding: 8px 12px 14px;
-  border-bottom: 1px solid var(--app-border);
+  padding: 10px 12px;
 }
 
 .gate-current-mmr-copy {
@@ -2232,7 +2200,7 @@ onBeforeUnmount(() => {
 .annualized-values {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px 14px;
 }
 
@@ -2265,6 +2233,49 @@ onBeforeUnmount(() => {
   color: var(--app-text);
   font-size: 12px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.gate-risk-combined {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 8px;
+}
+
+.gate-risk-combined-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.gate-risk-combined-values {
+  display: grid;
+  gap: 8px;
+}
+
+.gate-risk-combined-values > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gate-risk-combined-values span {
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.gate-risk-combined-values strong {
+  font-size: 18px;
+  text-align: right;
+}
+
+.risk-summary-help {
+  display: grid;
+  gap: 6px;
+  color: var(--app-text);
+  font-size: 12px;
+  line-height: 1.55;
   overflow-wrap: anywhere;
 }
 
@@ -2474,13 +2485,20 @@ onBeforeUnmount(() => {
   padding: 12px;
 }
 
-.chart-header {
+.chart-filter-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   color: var(--app-text);
   font-weight: 600;
   margin-bottom: 8px;
+}
+
+.chart-window-selector {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .metric-selector-row {
@@ -2490,7 +2508,6 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
 }
 
-.exchange-selector,
 .metric-selector {
   display: flex;
   flex-wrap: wrap;
@@ -2748,7 +2765,7 @@ onBeforeUnmount(() => {
     gap: 3px;
   }
 
-  .gate-risk-review-header span:last-child,
+  .gate-risk-review-header span + span,
   .gate-risk-review-label {
     white-space: normal;
     overflow-wrap: anywhere;
@@ -2836,14 +2853,13 @@ onBeforeUnmount(() => {
     text-align: left;
   }
 
-  .chart-header,
+  .chart-filter-bar,
   .metric-selector-row {
     align-items: flex-start;
     flex-direction: column;
     gap: 8px;
   }
 
-  .exchange-selector,
   .metric-selector {
     justify-content: flex-start;
   }

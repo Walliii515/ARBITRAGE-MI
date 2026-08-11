@@ -407,7 +407,7 @@ class CapitalHistoryQueryTests(unittest.TestCase):
         self.assertEqual(result['interval'], '1h')
         sql, params = cursor.execute.call_args.args
         self.assertIn('gate_cross_mmr_pct', sql)
-        self.assertIn('gate_cross_nearest_liq_distance_bps', sql)
+        self.assertNotIn('gate_cross_nearest_liq_distance_bps', sql)
         self.assertEqual(params, [3600, 3600, 30, 'gate'])
 
 
@@ -483,9 +483,31 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
 
+    def test_endpoint_accepts_short_annualized_periods(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = self._daily_rows(3)
+        cursor.fetchone.return_value = None
+        context = MagicMock()
+        context.__enter__.return_value = cursor
+        context.__exit__.return_value = False
+
+        with patch('api.trading_api.db_manager.get_cursor', return_value=context):
+            one_day = asyncio.run(get_capital_annualized_return(days=1))
+            three_day = asyncio.run(get_capital_annualized_return(days=3))
+
+        self.assertEqual(one_day['period_days'], 1)
+        self.assertEqual(three_day['period_days'], 3)
+
     def test_endpoint_loads_requested_daily_window(self):
         cursor = MagicMock()
         cursor.fetchall.return_value = self._daily_rows(7)
+        cursor.fetchone.return_value = {
+            'first_snapshot_at': datetime(2026, 7, 8, 0, 0, 1),
+            'last_snapshot_at': datetime(2026, 7, 8, 12, 0, 0),
+            'first_equity_usdt': Decimal('1000'),
+            'first_total_pnl_usdt': Decimal('10'),
+            'last_total_pnl_usdt': Decimal('12.5'),
+        }
         context = MagicMock()
         context.__enter__.return_value = cursor
         context.__exit__.return_value = False
@@ -494,10 +516,14 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
             result = asyncio.run(get_capital_annualized_return(days=7))
 
         self.assertTrue(result['sufficient_data'])
-        sql, params = cursor.execute.call_args.args
+        self.assertAlmostEqual(result['today_realized_pnl_usdt'], 2.5)
+        self.assertAlmostEqual(result['today_return_pct'], 0.25)
+        sql, params = cursor.execute.call_args_list[0].args
         self.assertIn('mi_capital_daily_summary', sql)
         self.assertIn('mi_capital_snapshot', sql)
         self.assertIn('d.summary_date < CURDATE()', sql)
+        today_sql = cursor.execute.call_args_list[1].args[0]
+        self.assertIn('snapshot_at >= CURDATE()', today_sql)
         self.assertEqual(params, (7,))
 
 
