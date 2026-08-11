@@ -42,7 +42,7 @@ def test_gate_summary_prioritizes_current_mmr_outside_exchange_card():
     assert 'Gate 风险重点' not in CAPITAL_MONITOR_SOURCE
     assert '<span>当前全仓MMR</span>' in CAPITAL_MONITOR_SOURCE
     current_mmr = CAPITAL_MONITOR_SOURCE.index('<span>当前全仓MMR</span>')
-    minimum_mmr = CAPITAL_MONITOR_SOURCE.index('近7天最低全仓MMR')
+    minimum_mmr = CAPITAL_MONITOR_SOURCE.index('近7天最低MMR')
     assert current_mmr < minimum_mmr
 
     gate_card_start = CAPITAL_MONITOR_SOURCE.index('<div v-else class="gate-summary-risk">')
@@ -87,13 +87,14 @@ def test_mmr_and_gate_risk_share_card_beside_annualized_card():
 
     current_mmr = summary_grid.index('当前全仓MMR')
     annualized = summary_grid.index('策略年化收益率')
-    risk_summary = summary_grid.index('Gate风险摘要')
-    minimum_mmr = summary_grid.index('近7天最低全仓MMR')
-    priority_asset = summary_grid.index('300%风险首平候选')
-    assert current_mmr < risk_summary < minimum_mmr < priority_asset < annualized
+    minimum_mmr = summary_grid.index('近7天最低MMR')
+    priority_asset = summary_grid.index('300%首平候选')
+    assert current_mmr < minimum_mmr < priority_asset < annualized
     assert 'grid-template-columns: repeat(2, minmax(0, 1fr));' in CAPITAL_MONITOR_SOURCE
-    assert 'class="gate-risk-review-item gate-risk-overview"' in summary_grid
-    assert 'class="gate-risk-review-item annualized-summary"' in summary_grid
+    assert 'class="insight-card gate-risk-overview"' in summary_grid
+    assert 'class="insight-card annualized-summary"' in summary_grid
+    assert 'class="insight-metric-grid"' in summary_grid
+    assert summary_grid.count('class="insight-metric"') >= 6
     assert 'annualized-period-select' in summary_grid
 
 
