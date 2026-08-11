@@ -1690,12 +1690,18 @@ onBeforeUnmount(() => {
               <span class="insight-metric-label">首平候选</span>
               <div class="priority-candidate-list">
                 <div class="priority-candidate-item priority-risk">
-                  <span>风险</span>
-                  <strong>{{ gatePriorityAsset }}</strong>
+                  <div class="priority-candidate-main">
+                    <span>风险</span>
+                    <strong>{{ gatePriorityAsset }}</strong>
+                  </div>
+                  <small>MMR ≤ 300%</small>
                 </div>
                 <div class="priority-candidate-item priority-profit">
-                  <span>盈利</span>
-                  <strong>{{ gateProfitReleaseAsset }}</strong>
+                  <div class="priority-candidate-main">
+                    <span>盈利</span>
+                    <strong>{{ gateProfitReleaseAsset }}</strong>
+                  </div>
+                  <small>MMR ≤ 350%</small>
                 </div>
               </div>
             </div>
@@ -2215,31 +2221,46 @@ onBeforeUnmount(() => {
 .priority-candidate-list {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
 }
 
 .priority-candidate-item {
+  display: grid;
+  gap: 5px;
+  min-width: 76px;
+  border-left: 2px solid currentColor;
+  border-radius: 4px;
+  padding: 3px 0 3px 8px;
+  line-height: 1.2;
+}
+
+.priority-candidate-main {
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
   min-width: 0;
-  border-left: 2px solid currentColor;
-  padding-left: 8px;
-  font-size: 12px;
-  line-height: 1.2;
 }
 
-.priority-candidate-item span {
+.priority-candidate-main span {
   color: var(--app-text-muted);
+  font-size: 12px;
   font-weight: 600;
 }
 
-.priority-candidate-item strong {
+.priority-candidate-main strong {
   font-size: 17px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
+  white-space: nowrap;
+}
+
+.priority-candidate-item small {
+  color: color-mix(in srgb, currentColor 68%, var(--app-text-muted));
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 
