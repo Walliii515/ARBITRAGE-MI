@@ -41,6 +41,17 @@ class TestOrderbookVolatilityContract(unittest.TestCase):
         self.assertIn("headerName: '合约24h振幅'", view_source)
         self.assertIn("field: 'future_range_24h_pct'", view_source)
 
+    def test_orderbook_actions_link_to_binance_spot_and_gate_futures(self):
+        view_source = (
+            Path(__file__).parents[2] / 'frontend/src/views/OrderBookMonitor.vue'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn('renderOrderbookActions(params.data)', view_source)
+        self.assertIn('https://www.binance.com/zh-CN/trade/${pair}?_from=markets&type=spot', view_source)
+        self.assertIn('https://www.gate.com/zh/futures/USDT/${pair}', view_source)
+        self.assertIn("link.target = '_blank'", view_source)
+        self.assertIn("link.rel = 'noopener noreferrer'", view_source)
+
 
 if __name__ == '__main__':
     unittest.main()

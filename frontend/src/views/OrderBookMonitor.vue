@@ -399,6 +399,43 @@ function openOrderbookDrawer(row: OrderBookRow) {
   drawerVisible.value = true
 }
 
+function createMarketLink(label: string, href: string, className: string): HTMLAnchorElement {
+  const link = document.createElement('a')
+  link.textContent = label
+  link.href = href
+  link.target = '_blank'
+  link.rel = 'noopener noreferrer'
+  link.className = `ob-market-link ${className}`
+  return link
+}
+
+function renderOrderbookActions(row: OrderBookRow): HTMLDivElement {
+  const actions = document.createElement('div')
+  actions.className = 'ob-action-group'
+
+  const depthButton = document.createElement('button')
+  depthButton.textContent = '5档盘口'
+  depthButton.className = 'ob-drawer-btn'
+  depthButton.addEventListener('click', () => openOrderbookDrawer(row))
+  actions.appendChild(depthButton)
+
+  const asset = String(row.base_asset || '').trim().toUpperCase()
+  if (asset) {
+    const pair = encodeURIComponent(`${asset}_USDT`)
+    actions.appendChild(createMarketLink(
+      'Binance',
+      `https://www.binance.com/zh-CN/trade/${pair}?_from=markets&type=spot`,
+      'ob-market-link--binance',
+    ))
+    actions.appendChild(createMarketLink(
+      'Gate',
+      `https://www.gate.com/zh/futures/USDT/${pair}`,
+      'ob-market-link--gate',
+    ))
+  }
+  return actions
+}
+
 function getOrderbookLevels(row: OrderBookRow, exchange: 'future' | 'spot', side: 'bid' | 'ask') {
   const levels = []
   for (let i = 1; i <= 5; i++) {
@@ -887,16 +924,12 @@ const columnDefs = computed<ColDef<OrderBookRow>[]>(() => {
     headerName: '操作',
     field: 'actions',
     pinned: 'right',
-    width: 100,
+    width: 220,
+    minWidth: 220,
+    maxWidth: 220,
     sortable: false,
     filter: false,
-    cellRenderer: (params: { data: OrderBookRow }) => {
-      const btn = document.createElement('button')
-      btn.textContent = '5档盘口'
-      btn.className = 'ob-drawer-btn'
-      btn.addEventListener('click', () => openOrderbookDrawer(params.data))
-      return btn
-    },
+    cellRenderer: (params: { data: OrderBookRow }) => renderOrderbookActions(params.data),
   },
   ]
 })
@@ -1715,21 +1748,56 @@ function onGridReady(params: GridReadyEvent<OrderBookRow>) {
   min-height: 420px;
 }
 
-/* 操作列按钮 */
-:global(.ob-drawer-btn) {
+/* 操作列按钮与交易所外链 */
+:global(.ob-action-group) {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+:global(.ob-drawer-btn),
+:global(.ob-market-link) {
   padding: 2px 10px;
   font-size: 12px;
-  color: #7eb8f7;
   background: transparent;
-  border: 1px solid #3a5a8a;
   border-radius: 3px;
   cursor: pointer;
   white-space: nowrap;
+  line-height: 20px;
+  text-decoration: none;
   transition: background 0.15s, color 0.15s;
 }
+
+:global(.ob-drawer-btn) {
+  color: #7eb8f7;
+  border: 1px solid #3a5a8a;
+}
+
 :global(.ob-drawer-btn:hover) {
   background: #1e3a5a;
   color: #a8d0f8;
+}
+
+:global(.ob-market-link--binance) {
+  color: #e8b923;
+  border: 1px solid #7a641d;
+}
+
+:global(.ob-market-link--binance:hover) {
+  color: #f3d15b;
+  background: #3a3218;
+}
+
+:global(.ob-market-link--gate) {
+  color: #2ac7ad;
+  border: 1px solid #287b70;
+}
+
+:global(.ob-market-link--gate:hover) {
+  color: #65dfca;
+  background: #183a35;
 }
 
 /* 抽屉整体风格 */
