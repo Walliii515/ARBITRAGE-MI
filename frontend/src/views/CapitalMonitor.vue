@@ -1689,20 +1689,13 @@ onBeforeUnmount(() => {
             <div class="insight-metric">
               <span class="insight-metric-label">首平候选</span>
               <div class="priority-candidate-list">
-                <div class="priority-candidate-row">
+                <div class="priority-candidate-item priority-risk">
                   <span>风险</span>
-                  <strong :class="gateMmrValueClass(gateCrossRisk.account_mmr_pct)">
-                    {{ gatePriorityAsset }}
-                  </strong>
+                  <strong>{{ gatePriorityAsset }}</strong>
                 </div>
-                <div class="priority-candidate-row">
+                <div class="priority-candidate-item priority-profit">
                   <span>盈利</span>
-                  <strong :class="Number(gateProfitReleaseCandidate?.floating_pnl_usdt || 0) > 0 ? 'pnl-positive' : 'risk-idle'">
-                    {{ gateProfitReleaseAsset }}
-                  </strong>
-                  <em v-if="gateProfitReleaseCandidate?.floating_pnl_usdt != null">
-                    {{ formatAmount(gateProfitReleaseCandidate.floating_pnl_usdt) }} USDT
-                  </em>
+                  <strong>{{ gateProfitReleaseAsset }}</strong>
                 </div>
               </div>
             </div>
@@ -2220,56 +2213,42 @@ onBeforeUnmount(() => {
 }
 
 .priority-candidate-list {
-  display: grid;
-  gap: 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
 
-.priority-candidate-row {
-  display: grid;
-  grid-template-columns: 34px minmax(42px, max-content) minmax(0, 1fr);
+.priority-candidate-item {
+  display: inline-flex;
   align-items: baseline;
-  gap: 7px;
+  gap: 6px;
   min-width: 0;
-  color: var(--app-text-muted);
+  border-left: 2px solid currentColor;
+  padding-left: 8px;
   font-size: 12px;
   line-height: 1.2;
 }
 
-.priority-candidate-row strong {
-  color: var(--app-text);
+.priority-candidate-item span {
+  color: var(--app-text-muted);
+  font-weight: 600;
+}
+
+.priority-candidate-item strong {
   font-size: 17px;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
   white-space: nowrap;
 }
 
-.priority-candidate-row strong.pnl-positive,
-.priority-candidate-row strong.risk-safe {
-  color: #67c23a;
+.priority-risk {
+  color: #f59e0b;
 }
 
-.priority-candidate-row strong.risk-warning {
-  color: #e6a23c;
-}
-
-.priority-candidate-row strong.risk-danger {
-  color: #f56c6c;
-}
-
-.priority-candidate-row strong.risk-idle {
-  color: var(--app-text-muted);
-}
-
-.priority-candidate-row em {
-  min-width: 0;
-  color: var(--app-text-muted);
-  font-size: 11px;
-  font-style: normal;
-  font-variant-numeric: tabular-nums;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.priority-profit {
+  color: #38bdf8;
 }
 
 .annualized-help {

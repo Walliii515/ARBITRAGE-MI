@@ -98,8 +98,12 @@ def test_mmr_and_gate_risk_share_card_beside_annualized_card():
     assert 'annualized-period-select' in summary_grid
     assert 'gatePriorityAsset' in summary_grid
     assert 'gateProfitReleaseAsset' in summary_grid
-    assert 'gateProfitReleaseCandidate.floating_pnl_usdt' in summary_grid
+    assert 'gateProfitReleaseCandidate.floating_pnl_usdt' not in summary_grid
     assert '.priority-candidate-list {' in CAPITAL_MONITOR_SOURCE
+    assert 'class="priority-candidate-item priority-risk"' in summary_grid
+    assert 'class="priority-candidate-item priority-profit"' in summary_grid
+    assert '.priority-risk {' in CAPITAL_MONITOR_SOURCE
+    assert '.priority-profit {' in CAPITAL_MONITOR_SOURCE
 
 
 def test_mmr_summary_values_are_rendered_without_decimal_places():
