@@ -20,6 +20,7 @@ from calc.gate_cross_risk import (
 from calc.popup_notification_store import upsert_popup_notification
 from calc.reconciliation import build_exchange_config
 from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
+from calc.closed_position_pnl import compute_executed_close_pnl
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger
@@ -725,27 +726,42 @@ class AccountCapitalSnapshotter:
         positions = self._load_strategy_positions(start_at, end_at)
         position_ids = [int(pos['id']) for pos in positions if pos.get('id') is not None]
         fee_summary = self._load_strategy_order_fee_summary(position_ids)
+        realized_by_position = self._load_strategy_executed_close_pnl(position_ids, positions)
         floating_summary = self._load_strategy_floating_pnl_summary(positions)
 
         funding_pnl = sum(_float(pos.get('funding_total_pnl')) for pos in positions)
         binance_spot_realized = {
             'closed_count': 0,
+            'partial_close_count': 0,
             'open_amount': 0.0,
             'close_amount': 0.0,
             'realized_pnl': 0.0,
         }
         strategy_realized = 0.0
         for pos in positions:
-            if pos.get('status') != 'closed':
+            pnl = realized_by_position.get(int(pos['id'])) if pos.get('id') is not None else None
+            is_closed = str(pos.get('status') or '').lower() == 'closed'
+            if pnl:
+                spot_open = _float(pnl.get('open_notional'))
+                spot_close = _float(pnl.get('spot_close_amount'))
+                spot_pnl = _float(pnl.get('realized_spot_pnl'))
+                realized = _float(pnl.get('realized_pnl'))
+            elif is_closed:
+                # 历史关仓记录可能早于订单账本；仅对已关闭仓位保留旧口径回退。
+                spot_open = _float(pos.get('spot_open_amount'))
+                spot_close = _float(pos.get('spot_close_amount'))
+                spot_pnl = spot_close - spot_open
+                realized = self._position_strategy_realized_pnl(pos)
+            else:
                 continue
-            spot_open = _float(pos.get('spot_open_amount'))
-            spot_close = _float(pos.get('spot_close_amount'))
-            spot_pnl = spot_close - spot_open
-            binance_spot_realized['closed_count'] += 1
+            if is_closed:
+                binance_spot_realized['closed_count'] += 1
+            else:
+                binance_spot_realized['partial_close_count'] += 1
             binance_spot_realized['open_amount'] += spot_open
             binance_spot_realized['close_amount'] += spot_close
             binance_spot_realized['realized_pnl'] += spot_pnl
-            strategy_realized += self._position_strategy_realized_pnl(pos)
+            strategy_realized += realized
 
         gate_realized = strategy_realized - binance_spot_realized['realized_pnl']
         return {
@@ -764,6 +780,45 @@ class AccountCapitalSnapshotter:
                 'derived_from': 'strategy_realized_pnl - binance_spot_realized_pnl',
             },
         }
+
+    @staticmethod
+    def _load_strategy_executed_close_pnl(
+        position_ids: List[int],
+        positions: List[Dict],
+    ) -> Dict[int, Dict]:
+        """Aggregate matched close PnL from the immutable executed-order ledger."""
+        if not position_ids:
+            return {}
+        placeholders = ','.join(['%s'] * len(position_ids))
+        sql = f"""
+            SELECT position_id, order_side, market_type, status,
+                   exec_price, exec_qty, exec_amount, target_amount,
+                   fee_rate, fee_amount_usdt, funding_rate_24h, executed_at
+            FROM mi_trade_order
+            WHERE position_id IN ({placeholders})
+              AND status = 'executed'
+            ORDER BY position_id, id ASC
+        """
+        orders_by_position: Dict[int, List[Dict]] = {}
+        with db_manager.get_cursor() as cursor:
+            cursor.execute(sql, position_ids)
+            for row in cursor.fetchall():
+                position_id = row.get('position_id')
+                if position_id is not None:
+                    orders_by_position.setdefault(int(position_id), []).append(row)
+
+        result: Dict[int, Dict] = {}
+        for pos in positions:
+            position_id = pos.get('id')
+            if position_id is None:
+                continue
+            pnl = compute_executed_close_pnl(
+                pos,
+                orders_by_position.get(int(position_id), []),
+            )
+            if pnl is not None:
+                result[int(position_id)] = pnl
+        return result
 
     def _load_strategy_positions(self, start_at: datetime, end_at: datetime) -> List[Dict]:
         sql = """

@@ -711,6 +711,7 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'gate_fee_cost': 0.0,
             'fee_cost': 0.0,
         }
+        snapshotter._load_strategy_executed_close_pnl = lambda position_ids, positions: {}
 
         summary = snapshotter._load_strategy_pnl_summary(
             datetime(2026, 8, 9, 0, 0, 0),
@@ -719,6 +720,85 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
 
         self.assertAlmostEqual(summary['binance_spot_floating_pnl'], 25.0)
         self.assertAlmostEqual(summary['floating_pnl'], 25.0)
+
+    def test_strategy_summary_includes_matched_partial_close_pnl(self):
+        snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
+        snapshotter._load_strategy_positions = lambda start, end: [{
+            'id': 123,
+            'status': 'holding',
+            'base_asset': 'AI',
+            'spot_open_qty': 6.0,
+            'spot_open_price': 10.0,
+            'spot_open_amount': 60.0,
+            'funding_total_pnl': 0.0,
+        }]
+        snapshotter._load_strategy_order_fee_summary = lambda position_ids: {
+            'binance_fee_cost': -0.03,
+            'gate_fee_cost': -0.02,
+            'fee_cost': -0.05,
+        }
+        snapshotter._load_strategy_executed_close_pnl = lambda position_ids, positions: {
+            123: {
+                'open_notional': 40.0,
+                'spot_close_amount': 42.0,
+                'realized_spot_pnl': 2.0,
+                'realized_pnl': 3.2,
+            },
+        }
+        snapshotter._load_strategy_floating_pnl_summary = lambda positions: {
+            'binance_spot_floating_pnl': 0.0,
+            'gate_future_floating_pnl': 0.0,
+            'floating_pnl': 0.0,
+            'floating_pnl_source': 'test',
+        }
+
+        summary = snapshotter._load_strategy_pnl_summary(
+            datetime(2026, 8, 13, 0, 0, 0),
+            datetime(2026, 8, 13, 1, 0, 0),
+        )
+
+        self.assertAlmostEqual(summary['realized_pnl'], 3.2)
+        self.assertAlmostEqual(summary['gate_realized_pnl'], 1.2)
+        self.assertEqual(summary['closed_count'], 0)
+        self.assertEqual(summary['binance_spot_realized']['partial_close_count'], 1)
+        self.assertAlmostEqual(summary['binance_spot_realized']['realized_pnl'], 2.0)
+
+    def test_strategy_summary_preserves_closed_history_without_order_ledger(self):
+        snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())
+        snapshotter._load_strategy_positions = lambda start, end: [{
+            'id': 124,
+            'status': 'closed',
+            'base_asset': 'BANK',
+            'spot_open_amount': 100.0,
+            'spot_close_amount': 104.0,
+            'future_open_qty': 10.0,
+            'future_open_price': 10.2,
+            'future_close_amount': 100.0,
+            'realized_pnl': 6.0,
+            'funding_total_pnl': 0.0,
+        }]
+        snapshotter._load_strategy_order_fee_summary = lambda position_ids: {
+            'binance_fee_cost': 0.0,
+            'gate_fee_cost': 0.0,
+            'fee_cost': 0.0,
+        }
+        snapshotter._load_strategy_executed_close_pnl = lambda position_ids, positions: {}
+        snapshotter._load_strategy_floating_pnl_summary = lambda positions: {
+            'binance_spot_floating_pnl': 0.0,
+            'gate_future_floating_pnl': 0.0,
+            'floating_pnl': 0.0,
+            'floating_pnl_source': 'test',
+        }
+
+        summary = snapshotter._load_strategy_pnl_summary(
+            datetime(2026, 8, 13, 0, 0, 0),
+            datetime(2026, 8, 13, 1, 0, 0),
+        )
+
+        self.assertAlmostEqual(summary['realized_pnl'], 6.0)
+        self.assertAlmostEqual(summary['binance_spot_realized']['realized_pnl'], 4.0)
+        self.assertEqual(summary['closed_count'], 1)
+        self.assertEqual(summary['binance_spot_realized']['partial_close_count'], 0)
 
     def test_incomplete_realtime_floating_does_not_overwrite_exchange_fallback(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())

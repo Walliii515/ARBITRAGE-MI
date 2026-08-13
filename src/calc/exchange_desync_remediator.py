@@ -535,10 +535,7 @@ class ExchangeDesyncRemediator:
         balance: Optional[Dict],
         gate_position: Optional[Dict],
     ) -> Dict:
-        if not positions or any(
-            not self._is_low_notional_residual_position(pos)
-            for pos in positions
-        ):
+        if not positions:
             return {'eligible': False, 'candidate': False, 'reason': 'contains_active_position'}
 
         spot_meta = (getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {}
