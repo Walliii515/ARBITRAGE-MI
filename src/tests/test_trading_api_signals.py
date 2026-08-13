@@ -501,13 +501,16 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
     def test_endpoint_loads_requested_daily_window(self):
         cursor = MagicMock()
         cursor.fetchall.return_value = self._daily_rows(7)
-        cursor.fetchone.return_value = {
+        cursor.fetchone.side_effect = [{
             'first_snapshot_at': datetime(2026, 7, 8, 0, 0, 1),
             'last_snapshot_at': datetime(2026, 7, 8, 12, 0, 0),
             'first_equity_usdt': Decimal('1000'),
             'first_total_pnl_usdt': Decimal('10'),
             'last_total_pnl_usdt': Decimal('12.5'),
-        }
+        }, {
+            'today_opened_count': 3,
+            'today_closed_count': 2,
+        }]
         context = MagicMock()
         context.__enter__.return_value = cursor
         context.__exit__.return_value = False
@@ -518,12 +521,18 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
         self.assertTrue(result['sufficient_data'])
         self.assertAlmostEqual(result['today_realized_pnl_usdt'], 2.5)
         self.assertAlmostEqual(result['today_return_pct'], 0.25)
+        self.assertEqual(result['today_opened_count'], 3)
+        self.assertEqual(result['today_closed_count'], 2)
         sql, params = cursor.execute.call_args_list[0].args
         self.assertIn('mi_capital_daily_summary', sql)
         self.assertIn('mi_capital_snapshot', sql)
         self.assertIn('d.summary_date < CURDATE()', sql)
         today_sql = cursor.execute.call_args_list[1].args[0]
         self.assertIn('snapshot_at >= CURDATE()', today_sql)
+        activity_sql = cursor.execute.call_args_list[2].args[0]
+        self.assertIn('FROM mi_trade_position', activity_sql)
+        self.assertIn('opened_at >= CURDATE()', activity_sql)
+        self.assertIn('closed_at >= CURDATE()', activity_sql)
         self.assertEqual(params, (7,))
 
 

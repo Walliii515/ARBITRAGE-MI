@@ -98,6 +98,8 @@ interface AnnualizedReturnSummary {
   today_return_pct?: number | null
   today_first_snapshot_at?: string | null
   today_last_snapshot_at?: string | null
+  today_opened_count?: number | null
+  today_closed_count?: number | null
   start_date?: string | null
   end_date?: string | null
   window_end_policy?: string | null
@@ -546,6 +548,11 @@ function dayStartKey(value: string): string | null {
 function formatAmount(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+function formatCount(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return '-'
+  return Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 })
 }
 
 function formatPercent(value: number | null | undefined): string {
@@ -1709,7 +1716,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="insight-card annualized-summary">
           <div class="insight-card-header">
-            <span class="insight-card-title">策略年化收益率</span>
+            <span class="insight-card-title">策略表现</span>
             <el-select
               v-model="selectedAnnualizedPeriod"
               size="small"
@@ -1723,7 +1730,7 @@ onBeforeUnmount(() => {
               />
             </el-select>
           </div>
-          <div class="insight-metric-grid">
+          <div class="insight-metric-grid performance-metric-grid">
             <div class="insight-metric">
               <span class="insight-metric-label annualized-label-with-help">
                 <span>策略年化</span>
@@ -1781,6 +1788,20 @@ onBeforeUnmount(() => {
               <strong class="insight-value" :class="annualizedValueClass(annualizedReturn?.today_realized_pnl_usdt)">
                 <span>{{ formatAmount(annualizedReturn?.today_realized_pnl_usdt) }}</span>
                 <span v-if="hasAmount(annualizedReturn?.today_realized_pnl_usdt)" class="metric-unit">USDT</span>
+              </strong>
+            </div>
+            <div class="insight-metric">
+              <span class="insight-metric-label">今日开仓</span>
+              <strong class="insight-value">
+                <span>{{ formatCount(annualizedReturn?.today_opened_count) }}</span>
+                <span class="metric-unit">笔</span>
+              </strong>
+            </div>
+            <div class="insight-metric">
+              <span class="insight-metric-label">今日平仓</span>
+              <strong class="insight-value">
+                <span>{{ formatCount(annualizedReturn?.today_closed_count) }}</span>
+                <span class="metric-unit">笔</span>
               </strong>
             </div>
           </div>
@@ -2178,6 +2199,10 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+}
+
+.performance-metric-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .insight-metric {

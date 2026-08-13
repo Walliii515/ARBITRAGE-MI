@@ -75,6 +75,12 @@ def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
         assert f"label: '{label}'" in CAPITAL_MONITOR_SOURCE
     assert '已有 ${summary.available_days} / ${summary.period_days} 天有效数据' in CAPITAL_MONITOR_SOURCE
     assert '当日已实现' in CAPITAL_MONITOR_SOURCE
+    assert '策略表现' in CAPITAL_MONITOR_SOURCE
+    assert '今日开仓' in CAPITAL_MONITOR_SOURCE
+    assert '今日平仓' in CAPITAL_MONITOR_SOURCE
+    assert 'formatCount(annualizedReturn?.today_opened_count)' in CAPITAL_MONITOR_SOURCE
+    assert 'formatCount(annualizedReturn?.today_closed_count)' in CAPITAL_MONITOR_SOURCE
+    assert 'class="insight-metric-grid performance-metric-grid"' in CAPITAL_MONITOR_SOURCE
 
 
 def test_mmr_and_gate_risk_share_card_beside_annualized_card():
@@ -86,7 +92,7 @@ def test_mmr_and_gate_risk_share_card_beside_annualized_card():
     summary_grid = CAPITAL_MONITOR_SOURCE[grid_start:grid_end]
 
     current_mmr = summary_grid.index('当前全仓MMR')
-    annualized = summary_grid.index('策略年化收益率')
+    annualized = summary_grid.index('策略表现')
     minimum_mmr = summary_grid.index('近7天最低MMR')
     priority_asset = summary_grid.index('首平候选')
     assert current_mmr < minimum_mmr < priority_asset < annualized

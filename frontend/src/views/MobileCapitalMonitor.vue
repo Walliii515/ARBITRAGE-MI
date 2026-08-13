@@ -42,6 +42,8 @@ interface AnnualizedReturn {
   realized_data_available?: boolean | null
   realized_annualized_return_pct?: number | null
   realized_available_days?: number | null
+  today_opened_count?: number | null
+  today_closed_count?: number | null
 }
 
 interface ReconciliationRow {
@@ -206,6 +208,11 @@ function formatAmount(value: number | null | undefined): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })
+}
+
+function formatCount(value: number | null | undefined): string {
+  if (!isFiniteNumber(value)) return '--'
+  return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
 }
 
 function formatBnb(value: number | null | undefined): string {
@@ -856,6 +863,16 @@ onBeforeUnmount(() => {
           <small>{{ annualizedHint }}</small>
         </div>
         <div>
+          <span>今日开仓</span>
+          <strong>{{ formatCount(annualized?.today_opened_count) }}</strong>
+          <small>笔</small>
+        </div>
+        <div>
+          <span>今日平仓</span>
+          <strong>{{ formatCount(annualized?.today_closed_count) }}</strong>
+          <small>笔</small>
+        </div>
+        <div>
           <span>对账情况</span>
           <strong :class="{
             safe: reconciliationState === 'matched',
@@ -1110,10 +1127,10 @@ footer {
 .total-mmr-label > i { overflow: hidden; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
 .total-mmr-metric > strong { display: block; margin-top: 2px; overflow: hidden; font-size: clamp(22px, 6.2vw, 27px); font-weight: 750; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-mmr-metric > small { display: block; margin-top: 1px; color: var(--mobile-muted); font-size: 9px; }
-.total-secondary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
 .total-secondary-grid > div { min-width: 0; padding-top: 8px; }
-.total-secondary-grid > div + div { margin-left: 8px; padding-left: 8px; border-left: 1px solid rgba(43, 55, 72, .7); }
-.total-secondary-grid strong { display: block; margin-top: 2px; overflow: hidden; font-size: 15px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.total-secondary-grid > div + div { margin-left: 6px; padding-left: 6px; border-left: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid strong { display: block; margin-top: 2px; overflow: hidden; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-secondary-grid small { display: block; min-height: 14px; margin-top: 2px; color: var(--mobile-muted); font-size: 9px; line-height: 1.4; }
 
 .exchange-grid { margin-top: 8px; gap: 8px; }

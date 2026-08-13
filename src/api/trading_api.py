@@ -970,6 +970,34 @@ def _empty_today_realized_pnl_summary() -> Dict[str, Any]:
     }
 
 
+def _load_today_position_activity_summary() -> Dict[str, Any]:
+    sql = """
+        SELECT
+            SUM(
+                CASE
+                    WHEN opened_at >= CURDATE()
+                     AND opened_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+                    THEN 1 ELSE 0
+                END
+            ) AS today_opened_count,
+            SUM(
+                CASE
+                    WHEN closed_at >= CURDATE()
+                     AND closed_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+                    THEN 1 ELSE 0
+                END
+            ) AS today_closed_count
+        FROM mi_trade_position
+    """
+    with db_manager.get_cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone() or {}
+    return {
+        'today_opened_count': int(row.get('today_opened_count') or 0),
+        'today_closed_count': int(row.get('today_closed_count') or 0),
+    }
+
+
 def _load_today_realized_pnl_summary() -> Dict[str, Any]:
     sql = """
         SELECT
@@ -993,12 +1021,19 @@ def _load_today_realized_pnl_summary() -> Dict[str, Any]:
     with db_manager.get_cursor() as cursor:
         cursor.execute(sql)
         row = cursor.fetchone()
+    activity = _load_today_position_activity_summary()
     if not isinstance(row, dict):
-        return _empty_today_realized_pnl_summary()
+        return {
+            **_empty_today_realized_pnl_summary(),
+            **activity,
+        }
     first_pnl = row.get('first_total_pnl_usdt')
     last_pnl = row.get('last_total_pnl_usdt')
     if first_pnl is None or last_pnl is None:
-        return _empty_today_realized_pnl_summary()
+        return {
+            **_empty_today_realized_pnl_summary(),
+            **activity,
+        }
     pnl_delta = float(last_pnl) - float(first_pnl)
     first_equity = float(row.get('first_equity_usdt') or 0)
     return {
@@ -1014,6 +1049,7 @@ def _load_today_realized_pnl_summary() -> Dict[str, Any]:
         'today_last_snapshot_at': (
             str(row.get('last_snapshot_at')) if row.get('last_snapshot_at') else None
         ),
+        **activity,
     }
 
 
