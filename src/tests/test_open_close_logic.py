@@ -7419,6 +7419,23 @@ class TestPositionPnlFees(unittest.TestCase):
         self.assertAlmostEqual(pnl['spot_close_amount'], 42.0)
         self.assertAlmostEqual(pnl['realized_pnl'], 3.2)
 
+    def test_partial_close_pnl_does_not_fallback_to_remaining_position_cost(self):
+        from calc.closed_position_pnl import compute_executed_close_pnl
+
+        position = {
+            'spot_open_qty': 6.0,
+            'spot_open_amount': 60.0,
+            'future_open_qty': 6.0,
+            'future_open_price': 10.1,
+        }
+        orders = [
+            {'order_side': 'open', 'market_type': 'future', 'status': 'executed', 'exec_qty': 10.0, 'exec_amount': 101.0},
+            {'order_side': 'close', 'market_type': 'spot', 'status': 'executed', 'exec_qty': 4.0, 'exec_amount': 42.0},
+            {'order_side': 'close', 'market_type': 'future', 'status': 'executed', 'exec_qty': 4.0, 'exec_amount': 39.2},
+        ]
+
+        self.assertIsNone(compute_executed_close_pnl(position, orders))
+
     def test_closed_realtime_pnl_prefers_stored_order_level_values(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
 

@@ -1769,6 +1769,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
                 'future_contract': 'BICO_USDT',
                 'spot_open_qty': 0.4,
                 'spot_open_price': 0.056,
+                'future_open_qty': 0.3,
                 'close_reason': '负资金费风险|部分平仓保留剩余',
                 '_spot_remaining_qty': 0.4,
                 '_future_remaining_qty': 0.3,
@@ -1780,6 +1781,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
                 'future_contract': 'BICO_USDT',
                 'spot_open_qty': 0.51513,
                 'spot_open_price': 0.056,
+                'future_open_qty': 0.3,
                 'close_reason': '负资金费风险|部分平仓保留剩余',
                 '_spot_remaining_qty': 0.51513,
                 '_future_remaining_qty': 0.3,
@@ -1845,6 +1847,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
                 'base_asset': 'BICO',
                 'spot_open_qty': 0.2,
                 'spot_open_price': 1.0,
+                'future_open_qty': 0.2,
                 'close_reason': '开仓通道(funding)',
                 '_spot_remaining_qty': 0.2,
                 '_future_remaining_qty': 0.2,
@@ -1854,6 +1857,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
                 'base_asset': 'BICO',
                 'spot_open_qty': 0.3,
                 'spot_open_price': 1.0,
+                'future_open_qty': 0.3,
                 'close_reason': '开仓通道(funding)',
                 '_spot_remaining_qty': 0.3,
                 '_future_remaining_qty': 0.3,
@@ -1953,6 +1957,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'base_asset': 'BICO',
             'spot_open_qty': 0.1,
             'spot_open_price': 0.04,
+            'future_open_qty': 0.1,
             'close_reason': '负资金费风险|低名义残仓跳过平仓|notional=0.0040',
             '_spot_remaining_qty': 0.1,
             '_future_remaining_qty': 0.1,
@@ -1968,6 +1973,124 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertTrue(prepared['eligible'])
         self.assertEqual(prepared['spot_qty'], 0.1)
         self.assertEqual(prepared['gate_contracts'], 1.0)
+
+    def test_dust_cleanup_rejects_local_spot_not_explained_by_order_ledger(self):
+        executor = MagicMock()
+        executor.contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+        executor.spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.00001}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.04)
+        position = {
+            'id': 501,
+            'status': 'holding',
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.2,
+            'future_open_qty': 0.1,
+            '_spot_remaining_qty': 0.1,
+            '_future_remaining_qty': 0.1,
+        }
+
+        prepared = remediator._prepare_dust_cleanup_candidate(
+            'BICO',
+            [position],
+            {'asset': 'BICO', 'total': 0.1, 'free': 0.1},
+            {'base_asset': 'BICO', 'size': -1, 'mark_price': 0.04},
+        )
+
+        self.assertFalse(prepared['eligible'])
+        self.assertEqual(prepared['reason'], 'local_spot_not_explained_by_orders')
+
+    def test_dust_cleanup_rejects_local_gate_not_explained_by_order_ledger(self):
+        executor = MagicMock()
+        executor.contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+        executor.spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.00001}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.04)
+        position = {
+            'id': 501,
+            'status': 'holding',
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.1,
+            'future_open_qty': 0.2,
+            '_spot_remaining_qty': 0.1,
+            '_future_remaining_qty': 0.1,
+        }
+
+        prepared = remediator._prepare_dust_cleanup_candidate(
+            'BICO',
+            [position],
+            {'asset': 'BICO', 'total': 0.1, 'free': 0.1},
+            {'base_asset': 'BICO', 'size': -1, 'mark_price': 0.04},
+        )
+
+        self.assertFalse(prepared['eligible'])
+        self.assertEqual(prepared['reason'], 'local_gate_not_explained_by_orders')
+
+    def test_pending_dust_uses_order_remainder_for_local_quantity_check(self):
+        executor = MagicMock()
+        executor.contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+        executor.spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.00001}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.04)
+        position = {
+            'id': 501,
+            'status': 'closed',
+            'exchange_risk_type': 'post_close_spot_dust_pending',
+            'base_asset': 'BICO',
+            'spot_open_qty': 10.0,
+            'future_open_qty': 10.0,
+            '_spot_remaining_qty': 0.1,
+            '_future_remaining_qty': 0.0,
+        }
+
+        prepared = remediator._prepare_dust_cleanup_candidate(
+            'BICO',
+            [position],
+            {'asset': 'BICO', 'total': 0.1, 'free': 0.1},
+            {'base_asset': 'BICO', 'size': 0, 'mark_price': 0.04},
+        )
+
+        self.assertTrue(prepared['eligible'])
+        self.assertEqual(prepared['spot_qty'], 0.1)
+        self.assertEqual(prepared['gate_contracts'], 0.0)
+
+    def test_dust_cleanup_rejects_future_remainder_without_quanto_multiplier(self):
+        executor = MagicMock()
+        executor.contract_meta = {}
+        executor.spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.00001}}
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._estimate_binance_spot_price = MagicMock(return_value=0.04)
+        position = {
+            'id': 501,
+            'status': 'holding',
+            'base_asset': 'BICO',
+            'spot_open_qty': 0.1,
+            'future_open_qty': 0.1,
+            '_spot_remaining_qty': 0.1,
+            '_future_remaining_qty': 0.1,
+        }
+
+        prepared = remediator._prepare_dust_cleanup_candidate(
+            'BICO',
+            [position],
+            {'asset': 'BICO', 'total': 0.1, 'free': 0.1},
+            {'base_asset': 'BICO', 'size': 0, 'mark_price': 0.04},
+        )
+
+        self.assertFalse(prepared['eligible'])
+        self.assertEqual(prepared['reason'], 'missing_quanto_multiplier')
 
     def test_spot_only_dust_is_settled_when_whole_asset_exposure_matches(self):
         executor = MagicMock()
@@ -2232,6 +2355,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'base_asset': 'BICO',
             'spot_open_qty': 0.91513,
             'spot_open_price': 0.056,
+            'future_open_qty': 0.6,
             'close_reason': '部分平仓保留剩余',
             '_spot_remaining_qty': 0.91513,
             '_future_remaining_qty': 0.6,

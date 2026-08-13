@@ -782,7 +782,15 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
             'gate_fee_cost': 0.0,
             'fee_cost': 0.0,
         }
-        snapshotter._load_strategy_executed_close_pnl = lambda position_ids, positions: {}
+        load_partial = MagicMock(return_value={
+            124: {
+                'open_notional': 50.0,
+                'spot_close_amount': 99.0,
+                'realized_spot_pnl': 49.0,
+                'realized_pnl': 88.0,
+            },
+        })
+        snapshotter._load_strategy_executed_close_pnl = load_partial
         snapshotter._load_strategy_floating_pnl_summary = lambda positions: {
             'binance_spot_floating_pnl': 0.0,
             'gate_future_floating_pnl': 0.0,
@@ -799,6 +807,7 @@ class TestAccountCapitalSnapshotter(unittest.TestCase):
         self.assertAlmostEqual(summary['binance_spot_realized']['realized_pnl'], 4.0)
         self.assertEqual(summary['closed_count'], 1)
         self.assertEqual(summary['binance_spot_realized']['partial_close_count'], 0)
+        load_partial.assert_called_once_with([], [])
 
     def test_incomplete_realtime_floating_does_not_overwrite_exchange_fallback(self):
         snapshotter = AccountCapitalSnapshotter(FakeCapitalExecutor(), AccountCapitalConfig())

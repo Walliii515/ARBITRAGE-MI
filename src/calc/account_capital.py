@@ -725,8 +725,18 @@ class AccountCapitalSnapshotter:
         """
         positions = self._load_strategy_positions(start_at, end_at)
         position_ids = [int(pos['id']) for pos in positions if pos.get('id') is not None]
+        holding_positions = [
+            pos for pos in positions
+            if str(pos.get('status') or '').lower() == 'holding'
+        ]
+        holding_position_ids = [
+            int(pos['id']) for pos in holding_positions if pos.get('id') is not None
+        ]
         fee_summary = self._load_strategy_order_fee_summary(position_ids)
-        realized_by_position = self._load_strategy_executed_close_pnl(position_ids, positions)
+        partial_realized_by_position = self._load_strategy_executed_close_pnl(
+            holding_position_ids,
+            holding_positions,
+        )
         floating_summary = self._load_strategy_floating_pnl_summary(positions)
 
         funding_pnl = sum(_float(pos.get('funding_total_pnl')) for pos in positions)
@@ -739,21 +749,25 @@ class AccountCapitalSnapshotter:
         }
         strategy_realized = 0.0
         for pos in positions:
-            pnl = realized_by_position.get(int(pos['id'])) if pos.get('id') is not None else None
             is_closed = str(pos.get('status') or '').lower() == 'closed'
-            if pnl:
-                spot_open = _float(pnl.get('open_notional'))
-                spot_close = _float(pnl.get('spot_close_amount'))
-                spot_pnl = _float(pnl.get('realized_spot_pnl'))
-                realized = _float(pnl.get('realized_pnl'))
-            elif is_closed:
-                # 历史关仓记录可能早于订单账本；仅对已关闭仓位保留旧口径回退。
+            if is_closed:
+                # 最终关仓（含尘埃核销）以已经持久化的结算口径为准。
                 spot_open = _float(pos.get('spot_open_amount'))
                 spot_close = _float(pos.get('spot_close_amount'))
                 spot_pnl = spot_close - spot_open
                 realized = self._position_strategy_realized_pnl(pos)
             else:
-                continue
+                pnl = (
+                    partial_realized_by_position.get(int(pos['id']))
+                    if pos.get('id') is not None
+                    else None
+                )
+                if not pnl:
+                    continue
+                spot_open = _float(pnl.get('open_notional'))
+                spot_close = _float(pnl.get('spot_close_amount'))
+                spot_pnl = _float(pnl.get('realized_spot_pnl'))
+                realized = _float(pnl.get('realized_pnl'))
             if is_closed:
                 binance_spot_realized['closed_count'] += 1
             else:

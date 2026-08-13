@@ -545,8 +545,19 @@ class ExchangeDesyncRemediator:
         if min_notional <= 0:
             return {'eligible': False, 'candidate': True, 'reason': 'missing_spot_min_notional'}
 
+        def _local_remaining_qty(pos: Dict, field: str, ledger_field: str) -> float:
+            if (
+                str(pos.get('status') or '').lower() == 'closed'
+                and str(pos.get('exchange_risk_type') or '') == POST_CLOSE_SPOT_DUST_PENDING
+            ):
+                return max(0.0, _float(pos.get(ledger_field)))
+            return max(0.0, _float(pos.get(field)))
+
         ledger_spot_qty = sum(max(0.0, _float(pos.get('_spot_remaining_qty'))) for pos in positions)
-        local_spot_qty = ledger_spot_qty
+        local_spot_qty = sum(
+            _local_remaining_qty(pos, 'spot_open_qty', '_spot_remaining_qty')
+            for pos in positions
+        )
         exchange_spot_qty = _float((balance or {}).get('total'))
         free_spot_qty = _float((balance or {}).get('free'), exchange_spot_qty)
         if abs(local_spot_qty - ledger_spot_qty) > qty_tolerance:
@@ -565,10 +576,22 @@ class ExchangeDesyncRemediator:
 
         multiplier = self._quanto_multiplier(base_asset)
         ledger_future_qty = sum(max(0.0, _float(pos.get('_future_remaining_qty'))) for pos in positions)
+        local_future_qty = sum(
+            _local_remaining_qty(pos, 'future_open_qty', '_future_remaining_qty')
+            for pos in positions
+        )
+        future_qty_tolerance = max(multiplier * 1e-6, 1e-8)
+        if abs(local_future_qty - ledger_future_qty) > future_qty_tolerance:
+            return {'eligible': False, 'candidate': True, 'reason': 'local_gate_not_explained_by_orders'}
+        gate_size = _float((gate_position or {}).get('size'))
+        if multiplier <= 0 and (
+            ledger_future_qty > future_qty_tolerance
+            or abs(gate_size) > 1e-9
+        ):
+            return {'eligible': False, 'candidate': True, 'reason': 'missing_quanto_multiplier'}
         ledger_contracts = ledger_future_qty / multiplier if multiplier > 0 else 0.0
         if ledger_spot_qty <= qty_tolerance and ledger_contracts <= 1e-6:
             return {'eligible': False, 'candidate': False, 'reason': 'no_execution_remainder'}
-        gate_size = _float((gate_position or {}).get('size'))
         if gate_size > 1e-9:
             return {'eligible': False, 'candidate': True, 'reason': 'gate_position_not_short'}
         exchange_contracts = abs(gate_size)

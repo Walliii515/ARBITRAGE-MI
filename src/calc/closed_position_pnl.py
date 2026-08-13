@@ -58,7 +58,12 @@ def _basis_bps(spot_price: float, future_price: float) -> Optional[float]:
     return (future_price - spot_price) / spot_price * 10000
 
 
-def _execution_values(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
+def _execution_values(
+    pos: Dict,
+    orders: Iterable[Dict],
+    *,
+    allow_position_fallback: bool,
+) -> Optional[Dict]:
     executed_orders = [
         order for order in orders
         if str(order.get('status') or '').lower() == 'executed'
@@ -77,19 +82,19 @@ def _execution_values(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
         'future_open_qty': _sum_exec_qty(executed_orders, 'open', 'future'),
         'future_close_qty': _sum_exec_qty(executed_orders, 'close', 'future'),
     }
-    if values['spot_open'] <= 0:
+    if allow_position_fallback and values['spot_open'] <= 0:
         values['spot_open'] = _float(pos.get('spot_open_amount'))
         values['spot_open_qty'] = _float(pos.get('spot_open_qty'))
-    if values['spot_close'] <= 0:
+    if allow_position_fallback and values['spot_close'] <= 0:
         values['spot_close'] = _float(pos.get('spot_close_amount'))
         values['spot_close_qty'] = _float(pos.get('spot_open_qty'))
-    if values['future_open'] <= 0:
+    if allow_position_fallback and values['future_open'] <= 0:
         values['future_open'] = (
             _float(pos.get('future_open_amount'))
             or _float(pos.get('future_open_qty')) * _float(pos.get('future_open_price'))
         )
         values['future_open_qty'] = _float(pos.get('future_open_qty'))
-    if values['future_close'] <= 0:
+    if allow_position_fallback and values['future_close'] <= 0:
         values['future_close'] = _float(pos.get('future_close_amount'))
         values['future_close_qty'] = _float(pos.get('future_open_qty'))
     return values
@@ -99,14 +104,10 @@ def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Di
     """
     用真实成交额计算正向套利已经双边成交的收益。
 
-    公式：
-      realized = spot_close - spot_open + future_open - future_close
-      total    = realized + funding_total_pnl - fee_cost
-
     部分平仓时，仅确认两腿均已成交的最小数量；开仓成交额按该数量
     按比例分摊。这样既不遗漏已落袋收益，也不会把单腿残差误算成套利收益。
     """
-    values = _execution_values(pos, orders)
+    values = _execution_values(pos, orders, allow_position_fallback=False)
     if values is None:
         return None
 
@@ -151,10 +152,6 @@ def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Di
     realized_spot = allocated_spot_close - allocated_spot_open
     realized_future = allocated_future_open - allocated_future_close
     realized_pnl = realized_spot + realized_future
-    fee_cost = sum(_fee_cost(order) for order in values['orders'])
-    funding_pnl = _float(pos.get('funding_total_pnl'))
-    total_pnl = realized_pnl + funding_pnl - fee_cost
-
     return {
         'open_notional': round(open_notional, 8),
         'matched_close_qty': round(matched_close_qty, 8),
@@ -164,18 +161,13 @@ def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Di
         'realized_future_pnl': round(realized_future, 8),
         'realized_pnl': round(realized_pnl, 8),
         'realized_pnl_bps': round(realized_pnl / open_notional * 10000, 4),
-        'funding_pnl': round(funding_pnl, 8),
-        'fee_cost': round(fee_cost, 8),
-        'fee_bps': round(-fee_cost / open_notional * 10000, 4),
-        'total_pnl': round(total_pnl, 8),
-        'total_pnl_bps': round(total_pnl / open_notional * 10000, 4),
         'close_spread_bps': round(close_spread_bps, 4) if close_spread_bps is not None else None,
     }
 
 
 def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
     """用全量成交额结算最终已关闭持仓，兼容尘埃按零回收价值核销。"""
-    values = _execution_values(pos, orders)
+    values = _execution_values(pos, orders, allow_position_fallback=True)
     if values is None:
         return None
 
