@@ -33,7 +33,7 @@ def test_mobile_capital_only_requests_required_monitoring_data():
         '&exchange=total&metric=daily_return',
     ):
         assert endpoint in MOBILE_SOURCE
-    for label in ('总计', '总资产', '今日已实现', '今日开仓', '今日平仓', '可用资金', 'BNB 可用', '全仓 MMR', '已实现年化', '对账情况', '总资产曲线', '每日收益'):
+    for label in ('总计', '总资产', '今日已实现', '今日开仓/平仓', '可用资金', 'BNB 可用', '全仓 MMR', '已实现年化', '对账情况', '总资产曲线', '每日收益'):
         assert label in MOBILE_SOURCE
 
 
@@ -107,13 +107,11 @@ def test_mobile_capital_places_actions_beside_title_and_summarizes_reconciliatio
     assert '<section class="mobile-fund-actions"' not in MOBILE_SOURCE
 
     annualized_metric = MOBILE_SOURCE.index('<span>已实现年化</span>')
-    today_opened_metric = MOBILE_SOURCE.index('<span>今日开仓</span>')
-    today_closed_metric = MOBILE_SOURCE.index('<span>今日平仓</span>')
+    today_activity_metric = MOBILE_SOURCE.index('<span>今日开仓/平仓</span>')
     reconciliation_metric = MOBILE_SOURCE.index('<span>对账情况</span>')
-    assert annualized_metric < today_opened_metric < today_closed_metric < reconciliation_metric
-    assert 'formatCount(annualized?.today_opened_count)' in MOBILE_SOURCE
-    assert 'formatCount(annualized?.today_closed_count)' in MOBILE_SOURCE
+    assert annualized_metric < today_activity_metric < reconciliation_metric
+    assert 'formatOpenCloseCount(annualized?.today_opened_count, annualized?.today_closed_count)' in MOBILE_SOURCE
     assert "matched: '一致'" in MOBILE_SOURCE
     assert "mismatched: '不一致'" in MOBILE_SOURCE
     assert "reconciliationRows.value.every" in MOBILE_SOURCE
-    assert 'grid-template-columns: repeat(5, minmax(0, 1fr));' in MOBILE_SOURCE
+    assert 'grid-template-columns: repeat(4, minmax(0, 1fr));' in MOBILE_SOURCE

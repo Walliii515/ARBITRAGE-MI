@@ -215,6 +215,10 @@ function formatCount(value: number | null | undefined): string {
   return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
 }
 
+function formatOpenCloseCount(opened: number | null | undefined, closed: number | null | undefined): string {
+  return `${formatCount(opened)}笔/${formatCount(closed)}笔`
+}
+
 function formatBnb(value: number | null | undefined): string {
   if (!isFiniteNumber(value)) return '--'
   return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 6 })
@@ -863,14 +867,9 @@ onBeforeUnmount(() => {
           <small>{{ annualizedHint }}</small>
         </div>
         <div>
-          <span>今日开仓</span>
-          <strong>{{ formatCount(annualized?.today_opened_count) }}</strong>
-          <small>笔</small>
-        </div>
-        <div>
-          <span>今日平仓</span>
-          <strong>{{ formatCount(annualized?.today_closed_count) }}</strong>
-          <small>笔</small>
+          <span>今日开仓/平仓</span>
+          <strong>{{ formatOpenCloseCount(annualized?.today_opened_count, annualized?.today_closed_count) }}</strong>
+          <small>开/平</small>
         </div>
         <div>
           <span>对账情况</span>
@@ -1127,7 +1126,7 @@ footer {
 .total-mmr-label > i { overflow: hidden; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
 .total-mmr-metric > strong { display: block; margin-top: 2px; overflow: hidden; font-size: clamp(22px, 6.2vw, 27px); font-weight: 750; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .total-mmr-metric > small { display: block; margin-top: 1px; color: var(--mobile-muted); font-size: 9px; }
-.total-secondary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
+.total-secondary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid rgba(43, 55, 72, .7); }
 .total-secondary-grid > div { min-width: 0; padding-top: 8px; }
 .total-secondary-grid > div + div { margin-left: 6px; padding-left: 6px; border-left: 1px solid rgba(43, 55, 72, .7); }
 .total-secondary-grid strong { display: block; margin-top: 2px; overflow: hidden; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }

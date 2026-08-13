@@ -555,6 +555,10 @@ function formatCount(value: number | null | undefined): string {
   return Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 })
 }
 
+function formatOpenCloseCount(opened: number | null | undefined, closed: number | null | undefined): string {
+  return `${formatCount(opened)}笔/${formatCount(closed)}笔`
+}
+
 function formatPercent(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-'
   return `${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
@@ -1791,17 +1795,9 @@ onBeforeUnmount(() => {
               </strong>
             </div>
             <div class="insight-metric">
-              <span class="insight-metric-label">今日开仓</span>
+              <span class="insight-metric-label">今日开仓/平仓</span>
               <strong class="insight-value">
-                <span>{{ formatCount(annualizedReturn?.today_opened_count) }}</span>
-                <span class="metric-unit">笔</span>
-              </strong>
-            </div>
-            <div class="insight-metric">
-              <span class="insight-metric-label">今日平仓</span>
-              <strong class="insight-value">
-                <span>{{ formatCount(annualizedReturn?.today_closed_count) }}</span>
-                <span class="metric-unit">笔</span>
+                <span>{{ formatOpenCloseCount(annualizedReturn?.today_opened_count, annualizedReturn?.today_closed_count) }}</span>
               </strong>
             </div>
           </div>
@@ -2202,7 +2198,7 @@ onBeforeUnmount(() => {
 }
 
 .performance-metric-grid {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .insight-metric {

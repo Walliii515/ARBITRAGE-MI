@@ -76,10 +76,8 @@ def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
     assert '已有 ${summary.available_days} / ${summary.period_days} 天有效数据' in CAPITAL_MONITOR_SOURCE
     assert '当日已实现' in CAPITAL_MONITOR_SOURCE
     assert '策略表现' in CAPITAL_MONITOR_SOURCE
-    assert '今日开仓' in CAPITAL_MONITOR_SOURCE
-    assert '今日平仓' in CAPITAL_MONITOR_SOURCE
-    assert 'formatCount(annualizedReturn?.today_opened_count)' in CAPITAL_MONITOR_SOURCE
-    assert 'formatCount(annualizedReturn?.today_closed_count)' in CAPITAL_MONITOR_SOURCE
+    assert '今日开仓/平仓' in CAPITAL_MONITOR_SOURCE
+    assert 'formatOpenCloseCount(annualizedReturn?.today_opened_count, annualizedReturn?.today_closed_count)' in CAPITAL_MONITOR_SOURCE
     assert 'class="insight-metric-grid performance-metric-grid"' in CAPITAL_MONITOR_SOURCE
 
 
