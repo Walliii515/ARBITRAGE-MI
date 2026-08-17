@@ -13,7 +13,7 @@ import math
 import threading
 import time
 from decimal import Decimal
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Optional, Any, Callable, List, Dict
 from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
@@ -65,6 +65,14 @@ from services.capital_query_service import (
 from services.fund_transfer_api_service import FundTransferApiService
 from services.reconciliation_query_service import ReconciliationQueryService
 from services.reverse_query_service import ReverseQueryService
+from services.risk_notification_service import (
+    RiskNotificationService,
+    append_unique_notification,
+    db_bool,
+    format_reconciliation_notification,
+    risk_notification_key,
+    should_emit_reconciliation_notification,
+)
 from services.trading_query_service import TradingQueryService
 
 logger = get_logger(__name__)
@@ -159,8 +167,7 @@ def _aggregate_capital_latest_account_rows(rows: List[Dict[str, Any]]) -> List[D
 
 
 def _risk_notification_key(prefix: str, *parts: Any) -> str:
-    values = [str(part if part is not None else '').strip() for part in parts]
-    return f"{prefix}:{':'.join(values)}"[:220]
+    return risk_notification_key(prefix, *parts)
 
 
 def _format_meta_dt(value) -> str | None:
@@ -368,6 +375,14 @@ def _fund_transfer_api_service() -> FundTransferApiService:
     )
 
 
+def _risk_notification_service() -> RiskNotificationService:
+    return RiskNotificationService(
+        db_manager,
+        serialize_row=_serialize_row,
+        ignore_clause=_reconciliation_ignore_clause,
+    )
+
+
 @router.get('/orders')
 async def get_orders(
     view: str = Query('open', pattern='^(open|close)$', description="订单视图(open/close)"),
@@ -502,59 +517,16 @@ def _reconciliation_latest_sql(ignore_sql: str) -> str:
 
 
 def _db_bool(value: Any) -> bool:
-    if value is None:
-        return False
-    try:
-        return bool(int(value))
-    except (TypeError, ValueError):
-        return bool(value)
+    return db_bool(value)
 
 
 def _should_emit_reconciliation_notification(row: Dict[str, Any], latest_snapshot_at: Any) -> bool:
     """Suppress one-off historical reconciliation mismatches caused by in-flight trades."""
-    if latest_snapshot_at is not None and row.get('snapshot_at') == latest_snapshot_at:
-        return True
-    previous_is_match = row.get('previous_is_match')
-    if previous_is_match is None:
-        return False
-    return not _db_bool(previous_is_match)
+    return should_emit_reconciliation_notification(row, latest_snapshot_at)
 
 
 def _format_reconciliation_notification(row: Dict[str, Any], dedup_key: str) -> Dict[str, Any]:
-    base_asset = row.get('base_asset') or '-'
-    exchange = row.get('exchange') or '-'
-    exchange_label = str(exchange).capitalize() if exchange != '-' else '-'
-    dimension = row.get('dimension') or '-'
-    detail = row.get('detail') if isinstance(row.get('detail'), dict) else {}
-    is_error = base_asset == '__ERROR__' or dimension == 'error'
-
-    if is_error:
-        error_msg = detail.get('error_msg') or '未返回持仓数据'
-        title = f"持仓对账拉取失败: {exchange_label}"
-        message = f"{exchange_label} 对账接口错误: {error_msg}"
-        status = 'error'
-    else:
-        title = f"持仓对账不一致: {base_asset}"
-        message = (
-            f"{exchange} {dimension} "
-            f"local={row.get('local_value') if row.get('local_value') is not None else '-'} "
-            f"exchange={row.get('exchange_value') if row.get('exchange_value') is not None else '-'} "
-            f"diff={row.get('diff_value') if row.get('diff_value') is not None else '-'}"
-        )
-        status = 'mismatch'
-
-    return {
-        'dedup_key': dedup_key,
-        'source': 'reconciliation',
-        'severity': 'warning',
-        'title': title,
-        'message': message,
-        'event_at': row.get('snapshot_at'),
-        'base_asset': base_asset,
-        'risk_type': dimension,
-        'status': status,
-        'detail': row,
-    }
+    return format_reconciliation_notification(row, dedup_key)
 
 
 def _append_unique_notification(
@@ -562,12 +534,7 @@ def _append_unique_notification(
     seen_keys: set[str],
     item: Dict[str, Any],
 ) -> None:
-    dedup_key = str(item.get('dedup_key') or '')
-    if dedup_key:
-        if dedup_key in seen_keys:
-            return
-        seen_keys.add(dedup_key)
-    items.append(item)
+    append_unique_notification(items, seen_keys, item)
 
 
 @router.get('/reconciliation/latest')
@@ -594,101 +561,7 @@ async def get_reconciliation_history(
 
 
 def _build_recent_risk_notification_items(hours: int = 24, limit: int = 50) -> List[Dict[str, Any]]:
-    cutoff = datetime.now() - timedelta(hours=hours)
-    items: List[Dict[str, Any]] = []
-    seen_notification_keys: set[str] = set()
-
-    exchange_sql = """
-        SELECT
-            id, event_key, exchange, market_type, risk_type, base_asset, contract,
-            event_at, side, size, fill_price, mark_price, liq_price, pnl,
-            status, remediation_action, created_at, updated_at
-        FROM mi_exchange_risk_event
-        WHERE event_key NOT LIKE 'recon:%%'
-          AND (created_at >= %s OR updated_at >= %s OR event_at >= %s)
-        ORDER BY GREATEST(created_at, updated_at) DESC, event_at DESC
-        LIMIT %s
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(exchange_sql, [cutoff, cutoff, cutoff, limit])
-        exchange_rows = cursor.fetchall()
-
-    for row in exchange_rows:
-        row = _serialize_row(row)
-        _append_unique_notification(items, seen_notification_keys, {
-            'dedup_key': _risk_notification_key('exchange_risk', row.get('event_key')),
-            'source': 'exchange_risk',
-            'severity': 'error',
-            'title': f"交易所风险: {row.get('base_asset') or '-'}",
-            'message': (
-                f"{row.get('exchange') or '-'} {row.get('risk_type') or 'unknown'} "
-                f"status={row.get('status') or '-'} "
-                f"size={row.get('size') if row.get('size') is not None else '-'} "
-                f"price={row.get('fill_price') if row.get('fill_price') is not None else '-'}"
-            ),
-            'event_at': row.get('event_at'),
-            'base_asset': row.get('base_asset'),
-            'risk_type': row.get('risk_type'),
-            'status': row.get('status'),
-            'detail': row,
-        })
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute("SELECT MAX(snapshot_at) AS latest_snapshot_at FROM mi_recon_snapshot")
-        latest_recon_row = cursor.fetchone()
-    latest_snapshot_at = latest_recon_row.get('latest_snapshot_at') if latest_recon_row else None
-
-    ignore_sql, ignore_params = _reconciliation_ignore_clause('r')
-    candidate_limit = min(max(limit * 5, 100), 1000)
-    recon_sql = f"""
-        SELECT
-            r.id, r.snapshot_at, r.exchange, r.base_asset, r.dimension,
-            r.local_value, r.exchange_value, r.diff_value, r.diff_ratio, r.detail,
-            (
-                SELECT prev.is_match
-                FROM mi_recon_snapshot prev
-                WHERE prev.exchange = r.exchange
-                  AND prev.base_asset = r.base_asset
-                  AND prev.dimension = r.dimension
-                  AND prev.snapshot_at < r.snapshot_at
-                ORDER BY prev.snapshot_at DESC
-                LIMIT 1
-            ) AS previous_is_match
-        FROM mi_recon_snapshot r
-        WHERE r.snapshot_at >= %s
-          AND r.is_match = 0
-          {ignore_sql}
-        ORDER BY r.snapshot_at DESC, r.exchange ASC, r.base_asset ASC
-        LIMIT %s
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(recon_sql, [cutoff, *ignore_params, candidate_limit])
-        recon_rows = cursor.fetchall()
-
-    for row in recon_rows:
-        if not _should_emit_reconciliation_notification(row, latest_snapshot_at):
-            continue
-        row.pop('previous_is_match', None)
-        row = _serialize_row(row)
-        base_asset = row.get('base_asset') or '-'
-        exchange = row.get('exchange') or '-'
-        dimension = row.get('dimension') or '-'
-        dedup_key = _risk_notification_key(
-            'reconciliation',
-            exchange,
-            base_asset,
-            dimension,
-            row.get('local_value'),
-            row.get('exchange_value'),
-        )
-        _append_unique_notification(
-            items,
-            seen_notification_keys,
-            _format_reconciliation_notification(row, dedup_key),
-        )
-
-    items.sort(key=lambda item: str(item.get('event_at') or ''), reverse=True)
-    return items[:limit]
+    return _risk_notification_service().list_recent_items(hours=hours, limit=limit)
 
 
 def _sync_recent_popup_notifications() -> Dict[str, int]:
@@ -749,18 +622,13 @@ def _sync_recent_popup_notifications() -> Dict[str, int]:
 async def get_recent_risk_notifications(
     hours: int = Query(24, ge=1, le=168, description="回看最近N小时风险事件"),
     limit: int = Query(50, ge=1, le=200, description="最多返回事件数"),
-):
+) -> Dict[str, Any]:
     """返回需要进入前端铃铛的近期风险事件。"""
-    items = _build_recent_risk_notification_items(hours=hours, limit=limit)
-    return {
-        'items': items,
-        'summary': {
-            'total': len(items),
-            'exchange_risk': sum(1 for item in items if item.get('source') == 'exchange_risk'),
-            'reconciliation': sum(1 for item in items if item.get('source') == 'reconciliation'),
-        },
-        'lookback_hours': hours,
-    }
+    return await asyncio.to_thread(
+        _risk_notification_service().recent,
+        hours=hours,
+        limit=limit,
+    )
 
 
 @router.get('/notifications')
