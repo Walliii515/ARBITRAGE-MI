@@ -63,6 +63,8 @@ from services.capital_query_service import (
     filter_capital_transfer_transient_rows,
 )
 from services.fund_transfer_api_service import FundTransferApiService
+from services.listing_event_api_service import ListingEventApiService
+from services.popup_notification_api_service import PopupNotificationApiService
 from services.reconciliation_query_service import ReconciliationQueryService
 from services.reverse_query_service import ReverseQueryService
 from services.risk_notification_service import (
@@ -391,6 +393,34 @@ def _threshold_query_service() -> ThresholdQueryService:
     )
 
 
+def _popup_notification_api_service() -> PopupNotificationApiService:
+    return PopupNotificationApiService(
+        serialize_row=_serialize_row,
+        serialize_rows=_serialize_rows,
+        list_listing_events=list_listing_events,
+        upsert_one=upsert_popup_notification,
+        upsert_many=upsert_popup_notifications,
+        list_notifications=list_popup_notifications,
+        count_unread=count_unread_popup_notifications,
+        mark_read=mark_popup_notifications_read,
+        list_recent_risk_items=_build_recent_risk_notification_items,
+        notification_key=_risk_notification_key,
+    )
+
+
+def _listing_event_api_service() -> ListingEventApiService:
+    return ListingEventApiService(
+        serialize_row=_serialize_row,
+        serialize_rows=_serialize_rows,
+        list_events=list_listing_events,
+        event_summary=listing_event_summary,
+        refresh_events=refresh_listing_events,
+        mark_events=mark_listing_events,
+        add_to_monitor=add_listing_asset_to_monitor,
+        disable_asset=disable_listing_asset,
+    )
+
+
 @router.get('/orders')
 async def get_orders(
     view: str = Query('open', pattern='^(open|close)$', description="订单视图(open/close)"),
@@ -574,56 +604,7 @@ def _build_recent_risk_notification_items(hours: int = 24, limit: int = 50) -> L
 
 def _sync_recent_popup_notifications() -> Dict[str, int]:
     """Materialize current backend risk/listing signals into persistent bell history."""
-    listing_synced = 0
-    risk_synced = 0
-
-    listing_rows = list_listing_events(
-        action_status='pending',
-        candidate_status='matched',
-        actionable_only=True,
-        limit=20,
-    )
-    if listing_rows:
-        rows = _serialize_rows(listing_rows)
-        fingerprint = '|'.join(sorted(
-            f"{row.get('base_asset')}:{row.get('gate_contract') or ''}:"
-            f"{row.get('binance_symbol') or ''}:{row.get('last_seen_at') or ''}"
-            for row in rows
-        ))
-        preview = '\n'.join(
-            f"{row.get('base_asset')} Gate:{row.get('gate_contract') or '-'} "
-            f"Binance:{row.get('binance_symbol') or '-'} "
-            f"24h={float(row.get('gate_volume_24h_settle') or 0):.0f}/"
-            f"{float(row.get('binance_quote_volume') or 0):.0f}"
-            for row in rows[:8]
-        )
-        upsert_popup_notification(
-            title=f"交易对上新候选 {len(rows)} 个",
-            message=preview,
-            type='warning',
-            source='listing_events',
-            dedup_key=_risk_notification_key('listing_events', fingerprint),
-            event_at=max((row.get('last_seen_at') for row in rows if row.get('last_seen_at')), default=None),
-            payload={'items': rows},
-        )
-        listing_synced = 1
-
-    risk_items = _build_recent_risk_notification_items(hours=24, limit=50)
-    risk_synced = upsert_popup_notifications(
-        [
-            {
-                'title': item.get('title') or '交易风险通知',
-                'message': item.get('message') or '',
-                'type': 'error' if item.get('severity') == 'error' else 'warning',
-                'source': item.get('source') or 'risk',
-                'dedup_key': item.get('dedup_key'),
-                'event_at': item.get('event_at'),
-                'payload': item,
-            }
-            for item in risk_items
-        ],
-    )
-    return {'listing_events': listing_synced, 'risk': risk_synced}
+    return _popup_notification_api_service().sync_recent()
 
 
 @router.get('/risk-notifications/recent')
@@ -646,56 +627,49 @@ async def get_popup_notifications(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     sync_recent: bool = Query(True, description="先同步近期后端风险/上新事件"),
-):
+) -> Dict[str, Any]:
     """查询持久化铃铛消息。"""
-    synced = _sync_recent_popup_notifications() if sync_recent else {}
-    result = list_popup_notifications(
+    return await asyncio.to_thread(
+        _popup_notification_api_service().list_items,
         read_status=read_status,
         source=source,
         page=page,
         page_size=page_size,
+        sync_recent=sync_recent,
     )
-    return {
-        'items': _serialize_rows(result['items']),
-        'pagination': result['pagination'],
-        'unread_count': result['unread_count'],
-        'synced': synced,
-    }
 
 
 @router.get('/notifications/unread-count')
-async def get_popup_notification_unread_count():
+async def get_popup_notification_unread_count() -> Dict[str, int]:
     """返回铃铛未读数量。"""
-    return {'unread_count': count_unread_popup_notifications()}
+    return await asyncio.to_thread(_popup_notification_api_service().unread_count)
 
 
 @router.post('/notifications', dependencies=[Depends(verify_token_dependency)])
-async def create_popup_notification(payload: PopupNotificationCreateRequest):
+async def create_popup_notification(payload: PopupNotificationCreateRequest) -> Dict[str, Any]:
     """写入一条持久化铃铛消息。"""
-    row = upsert_popup_notification(
+    return await asyncio.to_thread(
+        _popup_notification_api_service().create,
         title=payload.title,
         message=payload.message,
-        type=payload.type or 'info',
+        type=payload.type,
         source=payload.source,
         dedup_key=payload.dedup_key,
         event_at=payload.event_at,
         payload=payload.payload,
     )
-    return {'success': True, 'item': _serialize_row(row)}
 
 
 @router.post('/notifications/mark-read', dependencies=[Depends(verify_token_dependency)])
-async def mark_popup_notification_read(payload: PopupNotificationMarkReadRequest):
+async def mark_popup_notification_read(payload: PopupNotificationMarkReadRequest) -> Dict[str, Any]:
     """将指定消息或全部未读消息标记为已读。"""
-    affected = mark_popup_notifications_read(ids=payload.ids)
-    return {'success': True, 'affected': affected, 'unread_count': count_unread_popup_notifications()}
+    return await asyncio.to_thread(_popup_notification_api_service().mark_read, payload.ids)
 
 
 @router.post('/notifications/{notification_id}/read', dependencies=[Depends(verify_token_dependency)])
-async def mark_one_popup_notification_read(notification_id: int):
+async def mark_one_popup_notification_read(notification_id: int) -> Dict[str, Any]:
     """将单条铃铛消息标记为已读。"""
-    affected = mark_popup_notifications_read(ids=[notification_id])
-    return {'success': True, 'affected': affected, 'unread_count': count_unread_popup_notifications()}
+    return await asyncio.to_thread(_popup_notification_api_service().mark_read, [notification_id])
 
 
 @router.post('/reconciliation/run')
@@ -1215,67 +1189,58 @@ async def get_listing_events(
     monitor_status: Optional[str] = Query(None, description="监控状态过滤：not_added/added/all"),
     actionable_only: bool = Query(False, description="仅展示可提醒候选"),
     limit: int = Query(200, ge=1, le=1000),
-):
+) -> Dict[str, Any]:
     """查询交易对上新事件。"""
-    rows = list_listing_events(
+    return await asyncio.to_thread(
+        _listing_event_api_service().list_events,
         action_status=action_status,
         candidate_status=candidate_status,
         monitor_status=monitor_status,
         actionable_only=actionable_only,
         limit=limit,
     )
-    return {
-        'items': _serialize_rows(rows),
-        'summary': _serialize_row(listing_event_summary()),
-    }
 
 
 @router.get('/listing-events/summary')
-async def get_listing_events_summary():
+async def get_listing_events_summary() -> Dict[str, Any]:
     """交易对上新事件摘要，用于固定时间弹窗提醒。"""
-    items = list_listing_events(
-        action_status='pending',
-        candidate_status='matched',
-        actionable_only=True,
-        limit=20,
-    )
-    return {
-        'summary': _serialize_row(listing_event_summary()),
-        'items': _serialize_rows(items),
-    }
+    return await asyncio.to_thread(_listing_event_api_service().summary)
 
 
 @router.post('/listing-events/refresh', dependencies=[Depends(verify_token_dependency)])
-async def refresh_listing_events_api():
+async def refresh_listing_events_api() -> Dict[str, Any]:
     """手动刷新交易对上新事件。"""
-    return refresh_listing_events()
+    return await asyncio.to_thread(_listing_event_api_service().refresh)
 
 
 @router.post('/listing-events/{base_asset}/ack', dependencies=[Depends(verify_token_dependency)])
-async def ack_listing_event(base_asset: str, payload: ListingEventActionRequest | None = None):
+async def ack_listing_event(base_asset: str, payload: ListingEventActionRequest | None = None) -> Dict[str, Any]:
     """确认上新事件；保留在页面，但不再弹窗。"""
-    asset = (base_asset or '').strip().upper()
-    affected = mark_listing_events([asset], 'acknowledged', (payload.reason if payload else None) or 'acknowledged')
-    return {'success': True, 'base_asset': asset, 'affected': affected}
+    return await asyncio.to_thread(
+        _listing_event_api_service().ack,
+        base_asset,
+        payload.reason if payload else None,
+    )
 
 
 @router.post('/listing-events/{base_asset}/ignore', dependencies=[Depends(verify_token_dependency)])
-async def ignore_listing_event(base_asset: str, payload: ListingEventActionRequest | None = None):
+async def ignore_listing_event(base_asset: str, payload: ListingEventActionRequest | None = None) -> Dict[str, Any]:
     """忽略上新事件；不修改 mi_base_asset。"""
-    asset = (base_asset or '').strip().upper()
-    affected = mark_listing_events([asset], 'ignored', (payload.reason if payload else None) or 'ignored')
-    return {'success': True, 'base_asset': asset, 'affected': affected}
+    return await asyncio.to_thread(
+        _listing_event_api_service().ignore,
+        base_asset,
+        payload.reason if payload else None,
+    )
 
 
 @router.post('/listing-events/{base_asset}/add-to-monitor', dependencies=[Depends(verify_token_dependency)])
-async def add_listing_event_to_monitor(base_asset: str):
+async def add_listing_event_to_monitor(base_asset: str) -> Dict[str, Any]:
     """将上新候选加入 mi_base_asset，后续按普通标的进入监控候选。"""
-    try:
-        result = add_listing_asset_to_monitor(base_asset)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    subscription = await asyncio.to_thread(_subscribe_listing_asset_orderbook, result.get('base_asset') or base_asset)
+    result = await asyncio.to_thread(_listing_event_api_service().add_to_monitor, base_asset)
+    subscription = await asyncio.to_thread(
+        _subscribe_listing_asset_orderbook,
+        result.get('base_asset') or base_asset,
+    )
     result['dynamic_subscription'] = subscription
     result['requires_service_reload'] = not bool(subscription.get('ok'))
     if subscription.get('ok'):
@@ -1289,15 +1254,13 @@ async def add_listing_event_to_monitor(base_asset: str):
 
 
 @router.post('/listing-events/{base_asset}/disable', dependencies=[Depends(verify_token_dependency)])
-async def disable_listing_event_asset(base_asset: str, payload: ListingEventActionRequest | None = None):
+async def disable_listing_event_asset(base_asset: str, payload: ListingEventActionRequest | None = None) -> Dict[str, Any]:
     """将上新候选写入/更新为失效标的，后续不再弹窗。"""
-    try:
-        return disable_listing_asset(
-            base_asset,
-            (payload.reason if payload else None) or 'listing_event_disabled',
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    return await asyncio.to_thread(
+        _listing_event_api_service().disable,
+        base_asset,
+        payload.reason if payload else None,
+    )
 
 
 @router.post('/base-assets/{base_asset}/disable', dependencies=[Depends(verify_token_dependency)])
