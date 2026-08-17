@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from common.database import db_manager
 from common.config import config
-from common.errors import ValidationAppError
+from common.errors import AppError, ValidationAppError
 from common.logger import get_logger
 from api.auth import verify_token_dependency, verify_user_password
 from common.meta_loader import fetch_contract_meta
@@ -46,8 +46,11 @@ from calc.popup_notification_store import (
     upsert_popup_notifications,
 )
 from calc.position_pnl_calculator import PnlConfig
-from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
-from calc.reverse_trade_store import list_reverse_positions
+from calc.reverse_account_monitor import get_reverse_capital_snapshot
+from repositories.reconciliation_query_repo import (
+    reconciliation_ignore_clause,
+    reconciliation_latest_sql,
+)
 from repositories.trading_query_repo import build_forward_signal_filters
 from services.capital_query_service import (
     CAPITAL_ANNUALIZED_PERIODS,
@@ -59,6 +62,8 @@ from services.capital_query_service import (
     capital_history_select_columns,
     filter_capital_transfer_transient_rows,
 )
+from services.fund_transfer_api_service import FundTransferApiService
+from services.reconciliation_query_service import ReconciliationQueryService
 from services.reverse_query_service import ReverseQueryService
 from services.trading_query_service import TradingQueryService
 
@@ -347,6 +352,22 @@ def _capital_query_service() -> CapitalQueryService:
     )
 
 
+def _reconciliation_query_service() -> ReconciliationQueryService:
+    return ReconciliationQueryService(
+        db_manager,
+        serialize_rows=_serialize_rows,
+        ignore_clause=_reconciliation_ignore_clause,
+    )
+
+
+def _fund_transfer_api_service() -> FundTransferApiService:
+    return FundTransferApiService(
+        get_fund_transfer_service,
+        serialize_row=_serialize_row,
+        serialize_rows=_serialize_rows,
+    )
+
+
 @router.get('/orders')
 async def get_orders(
     view: str = Query('open', pattern='^(open|close)$', description="订单视图(open/close)"),
@@ -470,27 +491,14 @@ def _build_gate_cross_minimum_summary(row: Optional[Dict[str, Any]]) -> Optional
 
 
 def _reconciliation_ignore_clause(table_alias: str = '') -> tuple[str, List[Any]]:
-    ignored = sorted(get_ignored_binance_spot_assets())
-    if not ignored:
-        return '', []
-    placeholders = ','.join(['%s'] * len(ignored))
-    prefix = f"{table_alias}." if table_alias else ''
-    return f" AND NOT ({prefix}exchange = 'binance' AND {prefix}base_asset IN ({placeholders}))", ignored
+    return reconciliation_ignore_clause(
+        sorted(get_ignored_binance_spot_assets()),
+        table_alias,
+    )
 
 
 def _reconciliation_latest_sql(ignore_sql: str) -> str:
-    return """
-        SELECT
-            s.*,
-            c.quanto_multiplier
-        FROM mi_recon_snapshot s
-        LEFT JOIN mi_gate_future_contracts c
-          ON UPPER(TRIM(c.base_asset)) COLLATE utf8mb4_unicode_ci
-           = UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci
-        WHERE s.snapshot_at = (SELECT MAX(snapshot_at) FROM mi_recon_snapshot)
-        {ignore_sql}
-        ORDER BY s.exchange ASC, s.base_asset ASC
-    """.format(ignore_sql=ignore_sql)
+    return reconciliation_latest_sql(ignore_sql)
 
 
 def _db_bool(value: Any) -> bool:
@@ -563,14 +571,9 @@ def _append_unique_notification(
 
 
 @router.get('/reconciliation/latest')
-async def get_reconciliation_latest():
+async def get_reconciliation_latest() -> Dict[str, Any]:
     """返回最近一轮对账快照。"""
-    ignore_sql, ignore_params = _reconciliation_ignore_clause('s')
-    sql = _reconciliation_latest_sql(ignore_sql)
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, ignore_params)
-        rows = cursor.fetchall()
-    return {'rows': _serialize_rows(rows)}
+    return await asyncio.to_thread(_reconciliation_query_service().latest)
 
 
 @router.get('/reconciliation/history')
@@ -579,43 +582,15 @@ async def get_reconciliation_history(
     mismatches_only: bool = Query(False, description="是否仅显示差异/错误"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(500, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询对账历史快照。"""
-    where_clauses = ["snapshot_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"]
-    params: List[Any] = [days]
-    if mismatches_only:
-        where_clauses.append("is_match = 0")
-    ignore_sql, ignore_params = _reconciliation_ignore_clause()
-    where_sql = " AND ".join(where_clauses)
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(
-            f"SELECT COUNT(*) AS total FROM mi_recon_snapshot WHERE {where_sql}{ignore_sql}",
-            [*params, *ignore_params],
-        )
-        total_row = cursor.fetchone()
-        total = int(total_row['total']) if total_row else 0
-
-    offset = (page - 1) * page_size
-    sql = f"""
-        SELECT *
-        FROM mi_recon_snapshot
-        WHERE {where_sql}{ignore_sql}
-        ORDER BY snapshot_at DESC, exchange ASC, base_asset ASC
-        LIMIT %s OFFSET %s
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, [*params, *ignore_params, page_size, offset])
-        rows = cursor.fetchall()
-    return {
-        'rows': _serialize_rows(rows),
-        'pagination': {
-            'page': page,
-            'page_size': page_size,
-            'total': total,
-            'total_pages': (total + page_size - 1) // page_size if total else 0,
-        },
-    }
+    return await asyncio.to_thread(
+        _reconciliation_query_service().history,
+        days=days,
+        mismatches_only=mismatches_only,
+        page=page,
+        page_size=page_size,
+    )
 
 
 def _build_recent_risk_notification_items(hours: int = 24, limit: int = 50) -> List[Dict[str, Any]]:
@@ -1039,84 +1014,45 @@ async def run_capital_snapshot_now():
 
 
 @router.get('/capital/fund-transfer', dependencies=[Depends(verify_token_dependency)])
-async def get_fund_transfer_tasks(limit: int = Query(30, ge=1, le=200)):
+async def get_fund_transfer_tasks(limit: int = Query(30, ge=1, le=200)) -> Dict[str, Any]:
     """Return the active transfer and durable transfer history."""
-    try:
-        service = get_fund_transfer_service()
-        active = service.store.get_active()
-        history = service.store.list(limit=limit)
-        return {
-            'active': _serialize_row(active) if active else None,
-            'history': _serialize_rows(history),
-            'open_locked': service.open_locked,
-        }
-    except Exception as exc:
-        logger.error('读取资金划转任务失败: %s', exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f'读取资金划转任务失败: {exc}')
+    return await asyncio.to_thread(_fund_transfer_api_service().list_tasks, limit)
 
 
 @router.get(
     '/capital/fund-transfer/limits',
     dependencies=[Depends(verify_token_dependency)],
 )
-async def get_fund_transfer_limits():
+async def get_fund_transfer_limits() -> Dict[str, Any]:
     """Return current live minimum and maximum transferable amounts."""
-    try:
-        result = await asyncio.to_thread(
-            get_fund_transfer_service().limits
-        )
-        result.pop('_network_info', None)
-        return {'success': True, 'limits': _serialize_row(result)}
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        logger.error('读取资金划转额度失败: %s', exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f'读取资金划转额度失败: {exc}')
+    return await asyncio.to_thread(_fund_transfer_api_service().limits)
 
 
 @router.get(
     '/capital/fund-transfer/preflight',
     dependencies=[Depends(verify_token_dependency)],
 )
-async def preflight_fund_transfer(amount: Decimal = Query(..., gt=0)):
+async def preflight_fund_transfer(amount: Decimal = Query(..., gt=0)) -> Dict[str, Any]:
     """Read live balances, fee, network and fixed destination without moving money."""
-    try:
-        result = await asyncio.to_thread(
-            lambda: get_fund_transfer_service().preview(amount)
-        )
-        return {'success': True, 'preview': _serialize_row(result)}
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        logger.error('资金划转预检失败: %s', exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f'资金划转预检失败: {exc}')
+    return await asyncio.to_thread(_fund_transfer_api_service().preview, amount)
 
 
 @router.post('/capital/fund-transfer', status_code=201)
 async def create_fund_transfer(
     req: FundTransferCreateRequest,
     user: Dict[str, Any] = Depends(verify_token_dependency),
-):
+) -> Dict[str, Any]:
     """Create one real transfer after current-password re-authentication."""
     if config.get_trade_mode() == 'virtual':
-        raise HTTPException(status_code=409, detail='virtual 模式不执行真实资金划转')
+        raise AppError('virtual 模式不执行真实资金划转', status_code=409)
     if not verify_user_password(user_id=user.get('user_id'), password=req.password):
-        raise HTTPException(status_code=403, detail='当前登录密码校验失败')
-    try:
-        service = get_fund_transfer_service()
-        task = await asyncio.to_thread(
-            lambda: service.create_task(
-                amount=req.amount,
-                user_id=str(user.get('user_id') or 'default'),
-                username=str(user.get('username') or ''),
-            )
-        )
-        return {'success': True, 'task': _serialize_row(task)}
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        logger.error('创建资金划转任务失败: %s', exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f'创建资金划转任务失败: {exc}')
+        raise AppError('当前登录密码校验失败', status_code=403)
+    return await asyncio.to_thread(
+        _fund_transfer_api_service().create_task,
+        amount=req.amount,
+        user_id=str(user.get('user_id') or 'default'),
+        username=str(user.get('username') or ''),
+    )
 
 
 @router.post('/capital/fund-transfer/{task_id}/retry')
@@ -1124,20 +1060,14 @@ async def retry_fund_transfer(
     task_id: int,
     req: FundTransferRetryRequest,
     user: Dict[str, Any] = Depends(verify_token_dependency),
-):
+) -> Dict[str, Any]:
     """Recheck an ambiguous task or retry only its location-safe recovery step."""
     if not verify_user_password(user_id=user.get('user_id'), password=req.password):
-        raise HTTPException(status_code=403, detail='当前登录密码校验失败')
-    try:
-        task = await asyncio.to_thread(
-            lambda: get_fund_transfer_service().request_retry(task_id)
-        )
-        return {'success': True, 'task': _serialize_row(task)}
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except Exception as exc:
-        logger.error('资金划转恢复失败: task=%s error=%s', task_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f'资金划转恢复失败: {exc}')
+        raise AppError('当前登录密码校验失败', status_code=403)
+    return await asyncio.to_thread(
+        _fund_transfer_api_service().retry_task,
+        task_id,
+    )
 
 
 @router.post('/capital/clear-range', dependencies=[Depends(verify_token_dependency)])
@@ -1821,25 +1751,12 @@ async def get_reverse_reconciliation(
     mismatches_only: bool = Query(False, description="仅返回差异行"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """反向套利持仓对账（独立反向持仓表 + reverse 子账户）。"""
-    result = list_reverse_positions(
-        status='holding',
+    return await asyncio.to_thread(
+        _reconciliation_query_service().reverse_history,
         days=days,
-        page=1,
-        page_size=5000,
+        mismatches_only=mismatches_only,
+        page=page,
+        page_size=page_size,
     )
-    payload = build_reverse_reconciliation_rows(_serialize_rows(result.rows))
-    rows = payload.get('rows') or []
-    if mismatches_only:
-        rows = [row for row in rows if not row.get('is_match')]
-    total = len(rows)
-    offset = (page - 1) * page_size
-    payload['rows'] = rows[offset:offset + page_size]
-    payload['pagination'] = {
-        'page': page,
-        'page_size': page_size,
-        'total': total,
-        'total_pages': (total + page_size - 1) // page_size if total else 0,
-    }
-    return payload

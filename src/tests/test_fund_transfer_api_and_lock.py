@@ -4,7 +4,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from common.errors import AppError
 
 from api.auth import verify_user_password
 from api.trading_api import (
@@ -43,7 +43,7 @@ def test_create_api_rejects_wrong_current_password_before_service_call():
         patch('api.trading_api.verify_user_password', return_value=False),
         patch('api.trading_api.get_fund_transfer_service') as get_service,
     ):
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(AppError) as exc:
             asyncio.run(
                 create_fund_transfer(
                     FundTransferCreateRequest(amount=Decimal('10'), password='bad'),
