@@ -48,13 +48,9 @@ from calc.popup_notification_store import (
 )
 from calc.position_pnl_calculator import PnlConfig
 from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
-from calc.reverse_trade_store import (
-    list_reverse_orders,
-    list_reverse_position_orders,
-    list_reverse_positions,
-    summarize_reverse_positions,
-)
+from calc.reverse_trade_store import list_reverse_positions
 from repositories.trading_query_repo import build_forward_signal_filters
+from services.reverse_query_service import ReverseQueryService
 from services.trading_query_service import TradingQueryService
 
 logger = get_logger(__name__)
@@ -356,6 +352,14 @@ def _trading_query_service() -> TradingQueryService:
         delist_risk_asset_set=_delist_risk_asset_set,
         inject_current_funding_fields=_inject_current_funding_fields,
         position_pnl_config=_position_pnl_config,
+    )
+
+
+def _reverse_query_service() -> ReverseQueryService:
+    return ReverseQueryService(
+        db_manager,
+        serialize_row=_serialize_row,
+        serialize_rows=_serialize_rows,
     )
 
 
@@ -2342,95 +2346,16 @@ async def get_reverse_signals(
     days: int = Query(3, ge=1, le=30, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询反向套利交易信号（后端分页）。"""
-    where = [
-        "signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)",
-        "signal_basis_bps IS NOT NULL",
-    ]
-    aliased_where = [
-        "s.signal_time >= DATE_SUB(NOW(), INTERVAL %s DAY)",
-        "s.signal_basis_bps IS NOT NULL",
-    ]
-    params: List = [days]
-    if status:
-        where.append("status = %s")
-        aliased_where.append("s.status = %s")
-        params.append(status)
-    if base_asset:
-        where.append("base_asset LIKE %s")
-        aliased_where.append("s.base_asset LIKE %s")
-        params.append(f"%{base_asset}%")
-    where_sql = " AND ".join(where)
-    aliased_where_sql = " AND ".join(aliased_where)
-
-    count_sql = f"SELECT COUNT(*) AS total FROM mi_reverse_trade_signal WHERE {where_sql}"
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(count_sql, params)
-        total_row = cursor.fetchone()
-        total = int(total_row['total'] if total_row else 0)
-
-    offset = (page - 1) * page_size
-    sql = f"""
-        SELECT
-            s.*,
-            COALESCE(b.strategy_tier, 'C') AS strategy_tier,
-            COALESCE(b.market_profile, 'normal') AS market_profile
-        FROM mi_reverse_trade_signal s
-        LEFT JOIN mi_base_asset b
-          ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))
-        WHERE {aliased_where_sql}
-        ORDER BY s.signal_time DESC
-        LIMIT %s OFFSET %s
-    """
-    page_params = list(params)
-    page_params.extend([page_size, offset])
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, page_params)
-        rows = cursor.fetchall()
-
-    summary_sql = f"""
-        SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN status = 'monitoring' THEN 1 ELSE 0 END) AS monitoring,
-            SUM(CASE WHEN status = 'opened' THEN 1 ELSE 0 END) AS opened,
-            SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END) AS conditions_lost,
-            SUM(CASE WHEN status IN ('rejected', 'gate_rejected') THEN 1 ELSE 0 END) AS rejected,
-            SUM(CASE WHEN status = 'monitor_timeout' THEN 1 ELSE 0 END) AS monitor_timeout,
-            MAX(signal_time) AS latest_signal_time
-        FROM mi_reverse_trade_signal
-        WHERE {where_sql}
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(summary_sql, params)
-        summary_row = cursor.fetchone()
-
-    summary_data = _serialize_row(summary_row) if summary_row else {}
-    total_count = int(summary_data.get('total') or 0)
-    opened_count = int(summary_data.get('opened') or 0)
-    signal_rows = _serialize_rows(rows)
-    for row in signal_rows:
-        row.pop('funding_rate_2h', None)
-
-    return {
-        'signals': signal_rows,
-        'pagination': {
-            'page': page,
-            'page_size': page_size,
-            'total': total,
-            'total_pages': (total + page_size - 1) // page_size,
-        },
-        'summary': {
-            'total': total_count,
-            'monitoring': int(summary_data.get('monitoring') or 0),
-            'opened': opened_count,
-            'conditions_lost': int(summary_data.get('conditions_lost') or 0),
-            'rejected': int(summary_data.get('rejected') or 0),
-            'monitor_timeout': int(summary_data.get('monitor_timeout') or 0),
-            'conversion_rate': round(opened_count / total_count * 100, 1) if total_count > 0 else 0,
-            'latest_signal_time': summary_data.get('latest_signal_time'),
-        },
-    }
+    return await asyncio.to_thread(
+        _reverse_query_service().list_signals,
+        status=status,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get('/reverse-positions')
@@ -2442,14 +2367,10 @@ async def get_reverse_positions(
     days: int = Query(30, ge=1, le=365, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询反向套利持仓（独立于正向 mi_trade_position）。"""
-    summary = summarize_reverse_positions(
-        exchange_risk=exchange_risk,
-        base_asset=base_asset,
-        days=days,
-    )
-    result = list_reverse_positions(
+    return await asyncio.to_thread(
+        _reverse_query_service().list_positions,
         status=status,
         order_side=order_side,
         exchange_risk=exchange_risk,
@@ -2458,23 +2379,15 @@ async def get_reverse_positions(
         page=page,
         page_size=page_size,
     )
-    return {
-        'positions': _serialize_rows(result.rows),
-        'pagination': {
-            'page': result.page,
-            'page_size': result.page_size,
-            'total': result.total,
-            'total_pages': result.total_pages,
-        },
-        'summary': summary,
-    }
 
 
 @router.get('/reverse-positions/{position_id}/orders')
-async def get_reverse_position_orders(position_id: int):
+async def get_reverse_position_orders(position_id: int) -> Dict[str, Any]:
     """获取指定反向持仓的全部订单明细（弹窗用）。"""
-    rows = list_reverse_position_orders(position_id)
-    return {'orders': _serialize_rows(rows)}
+    return await asyncio.to_thread(
+        _reverse_query_service().list_position_orders,
+        position_id,
+    )
 
 
 @router.get('/reverse-orders')
@@ -2488,9 +2401,10 @@ async def get_reverse_orders(
     days: int = Query(30, ge=1, le=365, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询反向套利订单（独立于正向 mi_trade_order）。"""
-    result = list_reverse_orders(
+    return await asyncio.to_thread(
+        _reverse_query_service().list_orders,
         position_id=position_id,
         order_uuid=order_uuid,
         order_side=order_side,
@@ -2501,15 +2415,6 @@ async def get_reverse_orders(
         page=page,
         page_size=page_size,
     )
-    return {
-        'orders': _serialize_rows(result.rows),
-        'pagination': {
-            'page': result.page,
-            'page_size': result.page_size,
-            'total': result.total,
-            'total_pages': result.total_pages,
-        },
-    }
 
 
 @router.get('/reverse-capital')
