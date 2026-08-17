@@ -3,8 +3,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
-
+from common.errors import ValidationAppError
 from api.trading_api import get_orders
 
 
@@ -125,7 +124,7 @@ def test_order_views_return_unfiltered_current_open_and_today_closed_tab_counts(
 
 def test_order_view_rejects_unknown_scope_before_querying_database():
     with patch('api.trading_api.db_manager.get_cursor') as get_cursor:
-        with pytest.raises(HTTPException) as raised:
+        with pytest.raises(ValidationAppError) as raised:
             asyncio.run(get_orders(
                 view='all',
                 channel=None,
@@ -138,6 +137,7 @@ def test_order_view_rejects_unknown_scope_before_querying_database():
             ))
 
     assert raised.value.status_code == 400
+    assert raised.value.detail == 'view 必须为 open 或 close'
     get_cursor.assert_not_called()
 
 

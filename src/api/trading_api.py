@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from common.database import db_manager
 from common.config import config
+from common.errors import ValidationAppError
 from common.logger import get_logger
 from api.auth import verify_token_dependency, verify_user_password
 from common.meta_loader import fetch_contract_meta
@@ -368,11 +369,11 @@ async def get_orders(
     days: int = Query(90, ge=1, le=90, description="最近N天"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页持仓数"),
-):
+) -> Dict[str, Any]:
     """按当前持仓状态查询开仓或平仓视图，过滤、排序与分页全部在后端完成。"""
     normalized_view = str(view or '').strip().lower()
     if normalized_view not in {'open', 'close'}:
-        raise HTTPException(status_code=400, detail='view 必须为 open 或 close')
+        raise ValidationAppError('view 必须为 open 或 close')
     return await asyncio.to_thread(
         _trading_query_service().list_order_view,
         view=normalized_view,
@@ -387,7 +388,7 @@ async def get_orders(
 
 
 @router.get('/positions/{position_id}/orders')
-async def get_position_orders(position_id: int):
+async def get_position_orders(position_id: int) -> Dict[str, Any]:
     """获取指定持仓的全部订单明细（弹窗用）"""
     return await asyncio.to_thread(
         _trading_query_service().list_position_orders,
@@ -396,7 +397,7 @@ async def get_position_orders(position_id: int):
 
 
 @router.get('/orders/grouped')
-async def get_orders_grouped():
+async def get_orders_grouped() -> List[Dict[str, Any]]:
     """
     返回分组后的订单列表
     结构：[
@@ -418,7 +419,7 @@ async def get_positions(
     days: int = Query(90, ge=1, le=365, description="最近N天（开仓时间）"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询持仓列表（含资金费结算历史，支持分页）"""
     return await asyncio.to_thread(
         _trading_query_service().list_positions,
@@ -431,7 +432,7 @@ async def get_positions(
 
 
 @router.get('/positions/summary')
-async def get_positions_summary():
+async def get_positions_summary() -> Dict[str, Any]:
     """持仓汇总统计"""
     return await asyncio.to_thread(_trading_query_service().positions_summary)
 
@@ -2320,7 +2321,7 @@ async def get_signals(
     days: int = Query(1, ge=1, le=90, description="最近N天（time_range非today时生效）"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询历史交易信号（支持分页）"""
     return await asyncio.to_thread(
         _trading_query_service().list_signals,
