@@ -73,6 +73,7 @@ from services.risk_notification_service import (
     risk_notification_key,
     should_emit_reconciliation_notification,
 )
+from services.threshold_query_service import ThresholdQueryService
 from services.trading_query_service import TradingQueryService
 
 logger = get_logger(__name__)
@@ -380,6 +381,13 @@ def _risk_notification_service() -> RiskNotificationService:
         db_manager,
         serialize_row=_serialize_row,
         ignore_clause=_reconciliation_ignore_clause,
+    )
+
+
+def _threshold_query_service() -> ThresholdQueryService:
+    return ThresholdQueryService(
+        db_manager,
+        serialize_rows=_serialize_rows,
     )
 
 
@@ -1043,48 +1051,21 @@ async def buy_forward_binance_bnb(req: BinanceBnbBuyRequest):
 # ─── VWAP 基差阈值 ────────────────────────────────────────────────────────────
 
 @router.get('/threshold/latest-date')
-async def get_threshold_latest_date():
+async def get_threshold_latest_date() -> Dict[str, Any]:
     """获取 BTC 的最新数据写入时间（用于页面展示，避免全表扫描）"""
-    sql = """
-        SELECT updated_at
-        FROM mi_vwap_basis_threshold
-        WHERE base_asset = 'BTC'
-          AND updated_at IS NOT NULL
-        ORDER BY updated_at DESC
-        LIMIT 1
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql)
-        row = cursor.fetchone()
-        if row and row.get('updated_at'):
-            d = row['updated_at']
-            return {"latest_date": d.strftime('%Y-%m-%d %H:%M') if hasattr(d, 'strftime') else str(d)}
-        return {"latest_date": None}
+    return await asyncio.to_thread(_threshold_query_service().latest_date)
 
 
 @router.get('/threshold/dates')
-async def get_threshold_dates():
+async def get_threshold_dates() -> List[str]:
     """获取 mi_vwap_basis_threshold 表中所有可用日期（降序）"""
-    sql = "SELECT DISTINCT calc_date FROM mi_vwap_basis_threshold ORDER BY calc_date DESC LIMIT 365"
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql)
-        rows = cursor.fetchall()
-        return [row['calc_date'].strftime('%Y-%m-%d') if hasattr(row['calc_date'], 'strftime') else str(row['calc_date']) for row in rows]
+    return await asyncio.to_thread(_threshold_query_service().dates)
 
 
 @router.get('/threshold/assets')
-async def get_threshold_assets():
+async def get_threshold_assets() -> List[Any]:
     """获取 mi_vwap_basis_threshold 表中所有标的（按 open_basis_p20 降序）"""
-    sql = """
-        SELECT base_asset
-        FROM mi_vwap_basis_threshold
-        WHERE calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)
-        ORDER BY open_basis_p20 DESC
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql)
-        rows = cursor.fetchall()
-        return [row['base_asset'] for row in rows]
+    return await asyncio.to_thread(_threshold_query_service().assets)
 
 
 @router.get('/threshold/data')
@@ -1093,51 +1074,15 @@ async def get_threshold_data(
     base_asset: Optional[str] = Query(None, description="标的资产过滤"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
-):
+) -> Dict[str, Any]:
     """查询 mi_vwap_basis_threshold 表数据（后端分页）"""
-    where_sql = " FROM mi_vwap_basis_threshold WHERE 1=1"
-    params: list = []
-
-    if calc_date:
-        where_sql += " AND calc_date = %s"
-        params.append(calc_date)
-    else:
-        where_sql += " AND calc_date = (SELECT MAX(calc_date) FROM mi_vwap_basis_threshold)"
-
-    if base_asset:
-        where_sql += " AND base_asset = %s"
-        params.append(base_asset)
-
-    count_sql = "SELECT COUNT(*) AS total" + where_sql
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(count_sql, params)
-        total_row = cursor.fetchone()
-        total = int(total_row['total']) if total_row and total_row.get('total') is not None else 0
-
-    offset = (page - 1) * page_size
-    sql = """
-        SELECT
-            id, base_asset, calc_date,
-            open_basis_max, open_basis_min,
-            open_basis_p1, open_basis_p2, open_basis_p3, open_basis_p5, open_basis_p10, open_basis_p20,
-            close_basis_max, close_basis_min,
-            close_basis_p1, close_basis_p2, close_basis_p3, close_basis_p5, close_basis_p10, close_basis_p20,
-            updated_at
-    """ + where_sql + " ORDER BY open_basis_p20 DESC, base_asset ASC LIMIT %s OFFSET %s"
-    data_params = [*params, page_size, offset]
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, data_params)
-        rows = cursor.fetchall()
-        return {
-            'rows': _serialize_rows(rows),
-            'pagination': {
-                'page': page,
-                'page_size': page_size,
-                'total': total,
-                'total_pages': (total + page_size - 1) // page_size,
-            },
-        }
+    return await asyncio.to_thread(
+        _threshold_query_service().data,
+        calc_date=calc_date,
+        base_asset=base_asset,
+        page=page,
+        page_size=page_size,
+    )
 
 
 # 手动执行状态（避免并发重复触发）
