@@ -26,7 +26,7 @@ from api.trading_api import (
     run_capital_snapshot_now,
     cleanup_reconciliation_dust,
 )
-from fastapi import HTTPException
+from common.errors import ValidationAppError
 
 
 class ForwardSignalFilterTests(unittest.TestCase):
@@ -325,7 +325,7 @@ class CapitalHistoryQueryTests(unittest.TestCase):
         self.assertNotIn('bnb_fee_asset', realized_columns)
 
     def test_unknown_metric_is_rejected(self):
-        with self.assertRaises(HTTPException) as raised:
+        with self.assertRaises(ValidationAppError) as raised:
             _capital_history_select_columns('everything')
 
         self.assertEqual(raised.exception.status_code, 400)
@@ -478,7 +478,7 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
         self.assertIsNone(result['realized_annualized_return_pct'])
 
     def test_endpoint_rejects_unknown_period(self):
-        with self.assertRaises(HTTPException) as raised:
+        with self.assertRaises(ValidationAppError) as raised:
             asyncio.run(get_capital_annualized_return(days=14))
 
         self.assertEqual(raised.exception.status_code, 400)
