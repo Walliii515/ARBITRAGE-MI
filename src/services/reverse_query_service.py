@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from calc.reverse_account_monitor import get_reverse_capital_snapshot
 from calc.reverse_trade_store import (
     list_reverse_orders,
     list_reverse_position_orders,
@@ -20,6 +21,7 @@ from repositories.reverse_query_repo import ReverseQueryRepo, build_reverse_sign
 Row = dict[str, Any]
 SerializeRow = Callable[[Row], Row]
 SerializeRows = Callable[[list[Row]], list[Row]]
+GetCapitalSnapshot = Callable[[], dict[str, Any]]
 
 
 class ReverseQueryService:
@@ -29,10 +31,12 @@ class ReverseQueryService:
         *,
         serialize_row: SerializeRow,
         serialize_rows: SerializeRows,
+        get_capital_snapshot: GetCapitalSnapshot = get_reverse_capital_snapshot,
     ) -> None:
         self._repo = ReverseQueryRepo(db_manager)
         self._serialize_row = serialize_row
         self._serialize_rows = serialize_rows
+        self._get_capital_snapshot = get_capital_snapshot
 
     def list_signals(
         self,
@@ -159,3 +163,6 @@ class ReverseQueryService:
                 'total_pages': result.total_pages,
             },
         }
+
+    def capital(self) -> dict[str, Any]:
+        return self._get_capital_snapshot()

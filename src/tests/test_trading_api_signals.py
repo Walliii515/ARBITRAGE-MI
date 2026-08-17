@@ -80,10 +80,12 @@ class ManualCapitalSnapshotTests(unittest.TestCase):
                 return {'success': True, 'snapshot_at': '2026-07-25 12:00:00'}
 
         register_capital_strategy_pnl_provider(lambda: strategy_pnl)
-        with patch(
-            'api.trading_api.build_default_capital_snapshotter',
-            return_value=FakeSnapshotter(),
-        ):
+        with patch('api.trading_api.config.get_trade_mode', return_value='real'), \
+                patch('api.trading_api.config.get_bool', return_value=True), \
+                patch(
+                    'api.trading_api.build_default_capital_snapshotter',
+                    return_value=FakeSnapshotter(),
+                ):
             result = asyncio.run(run_capital_snapshot_now())
 
         self.assertTrue(result['success'])
@@ -92,7 +94,9 @@ class ManualCapitalSnapshotTests(unittest.TestCase):
     def test_manual_snapshot_without_realtime_provider_does_not_write(self):
         register_capital_strategy_pnl_provider(None)
 
-        with patch('api.trading_api.build_default_capital_snapshotter') as builder:
+        with patch('api.trading_api.config.get_trade_mode', return_value='real'), \
+                patch('api.trading_api.config.get_bool', return_value=True), \
+                patch('api.trading_api.build_default_capital_snapshotter') as builder:
             result = asyncio.run(run_capital_snapshot_now())
 
         self.assertFalse(result['success'])

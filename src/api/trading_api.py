@@ -9,12 +9,11 @@
 """
 import asyncio
 import json
-import math
 import threading
 from decimal import Decimal
 from datetime import datetime, date
 from typing import Optional, Any, Callable, List, Dict
-from fastapi import APIRouter, Query, Depends, HTTPException
+from fastapi import APIRouter, Query, Depends
 from pydantic import BaseModel
 
 from common.database import db_manager
@@ -51,6 +50,10 @@ from repositories.reconciliation_query_repo import (
 )
 from repositories.trading_query_repo import build_forward_signal_filters
 from services.base_asset_service import BaseAssetService
+from services.capital_command_service import (
+    CapitalCommandService,
+    parse_capital_range_datetime,
+)
 from services.capital_query_service import (
     CAPITAL_ANNUALIZED_PERIODS,
     CapitalQueryService,
@@ -71,6 +74,10 @@ from services.delist_risk_service import (
 from services.fund_transfer_api_service import FundTransferApiService
 from services.listing_event_api_service import ListingEventApiService
 from services.popup_notification_api_service import PopupNotificationApiService
+from services.reconciliation_command_service import (
+    ReconciliationCommandService,
+    format_dust_cleanup_message,
+)
 from services.reconciliation_query_service import ReconciliationQueryService
 from services.reverse_query_service import ReverseQueryService
 from services.risk_notification_service import (
@@ -81,6 +88,7 @@ from services.risk_notification_service import (
     risk_notification_key,
     should_emit_reconciliation_notification,
 )
+from services.threshold_calc_service import ThresholdCalcService
 from services.threshold_query_service import ThresholdQueryService
 from services.trading_query_service import TradingQueryService
 
@@ -283,6 +291,7 @@ def _reverse_query_service() -> ReverseQueryService:
         db_manager,
         serialize_row=_serialize_row,
         serialize_rows=_serialize_rows,
+        get_capital_snapshot=get_reverse_capital_snapshot,
     )
 
 
@@ -359,6 +368,66 @@ def _column_config_service() -> ColumnConfigService:
 
 def _base_asset_service() -> BaseAssetService:
     return BaseAssetService(db_manager)
+
+
+def _set_recon_running(value: bool) -> None:
+    global _recon_running
+    _recon_running = value
+
+
+def _set_capital_running(value: bool) -> None:
+    global _capital_running
+    _capital_running = value
+
+
+def _set_threshold_calc_running(value: bool) -> None:
+    global _threshold_calc_running
+    _threshold_calc_running = value
+
+
+def _run_threshold_analysis(lookback_days: int, progress_callback: Callable[..., Any]) -> Any:
+    from calc.calculate_vwap_basis_threshold import run_analysis
+    return run_analysis(lookback_days, progress_callback=progress_callback)
+
+
+def _reconciliation_command_service() -> ReconciliationCommandService:
+    return ReconciliationCommandService(
+        get_trade_mode=config.get_trade_mode,
+        get_bool=config.get_bool,
+        build_reconciler=build_default_reconciler,
+        lock=_recon_lock,
+        is_running=lambda: _recon_running,
+        set_running=_set_recon_running,
+    )
+
+
+def _capital_command_service() -> CapitalCommandService:
+    return CapitalCommandService(
+        db_manager,
+        get_trade_mode=config.get_trade_mode,
+        get_bool=config.get_bool,
+        build_snapshotter=build_default_capital_snapshotter,
+        build_bnb_buyer=build_default_forward_bnb_fee_buyer,
+        get_pnl_provider=lambda: _capital_strategy_pnl_provider,
+        lock=_capital_lock,
+        is_running=lambda: _capital_running,
+        set_running=_set_capital_running,
+        serialize_row=_serialize_row,
+    )
+
+
+def _threshold_calc_service() -> ThresholdCalcService:
+    return ThresholdCalcService(
+        get_bool=config.get_bool,
+        get_int=config.get_int,
+        lock=_threshold_calc_lock,
+        status=_threshold_calc_status,
+        is_running=lambda: _threshold_calc_running,
+        set_running=_set_threshold_calc_running,
+        set_status=_set_threshold_calc_status,
+        get_status=_get_threshold_calc_status,
+        run_analysis=_run_threshold_analysis,
+    )
 
 
 @router.get('/orders')
@@ -615,56 +684,11 @@ async def mark_one_popup_notification_read(notification_id: int) -> Dict[str, An
 @router.post('/reconciliation/run')
 async def run_reconciliation_now():
     """手动触发一次对账。virtual 模式下跳过。"""
-    global _recon_running
-    if config.get_trade_mode() == 'virtual':
-        return {'success': False, 'message': 'virtual 模式不执行交易所对账'}
-    if not config.get_bool('reconciliation.enabled', True):
-        return {'success': False, 'message': '对账功能已关闭'}
-
-    with _recon_lock:
-        if _recon_running:
-            return {'success': False, 'message': '对账任务正在执行中'}
-        _recon_running = True
-
-    try:
-        result = await asyncio.to_thread(
-            lambda: build_default_reconciler().run_with_fast_confirmation()
-        )
-        return {'success': True, 'message': '对账完成', **result}
-    except Exception as e:
-        logger.error(f'手动对账失败: {e}', exc_info=True)
-        return {'success': False, 'message': f'对账失败: {e}'}
-    finally:
-        with _recon_lock:
-            _recon_running = False
+    return await asyncio.to_thread(_reconciliation_command_service().run_now)
 
 
 def _format_dust_cleanup_message(cleanup: Dict[str, Any]) -> str:
-    if cleanup.get('message'):
-        return str(cleanup['message'])
-
-    if cleanup.get('success'):
-        return '小额残余清理完成'
-
-    reason = str(cleanup.get('reason') or 'unknown')
-    if reason == 'binance_dust_conversion_cooldown':
-        remaining = cleanup.get('cooldown_remaining_sec')
-        if remaining is not None:
-            seconds = max(0, int(math.ceil(float(remaining))))
-            return f'小额残余清理失败: Binance 小额兑换冷却中，剩余 {seconds} 秒'
-        return '小额残余清理失败: Binance 小额兑换冷却中'
-
-    skipped = cleanup.get('skipped')
-    if reason == 'no_safe_dust_found' and isinstance(skipped, list) and skipped:
-        summary = '；'.join(
-            f"{item.get('base_asset') or '-'}={item.get('reason') or 'unknown'}"
-            for item in skipped[:5]
-            if isinstance(item, dict)
-        )
-        if summary:
-            return f'未发现可安全兑换的小额残余，已跳过: {summary}'
-
-    return f'小额残余清理失败: {reason}'
+    return format_dust_cleanup_message(cleanup)
 
 
 @router.post(
@@ -673,51 +697,13 @@ def _format_dust_cleanup_message(cleanup: Dict[str, Any]) -> str:
 )
 async def cleanup_reconciliation_dust():
     """Clean one fully explained post-close dust hedge, then refresh reconciliation."""
-    global _recon_running
-    if config.get_trade_mode() == 'virtual':
-        return {'success': False, 'message': 'virtual 模式不执行小额兑换'}
-    if not config.get_bool('reconciliation.enabled', True):
-        return {'success': False, 'message': '对账功能已关闭'}
-
-    with _recon_lock:
-        if _recon_running:
-            return {'success': False, 'message': '对账任务正在执行中'}
-        _recon_running = True
-
-    try:
-        def _cleanup_and_reconcile():
-            reconciler = build_default_reconciler()
-            cleanup = reconciler.cleanup_post_close_dust()
-            reconciliation = reconciler.run_once()
-            return cleanup, reconciliation
-
-        cleanup, reconciliation = await asyncio.to_thread(_cleanup_and_reconcile)
-        message = _format_dust_cleanup_message(cleanup)
-        return {
-            **cleanup,
-            'message': message,
-            'reconciliation': reconciliation,
-        }
-    except Exception as e:
-        logger.error(f'小额残余清理失败: {e}', exc_info=True)
-        return {'success': False, 'message': f'小额残余清理失败: {e}'}
-    finally:
-        with _recon_lock:
-            _recon_running = False
+    return await asyncio.to_thread(_reconciliation_command_service().cleanup_dust)
 
 
 # ─── 真实资金快照 ────────────────────────────────────────────────────────────
 
 def _parse_capital_range_datetime(value: str, field_name: str) -> datetime:
-    text = (value or '').strip()
-    if not text:
-        raise HTTPException(status_code=400, detail=f'{field_name} 不能为空')
-    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            pass
-    raise HTTPException(status_code=400, detail=f'{field_name} 格式必须为 YYYY-MM-DD HH:mm:ss')
+    return parse_capital_range_datetime(value, field_name)
 
 
 @router.get('/capital/gate-cross-risk/summary')
@@ -770,37 +756,7 @@ async def get_capital_history(
 @router.post('/capital/run')
 async def run_capital_snapshot_now():
     """手动采集一次真实资金快照。"""
-    global _capital_running
-    if config.get_trade_mode() == 'virtual':
-        return {'success': False, 'message': 'virtual 模式不采集交易所真实资金'}
-    if not config.get_bool('account_capital.enabled', True):
-        return {'success': False, 'message': '真实资金采集已关闭'}
-
-    with _capital_lock:
-        if _capital_running:
-            return {'success': False, 'message': '资金采集正在执行中'}
-        _capital_running = True
-
-    try:
-        provider = _capital_strategy_pnl_provider
-        if provider is None:
-            return {
-                'success': False,
-                'message': '实时策略盈亏尚未就绪，本次未写入资金快照',
-            }
-        strategy_pnl = await asyncio.to_thread(provider)
-        if not isinstance(strategy_pnl, dict):
-            raise RuntimeError('实时策略盈亏返回格式无效')
-        result = await asyncio.to_thread(
-            lambda: build_default_capital_snapshotter().run_once(strategy_pnl)
-        )
-        return {'success': True, 'message': '资金采集完成', **result}
-    except Exception as e:
-        logger.error(f'手动资金采集失败: {e}', exc_info=True)
-        return {'success': False, 'message': f'资金采集失败: {e}'}
-    finally:
-        with _capital_lock:
-            _capital_running = False
+    return await asyncio.to_thread(_capital_command_service().run_snapshot)
 
 
 @router.get('/capital/fund-transfer', dependencies=[Depends(verify_token_dependency)])
@@ -863,103 +819,17 @@ async def retry_fund_transfer(
 @router.post('/capital/clear-range', dependencies=[Depends(verify_token_dependency)])
 async def clear_capital_snapshot_range(req: CapitalClearRangeRequest):
     """按时间段清理资金快照数据，清理前自动备份命中行。"""
-    start_at = _parse_capital_range_datetime(req.start_at, 'start_at')
-    end_at = _parse_capital_range_datetime(req.end_at, 'end_at')
-    if start_at > end_at:
-        raise HTTPException(status_code=400, detail='开始时间不能晚于结束时间')
-
-    backup_table = f"mi_capital_snapshot_backup_clear_range_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    try:
-        with db_manager.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS row_count,
-                        MIN(snapshot_at) AS first_snapshot_at,
-                        MAX(snapshot_at) AS last_snapshot_at
-                    FROM mi_capital_snapshot
-                    WHERE snapshot_at BETWEEN %s AND %s
-                    """,
-                    (start_at, end_at),
-                )
-                summary = cursor.fetchone() or {}
-                row_count = int(summary.get('row_count') or 0)
-                if row_count <= 0:
-                    return {
-                        'success': True,
-                        'deleted': 0,
-                        'backup_table': None,
-                        'message': '指定时间段没有资金监控数据',
-                    }
-
-                cursor.execute(
-                    f"""
-                    CREATE TABLE `{backup_table}` AS
-                    SELECT *
-                    FROM mi_capital_snapshot
-                    WHERE snapshot_at BETWEEN %s AND %s
-                    """,
-                    (start_at, end_at),
-                )
-                cursor.execute(
-                    """
-                    DELETE FROM mi_capital_snapshot
-                    WHERE snapshot_at BETWEEN %s AND %s
-                    """,
-                    (start_at, end_at),
-                )
-                deleted = cursor.rowcount
-
-        logger.warning(
-            '资金监控数据已按时间段清理: start=%s end=%s deleted=%s backup=%s',
-            start_at.strftime('%Y-%m-%d %H:%M:%S'),
-            end_at.strftime('%Y-%m-%d %H:%M:%S'),
-            deleted,
-            backup_table,
-        )
-        return {
-            'success': True,
-            'deleted': deleted,
-            'backup_table': backup_table,
-            'first_snapshot_at': _serialize_row({'value': summary.get('first_snapshot_at')})['value'],
-            'last_snapshot_at': _serialize_row({'value': summary.get('last_snapshot_at')})['value'],
-            'message': f'已清理 {deleted} 条资金监控数据',
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error('资金监控数据按时间段清理失败: %s', exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f'清理失败: {exc}')
+    return await asyncio.to_thread(
+        _capital_command_service().clear_range,
+        req.start_at,
+        req.end_at,
+    )
 
 
 @router.post('/capital/binance-bnb/buy', dependencies=[Depends(verify_token_dependency)])
 async def buy_forward_binance_bnb(req: BinanceBnbBuyRequest):
     """FORWARD Binance Spot 使用 USDT 市价买入 BNB 手续费余额。"""
-    if config.get_trade_mode() == 'virtual':
-        return {'success': False, 'message': 'virtual 模式不执行 Binance 真实买入'}
-    try:
-        result = await asyncio.to_thread(lambda: build_default_forward_bnb_fee_buyer().buy_with_usdt(req.amount_usdt))
-    except ValueError as exc:
-        return {'success': False, 'message': str(exc)}
-    except Exception as exc:
-        logger.error('FORWARD Binance BNB 手续费余额买入失败: %s', exc, exc_info=True)
-        return {'success': False, 'message': f'买入失败: {exc}'}
-
-    payload = {
-        'success': result.success,
-        'message': result.message,
-        'amount_usdt': result.amount_usdt,
-        'result': result.result,
-    }
-    if result.success:
-        try:
-            snapshot = await asyncio.to_thread(lambda: build_default_capital_snapshotter().run_once())
-            payload['capital_snapshot'] = snapshot
-        except Exception as exc:
-            logger.warning('FORWARD Binance BNB 买入后资金快照刷新失败: %s', exc, exc_info=True)
-            payload['snapshot_error'] = str(exc)
-    return payload
+    return await asyncio.to_thread(_capital_command_service().buy_bnb, req.amount_usdt)
 
 
 # ─── VWAP 基差阈值 ────────────────────────────────────────────────────────────
@@ -1028,90 +898,19 @@ def _get_threshold_calc_status() -> Dict[str, Any]:
 
 
 def _run_threshold_calculate_job(lookback_days: int):
-    global _threshold_calc_running
-
-    def on_progress(progress: Dict[str, Any]):
-        processed = int(progress.get('processed') or 0)
-        total = int(progress.get('total') or 0)
-        _set_threshold_calc_status(
-            processed=processed,
-            total=total,
-            current_asset=progress.get('current_asset'),
-            success_count=progress.get('success_count', 0),
-            skip_count=progress.get('skip_count', 0),
-            fail_count=progress.get('fail_count', 0),
-            message=f'{processed}/{total}' if total else '准备中',
-        )
-
-    try:
-        from calc.calculate_vwap_basis_threshold import run_analysis
-        run_analysis(lookback_days, progress_callback=on_progress)
-        status = _get_threshold_calc_status()
-        total = int(status.get('total') or 0)
-        _set_threshold_calc_status(
-            running=False,
-            processed=total,
-            message=f'{total}/{total} 计算完成' if total else '计算完成',
-            finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            error=None,
-        )
-    except Exception as e:
-        logger.error(f"手动执行阈值计算失败: {e}", exc_info=True)
-        _set_threshold_calc_status(
-            running=False,
-            message=f'计算失败: {e}',
-            finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            error=str(e),
-        )
-    finally:
-        with _threshold_calc_lock:
-            _threshold_calc_running = False
+    _threshold_calc_service().run_job(lookback_days)
 
 
 @router.post('/threshold/calculate')
 async def trigger_threshold_calculate():
     """手动触发 VWAP 基差分位阈值计算（后台执行）"""
-    global _threshold_calc_running
-    if not config.get_bool('trade.vwap.update_threshold_enabled', True):
-        return {
-            "success": False,
-            "message": "VWAP基差分位阈值更新已关闭，仅保留 mi_vwap_basis_snapshot 快照",
-        }
-
-    with _threshold_calc_lock:
-        if _threshold_calc_running:
-            return {"success": False, "message": "计算任务正在执行中", "status": dict(_threshold_calc_status)}
-
-        lookback_days = config.get_int('trade.vwap.threshold_lookback_days', 7)
-        _threshold_calc_running = True
-        _threshold_calc_status.update({
-            'running': True,
-            'processed': 0,
-            'total': 0,
-            'current_asset': None,
-            'success_count': 0,
-            'skip_count': 0,
-            'fail_count': 0,
-            'message': '准备中',
-            'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'finished_at': None,
-            'error': None,
-        })
-
-    thread = threading.Thread(
-        target=_run_threshold_calculate_job,
-        args=(lookback_days,),
-        name='vwap-threshold-calculate',
-        daemon=True,
-    )
-    thread.start()
-    return {"success": True, "message": f"计算已启动（回溯 {lookback_days} 天）", "status": _get_threshold_calc_status()}
+    return _threshold_calc_service().trigger()
 
 
 @router.get('/threshold/calculate/status')
 async def get_threshold_calculate_status():
     """获取手动 VWAP 阈值计算进度"""
-    return _get_threshold_calc_status()
+    return _threshold_calc_service().status()
 
 
 @router.get('/delist-risks')
@@ -1335,7 +1134,7 @@ async def get_reverse_orders(
 @router.get('/reverse-capital')
 async def get_reverse_capital():
     """读取反向套利资金快照（reverse 子账户，只读）。"""
-    return get_reverse_capital_snapshot()
+    return await asyncio.to_thread(_reverse_query_service().capital)
 
 
 @router.get('/reverse-reconciliation')
