@@ -11,7 +11,6 @@ import asyncio
 import json
 import math
 import threading
-import time
 from decimal import Decimal
 from datetime import datetime, date
 from typing import Optional, Any, Callable, List, Dict
@@ -26,7 +25,6 @@ from api.auth import verify_token_dependency, verify_user_password
 from common.meta_loader import fetch_contract_meta
 from calc.reconciliation import build_default_reconciler, get_ignored_binance_spot_assets
 from calc.account_capital import build_default_capital_snapshotter
-from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
 from calc.fund_transfer_service import get_fund_transfer_service
 from calc.listing_event_monitor import (
@@ -52,6 +50,7 @@ from repositories.reconciliation_query_repo import (
     reconciliation_latest_sql,
 )
 from repositories.trading_query_repo import build_forward_signal_filters
+from services.base_asset_service import BaseAssetService
 from services.capital_query_service import (
     CAPITAL_ANNUALIZED_PERIODS,
     CapitalQueryService,
@@ -63,6 +62,12 @@ from services.capital_query_service import (
     filter_capital_transfer_transient_rows,
 )
 from services.column_config_service import ColumnConfigService
+from services.delist_risk_service import (
+    attach_delist_risks,
+    delist_risk_asset_set,
+    format_delist_risk_summary,
+    get_delist_risk_report_cached,
+)
 from services.fund_transfer_api_service import FundTransferApiService
 from services.listing_event_api_service import ListingEventApiService
 from services.popup_notification_api_service import PopupNotificationApiService
@@ -241,98 +246,24 @@ def _inject_current_funding_fields(rows: List[Dict[str, Any]], contract_meta: Op
 
 def _get_delist_risk_report_cached(lookahead_days: int = 30, max_age_sec: int = 900) -> Dict[str, Any]:
     """下架风险报告供多个页面复用，避免持仓页面刷新时频繁请求交易所公告接口。"""
-    now = time.time()
-    cached_report = _delist_risk_cache.get('report')
-    if (
-        cached_report is not None
-        and _delist_risk_cache.get('lookahead_days') == lookahead_days
-        and now - float(_delist_risk_cache.get('at') or 0) < max_age_sec
-    ):
-        return cached_report
-
-    with _delist_risk_lock:
-        now = time.time()
-        cached_report = _delist_risk_cache.get('report')
-        if (
-            cached_report is not None
-            and _delist_risk_cache.get('lookahead_days') == lookahead_days
-            and now - float(_delist_risk_cache.get('at') or 0) < max_age_sec
-        ):
-            return cached_report
-
-        try:
-            monitor = DelistRiskMonitor(DelistRiskConfig(lookahead_days=lookahead_days))
-            report = monitor.build_report()
-            _delist_risk_cache.update({
-                'at': now,
-                'lookahead_days': lookahead_days,
-                'report': report,
-            })
-            return report
-        except Exception as exc:
-            logger.warning(f'下架风险报告刷新失败: {exc}', exc_info=True)
-            if cached_report is not None:
-                return cached_report
-            return {
-                'success': False,
-                'lookahead_days': lookahead_days,
-                'items': [],
-                'source_errors': {'internal': str(exc)},
-            }
+    return get_delist_risk_report_cached(
+        lookahead_days,
+        max_age_sec,
+        cache=_delist_risk_cache,
+        lock=_delist_risk_lock,
+    )
 
 
 def _delist_risk_asset_set(report: Optional[Dict[str, Any]] = None) -> set[str]:
-    report = report or _get_delist_risk_report_cached()
-    return {
-        str(item.get('base_asset') or '').strip().upper()
-        for item in report.get('items', [])
-        if item.get('base_asset')
-    }
+    return delist_risk_asset_set(report, get_report=_get_delist_risk_report_cached)
 
 
 def _format_delist_risk_summary(items: List[Dict[str, Any]]) -> str:
-    fragments = []
-    for item in items:
-        exchange = item.get('exchange') or ''
-        message = item.get('message') or item.get('status') or item.get('risk_type') or '下架风险'
-        due = item.get('delist_at')
-        fragments.append(f"{exchange}:{message}{f' {due}' if due else ''}")
-    return ' | '.join(fragments)
+    return format_delist_risk_summary(items)
 
 
 def _attach_delist_risks(rows: List[Dict[str, Any]]) -> None:
-    if not rows:
-        return
-    report = _get_delist_risk_report_cached()
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for item in report.get('items', []):
-        asset = str(item.get('base_asset') or '').strip().upper()
-        if not asset:
-            continue
-        grouped.setdefault(asset, []).append(item)
-
-    for row in rows:
-        asset = str(row.get('base_asset') or '').strip().upper()
-        items = grouped.get(asset, [])
-        levels = {item.get('severity') or item.get('risk_level') for item in items}
-        row['delist_risks'] = items
-        row['delist_risk_level'] = (
-            'critical' if 'critical' in levels
-            else 'warning' if items else None
-        )
-        row['delist_risk_summary'] = _format_delist_risk_summary(items) if items else None
-        if not items:
-            continue
-
-        existing_status = row.get('exchange_risk_status')
-        existing_detail = row.get('exchange_risk_detail')
-        summary = f"下架风险: {row['delist_risk_summary']}"
-        if not existing_status or existing_status == 'normal':
-            row['exchange_risk_status'] = 'delist_risk'
-            row['exchange_risk_type'] = 'delist_risk'
-            row['exchange_risk_detail'] = summary
-        elif existing_detail and summary not in str(existing_detail):
-            row['exchange_risk_detail'] = f"{existing_detail} | {summary}"
+    attach_delist_risks(rows, get_report=_get_delist_risk_report_cached)
 
 
 def _trading_query_service() -> TradingQueryService:
@@ -424,6 +355,10 @@ def _listing_event_api_service() -> ListingEventApiService:
 
 def _column_config_service() -> ColumnConfigService:
     return ColumnConfigService(db_manager)
+
+
+def _base_asset_service() -> BaseAssetService:
+    return BaseAssetService(db_manager)
 
 
 @router.get('/orders')
@@ -1182,9 +1117,9 @@ async def get_threshold_calculate_status():
 @router.get('/delist-risks')
 async def get_delist_risks(
     lookahead_days: int = Query(30, ge=1, le=180, description="下架计划预警窗口（天）"),
-):
+) -> Dict[str, Any]:
     """检查当前监控/持仓标的的交易所下架风险。"""
-    return _get_delist_risk_report_cached(lookahead_days=lookahead_days)
+    return await asyncio.to_thread(_get_delist_risk_report_cached, lookahead_days)
 
 
 @router.get('/listing-events')
@@ -1269,57 +1204,13 @@ async def disable_listing_event_asset(base_asset: str, payload: ListingEventActi
 
 
 @router.post('/base-assets/{base_asset}/disable', dependencies=[Depends(verify_token_dependency)])
-async def disable_base_asset(base_asset: str, payload: DisableBaseAssetRequest | None = None):
+async def disable_base_asset(base_asset: str, payload: DisableBaseAssetRequest | None = None) -> Dict[str, Any]:
     """将币种标记为失效，后续常规订阅/监控候选不再包含该币种。"""
-    asset = (base_asset or '').strip().upper()
-    if not asset or not asset.replace('_', '').replace('-', '').isalnum():
-        raise HTTPException(status_code=400, detail='无效标的资产')
-
-    reason = (payload.reason or '').strip() if payload else ''
-    with db_manager.get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COUNT(*) AS holding_count
-                FROM mi_trade_position
-                WHERE status = 'holding'
-                  AND UPPER(TRIM(base_asset)) = %s
-                """,
-                [asset],
-            )
-            holding_count = int((cursor.fetchone() or {}).get('holding_count') or 0)
-            cursor.execute(
-                """
-                UPDATE mi_base_asset
-                SET is_valid = 'N'
-                WHERE UPPER(TRIM(base_asset)) = %s
-                """,
-                [asset],
-            )
-            affected = cursor.rowcount
-
-    if affected <= 0:
-        raise HTTPException(status_code=404, detail=f'{asset} 不存在于 mi_base_asset')
-
-    logger.warning(
-        '标的资产已设为失效: asset=%s holding_count=%s reason=%s',
-        asset,
-        holding_count,
-        reason or '-',
+    return await asyncio.to_thread(
+        _base_asset_service().disable,
+        base_asset,
+        (payload.reason or '').strip() if payload else '',
     )
-    return {
-        'success': True,
-        'base_asset': asset,
-        'affected': affected,
-        'holding_count': holding_count,
-        'requires_service_reload': True,
-        'message': (
-            f'{asset} 已设为失效；当前仍有持仓，系统会保留必要持仓风险监控直到平仓，'
-            '常规新订阅/新监控候选将在重启订单簿服务后排除。'
-            if holding_count > 0
-            else f'{asset} 已设为失效；重启订单簿服务后不再进入常规订阅/监控。'
-        ),
-    }
 
 
 # ─── AG Grid 列配置管理 ───────────────────────────────────────────────────────
