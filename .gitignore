@@ -23,7 +23,7 @@ frontend/dist/
 # IDE
 .idea/
 .vscode/
-
+.tools
 # OS
 .DS_Store
 Thumbs.db

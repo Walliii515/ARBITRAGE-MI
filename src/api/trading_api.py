@@ -55,19 +55,18 @@ from calc.reverse_trade_store import (
     list_reverse_positions,
     summarize_reverse_positions,
 )
+from repositories.trading_query_repo import (
+    ALLOWED_CLOSE_THRESHOLD_COLS,
+    TradingQueryRepo,
+    build_forward_signal_filters,
+    build_order_view_where,
+)
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/trading", tags=["trading"])
 
-_ALLOWED_CLOSE_THRESHOLD_COLS = {
-    'close_basis_p1',
-    'close_basis_p2',
-    'close_basis_p3',
-    'close_basis_p5',
-    'close_basis_p10',
-    'close_basis_p20',
-}
+_ALLOWED_CLOSE_THRESHOLD_COLS = ALLOWED_CLOSE_THRESHOLD_COLS
 
 _delist_risk_cache: dict[str, Any] = {
     'at': 0.0,
@@ -220,14 +219,6 @@ def _position_pnl_config() -> PnlConfig:
     )
 
 
-def _build_signal_time_filter(time_range: Optional[str], days: int, prefix: str = "") -> tuple[str, List]:
-    column = f"{prefix}signal_time"
-    range_key = (time_range or "today").strip().lower()
-    if range_key in {"today", "date_today"}:
-        return f"{column} >= CURDATE() AND {column} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)", []
-    return f"{column} >= DATE_SUB(NOW(), INTERVAL %s DAY)", [days]
-
-
 def _build_forward_signal_filters(
     *,
     status: Optional[str],
@@ -237,24 +228,15 @@ def _build_forward_signal_filters(
     days: int,
     prefix: str = "",
 ) -> tuple[str, List]:
-    field_prefix = prefix
-    conditions: List[str] = []
-    params: List = []
-    time_sql, time_params = _build_signal_time_filter(time_range, days, field_prefix)
-    conditions.append(time_sql)
-    params.extend(time_params)
-
-    if status:
-        conditions.append(f"{field_prefix}status = %s")
-        params.append(status)
-    if exit_reason:
-        conditions.append(f"{field_prefix}exit_reason LIKE %s")
-        params.append(f"%{exit_reason}%")
-    if base_asset:
-        conditions.append(f"{field_prefix}base_asset LIKE %s")
-        params.append(f"%{base_asset}%")
-
-    return " AND ".join(conditions), params
+    # 兼容旧测试导入路径；实现已下沉到 TradingQueryRepo。
+    return build_forward_signal_filters(
+        status=status,
+        exit_reason=exit_reason,
+        base_asset=base_asset,
+        time_range=time_range,
+        days=days,
+        prefix=prefix,
+    )
 
 
 def _inject_current_funding_fields(rows: List[Dict[str, Any]], contract_meta: Optional[Dict[str, Dict]] = None) -> None:
@@ -396,105 +378,31 @@ async def get_orders(
     if normalized_view not in {'open', 'close'}:
         raise HTTPException(status_code=400, detail='view 必须为 open 或 close')
 
-    status_value = 'holding' if normalized_view == 'open' else 'closed'
     time_column = 'p.opened_at' if normalized_view == 'open' else 'p.closed_at'
-    base_where_clauses = [
-        "p.status = %s",
-        f"{time_column} >= DATE_SUB(NOW(), INTERVAL %s DAY)",
-    ]
-    base_params: list = [status_value, days]
+    delist_risk_assets: list[str] = sorted(_delist_risk_asset_set()) if exchange_risk else []
+    where_sql, params = build_order_view_where(
+        normalized_view=normalized_view,
+        days=days,
+        base_asset=base_asset,
+        position_id=position_id,
+        channel=channel,
+        delist_risk_assets=delist_risk_assets,
+        exchange_risk=exchange_risk,
+    )
 
-    if base_asset:
-        base_where_clauses.append("p.base_asset = %s")
-        base_params.append(base_asset)
-
-    if position_id is not None:
-        base_where_clauses.append("p.id = %s")
-        base_params.append(position_id)
-
-    if channel:
-        base_where_clauses.append("EXISTS (SELECT 1 FROM mi_trade_order o WHERE o.position_id = p.id AND o.channel = %s)")
-        base_params.append(channel)
-
-    delist_risk_assets: list[str] = []
-    if exchange_risk:
-        delist_risk_assets = sorted(_delist_risk_asset_set())
-        if delist_risk_assets:
-            placeholders = ','.join(['%s'] * len(delist_risk_assets))
-            base_where_clauses.append(
-                "(p.exchange_risk_status = 'desynced' "
-                f"OR UPPER(TRIM(p.base_asset)) IN ({placeholders}))"
-            )
-            base_params.extend(delist_risk_assets)
-        else:
-            base_where_clauses.append("p.exchange_risk_status = 'desynced'")
-
-    where_sql = " AND ".join(base_where_clauses)
-    params = list(base_params)
-
-    # ─── 统计持仓总数 ───
-    count_sql = f"SELECT COUNT(*) AS total FROM mi_trade_position p WHERE {where_sql}"
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(count_sql, params)
-        total_row = cursor.fetchone()
-        total = total_row['total'] if total_row else 0
-
-    # ─── 分页查询持仓 ───
+    repo = TradingQueryRepo(db_manager)
+    total = repo.count_positions_by_where(where_sql, params)
     offset = (page - 1) * page_size
-    query_params = list(params) + [page_size, offset]
-    sql = f"""
-        SELECT p.*,
-               COALESCE(b.market_profile, 'normal') AS market_profile,
-               t.open_basis_p20 AS open_vwap_threshold_bps,
-               t.{close_threshold_col} AS close_vwap_threshold_bps,
-               (SELECT o.channel FROM mi_trade_order o WHERE o.position_id = p.id LIMIT 1) AS channel,
-               (
-                   SELECT o.leverage
-                   FROM mi_trade_order o
-                   WHERE o.position_id = p.id
-                     AND o.order_side = 'open'
-                     AND o.market_type = 'future'
-                   ORDER BY o.id ASC
-                   LIMIT 1
-               ) AS gate_leverage,
-               (SELECT COUNT(*) FROM mi_trade_order o WHERE o.position_id = p.id) AS order_count
-        FROM mi_trade_position p
-        LEFT JOIN mi_base_asset b
-          ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
-        LEFT JOIN (
-            SELECT v.*
-            FROM mi_vwap_basis_threshold v
-            INNER JOIN (
-                SELECT base_asset, MAX(calc_date) AS calc_date
-                FROM mi_vwap_basis_threshold
-                GROUP BY base_asset
-            ) latest
-                ON latest.base_asset = v.base_asset
-               AND latest.calc_date = v.calc_date
-        ) t ON t.base_asset = p.base_asset
-        WHERE {where_sql}
-        ORDER BY {time_column} DESC, p.id DESC
-        LIMIT %s OFFSET %s
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, query_params)
-        rows = cursor.fetchall()
+    rows = repo.list_order_view_positions(
+        where_sql=where_sql,
+        params=params,
+        time_column=time_column,
+        close_threshold_col=close_threshold_col,
+        page_size=page_size,
+        offset=offset,
+    )
     _attach_delist_risks(rows)
-
-    tab_summary_sql = """
-        SELECT
-            (SELECT COUNT(*)
-             FROM mi_trade_position
-             WHERE status = 'holding') AS current_open,
-            (SELECT COUNT(*)
-             FROM mi_trade_position
-             WHERE status = 'closed'
-               AND closed_at >= CURDATE()
-               AND closed_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)) AS today_closed
-    """
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(tab_summary_sql)
-        tab_summary_row = cursor.fetchone() or {}
+    tab_summary_row = repo.fetch_order_tab_summary()
 
     return {
         'orders': _serialize_rows(rows),
@@ -515,10 +423,7 @@ async def get_orders(
 @router.get('/positions/{position_id}/orders')
 async def get_position_orders(position_id: int):
     """获取指定持仓的全部订单明细（弹窗用）"""
-    sql = "SELECT * FROM mi_trade_order WHERE position_id = %s ORDER BY id ASC"
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, [position_id])
-        rows = cursor.fetchall()
+    rows = TradingQueryRepo(db_manager).list_orders_by_position_id(position_id)
     return {'orders': _serialize_rows(rows)}
 
 
@@ -535,16 +440,7 @@ async def get_orders_grouped():
         }
     ]
     """
-    sql = """
-        SELECT * FROM mi_trade_order 
-        WHERE position_id IS NOT NULL
-        ORDER BY position_id, order_side, market_type, created_at DESC
-        LIMIT 2000
-    """
-    
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql)
-        rows = cursor.fetchall()
+    rows = TradingQueryRepo(db_manager).list_grouped_orders()
     
     # 按 position_id 分组
     groups = {}
@@ -586,69 +482,18 @@ async def get_positions(
 ):
     """查询持仓列表（含资金费结算历史，支持分页）"""
     try:
-        summary_sql = """
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'holding' THEN 1 ELSE 0 END) as holding_count,
-                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed_count
-            FROM mi_trade_position
-            WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
-        """
-        summary_params = [days]
-        if base_asset:
-            summary_sql += " AND base_asset = %s"
-            summary_params.append(base_asset)
+        repo = TradingQueryRepo(db_manager)
+        summary_row = repo.fetch_positions_status_summary(days, base_asset)
+        summary = {
+            'total': int(summary_row.get('total') or 0),
+            'holding': int(summary_row.get('holding_count') or 0),
+            'closed': int(summary_row.get('closed_count') or 0),
+        }
 
-        with db_manager.get_cursor() as cursor:
-            cursor.execute(summary_sql, summary_params)
-            summary_row = cursor.fetchone() or {}
-            summary = {
-                'total': int(summary_row.get('total') or 0),
-                'holding': int(summary_row.get('holding_count') or 0),
-                'closed': int(summary_row.get('closed_count') or 0),
-            }
-
-        # 查询总数
-        count_sql = "SELECT COUNT(*) as total FROM mi_trade_position WHERE opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)"
-        count_params = [days]
-        
-        if status:
-            count_sql += " AND status = %s"
-            count_params.append(status)
-        if base_asset:
-            count_sql += " AND base_asset = %s"
-            count_params.append(base_asset)
-        
-        with db_manager.get_cursor() as cursor:
-            cursor.execute(count_sql, count_params)
-            total_row = cursor.fetchone()
-            total = total_row['total'] if total_row else 0
-        
-        # 查询分页数据
+        total = repo.count_positions(days, status, base_asset)
         offset = (page - 1) * page_size
-        sql = """
-            SELECT p.*, COALESCE(b.market_profile, 'normal') AS market_profile
-            FROM mi_trade_position p
-            LEFT JOIN mi_base_asset b
-              ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(p.base_asset))
-            WHERE p.opened_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
-        """
-        params = [days]
-        
-        if status:
-            sql += " AND p.status = %s"
-            params.append(status)
-        if base_asset:
-            sql += " AND p.base_asset = %s"
-            params.append(base_asset)
-        
-        sql += " ORDER BY p.opened_at DESC LIMIT %s OFFSET %s"
-        params.extend([page_size, offset])
-        
-        with db_manager.get_cursor() as cursor:
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-        
+        rows = repo.list_positions(days, status, base_asset, page_size, offset)
+
         if not rows:
             return {
                 'positions': [],
@@ -660,20 +505,9 @@ async def get_positions(
                 },
                 'summary': summary,
             }
-        
-        # 获取资金费结算历史（仅查询当前返回的持仓 ID）
+
         position_ids = [r['id'] for r in rows]
-        placeholders = ','.join(['%s'] * len(position_ids))
-        history_sql = f"""
-            SELECT position_id, payment_seq, funding_rate, funding_rate_24h,
-                   funding_pnl, future_notional, settled_at
-            FROM mi_trade_funding_fee_history
-            WHERE position_id IN ({placeholders})
-            ORDER BY position_id, payment_seq
-        """
-        with db_manager.get_cursor() as cursor:
-            cursor.execute(history_sql, position_ids)
-            history_rows = cursor.fetchall()
+        history_rows = repo.list_funding_fee_history(position_ids)
         
         # 按 position_id 分组
         histories: dict = {}
@@ -726,20 +560,8 @@ async def get_positions(
 @router.get('/positions/summary')
 async def get_positions_summary():
     """持仓汇总统计"""
-    sql = """
-        SELECT 
-            COUNT(*) as total_positions,
-            SUM(CASE WHEN status = 'holding' THEN 1 ELSE 0 END) as holding_count,
-            SUM(CASE WHEN status = 'holding' THEN spot_open_amount ELSE 0 END) as total_holding_amount,
-            SUM(funding_total_pnl) as total_funding_pnl,
-            SUM(total_pnl) as total_pnl
-        FROM mi_trade_position
-    """
-    
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql)
-        row = cursor.fetchone()
-        return _serialize_row(row) if row else {}
+    row = TradingQueryRepo(db_manager).fetch_positions_aggregate_summary()
+    return _serialize_row(row) if row else {}
 
 
 # ─── 基础对账 ────────────────────────────────────────────────────────────────
@@ -2644,44 +2466,11 @@ async def get_signals(
         prefix="s.",
     )
 
-    # 查询分页数据
+    repo = TradingQueryRepo(db_manager)
     offset = (page - 1) * page_size
-    sql = f"""
-        SELECT
-            s.*,
-            COALESCE(b.strategy_tier, 'C') AS strategy_tier,
-            COALESCE(b.market_profile, 'normal') AS market_profile
-        FROM mi_trade_signal s
-        LEFT JOIN mi_base_asset b
-          ON UPPER(TRIM(b.base_asset)) = UPPER(TRIM(s.base_asset))
-        WHERE {aliased_where_sql}
-    """
-    params = list(aliased_where_params)
-    sql += " ORDER BY s.signal_time DESC LIMIT %s OFFSET %s"
-    params.extend([page_size, offset])
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-
+    rows = repo.list_forward_signals(aliased_where_sql, aliased_where_params, page_size, offset)
     data = _serialize_rows(rows)
-
-    # 计算汇总统计（基于全量数据，需要单独查询）
-    summary_sql = f"""
-        SELECT 
-            COUNT(*) as total,
-            SUM(CASE WHEN status = 'opened' THEN 1 ELSE 0 END) as opened,
-            SUM(CASE WHEN status IN ('rejected', 'gate_rejected') THEN 1 ELSE 0 END) as rejected,
-            SUM(CASE WHEN status = 'conditions_lost' THEN 1 ELSE 0 END) as conditions_lost,
-            SUM(CASE WHEN status = 'monitoring' THEN 1 ELSE 0 END) as monitoring,
-            MAX(signal_time) as latest_signal_time
-        FROM mi_trade_signal 
-        WHERE {where_sql}
-    """
-
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(summary_sql, where_params)
-        summary_row = cursor.fetchone()
+    summary_row = repo.fetch_forward_signal_summary(where_sql, where_params)
 
     summary_data = _serialize_row(summary_row) if summary_row else {}
     total_count = summary_data.get('total', 0)

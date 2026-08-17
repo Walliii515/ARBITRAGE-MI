@@ -17,11 +17,33 @@ import logging.handlers
 import os
 import sys
 from pathlib import Path
+from typing import Optional, TextIO
 
 _INITIALIZED = False
 _DEFAULT_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s:%(funcName)s:%(lineno)d | %(message)s"
 _DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S"
 _PRINT_LOGGER_NAME = "print"
+
+
+class _SafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """Keep writing to the current file when Windows file locks block rollover."""
+
+    def rotate(self, source: str, dest: str) -> None:
+        try:
+            super().rotate(source, dest)
+        except OSError:
+            return
+
+
+def _configure_stdio_utf8() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding='utf-8', errors='replace')
+        except (OSError, ValueError, AttributeError):
+            continue
 
 
 def _project_log_dir() -> Path:
@@ -31,10 +53,10 @@ def _project_log_dir() -> Path:
     return here.parents[1] / "log"
 
 
-def setup_logging(level: str = None,
-                  log_dir: str = None,
-                  filename: str = None,
-                  backup_count: int = None,
+def setup_logging(level: Optional[str] = None,
+                  log_dir: Optional[str] = None,
+                  filename: Optional[str] = None,
+                  backup_count: Optional[int] = None,
                   force: bool = False) -> logging.Logger:
     """
     初始化全局日志系统（幂等；多次调用默认不会重复添加 handler）
@@ -68,6 +90,12 @@ def setup_logging(level: str = None,
     if force:
         for h in list(root.handlers):
             root.removeHandler(h)
+            try:
+                h.close()
+            except OSError:
+                pass
+
+    _configure_stdio_utf8()
 
     # 终端 handler（stdout）
     if not any(getattr(h, "_arb_console", False) for h in root.handlers):
@@ -80,7 +108,7 @@ def setup_logging(level: str = None,
     # 文件 handler（按天滚动，保留 backup_count 天）
     if not any(getattr(h, "_arb_file", False) for h in root.handlers):
         file_path = log_dir_path / file_name
-        file_handler = logging.handlers.TimedRotatingFileHandler(
+        file_handler = _SafeTimedRotatingFileHandler(
             filename=str(file_path),
             when="midnight",
             interval=1,
@@ -107,14 +135,14 @@ def setup_logging(level: str = None,
     return root
 
 
-def get_logger(name: str = None) -> logging.Logger:
+def get_logger(name: Optional[str] = None) -> logging.Logger:
     """获取一个 logger（首次调用会自动初始化日志系统）"""
     if not _INITIALIZED:
         setup_logging()
     return logging.getLogger(name if name else "app")
 
 
-def log_print(*args, sep: str = " ", end: str = "\n", file=None,
+def log_print(*args: object, sep: str = " ", end: str = "\n", file: Optional[TextIO] = None,
               flush: bool = False, level: int = logging.INFO) -> None:
     """
     与内置 print 兼容的日志函数：将参数按 print 语义拼接后写入日志，

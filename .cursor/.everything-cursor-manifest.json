@@ -1,0 +1,628 @@
+{
+  "version": "0.0.8",
+  "selectedLocation": "local",
+  "installPath": "C:\\workspace\\ARBITRAGE-MI\\.cursor",
+  "installedAt": "2026-08-14T01:35:50.736Z",
+  "files": {
+    "agents/architect.md": {
+      "installedAt": "2026-08-14T01:35:50.739Z",
+      "checksum": "e4c02d466d90f1b70d77a0ad9c23b048d852a1d4e040d33e55ba1a859801a1f0"
+    },
+    "agents/build-error-resolver.md": {
+      "installedAt": "2026-08-14T01:35:50.741Z",
+      "checksum": "28597d1e97a68701999704b789a97a20a28b121b7c27ee6a6e80ab43bcd514b8"
+    },
+    "agents/chief-of-staff.md": {
+      "installedAt": "2026-08-14T01:35:50.743Z",
+      "checksum": "1a1f971e158824a89b7986f6688fe16d7708b88b0a00631b28bd53956c68e9d2"
+    },
+    "agents/code-reviewer.md": {
+      "installedAt": "2026-08-14T01:35:50.754Z",
+      "checksum": "e112e5e0bbc501788e8a3bfd2771d34e31a8564bbd87391bff7401af1509782c"
+    },
+    "agents/database-reviewer.md": {
+      "installedAt": "2026-08-14T01:35:50.755Z",
+      "checksum": "2dcb2e2dc99f8425cf260ee3630920bc80da18959dde7ad95350ccf70c0931a4"
+    },
+    "agents/doc-updater.md": {
+      "installedAt": "2026-08-14T01:35:50.757Z",
+      "checksum": "a0b96a358534fc9cefc33355b73d8b232132754283c3f335907468cb98ee021d"
+    },
+    "agents/e2e-runner.md": {
+      "installedAt": "2026-08-14T01:35:50.800Z",
+      "checksum": "89813024c93cb28948656b066609eb42b4d024e96a8aeb5cbc320913c1e75123"
+    },
+    "agents/go-build-resolver.md": {
+      "installedAt": "2026-08-14T01:35:50.801Z",
+      "checksum": "f331c2a89232b8d24712b4ceb6a63f4180eab6e81cbe75dc13390947ac3fd4a9"
+    },
+    "agents/go-reviewer.md": {
+      "installedAt": "2026-08-14T01:35:50.803Z",
+      "checksum": "83e6fd9f80c05e4dc1cdfd325e611ab4d3543226c68e91425b876a920514a520"
+    },
+    "agents/harness-optimizer.md": {
+      "installedAt": "2026-08-14T01:35:50.804Z",
+      "checksum": "a0f42e525781a1fc4a2305ef4b5d055f296a04b9814ff81b7d1d99be93c48b58"
+    },
+    "agents/loop-operator.md": {
+      "installedAt": "2026-08-14T01:35:50.805Z",
+      "checksum": "1a2b9c6cd104f76b071ac14eb35aea16d09d631b583fd2e8152b2ccb1ccb6f1b"
+    },
+    "agents/planner.md": {
+      "installedAt": "2026-08-14T01:35:50.807Z",
+      "checksum": "b4ab1263bcd0257cfd7f99075f1cae6ea17cb32f37235fbb76fdf71bc3b21c4e"
+    },
+    "agents/python-reviewer.md": {
+      "installedAt": "2026-08-14T01:35:50.808Z",
+      "checksum": "e2cf129892998841b01817e03736a9b5f9598681a096e28afbc12577d3ed9adf"
+    },
+    "agents/refactor-cleaner.md": {
+      "installedAt": "2026-08-14T01:35:50.810Z",
+      "checksum": "30ed8fae5a0bf75ded440a3cce716ece4e5ab3d8e4912415211a20bb76409e75"
+    },
+    "agents/security-reviewer.md": {
+      "installedAt": "2026-08-14T01:35:50.811Z",
+      "checksum": "eacaa50c2b2fdee398ba2e3c896c018ea8887d34701e5b841278ea2c1472cc19"
+    },
+    "agents/tdd-guide.md": {
+      "installedAt": "2026-08-14T01:35:50.813Z",
+      "checksum": "de339a6158d7708000ef796f8bd5e6d7ed45fe744f443d2d84739470ba4c5f2c"
+    },
+    "commands/build-fix.md": {
+      "installedAt": "2026-08-14T01:35:50.814Z",
+      "checksum": "5088ccbffd1fdea77681916a92832a5c19a71333f04a5f066e1a36670521caa1"
+    },
+    "commands/checkpoint.md": {
+      "installedAt": "2026-08-14T01:35:50.815Z",
+      "checksum": "688a05474a64fb9543841d8e428a3a27dfb999bb88c0e648df09961b2247ddad"
+    },
+    "commands/claw.md": {
+      "installedAt": "2026-08-14T01:35:50.817Z",
+      "checksum": "2ecf2219ff15469acb63d250eb5e0119fde4e85557e8a5e965c18280a25ab7ce"
+    },
+    "commands/code-review.md": {
+      "installedAt": "2026-08-14T01:35:50.831Z",
+      "checksum": "690b878d1b9ba6ecf6c1ce180ec5de0d79db5575d367e52f91031f103a2ff9df"
+    },
+    "commands/e2e.md": {
+      "installedAt": "2026-08-14T01:35:50.842Z",
+      "checksum": "eb0f0d68d5f58d0c5dd0d59fe653c22cc104b8f4a51df621eac04f5aeb7ca1b2"
+    },
+    "commands/eval.md": {
+      "installedAt": "2026-08-14T01:35:50.844Z",
+      "checksum": "7c8e20c659952ce33b248d83517ad988abefe0bff31580a937896b3531a8798f"
+    },
+    "commands/evolve.md": {
+      "installedAt": "2026-08-14T01:35:50.845Z",
+      "checksum": "c8f94e2d2517539fd3e3cf05edb5a7187a887d76f2c936798e93e546f8b30ebb"
+    },
+    "commands/go-build.md": {
+      "installedAt": "2026-08-14T01:35:50.846Z",
+      "checksum": "ebb9375b0c441f0be31d47992709cc1ef878acb2e531edfad6daec563eb9ac62"
+    },
+    "commands/go-review.md": {
+      "installedAt": "2026-08-14T01:35:50.847Z",
+      "checksum": "4cbaf58d3f2d8bf82cb37d1e3985ad48d994d162e96bb470af05e194e978e43a"
+    },
+    "commands/go-test.md": {
+      "installedAt": "2026-08-14T01:35:50.849Z",
+      "checksum": "803cec4d92a361e2623fdf027eb67eea56843ad563814d693382ab7fe6163708"
+    },
+    "commands/harness-audit.md": {
+      "installedAt": "2026-08-14T01:35:50.850Z",
+      "checksum": "8051ebfe1ac1efd74d9cf6f1dc526a06bc35fdfab88ac40c6700dbfa51504542"
+    },
+    "commands/instinct-export.md": {
+      "installedAt": "2026-08-14T01:35:50.851Z",
+      "checksum": "cd2052ae1b9c49f75ad81aae6e236be959cc6656d32e3b8f3e6e13d2d3bd2d3c"
+    },
+    "commands/instinct-import.md": {
+      "installedAt": "2026-08-14T01:35:50.862Z",
+      "checksum": "6c4cba6af60c8f11926578d8c74d62b295209c1567a72bb3f688ac82662f17f5"
+    },
+    "commands/instinct-status.md": {
+      "installedAt": "2026-08-14T01:35:50.863Z",
+      "checksum": "514b31b312e7d093edc7da373de25898490f363d9cf34ae5e6508e769b78d384"
+    },
+    "commands/learn-eval.md": {
+      "installedAt": "2026-08-14T01:35:50.865Z",
+      "checksum": "653fbeefd217a4310b5941202083aeb4dc537796887b92943b63f8815e6775f2"
+    },
+    "commands/learn.md": {
+      "installedAt": "2026-08-14T01:35:50.866Z",
+      "checksum": "696c0a0aa3d5053ff3b383f167225fcc8dc8b91f1bc54fea2bf3826e830a70e8"
+    },
+    "commands/loop-start.md": {
+      "installedAt": "2026-08-14T01:35:50.867Z",
+      "checksum": "3ad109a9f69cfd2ae041d3fe09aff963e00ba0a63408a1fa5fb2ff408085d69b"
+    },
+    "commands/loop-status.md": {
+      "installedAt": "2026-08-14T01:35:50.869Z",
+      "checksum": "24181d1392154e6b7a3aedd1691e021a43de2a9c0969074accfff7ccb800967e"
+    },
+    "commands/model-route.md": {
+      "installedAt": "2026-08-14T01:35:50.871Z",
+      "checksum": "9ad52439f152dd7c94c935f827bb8ef366f87c1848aefa4f054e34bd9365c500"
+    },
+    "commands/multi-backend.md": {
+      "installedAt": "2026-08-14T01:35:50.872Z",
+      "checksum": "6f8d4989c25f0963ec30869c3fdf747f07ac5a993de27b1e5d9b0fc874f828b1"
+    },
+    "commands/multi-execute.md": {
+      "installedAt": "2026-08-14T01:35:50.873Z",
+      "checksum": "d848b570000f80588ac2d3f1125280a47ad4b21a5302c3d740e0c269cd57f92f"
+    },
+    "commands/multi-frontend.md": {
+      "installedAt": "2026-08-14T01:35:50.874Z",
+      "checksum": "9e85eb5eb5478b45ccc4e5f1f86978eb29aae1971cbf9774900c9d27faa89e0b"
+    },
+    "commands/multi-plan.md": {
+      "installedAt": "2026-08-14T01:35:50.885Z",
+      "checksum": "ec3f524c6ff7d5f7f0aea3536eff0bc7032bb1c779bbd5f5cbd8e7cd84c3d6e5"
+    },
+    "commands/multi-workflow.md": {
+      "installedAt": "2026-08-14T01:35:50.897Z",
+      "checksum": "5395c40f2318a6ab4b7f5e4794d57a70f1d6b950d328de624cb0229ecc144b18"
+    },
+    "commands/orchestrate.md": {
+      "installedAt": "2026-08-14T01:35:50.898Z",
+      "checksum": "dcea19fd950fb7c91a7a7ae8ec6f7836d1ad2f91e1f5f291c0131c90deb13374"
+    },
+    "commands/plan.md": {
+      "installedAt": "2026-08-14T01:35:50.899Z",
+      "checksum": "b39360bbb2e549107c3ac374de344124f35b7fd505f2b4f964923dbfec8d7e9c"
+    },
+    "commands/pm2.md": {
+      "installedAt": "2026-08-14T01:35:50.901Z",
+      "checksum": "638ff26f4ede729d6639f32e4077aa423f72d92725b34936afffe57ba2076cb3"
+    },
+    "commands/projects.md": {
+      "installedAt": "2026-08-14T01:35:50.902Z",
+      "checksum": "dc939242028d24119b985e6ad4fee3d6c8185f6bd19c716535384149bc9876f3"
+    },
+    "commands/promote.md": {
+      "installedAt": "2026-08-14T01:35:50.903Z",
+      "checksum": "8d2faf47b1322c24a1dfa221b2f5e85b9e766fcd1d460c157c472246a3b86846"
+    },
+    "commands/python-review.md": {
+      "installedAt": "2026-08-14T01:35:50.904Z",
+      "checksum": "3f1791ba569f79098bb337dad1bca989e13dc0ac03dba7483183ce4937bb9662"
+    },
+    "commands/quality-gate.md": {
+      "installedAt": "2026-08-14T01:35:50.905Z",
+      "checksum": "826bbb000043b1401fb8c73cff9cace55cfd38d7f6c7b006efbd43c8ce9cb754"
+    },
+    "commands/refactor-clean.md": {
+      "installedAt": "2026-08-14T01:35:50.906Z",
+      "checksum": "f78cb91996bcb5cd816b28b617fa3cbf7ce814c559ba18f6fa48e1f7ca16af0a"
+    },
+    "commands/sessions.md": {
+      "installedAt": "2026-08-14T01:35:50.908Z",
+      "checksum": "9a82402ca1075655b0df9beba95d5b7a7dbaf3b2e05268076d6bcf096c379012"
+    },
+    "commands/setup-pm.md": {
+      "installedAt": "2026-08-14T01:35:50.909Z",
+      "checksum": "163b3cd106028d21dbd2a91b47f1cf99957e40a78ed9e5e5dc8507e225f73a2d"
+    },
+    "commands/skill-create.md": {
+      "installedAt": "2026-08-14T01:35:50.910Z",
+      "checksum": "3acec769ffb32348d5865d3ba24fa3e62feb1096fefdbce8e0ac52779b5659cd"
+    },
+    "commands/tdd.md": {
+      "installedAt": "2026-08-14T01:35:50.912Z",
+      "checksum": "9c2ee860a415d6bfc4dbf869392b8ff0a626733e7ccdd4e888dd1e71db090e64"
+    },
+    "commands/test-coverage.md": {
+      "installedAt": "2026-08-14T01:35:50.913Z",
+      "checksum": "3b6899e41753d91ba7e376f107269694e814c7d5523a18fa7785516390bb4dbd"
+    },
+    "commands/update-codemaps.md": {
+      "installedAt": "2026-08-14T01:35:50.914Z",
+      "checksum": "3514e183daeda86331687ed3f863b3ad8e4e2b91a0430b72cd1d28316c0b585b"
+    },
+    "commands/update-docs.md": {
+      "installedAt": "2026-08-14T01:35:50.915Z",
+      "checksum": "09d8332a9e11a94b84462f7918471e1db5264312619d687496ad3ff8e8226631"
+    },
+    "commands/verify.md": {
+      "installedAt": "2026-08-14T01:35:50.935Z",
+      "checksum": "22ad1cca29aa497327d466836e16604a9b4561c2fd6a293ec7ab5780f9966708"
+    },
+    "rules/README.md": {
+      "installedAt": "2026-08-14T01:35:50.936Z",
+      "checksum": "c8824356f865220d3526d8eaa1e79091662d5249d78fa6bf7f6049dc1e810290"
+    },
+    "rules/common/agents.md": {
+      "installedAt": "2026-08-14T01:35:50.937Z",
+      "checksum": "84acffb05e73de7264c89e6b302e653140a3a5b98897601c14edaf0b11065e93"
+    },
+    "rules/common/coding-style.md": {
+      "installedAt": "2026-08-14T01:35:50.938Z",
+      "checksum": "52d1da9e124bfbef9f65f0401ec76b48f8e6293c8971969303efd4d7292a6a90"
+    },
+    "rules/common/development-workflow.md": {
+      "installedAt": "2026-08-14T01:35:50.939Z",
+      "checksum": "e0a9f977cec80c8465f80c8328a114774402a907dde1a39040459ef6f8ba7e2c"
+    },
+    "rules/common/git-workflow.md": {
+      "installedAt": "2026-08-14T01:35:50.955Z",
+      "checksum": "c8a1fac8bb9563406a1d04c6fd87737b4790d6699dfdde8a868248c8e261c18c"
+    },
+    "rules/common/hooks.md": {
+      "installedAt": "2026-08-14T01:35:50.956Z",
+      "checksum": "b3bfb0ed86bfa71d29c076de5363656265218aa5fb8abd26edf285e652a2b234"
+    },
+    "rules/common/patterns.md": {
+      "installedAt": "2026-08-14T01:35:50.958Z",
+      "checksum": "8a32c0552c8b309e961ef3f68a56ae84b0b1d411c17f23675ec26b685dea5e9a"
+    },
+    "rules/common/performance.md": {
+      "installedAt": "2026-08-14T01:35:50.959Z",
+      "checksum": "227f8aa0fb711335e0f341bfa0ad46e81271434f03c467acce9aef5fec13fa97"
+    },
+    "rules/common/security.md": {
+      "installedAt": "2026-08-14T01:35:50.960Z",
+      "checksum": "58f0acc56331b8d554dd036b8a1d5b2305a908e3960ff1e2d7e55223d5918bc3"
+    },
+    "rules/common/testing.md": {
+      "installedAt": "2026-08-14T01:35:50.962Z",
+      "checksum": "1fe96e1188217bcf35acca3459d9afe00dcfb84bc938bba5abf2c4d8e0d9b4a9"
+    },
+    "rules/golang/coding-style.md": {
+      "installedAt": "2026-08-14T01:35:50.963Z",
+      "checksum": "c32f6a2715297a1637b35567bb2e65054b4b28064b4d91fad26ad688f758243d"
+    },
+    "rules/golang/hooks.md": {
+      "installedAt": "2026-08-14T01:35:50.966Z",
+      "checksum": "518fe31d4baa4a10e2f5ae341ececb7063bbc794ef44c4cdefd7dcf75ab50cc3"
+    },
+    "rules/golang/patterns.md": {
+      "installedAt": "2026-08-14T01:35:50.967Z",
+      "checksum": "aca279088c39a43e8b1371d61abbb5da15206c5f52cce52443252d47ad5c5ddb"
+    },
+    "rules/golang/security.md": {
+      "installedAt": "2026-08-14T01:35:50.968Z",
+      "checksum": "72ff9516083e017b718f76e7a6f6838611fa3c02b810b3572fef7d605b38d033"
+    },
+    "rules/golang/testing.md": {
+      "installedAt": "2026-08-14T01:35:50.969Z",
+      "checksum": "b0fcde8be4ce98e34fe872cc2ecca63cab8c8cd87d5faa1e1667ee82f3707d74"
+    },
+    "rules/python/coding-style.md": {
+      "installedAt": "2026-08-14T01:35:50.971Z",
+      "checksum": "f9d6d7a39c5f5ea809579fecac591f390fa9264c088c7e209d464d5244747003"
+    },
+    "rules/python/hooks.md": {
+      "installedAt": "2026-08-14T01:35:50.973Z",
+      "checksum": "7ebd12233f6917905d5653a63afe2361450ed732fd965de55055ed5ffd3c14a7"
+    },
+    "rules/python/patterns.md": {
+      "installedAt": "2026-08-14T01:35:50.974Z",
+      "checksum": "d9cab9b536321ea7efc6180668fd48820deaf571400db732f0ca17bdda92b7d0"
+    },
+    "rules/python/security.md": {
+      "installedAt": "2026-08-14T01:35:50.975Z",
+      "checksum": "6bbbb6c800cdfef23c3f9a5055ce31096a7724b51f0d528935f6c32970639453"
+    },
+    "rules/python/testing.md": {
+      "installedAt": "2026-08-14T01:35:50.976Z",
+      "checksum": "92655aa5047ee456501ad6605c428680bac6433965f89ce531fe79627004e8c6"
+    },
+    "rules/swift/coding-style.md": {
+      "installedAt": "2026-08-14T01:35:50.977Z",
+      "checksum": "187d44050ed492076640f504a3fe7eb132ddabad262099d698a5b703b89d2659"
+    },
+    "rules/swift/hooks.md": {
+      "installedAt": "2026-08-14T01:35:50.996Z",
+      "checksum": "654da388192df405927c5e4cea2f588d01cd349ba7ba30a813a4aa7c3d3a4661"
+    },
+    "rules/swift/patterns.md": {
+      "installedAt": "2026-08-14T01:35:50.997Z",
+      "checksum": "4381cb9fa1c1ec01a600a96d80e320385148728748fb702822f9ac1c3c079860"
+    },
+    "rules/swift/security.md": {
+      "installedAt": "2026-08-14T01:35:50.998Z",
+      "checksum": "345a471220b7f448d991b9d28a0a047165aa7480a1ed758703d0c74041239b3a"
+    },
+    "rules/swift/testing.md": {
+      "installedAt": "2026-08-14T01:35:50.999Z",
+      "checksum": "9a44133b6a8afd496a79bd4e8211985f44cb4a24f83c45b64160d26411e434e9"
+    },
+    "rules/typescript/coding-style.md": {
+      "installedAt": "2026-08-14T01:35:51.022Z",
+      "checksum": "2bd6ace5bfbae10c84401dddd623b8c39d9b7d79b358aacf36e3c3436d035b54"
+    },
+    "rules/typescript/hooks.md": {
+      "installedAt": "2026-08-14T01:35:51.023Z",
+      "checksum": "930bbe5d5a66e0022a55c87d5a17765d1633669620f9a3be6815f3ab4ddcd6b4"
+    },
+    "rules/typescript/patterns.md": {
+      "installedAt": "2026-08-14T01:35:51.024Z",
+      "checksum": "20870f78aa32429fe13f35b415e9f6f8f7809e39c460cf8146d181b7306159fd"
+    },
+    "rules/typescript/security.md": {
+      "installedAt": "2026-08-14T01:35:51.025Z",
+      "checksum": "7a74c95dfebca6923ab602edfe49688c9e4212defed40579de6fc0bb809f909a"
+    },
+    "rules/typescript/testing.md": {
+      "installedAt": "2026-08-14T01:35:51.046Z",
+      "checksum": "92e3d02b4fff30899bc1a2af043d74941adbf3b2c0e972d2fcd2c68c9c2ea70b"
+    },
+    "skills/agent-harness-construction/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.048Z",
+      "checksum": "8da8d0cd5ab9bcdfc3885818de04fbb7de18446b282138bb1b39b6863f335020"
+    },
+    "skills/agentic-engineering/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.050Z",
+      "checksum": "c202c6bfe6c98a6842b2e2c99c0bf030d82200fccf1f9fdb0143d7b51f0a3d13"
+    },
+    "skills/ai-first-engineering/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.067Z",
+      "checksum": "41239a1d15ef590efe9836f686a07697586acf8b6a2f3248b8cb55322484c6a9"
+    },
+    "skills/api-design/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.069Z",
+      "checksum": "d2b090c4319e030fddb576950400724ff12ccb285083a540b6afb62431185d25"
+    },
+    "skills/article-writing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.070Z",
+      "checksum": "6ab082c7850e8e46e471026ea388024b1b9a574d84eb210fcb7391c15aa6b51a"
+    },
+    "skills/autonomous-loops/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.072Z",
+      "checksum": "3a3d9a1bc8f1d7e0574d2733e56d1de03ca25091a407a96404bf9b74e6ae0aac"
+    },
+    "skills/backend-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.076Z",
+      "checksum": "681c33b4e125860295ca2639083cba524c77261e81efd67a3ce30b75593e7512"
+    },
+    "skills/clickhouse-io/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.078Z",
+      "checksum": "bc0d9351ae909eaa725b57ee5c4928274ed94e0b55e0fef4076cbe2844ae8a7b"
+    },
+    "skills/coding-standards/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.079Z",
+      "checksum": "be0b5f2063e9b4b1c6514889b0dc408316f7b0c7892832d10b69ec28e1389b7c"
+    },
+    "skills/configure-ecc/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.081Z",
+      "checksum": "5f3506f77baf2b910b89dd66d98eb47ed0135e77d6b81d10e233d596cff0cf19"
+    },
+    "skills/content-engine/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.082Z",
+      "checksum": "057a610eab12e16bf447a46dd91de867ea450ce541fddc956d1abd55be5ec2cc"
+    },
+    "skills/content-hash-cache-pattern/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.084Z",
+      "checksum": "cdef26f0fc59be4320d3b8acc75a1084c06d7f8b58d635de51cd98e1d4343dbc"
+    },
+    "skills/continuous-agent-loop/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.085Z",
+      "checksum": "9a014a9cf31cbc43dc2e48e4323438de562fa28de017a9c3b9bad8863d16eb6d"
+    },
+    "skills/continuous-learning-v2/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.086Z",
+      "checksum": "b0a7efabaef654921a7871807cd81ea10fb50c0890ffb496668e48840a157508"
+    },
+    "skills/continuous-learning-v2/agents/observer.md": {
+      "installedAt": "2026-08-14T01:35:51.096Z",
+      "checksum": "654f2f0fc9d9ee1ee6e16e56c24cdb7aced277cddf0dd7961e91443291a79187"
+    },
+    "skills/continuous-learning/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.098Z",
+      "checksum": "93924eec09b0cae312cfeda0441764602f313d1914fe899981497697fe13822d"
+    },
+    "skills/cost-aware-llm-pipeline/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.100Z",
+      "checksum": "09eb41fdfa081cd09d3843449275d80ae1c56938a459061d4d3faac3b13012cd"
+    },
+    "skills/cpp-coding-standards/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.102Z",
+      "checksum": "70919980c635f66db649b7eb1e426fb2098754ed6c9db22f1a7eee0935227d35"
+    },
+    "skills/cpp-testing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.118Z",
+      "checksum": "84e58979240d0387d55dd5bf0d4ba9976733098e2f839f10b17251797eae7e50"
+    },
+    "skills/database-migrations/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.124Z",
+      "checksum": "01d862480a071015cd9a7efedb4e0ec63568a1e90bbe82d4d135cad03f795309"
+    },
+    "skills/deployment-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.126Z",
+      "checksum": "b2d18f90ea5f5b7e6c357c3ded7353fa2d23b04464eed4b81745b0c8340e31ba"
+    },
+    "skills/django-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.128Z",
+      "checksum": "267eb89f537a6626937d60fc732675f685b11209fa9025599c80e0f322e9a503"
+    },
+    "skills/django-security/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.129Z",
+      "checksum": "d5d174690a16dca99798693f47b5df17478bfc5ff0f91684caf56dc1e9bef8b5"
+    },
+    "skills/django-tdd/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.131Z",
+      "checksum": "99ef0936053afecf9f1ebbca687cd4232f4baa5f491878d5157c70344f237cd6"
+    },
+    "skills/django-verification/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.132Z",
+      "checksum": "b330cd018e559d568990f485f6ba90795e22e4b38dd68911167af88f54388674"
+    },
+    "skills/docker-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.134Z",
+      "checksum": "6deb8e45b322481036cbf21c0ea61fb1427b0f47a01e675068ccdba93a1a2164"
+    },
+    "skills/e2e-testing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.142Z",
+      "checksum": "f84ae93c159bf6ecef5a60c9735dc82d96bc5f977ef52eb71678b66722acf684"
+    },
+    "skills/enterprise-agent-ops/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.143Z",
+      "checksum": "27edc796df2bf30b611b05ca443434bf65bfc6fde18c94cd16ec41357f4c8ac5"
+    },
+    "skills/eval-harness/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.153Z",
+      "checksum": "0b1933f5532df4bcc750d8799b7b33037e66c5d41f87d2953065868d08981926"
+    },
+    "skills/foundation-models-on-device/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.155Z",
+      "checksum": "8efee7e392b39990e4ed58d85ac0783c1cbaac8e1cd87e7a4ef502f15987963e"
+    },
+    "skills/frontend-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.156Z",
+      "checksum": "d32a3f430d658a8a8adb3d05da56fa1b49ef39cf2d1a6be8f27e5164f2d510df"
+    },
+    "skills/frontend-slides/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.158Z",
+      "checksum": "bc890c0deeb766e78991d6de150fd981a70b3dac5507a4d20b43c1a210b1819d"
+    },
+    "skills/frontend-slides/STYLE_PRESETS.md": {
+      "installedAt": "2026-08-14T01:35:51.159Z",
+      "checksum": "f3448493022f8fa3f858319b14c0c48a35d441864dc78a2411f7938c28e7a265"
+    },
+    "skills/golang-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.160Z",
+      "checksum": "f36a89926fab1e895e7e2e2522e4104e1d7b07452244f31ff09ef1eeb069495c"
+    },
+    "skills/golang-testing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.161Z",
+      "checksum": "2da1afcd9df6529392653cd450edc40eb8bbc0b073f3eda17a510f4b89411c1b"
+    },
+    "skills/investor-materials/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.163Z",
+      "checksum": "0541ac8ede8d39c59a646834481d0de86312e598331b86dc7027ece0def3c193"
+    },
+    "skills/investor-outreach/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.164Z",
+      "checksum": "e1f6e1ac6d85381cdc7f8ae29ff60647f9de46b4c17ef452f7e343ae50749c55"
+    },
+    "skills/iterative-retrieval/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.177Z",
+      "checksum": "5bf02488afe5504290a715d534b8dc41fa366997077715bd555f25c6e372f5bc"
+    },
+    "skills/java-coding-standards/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.187Z",
+      "checksum": "253c3ef143330a2901c2b75fd8def3a3f9ec66e6cb1f8fd1e323b803004dd22b"
+    },
+    "skills/jpa-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.188Z",
+      "checksum": "5302c813a58deb5420e10c6dec4c5f0d036c278f2c494c8243a23326a994063e"
+    },
+    "skills/liquid-glass-design/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.190Z",
+      "checksum": "024aa207eb3d4d31d868954a7352a40b78c61f2fd007ab8b452afb6217070f84"
+    },
+    "skills/market-research/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.191Z",
+      "checksum": "7ef3fa13d6272fd295eeb2aca9f6a2f09f6a8270cf33b0675fc5a0018cf6e406"
+    },
+    "skills/nanoclaw-repl/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.192Z",
+      "checksum": "a917d56baef854638fd6a33c9d9ce4f819d3dd128286514ed28807d911935d27"
+    },
+    "skills/nutrient-document-processing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.194Z",
+      "checksum": "0a3c491ccad41aeabea783e3b42a53d1b790e5b68fcacfb62d954f81cc0c1467"
+    },
+    "skills/plankton-code-quality/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.197Z",
+      "checksum": "e75be8a685f21a10c12e137a6500e349c242791c24d98dd118d5c1845f2070c2"
+    },
+    "skills/postgres-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.207Z",
+      "checksum": "2b07d5f7de1b68a93c8b25d093be2f0e9bfde11b8f488bd5433f0bac15415074"
+    },
+    "skills/project-guidelines-example/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.208Z",
+      "checksum": "68a3764074ab8b9448049010b368c2be75295b9d1e1de8bec6ccacf35fd52c08"
+    },
+    "skills/python-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.218Z",
+      "checksum": "df0c0abbbd0e6a01811d1b1d10d8fa7a8a19ce73afdc9432d24843f62649cdd2"
+    },
+    "skills/python-testing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.220Z",
+      "checksum": "b304a8c503af32644f97a889c5545ee4f90e91980462ad4ce33fee3dea6f414f"
+    },
+    "skills/ralphinho-rfc-pipeline/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.221Z",
+      "checksum": "3564f14e56b1af6019bbf59a7162136f4971f9884243fcb67d1229d039e3f19f"
+    },
+    "skills/regex-vs-llm-structured-text/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.223Z",
+      "checksum": "1f4338a9d8eee84bf9236e1377aae2d44fc067e10d7eb923bebe06d6c006d26f"
+    },
+    "skills/search-first/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.224Z",
+      "checksum": "752b24a8a06b3df1ce35598a789af92a72b61ecbb3c73e69d9af38708015d903"
+    },
+    "skills/security-review/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.226Z",
+      "checksum": "f7530a63c7561bd1036cf4cd4d5939b04ac7a9e919ceefeb4c1a3586eb907d82"
+    },
+    "skills/security-review/cloud-infrastructure-security.md": {
+      "installedAt": "2026-08-14T01:35:51.227Z",
+      "checksum": "98419e575de23d9ea9eef052556fcf8502cf19f307af0a0597997fd1ddd0d6dd"
+    },
+    "skills/security-scan/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.239Z",
+      "checksum": "6facddfa83c1c53eb02d21e0fc4cfe70d785b9fd5159ed91e918c47466bf12d8"
+    },
+    "skills/skill-stocktake/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.241Z",
+      "checksum": "7b0b982d8d0c60ead792d7befe1b4ef8890543cba931132a7618730d9987b246"
+    },
+    "skills/springboot-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.242Z",
+      "checksum": "7ecbb9ce50282c9c1cf71e3e9245d077036c3f72bd589418d8dd573118faa0e5"
+    },
+    "skills/springboot-security/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.261Z",
+      "checksum": "7bfabd0a87dd3abda4af572e913a84bd2470a876490799d3bf024e22a6870885"
+    },
+    "skills/springboot-tdd/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.265Z",
+      "checksum": "67d3d67c8f9d18109979944c028d8c0e1a219c0366ef96c95befd6fb3a0856d4"
+    },
+    "skills/springboot-verification/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.267Z",
+      "checksum": "4895b880d86d5703f167f88ca376a55195b40c3b459ec228f5ec8f27bd1a704a"
+    },
+    "skills/strategic-compact/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.268Z",
+      "checksum": "c83c4c9d60d30d508bbd2bf0c6ffa724b5fdac679addd4828b268892dc39dc1b"
+    },
+    "skills/swift-actor-persistence/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.269Z",
+      "checksum": "dddfd2f5da0c3fa674dfdd9c54abecb004be1259cb2a892b38dd703f02fbb6aa"
+    },
+    "skills/swift-concurrency-6-2/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.271Z",
+      "checksum": "f12ca9feeed25834fc06f59a70c679629962a4653c8354ecd833b68403da652c"
+    },
+    "skills/swift-protocol-di-testing/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.272Z",
+      "checksum": "780bf7d46242c38b74af0a4d56ea368f288e8dd5132e1b64850614ed2cf20a61"
+    },
+    "skills/swiftui-patterns/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.273Z",
+      "checksum": "c27f90145101dd77d64e9f9b70297c4167af26abb8a924f2a91326289bc3ec2c"
+    },
+    "skills/tdd-workflow/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.275Z",
+      "checksum": "0c0d287804b33a98bbba2df8169da80403b29fcae4a45aca96522e6c8d022d17"
+    },
+    "skills/verification-loop/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.286Z",
+      "checksum": "01a9ae310ad4426bb05660dda6cefdeaac9513417585c09c8bb1b94738649a78"
+    },
+    "skills/visa-doc-translate/README.md": {
+      "installedAt": "2026-08-14T01:35:51.287Z",
+      "checksum": "d17f5db284f703ee0d432a4b73886780b9c9c0f7dfe1d9c46c21d6b352bca642"
+    },
+    "skills/visa-doc-translate/SKILL.md": {
+      "installedAt": "2026-08-14T01:35:51.288Z",
+      "checksum": "9c429c2c57789cc6631c9a9d244c40026d96b65f8a6c927e44abc152c463320a"
+    }
+  }
+}

@@ -50,6 +50,7 @@ from api.trading_api import (
     router as trading_router,
 )
 from api.auth import router as auth_router, verify_token_dependency, verify_ws_token
+from api.error_handlers import register_exception_handlers
 from calc.trading_executor import TradingExecutor, TradingExecutorConfig
 from calc.position_tracker import PositionTracker
 from calc.orderbook_enricher import EnrichConfig, enrich_trading_fields, enrich_snapshot_fields
@@ -1146,6 +1147,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='Cross-Exchange OrderBook Monitor', lifespan=lifespan)
+register_exception_handlers(app)
 app.include_router(trading_router)
 app.include_router(auth_router)
 
@@ -3237,11 +3239,11 @@ def _asyncio_exception_handler(loop, context):
         logger.critical(f'asyncio 未处理异常: {message}')
 
 
-def main():
+def main() -> None:
     import uvicorn
 
-    host = '0.0.0.0'
-    port = 19876
+    host = config.get_str('orderbook.server_host', '0.0.0.0', env='ORDERBOOK_SERVER_HOST')
+    port = config.get_int('orderbook.server_port', 19876, env='ORDERBOOK_SERVER_PORT')
 
     log_print(f'启动业务订单簿服务 http://{host}:{port}')
     log_print('Binance/Gate WS 由独立 orderbook_data_service 维护')
