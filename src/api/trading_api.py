@@ -29,7 +29,6 @@ from calc.delist_risk_monitor import DelistRiskConfig, DelistRiskMonitor
 from calc.forward_bnb_fee import build_default_forward_bnb_fee_buyer
 from calc.fund_transfer_service import get_fund_transfer_service
 from calc.gate_cross_risk import gate_cross_risk_pressure
-from calc.gate_position_risk import attach_gate_position_risk
 from calc.listing_event_monitor import (
     add_listing_asset_to_monitor,
     disable_listing_asset,
@@ -39,7 +38,6 @@ from calc.listing_event_monitor import (
     refresh_listing_events,
 )
 from calc.orderbook_data_client import OrderBookDataClient
-from calc.position_order_fees import attach_position_order_fee_summary
 from calc.popup_notification_store import (
     count_unread_popup_notifications,
     list_popup_notifications,
@@ -47,7 +45,7 @@ from calc.popup_notification_store import (
     upsert_popup_notification,
     upsert_popup_notifications,
 )
-from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+from calc.position_pnl_calculator import PnlConfig
 from calc.reverse_account_monitor import build_reverse_reconciliation_rows, get_reverse_capital_snapshot
 from calc.reverse_trade_store import (
     list_reverse_orders,
@@ -55,18 +53,12 @@ from calc.reverse_trade_store import (
     list_reverse_positions,
     summarize_reverse_positions,
 )
-from repositories.trading_query_repo import (
-    ALLOWED_CLOSE_THRESHOLD_COLS,
-    TradingQueryRepo,
-    build_forward_signal_filters,
-    build_order_view_where,
-)
+from repositories.trading_query_repo import build_forward_signal_filters
+from services.trading_query_service import TradingQueryService
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/trading", tags=["trading"])
-
-_ALLOWED_CLOSE_THRESHOLD_COLS = ALLOWED_CLOSE_THRESHOLD_COLS
 
 _delist_risk_cache: dict[str, Any] = {
     'at': 0.0,
@@ -354,6 +346,18 @@ def _attach_delist_risks(rows: List[Dict[str, Any]]) -> None:
             row['exchange_risk_detail'] = f"{existing_detail} | {summary}"
 
 
+def _trading_query_service() -> TradingQueryService:
+    return TradingQueryService(
+        db_manager,
+        serialize_row=_serialize_row,
+        serialize_rows=_serialize_rows,
+        attach_delist_risks=_attach_delist_risks,
+        delist_risk_asset_set=_delist_risk_asset_set,
+        inject_current_funding_fields=_inject_current_funding_fields,
+        position_pnl_config=_position_pnl_config,
+    )
+
+
 @router.get('/orders')
 async def get_orders(
     view: str = Query('open', pattern='^(open|close)$', description="订单视图(open/close)"),
@@ -366,65 +370,29 @@ async def get_orders(
     page_size: int = Query(100, ge=1, le=5000, description="每页持仓数"),
 ):
     """按当前持仓状态查询开仓或平仓视图，过滤、排序与分页全部在后端完成。"""
-    close_threshold_col = config.get_str(
-        'trade.vwap.close_threshold_percentile',
-        'close_basis_p20',
-    ).strip()
-    if close_threshold_col not in _ALLOWED_CLOSE_THRESHOLD_COLS:
-        logger.warning(f'无效平仓VWAP阈值字段 {close_threshold_col}，回退 close_basis_p20')
-        close_threshold_col = 'close_basis_p20'
-
     normalized_view = str(view or '').strip().lower()
     if normalized_view not in {'open', 'close'}:
         raise HTTPException(status_code=400, detail='view 必须为 open 或 close')
-
-    time_column = 'p.opened_at' if normalized_view == 'open' else 'p.closed_at'
-    delist_risk_assets: list[str] = sorted(_delist_risk_asset_set()) if exchange_risk else []
-    where_sql, params = build_order_view_where(
-        normalized_view=normalized_view,
-        days=days,
-        base_asset=base_asset,
-        position_id=position_id,
+    return await asyncio.to_thread(
+        _trading_query_service().list_order_view,
+        view=normalized_view,
         channel=channel,
-        delist_risk_assets=delist_risk_assets,
         exchange_risk=exchange_risk,
-    )
-
-    repo = TradingQueryRepo(db_manager)
-    total = repo.count_positions_by_where(where_sql, params)
-    offset = (page - 1) * page_size
-    rows = repo.list_order_view_positions(
-        where_sql=where_sql,
-        params=params,
-        time_column=time_column,
-        close_threshold_col=close_threshold_col,
+        position_id=position_id,
+        base_asset=base_asset,
+        days=days,
+        page=page,
         page_size=page_size,
-        offset=offset,
     )
-    _attach_delist_risks(rows)
-    tab_summary_row = repo.fetch_order_tab_summary()
-
-    return {
-        'orders': _serialize_rows(rows),
-        'pagination': {
-            'page': page,
-            'page_size': page_size,
-            'total': total,
-            'total_pages': (total + page_size - 1) // page_size if total else 0,
-        },
-        'view': normalized_view,
-        'summary': {
-            'current_open': int(tab_summary_row.get('current_open') or 0),
-            'today_closed': int(tab_summary_row.get('today_closed') or 0),
-        },
-    }
 
 
 @router.get('/positions/{position_id}/orders')
 async def get_position_orders(position_id: int):
     """获取指定持仓的全部订单明细（弹窗用）"""
-    rows = TradingQueryRepo(db_manager).list_orders_by_position_id(position_id)
-    return {'orders': _serialize_rows(rows)}
+    return await asyncio.to_thread(
+        _trading_query_service().list_position_orders,
+        position_id,
+    )
 
 
 @router.get('/orders/grouped')
@@ -440,36 +408,7 @@ async def get_orders_grouped():
         }
     ]
     """
-    rows = TradingQueryRepo(db_manager).list_grouped_orders()
-    
-    # 按 position_id 分组
-    groups = {}
-    for row in rows:
-        pid = row['position_id']
-        if pid not in groups:
-            groups[pid] = {
-                'position_id': pid,
-                'base_asset': row['base_asset'],
-                'orders': [],
-                'summary': {}
-            }
-        groups[pid]['orders'].append(_serialize_row(row))
-    
-    # 计算汇总信息
-    result = []
-    for pid, group in groups.items():
-        orders = group['orders']
-        total_exec_amount = sum(float(o['exec_amount'] or 0) for o in orders)
-        total_target_amount = sum(float(o['target_amount'] or 0) for o in orders)
-        
-        group['summary'] = {
-            'total_exec_amount': total_exec_amount,
-            'total_target_amount': total_target_amount,
-            'order_count': len(orders),
-        }
-        result.append(group)
-    
-    return result
+    return await asyncio.to_thread(_trading_query_service().list_grouped_orders)
 
 
 @router.get('/positions')
@@ -481,87 +420,20 @@ async def get_positions(
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
     """查询持仓列表（含资金费结算历史，支持分页）"""
-    try:
-        repo = TradingQueryRepo(db_manager)
-        summary_row = repo.fetch_positions_status_summary(days, base_asset)
-        summary = {
-            'total': int(summary_row.get('total') or 0),
-            'holding': int(summary_row.get('holding_count') or 0),
-            'closed': int(summary_row.get('closed_count') or 0),
-        }
-
-        total = repo.count_positions(days, status, base_asset)
-        offset = (page - 1) * page_size
-        rows = repo.list_positions(days, status, base_asset, page_size, offset)
-
-        if not rows:
-            return {
-                'positions': [],
-                'pagination': {
-                    'page': page,
-                    'page_size': page_size,
-                    'total': 0,
-                    'total_pages': 0,
-                },
-                'summary': summary,
-            }
-
-        position_ids = [r['id'] for r in rows]
-        history_rows = repo.list_funding_fee_history(position_ids)
-        
-        # 按 position_id 分组
-        histories: dict = {}
-        for h in history_rows:
-            pid = h['position_id']
-            if pid not in histories:
-                histories[pid] = []
-            histories[pid].append({
-                'seq': h['payment_seq'],
-                'rate': float(h['funding_rate']) if h.get('funding_rate') is not None else None,
-                'rate_24h': float(h['funding_rate_24h']) if h.get('funding_rate_24h') else None,
-                'pnl': float(h['funding_pnl']) if h.get('funding_pnl') is not None else 0,
-                'notional': float(h['future_notional']) if h.get('future_notional') else None,
-                'time': h['settled_at'].strftime('%m-%d %H:%M') if h.get('settled_at') else None,
-            })
-        
-        # 注入到每个持仓记录
-        attach_position_order_fee_summary(rows)
-        if any(row.get('status') == 'holding' for row in rows):
-            try:
-                gate_positions = build_default_reconciler().executor.fetch_gate_futures_positions()
-                attach_gate_position_risk(rows, gate_positions)
-            except Exception as e:
-                logger.warning(f'Gate维持保证金率拉取失败: {e}')
-        contract_meta = fetch_contract_meta()
-        calculate_realtime_pnl(rows, {}, contract_meta, _position_pnl_config())
-        _attach_delist_risks(rows)
-        serialized = _serialize_rows(rows)
-        _inject_current_funding_fields(serialized, contract_meta)
-        for row in serialized:
-            row['funding_history'] = histories.get(row.get('id'), [])
-        
-        return {
-            'positions': serialized,
-            'pagination': {
-                'page': page,
-                'page_size': page_size,
-                'total': total,
-                'total_pages': (total + page_size - 1) // page_size,
-            },
-            'summary': summary,
-            # 标准开仓金额，前端用于兑底计算 funding_pnl_bps、避免硬编码与后端配置漂移
-            'open_amount_usdt': config.get_float('trade.open.amount_usdt', 10.0),
-        }
-    except Exception as e:
-        logger.error(f'查询持仓失败: {e}', exc_info=True)
-        raise
+    return await asyncio.to_thread(
+        _trading_query_service().list_positions,
+        status=status,
+        base_asset=base_asset,
+        days=days,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get('/positions/summary')
 async def get_positions_summary():
     """持仓汇总统计"""
-    row = TradingQueryRepo(db_manager).fetch_positions_aggregate_summary()
-    return _serialize_row(row) if row else {}
+    return await asyncio.to_thread(_trading_query_service().positions_summary)
 
 
 # ─── 基础对账 ────────────────────────────────────────────────────────────────
@@ -2450,54 +2322,16 @@ async def get_signals(
     page_size: int = Query(100, ge=1, le=5000, description="每页条数"),
 ):
     """查询历史交易信号（支持分页）"""
-    where_sql, where_params = _build_forward_signal_filters(
+    return await asyncio.to_thread(
+        _trading_query_service().list_signals,
         status=status,
         exit_reason=exit_reason,
         base_asset=base_asset,
         time_range=time_range,
         days=days,
+        page=page,
+        page_size=page_size,
     )
-    aliased_where_sql, aliased_where_params = _build_forward_signal_filters(
-        status=status,
-        exit_reason=exit_reason,
-        base_asset=base_asset,
-        time_range=time_range,
-        days=days,
-        prefix="s.",
-    )
-
-    repo = TradingQueryRepo(db_manager)
-    offset = (page - 1) * page_size
-    rows = repo.list_forward_signals(aliased_where_sql, aliased_where_params, page_size, offset)
-    data = _serialize_rows(rows)
-    summary_row = repo.fetch_forward_signal_summary(where_sql, where_params)
-
-    summary_data = _serialize_row(summary_row) if summary_row else {}
-    total_count = summary_data.get('total', 0)
-    opened_count = summary_data.get('opened', 0)
-    rejected_count = summary_data.get('rejected', 0)
-    conditions_lost_count = summary_data.get('conditions_lost', 0)
-    monitoring_count = summary_data.get('monitoring', 0)
-    latest_signal_time = summary_data.get('latest_signal_time')
-
-    return {
-        'signals': data,
-        'pagination': {
-            'page': page,
-            'page_size': page_size,
-            'total': total_count,
-            'total_pages': (total_count + page_size - 1) // page_size,
-        },
-        'summary': {
-            'total': total_count,
-            'opened': opened_count,
-            'rejected': rejected_count,
-            'conditions_lost': conditions_lost_count,
-            'monitoring': monitoring_count,
-            'conversion_rate': round(opened_count / total_count * 100, 1) if total_count > 0 else 0,
-            'latest_signal_time': latest_signal_time,
-        }
-    }
 
 
 @router.get('/reverse-signals')
