@@ -62,6 +62,7 @@ from services.capital_query_service import (
     capital_history_select_columns,
     filter_capital_transfer_transient_rows,
 )
+from services.column_config_service import ColumnConfigService
 from services.fund_transfer_api_service import FundTransferApiService
 from services.listing_event_api_service import ListingEventApiService
 from services.popup_notification_api_service import PopupNotificationApiService
@@ -419,6 +420,10 @@ def _listing_event_api_service() -> ListingEventApiService:
         add_to_monitor=add_listing_asset_to_monitor,
         disable_asset=disable_listing_asset,
     )
+
+
+def _column_config_service() -> ColumnConfigService:
+    return ColumnConfigService(db_manager)
 
 
 @router.get('/orders')
@@ -1320,94 +1325,15 @@ async def disable_base_asset(base_asset: str, payload: DisableBaseAssetRequest |
 # ─── AG Grid 列配置管理 ───────────────────────────────────────────────────────
 
 @router.get('/column-config/{page_key}')
-async def get_column_config(page_key: str):
+async def get_column_config(page_key: str) -> Dict[str, Any]:
     """获取指定页面的AG Grid列配置"""
-    # TODO: 从认证信息中获取 user_id，暂时使用 'default'
-    user_id = 'default'
-    
-    with db_manager.get_cursor() as cursor:
-        cursor.execute(
-            "SELECT col_id, sort_order, is_visible, width, pinned, sort, filter_model "
-            "FROM ag_grid_column_config "
-            "WHERE user_id = %s AND page_key = %s "
-            "ORDER BY sort_order ASC",
-            (user_id, page_key)
-        )
-        rows = cursor.fetchall()
-    
-    # 转换为 AG Grid ColumnState 格式
-    # 注意：AG Grid 的 applyColumnState 依赖数组顺序来确定列顺序
-    # order 字段不是必须的，关键是数组的排列顺序
-    column_state = []
-    for row in rows:
-        state = {
-            'colId': row['col_id'],
-            'hide': not bool(row['is_visible']),
-        }
-        if row['width'] is not None:
-            state['width'] = row['width']
-        if row['pinned']:
-            state['pinned'] = row['pinned']
-        if row['sort']:
-            state['sort'] = row['sort']
-        if row['filter_model']:
-            state['filterModel'] = json.loads(row['filter_model']) if isinstance(row['filter_model'], str) else row['filter_model']
-        column_state.append(state)
-    
-    return {'columnState': column_state}
+    return await asyncio.to_thread(_column_config_service().get, page_key)
 
 
 @router.post('/column-config/{page_key}')
-async def save_column_config(page_key: str, payload: Dict[str, Any]):
+async def save_column_config(page_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """保存指定页面的AG Grid列配置"""
-    # TODO: 从认证信息中获取 user_id，暂时使用 'default'
-    user_id = 'default'
-    column_state = payload.get('columnState', [])
-    
-    if not column_state or not isinstance(column_state, list):
-        return {'success': False, 'message': 'columnState 必须是非空数组'}
-    
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        try:
-            # 批量 upsert（列顺序由数组索引决定，而非 item 中的 order 字段）
-            for idx, item in enumerate(column_state):
-                if 'colId' not in item:
-                    continue
-                
-                filter_model_json = None
-                if item.get('filterModel'):
-                    filter_model_json = json.dumps(item['filterModel'])
-                
-                cursor.execute(
-                    "INSERT INTO ag_grid_column_config "
-                    "(user_id, page_key, col_id, sort_order, is_visible, width, pinned, sort, filter_model) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                    "ON DUPLICATE KEY UPDATE "
-                    "sort_order = VALUES(sort_order), "
-                    "is_visible = VALUES(is_visible), "
-                    "width = VALUES(width), "
-                    "pinned = VALUES(pinned), "
-                    "sort = VALUES(sort), "
-                    "filter_model = VALUES(filter_model)",
-                    (
-                        user_id,
-                        page_key,
-                        item['colId'],
-                        idx,
-                        not item.get('hide', False),
-                        item.get('width'),
-                        item.get('pinned'),
-                        item.get('sort'),
-                        filter_model_json
-                    )
-                )
-            return {'success': True, 'message': '列配置保存成功'}
-        except Exception as e:
-            logger.error(f"保存列配置失败: {e}", exc_info=True)
-            return {'success': False, 'message': f'保存失败: {str(e)}'}
-        finally:
-            cursor.close()
+    return await asyncio.to_thread(_column_config_service().save, page_key, payload)
 
 
 # ──────────────────────────────────────────────────────────────────
