@@ -40,7 +40,7 @@ class ExchangeConfig:
     binance_api_key: str = ''
     binance_api_secret: str = ''
     # Gate
-    gate_base_url: str = 'https://fx-api-testnet.gateio.ws'
+    gate_base_url: str = 'https://api-testnet.gateapi.io'
     gate_api_key: str = ''
     gate_api_secret: str = ''
     # 通用

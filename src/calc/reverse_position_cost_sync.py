@@ -61,7 +61,7 @@ def _build_reverse_exchange_config() -> ExchangeConfig:
         binance_base_url='https://api1.binance.com' if mainnet else 'https://testnet.binance.vision',
         binance_api_key=binance_creds.api_key,
         binance_api_secret=binance_creds.api_secret,
-        gate_base_url='https://api.gateio.ws' if mainnet else 'https://fx-api-testnet.gateio.ws',
+        gate_base_url='https://api.gateio.ws' if mainnet else 'https://api-testnet.gateapi.io',
         gate_api_key=gate_creds.api_key,
         gate_api_secret=gate_creds.api_secret,
         timeout_sec=config.get_int('real_executor.timeout_sec', 10),

@@ -12,7 +12,8 @@ trade:
   # 运行模式（统一开关）：virtual=虚拟盘(本地账本) / testnet=模拟盘(交易所Testnet) / live=实盘
   # 主变量，trade.executor.url 和 real_executor.env 均由本参数派生。可用 TRADE_MODE 环境变量临时覆盖。
   # mode: virtual
-  mode: live
+  # mode: live
+  mode: testnet
 
   # ─── 成交引擎 ───
   executor:

@@ -98,7 +98,7 @@ def build_exchange_config() -> ExchangeConfig:
         binance_base_url='https://testnet.binance.vision',
         binance_api_key=os.getenv('BINANCE_TESTNET_API_KEY', ''),
         binance_api_secret=os.getenv('BINANCE_TESTNET_API_SECRET', ''),
-        gate_base_url='https://fx-api-testnet.gateio.ws',
+        gate_base_url='https://api-testnet.gateapi.io',
         gate_api_key=os.getenv('GATE_FUTURES_TESTNET_API_KEY', ''),
         gate_api_secret=os.getenv('GATE_FUTURES_TESTNET_API_SECRET', ''),
         timeout_sec=timeout_sec,
