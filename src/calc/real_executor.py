@@ -246,7 +246,9 @@ class RealExecutor:
             result['success'] = True
             result['message'] = '成交成功'
             execution_style = (
-                '保护IOC' if future_order.get('protective_price') is not None else '市价'
+                '保护FOK' if future_order.get('time_in_force') == 'fok'
+                else '保护IOC' if future_order.get('protective_price') is not None
+                else '市价'
             )
             logger.warning(
                 "平仓成功(Gate%s优先) | %s | future: price=%s, qty=%s | "
@@ -1870,6 +1872,10 @@ class RealExecutor:
         protective_price = order.get('protective_price')
         if protective_price is not None:
             price = self._format_gate_price(base_asset, float(protective_price))
+            requested_tif = str(order.get('time_in_force') or 'ioc').lower()
+            if requested_tif not in {'ioc', 'fok'}:
+                return {'success': False, 'reason': f'Gate保护单TIF无效({requested_tif})'}
+            tif = requested_tif
         if self._is_future_maker_order(order):
             maker_price = float(order.get('maker_price') or 0)
             if maker_price <= 0:
@@ -1882,7 +1888,7 @@ class RealExecutor:
             'contract': contract,
             'size': contracts_size,
             'price': price,     # 0=市价IOC；非0=保护限价/POC
-            'tif': tif,         # ioc=即时成交或取消；poc=post-only
+            'tif': tif,         # ioc=可部分成交；fok=全成或全撤；poc=post-only
             'text': f"t-arb{order.get('order_uuid', '')[:8]}",
         }
 
@@ -1921,7 +1927,7 @@ class RealExecutor:
                     taker_reference_price=order.get('maker_taker_reference_price'),
                     spot_reference_price=order.get('maker_spot_reference_price'),
                 )
-            return self._parse_gate_response(data, quanto_multiplier)
+            return self._parse_gate_response(data, quanto_multiplier, time_in_force=tif)
 
         except requests.exceptions.Timeout:
             return {'success': False, 'reason': f'Gate 请求超时({self.config.timeout_sec}s)'}
@@ -2142,7 +2148,13 @@ class RealExecutor:
         left = abs(self._gate_int(data.get('left')))
         return max(size - left, 0)
 
-    def _parse_gate_response(self, data: Dict, quanto_multiplier: float, allow_partial: bool = False) -> Dict:
+    def _parse_gate_response(
+        self,
+        data: Dict,
+        quanto_multiplier: float,
+        allow_partial: bool = False,
+        time_in_force: str = 'ioc',
+    ) -> Dict:
         """
         解析 Gate 期货订单响应
 
@@ -2170,10 +2182,11 @@ class RealExecutor:
 
         if exec_price == 0 or size == 0:
             finish_as = str(data.get('finish_as', 'unknown') or 'unknown')
-            if finish_as.lower() in {'ioc', 'cancelled', 'canceled'} or size == 0:
+            if finish_as.lower() in {'ioc', 'fok', 'cancelled', 'canceled'} or size == 0:
+                tif_label = str(time_in_force or 'ioc').upper()
                 return {
                     'success': False,
-                    'reason': f"IOC未成交(fill=0, finish_as={finish_as})"
+                    'reason': f"{tif_label}未成交(fill=0, finish_as={finish_as})"
                 }
             return {
                 'success': False,

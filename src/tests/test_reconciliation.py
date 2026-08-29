@@ -3502,6 +3502,412 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertTrue(result['success'])
         remediator._resolve_balanced_spot_excess_positions.assert_called_once_with('TUT')
 
+    @staticmethod
+    def _build_low_notional_paired_trim_case(
+        *,
+        gate_result=None,
+        spot_result=None,
+        available_qty=14037.0,
+        position=None,
+    ):
+        calls = []
+
+        class FakeExecutor:
+            contract_meta = {'AI': {'quanto_multiplier': 1.0}}
+            spot_meta = {'AI': {'min_notional': 5.0, 'step_size': 1.0}}
+
+            def place_gate_futures_order(self, order):
+                calls.append('gate')
+                if gate_result is not None:
+                    return gate_result
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': order['protective_price'],
+                    'exec_amount': order['target_qty'] * order['protective_price'],
+                    'exchange_order_id': 'gate-fok-1',
+                }
+
+            def place_binance_spot_close_with_retry(self, order):
+                calls.append('binance')
+                if spot_result is not None:
+                    return spot_result
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': 0.0184,
+                    'exec_amount': order['target_qty'] * 0.0184,
+                    'exchange_order_id': 'binance-sell-1',
+                }
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.0184
+
+        explained = position or {
+            'id': 801,
+            'base_asset': 'AI',
+            'spot_symbol': 'AIUSDT',
+            'future_contract': 'AI_USDT',
+            'spot_open_qty': 1127.0,
+            'spot_open_price': 0.0180,
+            'future_open_qty': 1000.0,
+            'future_open_price': 0.0182,
+            'future_open_contracts': 1000.0,
+            'exchange_risk_status': 'desynced',
+            'exchange_risk_type': 'binance_spot_excess',
+            '_spot_excess_qty': 127.0,
+        }
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(
+                enabled=True,
+                low_notional_buffer_ratio=1.2,
+                low_notional_fok_slippage_bps=100.0,
+                low_notional_retry_cooldown_sec=300.0,
+            ),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=available_qty)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(
+            return_value=[explained],
+        )
+        remediator._persist_low_notional_paired_trim = MagicMock(return_value={
+            'position_count': 1,
+            'closed_position_count': 0,
+            'spot_qty': 327.0,
+            'future_qty': 200.0,
+        })
+        return remediator, executor, explained, calls
+
+    def test_low_notional_binance_excess_uses_gate_fok_then_combined_spot_sale(self):
+        remediator, executor, _position, calls = self._build_low_notional_paired_trim_case()
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI',
+            local_qty=13910.0,
+            exchange_qty=14037.0,
+            risk={
+                'type': 'binance_spot_excess',
+                'contract': 'AI_USDT',
+                'mark_price': 0.0185,
+            },
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['action'], 'paired_trim_low_notional_binance_excess')
+        self.assertEqual(calls, ['gate', 'binance'])
+        self.assertEqual(result['paired_qty'], 200.0)
+        self.assertEqual(result['spot_exec_qty'], 327.0)
+        persisted = remediator._persist_low_notional_paired_trim.call_args.kwargs
+        self.assertEqual(persisted['excess_qty'], 127.0)
+        self.assertEqual(persisted['paired_contracts'], 200)
+        self.assertEqual(persisted['future_order']['time_in_force'], 'fok')
+        self.assertEqual(persisted['future_order']['target_contracts'], 200)
+        self.assertAlmostEqual(persisted['future_order']['protective_price'], 0.018685)
+        self.assertEqual(persisted['spot_order']['target_qty'], 327.0)
+
+    def test_low_notional_paired_trim_honors_non_unit_contract_multiplier(self):
+        class FakeExecutor:
+            contract_meta = {'BICO': {'quanto_multiplier': 0.1}}
+            spot_meta = {'BICO': {'min_notional': 5.0, 'step_size': 0.1}}
+
+            def __init__(self):
+                self.gate_order = None
+                self.spot_order = None
+
+            def _get_binance_usdt_price(self, _asset):
+                return 0.04
+
+            def place_gate_futures_order(self, order):
+                self.gate_order = order
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': order['protective_price'],
+                    'exec_amount': order['target_qty'] * order['protective_price'],
+                }
+
+            def place_binance_spot_close_with_retry(self, order):
+                self.spot_order = order
+                return {
+                    'success': True,
+                    'exec_qty': order['target_qty'],
+                    'exec_price': 0.04,
+                    'exec_amount': order['target_qty'] * 0.04,
+                }
+
+        executor = FakeExecutor()
+        remediator = ExchangeDesyncRemediator(
+            executor,
+            ExchangeDesyncRemediationConfig(enabled=True),
+        )
+        remediator._load_binance_available_qty = MagicMock(return_value=210.0)
+        remediator._load_spot_excess_positions_to_remediate = MagicMock(return_value=[{
+            'id': 802,
+            'base_asset': 'BICO',
+            'spot_open_qty': 210.0,
+            'future_open_qty': 200.0,
+            'future_open_contracts': 2000.0,
+            '_spot_excess_qty': 10.0,
+        }])
+        remediator._persist_low_notional_paired_trim = MagicMock(return_value={})
+
+        result = remediator.remediate_binance_spot_desync(
+            'BICO', 200.0, 210.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.041},
+        )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(executor.gate_order['target_contracts'], 1400)
+        self.assertAlmostEqual(executor.gate_order['target_qty'], 140.0)
+        self.assertAlmostEqual(executor.spot_order['target_qty'], 150.0)
+        persisted = remediator._persist_low_notional_paired_trim.call_args.kwargs
+        self.assertEqual(persisted['paired_contracts'], 1400)
+        self.assertEqual(persisted['multiplier'], 0.1)
+
+    def test_low_notional_gate_fok_failure_does_not_touch_binance_and_cools_down(self):
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            gate_result={'success': False, 'reason': 'FOK未成交'},
+        )
+        risk = {'type': 'binance_spot_excess', 'mark_price': 0.0185}
+
+        first = remediator.remediate_binance_spot_desync('AI', 13910.0, 14037.0, risk)
+        second = remediator.remediate_binance_spot_desync('AI', 13910.0, 14037.0, risk)
+
+        self.assertFalse(first['success'])
+        self.assertTrue(first['attempted'])
+        self.assertFalse(first['retry_needed'])
+        self.assertEqual(calls, ['gate'])
+        self.assertFalse(second['attempted'])
+        self.assertEqual(second['reason'], 'low_notional_retry_cooldown')
+
+    def test_low_notional_gate_unexpected_partial_fill_never_sells_spot(self):
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            gate_result={
+                'success': True,
+                'exec_qty': 199.0,
+                'exec_price': 0.018685,
+                'exec_amount': 3.718315,
+            },
+        )
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(calls, ['gate'])
+        self.assertIn('fok_qty_mismatch', result['reason'])
+
+    def test_low_notional_gate_fill_check_does_not_use_large_spot_step_as_tolerance(self):
+        remediator, executor, _position, calls = self._build_low_notional_paired_trim_case(
+            gate_result={
+                'success': True,
+                'exec_qty': 272.0,
+                'exec_price': 0.018685,
+                'exec_amount': 5.083,
+            },
+        )
+        executor.spot_meta['AI']['step_size'] = 100.0
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(calls, ['gate'])
+        self.assertIn('272!=273', result['reason'])
+
+    def test_low_notional_spot_failure_after_gate_fill_requests_fresh_reconciliation(self):
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            spot_result={'success': False, 'exec_qty': 0.0, 'reason': 'Binance rejected'},
+        )
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertTrue(result['retry_needed'])
+        self.assertEqual(calls, ['gate', 'binance'])
+        self.assertEqual(result['reason'], 'Binance rejected')
+
+    def test_low_notional_unexplained_excess_never_places_either_leg(self):
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case()
+        remediator._load_spot_excess_positions_to_remediate.return_value = []
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertFalse(result['attempted'])
+        self.assertEqual(result['reason'], 'low_notional_excess_not_fully_explained')
+        self.assertEqual(calls, [])
+
+    def test_low_notional_non_spot_excess_risk_never_places_either_leg(self):
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case()
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'extra_gate_position', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['reason'], 'low_notional_excess_not_pairable')
+        self.assertEqual(calls, [])
+
+    def test_low_notional_insufficient_matched_gate_position_never_places_order(self):
+        position = {
+            'id': 801,
+            'base_asset': 'AI',
+            'spot_open_qty': 227.0,
+            'spot_open_price': 0.0180,
+            'future_open_qty': 100.0,
+            'future_open_contracts': 100.0,
+            '_spot_excess_qty': 127.0,
+        }
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            position=position,
+        )
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(
+            result['reason'],
+            'insufficient_matched_gate_position_for_low_notional_repair',
+        )
+        self.assertEqual(calls, [])
+
+    def test_low_notional_multiplier_mismatch_never_places_either_leg(self):
+        position = {
+            'id': 801,
+            'base_asset': 'AI',
+            'spot_open_qty': 1127.0,
+            'future_open_qty': 1000.0,
+            'future_open_contracts': 999.0,
+            '_spot_excess_qty': 127.0,
+        }
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            position=position,
+        )
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['reason'], 'position_contract_multiplier_mismatch')
+        self.assertEqual(calls, [])
+
+    def test_low_notional_partially_selected_position_excess_never_places_either_leg(self):
+        position = {
+            'id': 801,
+            'base_asset': 'AI',
+            'spot_open_qty': 1200.0,
+            'future_open_qty': 1000.0,
+            'future_open_contracts': 1000.0,
+            '_spot_excess_qty': 127.0,
+        }
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            position=position,
+        )
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['reason'], 'position_spot_excess_not_fully_selected')
+        self.assertEqual(calls, [])
+
+    def test_low_notional_insufficient_binance_balance_never_places_gate_order(self):
+        remediator, _executor, _position, calls = self._build_low_notional_paired_trim_case(
+            available_qty=300.0,
+        )
+
+        result = remediator.remediate_binance_spot_desync(
+            'AI', 13910.0, 14037.0,
+            {'type': 'binance_spot_excess', 'mark_price': 0.0185},
+        )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(
+            result['reason'],
+            'spot_available_qty_insufficient_for_low_notional_repair',
+        )
+        self.assertEqual(calls, [])
+
+    def test_low_notional_paired_trim_persistence_reduces_both_local_legs_equally(self):
+        remediator, _executor, position, _calls = self._build_low_notional_paired_trim_case()
+        remediator._persist_low_notional_paired_trim = (
+            ExchangeDesyncRemediator._persist_low_notional_paired_trim.__get__(remediator)
+        )
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        context = MagicMock()
+        context.__enter__.return_value = connection
+        context.__exit__.return_value = False
+
+        with patch(
+            'calc.exchange_desync_remediator.db_manager.get_connection',
+            return_value=context,
+        ):
+            result = remediator._persist_low_notional_paired_trim(
+                positions=[position],
+                excess_qty=127.0,
+                paired_contracts=200,
+                multiplier=1.0,
+                future_order={
+                    'order_uuid': 'repair-1',
+                    'base_asset': 'AI',
+                    'market_type': 'future',
+                    'future_contract': 'AI_USDT',
+                },
+                future_result={
+                    'exec_qty': 200.0,
+                    'exec_price': 0.018685,
+                    'exec_amount': 3.737,
+                },
+                spot_order={
+                    'order_uuid': 'repair-1',
+                    'base_asset': 'AI',
+                    'market_type': 'spot',
+                    'spot_symbol': 'AIUSDT',
+                },
+                spot_result={
+                    'exec_qty': 327.0,
+                    'exec_price': 0.0184,
+                    'exec_amount': 6.0168,
+                },
+                reason='对账兜底小额净敞口合并减仓',
+                now=datetime(2026, 8, 29, 12, 0, 0),
+            )
+
+        self.assertEqual(result['spot_qty'], 327.0)
+        self.assertEqual(result['future_qty'], 200.0)
+        self.assertEqual(position['spot_open_qty'], 800.0)
+        self.assertEqual(position['future_open_qty'], 800.0)
+        self.assertEqual(position['future_open_contracts'], 800.0)
+        self.assertEqual(position['exchange_risk_status'], 'resolved')
+        sql_calls = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertEqual(sum('INSERT INTO mi_trade_order' in sql for sql in sql_calls), 2)
+        self.assertEqual(sum('UPDATE mi_trade_position' in sql for sql in sql_calls), 1)
+
     def test_insufficient_available_spot_requests_fast_retry_without_order(self):
         executor = MagicMock()
         executor.spot_meta = {'TUT': {'step_size': 1}}

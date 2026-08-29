@@ -981,7 +981,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         executor._place_binance_spot_order.assert_not_called()
         executor._place_gate_futures_order.assert_not_called()
 
-    def test_take_profit_protective_ioc_hedges_gate_partial_fill_by_position_ratio(self):
+    def test_take_profit_protective_fok_defensively_hedges_reported_fill_by_position_ratio(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
         calls = []
@@ -1030,19 +1030,20 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                 'trade_direction': 'buy',
                 'target_qty': 493.0,
                 'protective_price': 0.119,
+                'time_in_force': 'fok',
             },
         }, {})
 
         self.assertTrue(result['success'])
         self.assertEqual(calls, ['future', 'spot'])
 
-    def test_take_profit_protective_ioc_zero_fill_does_not_touch_spot(self):
+    def test_take_profit_protective_fok_zero_fill_does_not_touch_spot(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
         executor = RealExecutor(ExchangeConfig(), contract_meta={}, spot_meta={})
         executor._place_gate_futures_order = MagicMock(return_value={
             'success': False,
-            'reason': 'IOC未成交(fill=0, finish_as=ioc)',
+            'reason': 'FOK未成交(fill=0, finish_as=fok)',
         })
         executor._place_binance_spot_order = MagicMock()
 
@@ -1062,6 +1063,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                 'trade_direction': 'buy',
                 'target_qty': 297.0,
                 'protective_price': 0.69195,
+                'time_in_force': 'fok',
             },
         }, {})
 
@@ -1204,7 +1206,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         gate_order = executor._place_gate_futures_order.call_args.args[0]
         self.assertEqual(gate_order['protective_price'], 0.121)
 
-    def test_gate_take_profit_protective_ioc_uses_nonzero_limit_and_reduce_only(self):
+    def test_gate_take_profit_protective_fok_uses_nonzero_limit_and_reduce_only(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
 
         class FakeResponse:
@@ -1239,13 +1241,39 @@ class TestRealExecutorGateParsing(unittest.TestCase):
             'trade_direction': 'buy',
             'target_qty': 297.0,
             'protective_price': 0.69195,
+            'time_in_force': 'fok',
         })
 
         self.assertTrue(result['success'])
         body = json.loads(executor._session.post.call_args.kwargs['data'])
         self.assertNotEqual(body['price'], '0')
-        self.assertEqual(body['tif'], 'ioc')
+        self.assertEqual(body['tif'], 'fok')
         self.assertTrue(body['reduce_only'])
+
+    def test_gate_protective_order_rejects_unknown_time_in_force_before_http(self):
+        from calc.real_executor import RealExecutor, ExchangeConfig
+
+        executor = RealExecutor(
+            ExchangeConfig(gate_base_url='https://gate.test'),
+            contract_meta={'EPIC': {'quanto_multiplier': 1.0}},
+            spot_meta={},
+        )
+        executor._session = MagicMock()
+
+        result = executor._place_gate_futures_order({
+            'order_uuid': 'abcdef123456',
+            'base_asset': 'EPIC',
+            'future_contract': 'EPIC_USDT',
+            'order_side': 'close',
+            'trade_direction': 'buy',
+            'target_qty': 297.0,
+            'protective_price': 0.69195,
+            'time_in_force': 'gtc',
+        })
+
+        self.assertFalse(result['success'])
+        self.assertIn('TIF无效', result['reason'])
+        executor._session.post.assert_not_called()
 
     def test_gate_risk_close_uses_market_ioc_and_reduce_only(self):
         from calc.real_executor import RealExecutor, ExchangeConfig
@@ -5087,7 +5115,7 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertIn('鲜度(gate=', detail)
         self.assertNotIn('鲜度(NA)', detail)
         self.assertIn('旁路✓', detail)
-        self.assertIn('保护IOC', detail)
+        self.assertIn('保护FOK', detail)
         self.assertAlmostEqual(
             execute_mock.call_args.kwargs['future_protective_price'],
             100.05,
@@ -6518,6 +6546,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         }, close_reason='negative_funding_exit', future_protective_price=1.01)
 
         self.assertEqual(group['future_order']['protective_price'], 1.01)
+        self.assertEqual(group['future_order']['time_in_force'], 'fok')
         self.assertTrue(group['allow_protective_close'])
 
     def test_close_order_target_amount_uses_target_qty_and_close_vwap(self):
@@ -6732,7 +6761,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertTrue(eval_.aging_blocked_by_funding)
         self.assertEqual(eval_.threshold_bps, 200.0)
 
-    def test_take_profit_close_adds_protective_ioc_without_maker(self):
+    def test_take_profit_close_adds_protective_fok_without_maker(self):
         group = self.ce._build_close_order_group({
             'base_asset': 'BTC',
             'spot_open_qty': 0.99,
@@ -6742,9 +6771,84 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
 
         future_order = group['future_order']
         self.assertEqual(future_order['protective_price'], 100.05)
+        self.assertEqual(future_order['time_in_force'], 'fok')
         self.assertNotIn('execution_style', future_order)
         self.assertFalse(any(str(key).startswith('maker_') for key in future_order))
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
+
+    def test_protective_fok_uses_buffered_tradeable_slice(self):
+        self.ce.spot_meta = {'BTC': {'min_notional': 5.0}}
+        self.ce.protective_fok_chunk_notional_usdt = 10.0
+        self.ce.protective_fok_min_notional_buffer_ratio = 1.2
+        group = self.ce._build_close_order_group({
+            'base_asset': 'BTC',
+            'spot_open_qty': 100.0,
+            'spot_open_price': 1.0,
+            'future_open_qty': 100.0,
+            'future_open_price': 1.01,
+            'future_open_contracts': 100,
+            'future_contract': 'BTC_USDT',
+        }, close_reason='take_profit', future_protective_price=1.02)
+
+        self.assertEqual(group['spot_order']['target_qty'], 10.0)
+        self.assertEqual(group['future_order']['target_qty'], 10.0)
+        self.assertEqual(group['future_order']['target_contracts'], 10.0)
+        self.assertEqual(group['future_order']['time_in_force'], 'fok')
+
+    def test_protective_fok_absorbs_tail_below_buffered_min_notional(self):
+        self.ce.spot_meta = {'BTC': {'min_notional': 5.0}}
+        self.ce.protective_fok_chunk_notional_usdt = 10.0
+        self.ce.protective_fok_min_notional_buffer_ratio = 1.2
+        group = self.ce._build_close_order_group({
+            'base_asset': 'BTC',
+            'spot_open_qty': 15.0,
+            'spot_open_price': 1.0,
+            'future_open_qty': 15.0,
+            'future_open_price': 1.01,
+            'future_open_contracts': 15,
+            'future_contract': 'BTC_USDT',
+        }, close_reason='take_profit', future_protective_price=1.02)
+
+        self.assertEqual(group['spot_order']['target_qty'], 15.0)
+        self.assertEqual(group['future_order']['target_qty'], 15.0)
+        self.assertEqual(group['future_order']['target_contracts'], 15.0)
+
+    def test_protective_fok_rounds_slice_to_whole_gate_contracts(self):
+        self.ce.spot_meta = {'BTC': {'min_notional': 5.0}}
+        self.ce.protective_fok_chunk_notional_usdt = 10.0
+        group = self.ce._build_close_order_group({
+            'base_asset': 'BTC',
+            'spot_open_qty': 50.0,
+            'spot_open_price': 0.37,
+            'future_open_qty': 50.0,
+            'future_open_price': 0.38,
+            'future_open_contracts': 20,
+            'future_contract': 'BTC_USDT',
+        }, close_reason='take_profit', future_protective_price=0.39)
+
+        self.assertEqual(group['future_order']['target_contracts'], 11.0)
+        self.assertAlmostEqual(group['spot_order']['target_qty'], 27.5)
+        self.assertAlmostEqual(group['future_order']['target_qty'], 27.5)
+
+    def test_filled_fok_slice_keeps_balanced_position_remainder(self):
+        pos = self._bel_close_position(qty=100.0)
+        order_group = self._bel_close_order_group(qty=10.0)
+        cursor, triggered = self._record_save_close(
+            pos,
+            order_group,
+            self._close_exec_result(10.0, 10.0),
+        )
+
+        updates = [
+            params for sql, params in cursor.calls
+            if 'spot_open_qty = %(spot_open_qty)s' in sql
+        ]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]['spot_open_qty'], 90.0)
+        self.assertEqual(updates[0]['future_open_qty'], 90.0)
+        self.assertEqual(updates[0]['future_open_contracts'], 90.0)
+        self.assertFalse(any("status            = 'closed'" in sql for sql, _ in cursor.calls))
+        self.assertEqual(triggered, [('close_partial_fill', 'BEL')])
 
     def test_margin_close_uses_gate_market_first_without_protective_ioc(self):
         group = self.ce._build_close_order_group({
@@ -6757,6 +6861,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         future_order = group['future_order']
         self.assertNotIn('execution_style', future_order)
         self.assertNotIn('protective_price', future_order)
+        self.assertNotIn('time_in_force', future_order)
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
 
     def test_risk_close_reasons_use_gate_market_first_without_maker_or_protective_ioc(self):
@@ -6772,6 +6877,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
                 future_order = group['future_order']
                 self.assertNotIn('execution_style', future_order)
                 self.assertNotIn('protective_price', future_order)
+                self.assertNotIn('time_in_force', future_order)
                 self.assertEqual(group['execution_sequence'], 'future_then_spot')
                 self.assertEqual(group['execution_reason'], reason)
 
@@ -6786,6 +6892,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         future_order = group['future_order']
         self.assertNotIn('execution_style', future_order)
         self.assertNotIn('protective_price', future_order)
+        self.assertNotIn('time_in_force', future_order)
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
 
 

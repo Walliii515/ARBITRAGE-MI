@@ -4,6 +4,7 @@
 Gate futures 被 ADL 自动减仓后，本地 holding 仍对应 Binance spot 多头。
 本模块由实时 Gate 风险事件触发，自动卖出对应 spot，关闭本地持仓。
 """
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -43,6 +44,9 @@ class ExchangeDesyncRemediationConfig:
     future_close_fee: float = 0.0002
     future_taker_open_fee: float = 0.0005
     future_taker_close_fee: float = 0.0005
+    low_notional_buffer_ratio: float = 1.2
+    low_notional_fok_slippage_bps: float = 100.0
+    low_notional_retry_cooldown_sec: float = 300.0
 
 
 def _float(value, default: float = 0.0) -> float:
@@ -85,6 +89,7 @@ class ExchangeDesyncRemediator:
         self.executor = executor
         self.cfg = cfg
         self._position_columns_cache: Optional[set[str]] = None
+        self._low_notional_retry_after: Dict[str, datetime] = {}
 
     @_guard_asset_reduction('reconciliation_gate_missing')
     def remediate_gate_short_desync(
@@ -1447,6 +1452,25 @@ class ExchangeDesyncRemediator:
             bool(explained_positions)
             and explained_qty + allocation_tolerance > target_qty
         )
+        min_notional = max(
+            0.0,
+            _float(
+                ((getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {}).get(
+                    'min_notional'
+                )
+            ),
+        )
+        if min_notional > 0 and target_qty * price_hint + 1e-9 < min_notional:
+            return self._remediate_low_notional_binance_excess(
+                base_asset=base_asset,
+                target_qty=target_qty,
+                available_qty=available_qty,
+                price_hint=price_hint,
+                min_notional=min_notional,
+                risk=risk,
+                positions=explained_positions,
+                explained_qty=explained_qty,
+            )
         order = {
             'order_uuid': order_uuid,
             'position_id': None,
@@ -1660,6 +1684,456 @@ class ExchangeDesyncRemediator:
             'reason': allocation_error or (result.get('reason') if not success else None),
         }
 
+    def _remediate_low_notional_binance_excess(
+        self,
+        *,
+        base_asset: str,
+        target_qty: float,
+        available_qty: float,
+        price_hint: float,
+        min_notional: float,
+        risk: Dict,
+        positions: List[Dict],
+        explained_qty: float,
+    ) -> Dict:
+        """Clear a tiny spot excess by trimming a small matched hedge with Gate FOK first."""
+        now = datetime.now()
+        retry_after = self._low_notional_retry_after.get(base_asset)
+        if retry_after and now < retry_after:
+            return {
+                'attempted': False,
+                'success': False,
+                'action': 'wait_low_notional_paired_trim',
+                'base_asset': base_asset,
+                'target_qty': target_qty,
+                'reason': 'low_notional_retry_cooldown',
+                'retry_after': retry_after,
+            }
+
+        def defer(reason: str, *, attempted: bool = False, **extra) -> Dict:
+            cooldown = max(0.0, float(self.cfg.low_notional_retry_cooldown_sec or 0.0))
+            self._low_notional_retry_after[base_asset] = now + timedelta(seconds=cooldown)
+            logger.warning(
+                "Binance小额净敞口等待安全合并减仓 | %s | qty=%s | reason=%s",
+                base_asset,
+                target_qty,
+                reason,
+            )
+            return {
+                'attempted': attempted,
+                'success': False,
+                'action': 'wait_low_notional_paired_trim',
+                'base_asset': base_asset,
+                'target_qty': target_qty,
+                'reason': reason,
+                'retry_needed': False,
+                **extra,
+            }
+
+        if str(risk.get('type') or '') != 'binance_spot_excess':
+            return defer('low_notional_excess_not_pairable')
+        tolerance = self._spot_qty_tolerance(base_asset)
+        if not positions or explained_qty + tolerance <= target_qty:
+            return defer('low_notional_excess_not_fully_explained')
+
+        multiplier = self._quanto_multiplier(base_asset)
+        if multiplier <= 0:
+            return defer('missing_contract_multiplier')
+        available_contracts = 0
+        for pos in positions:
+            spot_qty = max(0.0, _float(pos.get('spot_open_qty')))
+            future_qty = max(0.0, _float(pos.get('future_open_qty')))
+            selected_excess = max(0.0, _float(pos.get('_spot_excess_qty')))
+            actual_excess = max(0.0, spot_qty - future_qty)
+            if abs(selected_excess - actual_excess) >= tolerance:
+                return defer(
+                    'position_spot_excess_not_fully_selected',
+                    position_id=pos.get('id'),
+                    selected_excess=selected_excess,
+                    actual_excess=actual_excess,
+                )
+            contracts = abs(_float(pos.get('future_open_contracts')))
+            rounded = int(round(contracts))
+            if rounded <= 0 or abs(contracts - rounded) > 1e-8:
+                return defer(
+                    'invalid_position_contract_count',
+                    position_id=pos.get('id'),
+                    future_open_contracts=contracts,
+                )
+            expected_future_qty = rounded * multiplier
+            if abs(future_qty - expected_future_qty) >= tolerance:
+                return defer(
+                    'position_contract_multiplier_mismatch',
+                    position_id=pos.get('id'),
+                    future_open_qty=future_qty,
+                    expected_future_qty=expected_future_qty,
+                    quanto_multiplier=multiplier,
+                )
+            available_contracts += rounded
+        mark_price = _float(risk.get('mark_price') or risk.get('future_close_price'))
+        if price_hint <= 0 or mark_price <= 0:
+            return defer('missing_low_notional_repair_price')
+
+        spot_meta = ((getattr(self.executor, 'spot_meta', {}) or {}).get(base_asset) or {})
+        step_size = max(0.0, _float(spot_meta.get('step_size')))
+        buffered_notional = min_notional * max(
+            1.0,
+            float(self.cfg.low_notional_buffer_ratio or 1.0),
+        )
+        minimum_sale_qty = buffered_notional / price_hint
+        if step_size > 0:
+            minimum_sale_qty = math.ceil(
+                minimum_sale_qty / step_size - 1e-12
+            ) * step_size
+
+        required_pair_qty = max(0.0, minimum_sale_qty - target_qty)
+        required_contracts = max(1, int(math.ceil(required_pair_qty / multiplier - 1e-12)))
+        while (
+            target_qty + required_contracts * multiplier
+        ) * price_hint + 1e-9 < buffered_notional:
+            required_contracts += 1
+        if required_contracts > available_contracts:
+            return defer(
+                'insufficient_matched_gate_position_for_low_notional_repair',
+                required_contracts=required_contracts,
+                available_contracts=available_contracts,
+            )
+
+        paired_qty = required_contracts * multiplier
+        combined_spot_qty = target_qty + paired_qty
+        if available_qty + 1e-9 < combined_spot_qty:
+            return defer(
+                'spot_available_qty_insufficient_for_low_notional_repair',
+                required_spot_qty=combined_spot_qty,
+                available_qty=available_qty,
+            )
+
+        order_uuid = str(uuid.uuid4())
+        protective_price = mark_price * (
+            1.0 + max(0.0, float(self.cfg.low_notional_fok_slippage_bps or 0.0)) / 10000.0
+        )
+        reason = (
+            f"对账兜底小额净敞口合并减仓|asset={base_asset}|"
+            f"excess={target_qty:g}|paired={paired_qty:g}|spot_total={combined_spot_qty:g}|"
+            f"min_notional={min_notional:g}"
+        )
+        future_order = {
+            'order_uuid': order_uuid,
+            'position_id': None,
+            'base_asset': base_asset,
+            'spot_symbol': None,
+            'future_contract': risk.get('contract') or f'{base_asset}_USDT',
+            'order_side': 'close',
+            'market_type': 'future',
+            'trade_direction': 'buy',
+            'target_qty': paired_qty,
+            'target_contracts': required_contracts,
+            'target_amount': paired_qty * protective_price,
+            'protective_price': protective_price,
+            'time_in_force': 'fok',
+        }
+        future_result = dict(self.executor.place_gate_futures_order(future_order) or {})
+        if not future_result.get('success'):
+            return defer(
+                future_result.get('reason') or 'low_notional_gate_fok_failed',
+                attempted=True,
+                exchange_order_submitted=True,
+                future_result=future_result,
+            )
+        future_exec_qty = max(0.0, _float(future_result.get('exec_qty')))
+        gate_exec_tolerance = max(1e-8, multiplier * 1e-8)
+        if abs(future_exec_qty - paired_qty) > gate_exec_tolerance:
+            return defer(
+                f'low_notional_gate_fok_qty_mismatch:{future_exec_qty:g}!={paired_qty:g}',
+                attempted=True,
+                exchange_order_submitted=True,
+                future_result=future_result,
+                retry_needed=True,
+            )
+
+        spot_order = {
+            'order_uuid': order_uuid,
+            'position_id': None,
+            'base_asset': base_asset,
+            'spot_symbol': f'{base_asset}USDT',
+            'future_contract': risk.get('contract') or f'{base_asset}_USDT',
+            'order_side': 'close',
+            'market_type': 'spot',
+            'trade_direction': 'sell',
+            'target_qty': combined_spot_qty,
+            'target_amount': combined_spot_qty * price_hint,
+        }
+        spot_result = dict(self._place_binance_spot_reduction(spot_order) or {})
+        spot_exec_qty = max(0.0, _float(spot_result.get('exec_qty')))
+        spot_exec_tolerance = max(1e-8, step_size * 1e-8)
+        if (
+            not spot_result.get('success')
+            or abs(spot_exec_qty - combined_spot_qty) > spot_exec_tolerance
+        ):
+            return defer(
+                spot_result.get('reason') or (
+                    f'low_notional_spot_qty_mismatch:{spot_exec_qty:g}!={combined_spot_qty:g}'
+                ),
+                attempted=True,
+                exchange_order_submitted=True,
+                future_result=future_result,
+                spot_result=spot_result,
+                retry_needed=True,
+            )
+
+        try:
+            allocation = self._persist_low_notional_paired_trim(
+                positions=positions,
+                excess_qty=target_qty,
+                paired_contracts=required_contracts,
+                multiplier=multiplier,
+                future_order=future_order,
+                future_result=future_result,
+                spot_order=spot_order,
+                spot_result=spot_result,
+                reason=reason,
+                now=now,
+            )
+        except Exception as exc:
+            logger.exception("小额净敞口已成交但本地分配失败 | %s", base_asset)
+            return defer(
+                f'low_notional_local_allocation_failed:{exc}',
+                attempted=True,
+                exchange_order_submitted=True,
+                future_result=future_result,
+                spot_result=spot_result,
+                retry_needed=True,
+            )
+
+        self._low_notional_retry_after.pop(base_asset, None)
+        logger.warning(
+            "Binance小额净敞口合并减仓完成 | %s | excess=%s | paired=%s | spot=%s",
+            base_asset,
+            target_qty,
+            paired_qty,
+            combined_spot_qty,
+        )
+        return {
+            'attempted': True,
+            'exchange_order_submitted': True,
+            'success': True,
+            'action': 'paired_trim_low_notional_binance_excess',
+            'base_asset': base_asset,
+            'target_qty': target_qty,
+            'paired_qty': paired_qty,
+            'spot_exec_qty': spot_exec_qty,
+            'future_result': future_result,
+            'spot_result': spot_result,
+            'allocation': allocation,
+            'retry_needed': False,
+        }
+
+    def _persist_low_notional_paired_trim(
+        self,
+        *,
+        positions: List[Dict],
+        excess_qty: float,
+        paired_contracts: int,
+        multiplier: float,
+        future_order: Dict,
+        future_result: Dict,
+        spot_order: Dict,
+        spot_result: Dict,
+        reason: str,
+        now: datetime,
+    ) -> Dict:
+        """Allocate one paired repair to the exact broken rows in a single DB transaction."""
+        remaining_excess = excess_qty
+        remaining_contracts = int(paired_contracts)
+        allocations = []
+        tolerance = self._spot_qty_tolerance(str(spot_order.get('base_asset') or ''))
+
+        for pos in positions:
+            excess = min(max(0.0, _float(pos.get('_spot_excess_qty'))), remaining_excess)
+            available_contracts = int(round(abs(_float(pos.get('future_open_contracts')))))
+            contract_qty = min(available_contracts, remaining_contracts)
+            paired_qty = contract_qty * multiplier
+            spot_qty = excess + paired_qty
+            if spot_qty <= 0 and contract_qty <= 0:
+                continue
+            allocations.append({
+                'pos': pos,
+                'excess_qty': excess,
+                'paired_contracts': contract_qty,
+                'paired_qty': paired_qty,
+                'spot_qty': spot_qty,
+            })
+            remaining_excess = max(0.0, remaining_excess - excess)
+            remaining_contracts -= contract_qty
+        if remaining_excess >= tolerance or remaining_contracts != 0:
+            raise ValueError(
+                f'paired_trim_allocation_shortfall:excess={remaining_excess:g},'
+                f'contracts={remaining_contracts}'
+            )
+
+        total_spot_qty = sum(item['spot_qty'] for item in allocations)
+        total_future_qty = sum(item['paired_qty'] for item in allocations)
+        closed_positions = []
+        with db_manager.get_connection() as connection:
+            cursor = connection.cursor()
+            try:
+                for item in allocations:
+                    pos = item['pos']
+                    spot_ratio = item['spot_qty'] / total_spot_qty
+                    future_ratio = item['paired_qty'] / total_future_qty
+                    allocated_spot_result = self._proportional_execution_result(
+                        spot_result, spot_ratio, item['spot_qty']
+                    )
+                    allocated_future_result = self._proportional_execution_result(
+                        future_result, future_ratio, item['paired_qty']
+                    )
+                    self._insert_allocated_close_order(
+                        self._paired_trim_order_payload(
+                            pos,
+                            spot_order,
+                            allocated_spot_result,
+                            item['spot_qty'],
+                            reason,
+                            now,
+                        ),
+                        cursor=cursor,
+                    )
+                    if item['paired_qty'] > 0:
+                        self._insert_allocated_close_order(
+                            self._paired_trim_order_payload(
+                                pos,
+                                future_order,
+                                allocated_future_result,
+                                item['paired_qty'],
+                                reason,
+                                now,
+                            ),
+                            cursor=cursor,
+                        )
+
+                    spot_remaining = max(0.0, _float(pos.get('spot_open_qty')) - item['spot_qty'])
+                    future_remaining = max(0.0, _float(pos.get('future_open_qty')) - item['paired_qty'])
+                    contracts_remaining = max(
+                        0.0,
+                        abs(_float(pos.get('future_open_contracts'))) - item['paired_contracts'],
+                    )
+                    balanced = abs(spot_remaining - future_remaining) < tolerance
+                    if not balanced:
+                        raise ValueError(
+                            f'paired_trim_unbalanced_position:{pos.get("id")}: '
+                            f'{spot_remaining:g}!={future_remaining:g}'
+                        )
+                    closed = spot_remaining < tolerance and future_remaining < tolerance
+                    cursor.execute(
+                        """
+                        UPDATE mi_trade_position
+                        SET spot_open_qty = %(spot_qty)s,
+                            spot_open_amount = %(spot_amount)s,
+                            future_open_qty = %(future_qty)s,
+                            future_open_contracts = %(future_contracts)s,
+                            status = %(status)s,
+                            closed_at = CASE WHEN %(closed)s = 1 THEN %(now)s ELSE closed_at END,
+                            close_reason = CONCAT(COALESCE(close_reason, ''), '|', %(reason)s),
+                            exchange_risk_status = 'resolved',
+                            exchange_risk_type = NULL,
+                            exchange_risk_at = %(now)s,
+                            exchange_risk_detail = CONCAT(
+                                COALESCE(exchange_risk_detail, ''),
+                                '|小额净敞口合并减仓后已平衡'
+                            )
+                        WHERE id = %(position_id)s
+                          AND status = 'holding'
+                        """,
+                        {
+                            'spot_qty': 0.0 if closed else spot_remaining,
+                            'spot_amount': 0.0 if closed else (
+                                spot_remaining * _float(pos.get('spot_open_price'))
+                            ),
+                            'future_qty': 0.0 if closed else future_remaining,
+                            'future_contracts': 0.0 if closed else contracts_remaining,
+                            'status': 'closed' if closed else 'holding',
+                            'closed': 1 if closed else 0,
+                            'now': now,
+                            'reason': reason,
+                            'position_id': int(pos['id']),
+                        },
+                    )
+                    if int(cursor.rowcount or 0) != 1:
+                        raise ValueError(f'paired_trim_position_update_lost:{pos.get("id")}')
+                    pos['spot_open_qty'] = 0.0 if closed else spot_remaining
+                    pos['future_open_qty'] = 0.0 if closed else future_remaining
+                    pos['future_open_contracts'] = 0.0 if closed else contracts_remaining
+                    pos['exchange_risk_status'] = 'resolved'
+                    pos['exchange_risk_type'] = None
+                    if closed:
+                        pos['status'] = 'closed'
+                        closed_positions.append(pos)
+            finally:
+                cursor.close()
+
+        for pos in closed_positions:
+            self._refresh_closed_position_pnl(pos)
+        return {
+            'position_count': len(allocations),
+            'closed_position_count': len(closed_positions),
+            'spot_qty': total_spot_qty,
+            'future_qty': total_future_qty,
+        }
+
+    @staticmethod
+    def _proportional_execution_result(result: Dict, ratio: float, qty: float) -> Dict:
+        allocated = dict(result)
+        allocated['exec_qty'] = qty
+        allocated['exec_amount'] = max(0.0, _float(result.get('exec_amount'))) * ratio
+        for key in ('fee_amount', 'fee_amount_usdt'):
+            if result.get(key) is not None:
+                allocated[key] = _float(result.get(key)) * ratio
+        return allocated
+
+    def _paired_trim_order_payload(
+        self,
+        pos: Dict,
+        order: Dict,
+        result: Dict,
+        qty: float,
+        reason: str,
+        now: datetime,
+    ) -> Dict:
+        market_type = str(order.get('market_type') or '')
+        fields = self._execution_fields(
+            'spot_order' if market_type == 'spot' else 'future_order',
+            order,
+            result,
+            True,
+        )
+        return {
+            'order_uuid': order.get('order_uuid'),
+            'position_id': int(pos['id']),
+            'base_asset': str(pos.get('base_asset') or '').upper(),
+            'spot_symbol': pos.get('spot_symbol'),
+            'future_contract': pos.get('future_contract'),
+            'order_side': 'close',
+            'market_type': market_type,
+            'trade_direction': 'sell' if market_type == 'spot' else 'buy',
+            'leverage': 1.0 if market_type == 'spot' else 0.0,
+            'status': 'executed',
+            'channel': 'Live',
+            'reject_reason': reason,
+            'target_qty': qty,
+            'target_amount': max(0.0, _float(result.get('exec_amount'))),
+            'exec_price': result.get('exec_price'),
+            'exec_qty': qty,
+            'exec_amount': result.get('exec_amount'),
+            'coverage_ratio': result.get('coverage_ratio') or 0.0,
+            'liquidity_role': fields.get('liquidity_role'),
+            'fee_rate': fields.get('fee_rate'),
+            'fee_amount': fields.get('fee_amount'),
+            'fee_amount_usdt': fields.get('fee_amount_usdt'),
+            'fee_asset': fields.get('fee_asset'),
+            'exchange_order_id': fields.get('exchange_order_id'),
+            'executed_at': now,
+        }
+
     @_guard_asset_reduction('reconciliation_spot_only')
     def remediate_binance_spot_only_exposure(
         self,
@@ -1739,10 +2213,9 @@ class ExchangeDesyncRemediator:
         }
 
     def _estimate_binance_spot_price(self, base_asset: str, risk: Dict) -> float:
-        for key in ('spot_price', 'mark_price', 'future_close_price'):
-            price = _float(risk.get(key))
-            if price > 0:
-                return price
+        spot_price = _float(risk.get('spot_price'))
+        if spot_price > 0:
+            return spot_price
         getter = getattr(self.executor, '_get_binance_usdt_price', None)
         if callable(getter):
             try:
@@ -1751,6 +2224,10 @@ class ExchangeDesyncRemediator:
                     return price
             except Exception:
                 logger.debug("Binance spot price estimate failed | %s", base_asset, exc_info=True)
+        for key in ('mark_price', 'future_close_price'):
+            price = _float(risk.get(key))
+            if price > 0:
+                return price
         return 0.0
 
     def _below_spot_min_notional(self, pos: Dict, target_qty: float) -> Optional[str]:

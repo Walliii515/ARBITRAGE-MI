@@ -139,16 +139,27 @@ class ClosingExecutor:
             config.get_float('trade.close.delist_risk_exit_days', 2.0),
             0.0,
         )
-        self.take_profit_protective_ioc_enabled = config.get_bool(
-            'trade.close.take_profit_protective_ioc_enabled',
+        self.protective_fok_enabled = config.get_bool(
+            'trade.close.protective_fok_enabled',
             True,
         )
-        self.take_profit_protective_ioc_slippage_bps = max(
+        self.protective_fok_slippage_bps = max(
             config.get_float(
-                'trade.close.take_profit_protective_ioc_slippage_bps',
+                'trade.close.protective_fok_slippage_bps',
                 5.0,
             ),
             0.0,
+        )
+        self.protective_fok_chunk_notional_usdt = max(
+            config.get_float('trade.close.protective_fok_chunk_notional_usdt', 10.0),
+            0.0,
+        )
+        self.protective_fok_min_notional_buffer_ratio = max(
+            config.get_float(
+                'trade.close.protective_fok_min_notional_buffer_ratio',
+                1.2,
+            ),
+            1.0,
         )
         # 手续费率（用于止盈阈值计算）
         self.fee_spot_open = config.get_float('trade.fee.spot_open', 0.00075)
@@ -1001,19 +1012,20 @@ class ClosingExecutor:
                     continue
             future_protective_price = None
             protective_close = close_reason in {'take_profit', 'negative_funding_exit'}
-            if protective_close and self.take_profit_protective_ioc_enabled:
+            if protective_close and self.protective_fok_enabled:
                 future_protective_price = self._future_close_protective_price(
                     orderbook_row,
-                    self.take_profit_protective_ioc_slippage_bps,
+                    self.protective_fok_slippage_bps,
                 )
                 if future_protective_price is None:
-                    logger.info(f"保护IOC缺少有效价格，跳过本轮 | {ba} | reason={close_reason}")
+                    logger.info(f"保护FOK缺少有效价格，跳过本轮 | {ba} | reason={close_reason}")
                     self._close_cooldown[ba] = datetime.now()
                     continue
                 close_reason_detail = (
-                    f"{close_reason_detail}|保护IOC("
+                    f"{close_reason_detail}|保护FOK("
                     f"future_buy≤{future_protective_price},"
-                    f"slip≤{self.take_profit_protective_ioc_slippage_bps:.1f}bps)"
+                    f"slip≤{self.protective_fok_slippage_bps:.1f}bps,"
+                    f"chunk≈{self.protective_fok_chunk_notional_usdt:.1f}U)"
                 )
             try:
                 result = self._execute_close(
@@ -2597,6 +2609,14 @@ class ClosingExecutor:
         future_contract = pos.get('future_contract', '')
         spot_target_qty = float(pos.get('spot_open_qty') or 0)
         future_target_qty = float(pos.get('future_open_qty') or 0)
+        future_open_contracts = abs(_float_or_none(pos.get('future_open_contracts')) or 0.0)
+        target_contracts = future_open_contracts
+        if future_protective_price is not None:
+            (
+                spot_target_qty,
+                future_target_qty,
+                target_contracts,
+            ) = self._protective_fok_slice(pos, orderbook_row or {})
         spot_target_amount = self._close_leg_target_amount(
             spot_target_qty,
             orderbook_row,
@@ -2635,11 +2655,11 @@ class ClosingExecutor:
             'target_qty': future_target_qty,
             'target_amount': future_target_amount,
         }
-        future_open_contracts = abs(_float_or_none(pos.get('future_open_contracts')) or 0.0)
-        if future_open_contracts > 0:
-            future_order['target_contracts'] = future_open_contracts
+        if target_contracts > 0:
+            future_order['target_contracts'] = target_contracts
         if future_protective_price is not None:
             future_order['protective_price'] = future_protective_price
+            future_order['time_in_force'] = 'fok'
         order_group = {
             'order_uuid': order_uuid,
             'base_asset': ba,
@@ -2652,6 +2672,63 @@ class ClosingExecutor:
             'allow_protective_close': future_protective_price is not None,
         }
         return order_group
+
+    def _protective_fok_slice(
+        self,
+        pos: Dict,
+        orderbook_row: Dict,
+    ) -> tuple[float, float, float]:
+        """Return one all-or-none close slice without leaving an untradable tail."""
+        base_asset = str(pos.get('base_asset') or '').upper()
+        spot_qty = max(0.0, _float_or_none(pos.get('spot_open_qty')) or 0.0)
+        future_qty = max(0.0, _float_or_none(pos.get('future_open_qty')) or 0.0)
+        contracts = abs(_float_or_none(pos.get('future_open_contracts')) or 0.0)
+        rounded_contracts = int(round(contracts))
+        if (
+            spot_qty <= CLOSE_QTY_TOLERANCE
+            or future_qty <= CLOSE_QTY_TOLERANCE
+            or rounded_contracts <= 0
+            or abs(contracts - rounded_contracts) > CLOSE_QTY_TOLERANCE
+        ):
+            return spot_qty, future_qty, contracts
+
+        price = self._spot_close_reference_price(pos, orderbook_row)
+        if price is None or price <= 0:
+            return spot_qty, future_qty, contracts
+
+        min_notional = max(
+            0.0,
+            _float_or_none((self.spot_meta.get(base_asset) or {}).get('min_notional')) or 0.0,
+        )
+        buffered_min_notional = min_notional * self.protective_fok_min_notional_buffer_ratio
+        chunk_notional = max(
+            self.protective_fok_chunk_notional_usdt,
+            buffered_min_notional,
+        )
+        full_notional = spot_qty * price
+        if chunk_notional <= 0 or full_notional <= chunk_notional + 1e-9:
+            return spot_qty, future_qty, float(rounded_contracts)
+
+        spot_per_contract = spot_qty / rounded_contracts
+        notional_per_contract = spot_per_contract * price
+        if notional_per_contract <= 0:
+            return spot_qty, future_qty, float(rounded_contracts)
+
+        slice_contracts = min(
+            rounded_contracts,
+            max(1, int(math.ceil(chunk_notional / notional_per_contract - 1e-12))),
+        )
+        remaining_contracts = rounded_contracts - slice_contracts
+        remaining_notional = remaining_contracts * notional_per_contract
+        if 0 < remaining_notional + 1e-9 < buffered_min_notional:
+            slice_contracts = rounded_contracts
+
+        ratio = slice_contracts / rounded_contracts
+        return (
+            spot_qty * ratio,
+            future_qty * ratio,
+            float(slice_contracts),
+        )
 
     @staticmethod
     def _close_leg_target_amount(
@@ -2898,11 +2975,22 @@ class ClosingExecutor:
             return None
 
     def _close_partial_fill_state(self, pos: Dict, order_group: Dict, exec_result: Dict) -> Dict:
-        spot_target = _float_or_none((order_group.get('spot_order') or {}).get('target_qty')) or 0.0
-        future_target = _float_or_none((order_group.get('future_order') or {}).get('target_qty')) or 0.0
+        spot_attempt_target = _float_or_none(
+            (order_group.get('spot_order') or {}).get('target_qty')
+        ) or 0.0
+        future_attempt_target = _float_or_none(
+            (order_group.get('future_order') or {}).get('target_qty')
+        ) or 0.0
+        spot_target = max(0.0, _float_or_none(pos.get('spot_open_qty')) or 0.0)
+        future_target = max(0.0, _float_or_none(pos.get('future_open_qty')) or 0.0)
         spot_exec = _float_or_none((exec_result.get('spot_order') or {}).get('exec_qty')) or 0.0
         future_exec = _float_or_none((exec_result.get('future_order') or {}).get('exec_qty')) or 0.0
-        if spot_target <= CLOSE_QTY_TOLERANCE or future_target <= CLOSE_QTY_TOLERANCE:
+        if (
+            spot_attempt_target <= CLOSE_QTY_TOLERANCE
+            or future_attempt_target <= CLOSE_QTY_TOLERANCE
+            or spot_target <= CLOSE_QTY_TOLERANCE
+            or future_target <= CLOSE_QTY_TOLERANCE
+        ):
             return {'partial': False}
         if spot_exec <= CLOSE_QTY_TOLERANCE or future_exec <= CLOSE_QTY_TOLERANCE:
             return {'partial': False}
@@ -2914,9 +3002,9 @@ class ClosingExecutor:
             return {'partial': False}
 
         remaining_contracts = self._remaining_future_contracts(pos, future_target, future_shortfall)
-        spot_fill_ratio = spot_exec / spot_target
-        future_fill_ratio = future_exec / future_target
-        expected_spot_exec = spot_target * future_fill_ratio
+        spot_fill_ratio = spot_exec / spot_attempt_target
+        future_fill_ratio = future_exec / future_attempt_target
+        expected_spot_exec = spot_attempt_target * future_fill_ratio
         spot_step = _float_or_none(
             (self.spot_meta.get(str(pos.get('base_asset') or '').upper()) or {}).get('step_size')
         ) or 0.0
@@ -2936,6 +3024,8 @@ class ClosingExecutor:
             'balanced': balanced,
             'spot_target': spot_target,
             'future_target': future_target,
+            'spot_attempt_target': spot_attempt_target,
+            'future_attempt_target': future_attempt_target,
             'spot_exec': spot_exec,
             'future_exec': future_exec,
             'spot_remaining': spot_shortfall,

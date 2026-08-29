@@ -47,6 +47,9 @@ class ReconciliationConfig:
     auto_remediate_min_spot_qty: float = 0.0
     auto_remediate_close_extra_gate_position: bool = True
     auto_remediate_binance_spot_position: bool = True
+    auto_remediate_low_notional_buffer_ratio: float = 1.2
+    auto_remediate_low_notional_fok_slippage_bps: float = 100.0
+    auto_remediate_low_notional_retry_cooldown_sec: float = 300.0
 
 
 def normalize_asset_set(values) -> Set[str]:
@@ -143,6 +146,15 @@ def build_default_reconciler() -> 'Reconciler':
         auto_remediate_binance_spot_position=config.get_bool(
             'reconciliation.auto_remediate.binance_spot_position', True
         ),
+        auto_remediate_low_notional_buffer_ratio=config.get_float(
+            'reconciliation.auto_remediate.low_notional_buffer_ratio', 1.2
+        ),
+        auto_remediate_low_notional_fok_slippage_bps=config.get_float(
+            'reconciliation.auto_remediate.low_notional_fok_slippage_bps', 100.0
+        ),
+        auto_remediate_low_notional_retry_cooldown_sec=config.get_float(
+            'reconciliation.auto_remediate.low_notional_retry_cooldown_sec', 300.0
+        ),
     )
     return Reconciler(executor, cfg)
 
@@ -167,6 +179,9 @@ class Reconciler:
                 future_close_fee=config.get_float('trade.fee.future_close', 0.0002),
                 future_taker_open_fee=config.get_float('trade.fee.future_taker_open', 0.0005),
                 future_taker_close_fee=config.get_float('trade.fee.future_taker_close', 0.0005),
+                low_notional_buffer_ratio=self.cfg.auto_remediate_low_notional_buffer_ratio,
+                low_notional_fok_slippage_bps=self.cfg.auto_remediate_low_notional_fok_slippage_bps,
+                low_notional_retry_cooldown_sec=self.cfg.auto_remediate_low_notional_retry_cooldown_sec,
             ),
         )
 
