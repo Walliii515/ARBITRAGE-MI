@@ -100,17 +100,8 @@ def _execution_values(
     return values
 
 
-def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
-    """
-    用真实成交额计算正向套利已经双边成交的收益。
-
-    部分平仓时，仅确认两腿均已成交的最小数量；开仓成交额按该数量
-    按比例分摊。这样既不遗漏已落袋收益，也不会把单腿残差误算成套利收益。
-    """
-    values = _execution_values(pos, orders, allow_position_fallback=False)
-    if values is None:
-        return None
-
+def compute_matched_close_pnl(values: Dict) -> Optional[Dict]:
+    """Calculate spread PnL for the quantity executed on both close legs."""
     spot_open = values['spot_open']
     spot_close = values['spot_close']
     future_open = values['future_open']
@@ -163,6 +154,17 @@ def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Di
         'realized_pnl_bps': round(realized_pnl / open_notional * 10000, 4),
         'close_spread_bps': round(close_spread_bps, 4) if close_spread_bps is not None else None,
     }
+
+
+def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
+    """
+    用真实成交额计算正向套利已经双边成交的收益。
+
+    部分平仓时，仅确认两腿均已成交的最小数量；开仓成交额按该数量
+    按比例分摊。这样既不遗漏已落袋收益，也不会把单腿残差误算成套利收益。
+    """
+    values = _execution_values(pos, orders, allow_position_fallback=False)
+    return compute_matched_close_pnl(values) if values is not None else None
 
 
 def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:

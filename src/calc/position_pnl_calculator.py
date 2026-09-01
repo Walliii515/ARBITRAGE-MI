@@ -7,6 +7,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from calc.closed_position_pnl import compute_matched_close_pnl
 from calc.orderbook_enricher import calc_vwap_basis_bps
 
 
@@ -70,6 +71,10 @@ def _position_fee_rates(pos: Dict, cfg: PnlConfig) -> Tuple[float, float]:
 
 
 def _position_open_notional(pos: Dict, cfg: PnlConfig) -> float:
+    order_open_notional = _float_or_none(pos.get('original_spot_open_amount'))
+    if order_open_notional is not None and order_open_notional > 0:
+        return order_open_notional
+
     configured_at_open = _float_or_none(pos.get('open_amount_usdt'))
     if configured_at_open is not None and configured_at_open > 0:
         return configured_at_open
@@ -79,6 +84,81 @@ def _position_open_notional(pos: Dict, cfg: PnlConfig) -> float:
         return spot_amount
 
     return float(cfg.open_amount_usdt or 0.0)
+
+
+def _executed_close_realized_pnl(pos: Dict) -> float:
+    """Return matched two-leg realized spread PnL from partial close orders."""
+    pnl = compute_matched_close_pnl({
+        'spot_open': _float_or_none(pos.get('original_spot_open_amount')) or 0.0,
+        'spot_open_qty': _float_or_none(pos.get('original_spot_open_qty')) or 0.0,
+        'future_open': _float_or_none(pos.get('original_future_open_amount')) or 0.0,
+        'future_open_qty': _float_or_none(pos.get('original_future_open_qty')) or 0.0,
+        'spot_close': _float_or_none(pos.get('executed_spot_close_amount')) or 0.0,
+        'spot_close_qty': _float_or_none(pos.get('executed_spot_close_qty')) or 0.0,
+        'future_close': _float_or_none(pos.get('executed_future_close_amount')) or 0.0,
+        'future_close_qty': _float_or_none(pos.get('executed_future_close_qty')) or 0.0,
+    })
+    return float(pnl.get('realized_pnl') or 0.0) if pnl else 0.0
+
+
+def _known_fee_cost(pos: Dict, prefix: str) -> Optional[float]:
+    actual = _float_or_none(pos.get(f'{prefix}_fee_amount_usdt'))
+    estimated = _float_or_none(pos.get(f'{prefix}_fee_estimated_usdt'))
+    if actual is None and estimated is None:
+        return None
+    return (actual or 0.0) + (estimated or 0.0)
+
+
+def _projected_total_fee_bps(
+    pos: Dict,
+    cfg: PnlConfig,
+    open_notional: float,
+    current_spot: Optional[float],
+    current_future: Optional[float],
+) -> float:
+    """Executed fees plus the estimated cost to close only the remaining legs."""
+    if open_notional <= 0:
+        return 0.0
+
+    future_open_fee, future_close_fee = _position_fee_rates(pos, cfg)
+    future_open_notional = (
+        (_float_or_none(pos.get('original_future_open_amount')) or 0.0)
+        or (
+            (_float_or_none(pos.get('future_open_qty')) or 0.0)
+            * (_float_or_none(pos.get('future_open_price')) or 0.0)
+        )
+    )
+    known_spot_open_fee = _known_fee_cost(pos, 'spot_open')
+    known_future_open_fee = _known_fee_cost(pos, 'future_open')
+    open_fee_cost = (
+        known_spot_open_fee
+        if known_spot_open_fee is not None
+        else open_notional * cfg.spot_open_fee
+    ) + (
+        known_future_open_fee
+        if known_future_open_fee is not None
+        else future_open_notional * future_open_fee
+    )
+
+    executed_close_fee_cost = (
+        (_known_fee_cost(pos, 'spot_close') or 0.0)
+        + (_known_fee_cost(pos, 'future_close') or 0.0)
+    )
+    spot_remaining_notional = (
+        (_float_or_none(pos.get('spot_open_qty')) or 0.0)
+        * float(current_spot or 0.0)
+    )
+    future_remaining_notional = (
+        (_float_or_none(pos.get('future_open_qty')) or 0.0)
+        * float(current_future or 0.0)
+    )
+    projected_cost = (
+        open_fee_cost
+        + executed_close_fee_cost
+        + spot_remaining_notional * cfg.spot_close_fee
+        + future_remaining_notional * future_close_fee
+    )
+    return round(projected_cost / open_notional * 10000.0, 2)
 
 
 def _leg_fee_cost(
@@ -206,7 +286,7 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
         vwap_data = close_vwaps.get(ba)
         open_notional = _position_open_notional(pos, cfg)
 
-        # 注入费率 (bps) - 根据状态区分：持仓中只显示开仓费，已平仓显示全部费
+        # 注入费率 (bps)：持仓基础值为开仓费，部分平仓费在实时分支继续累加。
         c_meta = contract_meta.get(ba, {})
         (
             fee_bps_open,
@@ -328,18 +408,42 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['floating_future_pnl'] = round(floating_future, 4)
             pos['floating_pnl_total'] = round(floating_spot + floating_future, 4)
 
-            # 手续费金额 - 持仓中只计开仓手续费
-            fee_cost_usdt = fee_cost_open
-            pos['fee_cost'] = fee_cost_usdt
+            partial_realized_pnl = _executed_close_realized_pnl(pos)
+            pos['realized_pnl'] = round(partial_realized_pnl, 4)
+            pos['realized_pnl_bps'] = round(
+                partial_realized_pnl / open_notional * 10000.0, 2
+            ) if open_notional else 0.0
+            economic_spread_pnl = partial_realized_pnl + pos['floating_pnl_total']
+            pos['economic_spread_pnl_bps'] = round(
+                economic_spread_pnl / open_notional * 10000.0, 2
+            ) if open_notional else pos['floating_pnl_bps']
+            pos['projected_fee_bps'] = _projected_total_fee_bps(
+                pos,
+                cfg,
+                open_notional,
+                current_spot,
+                current_future,
+            )
 
-            # 已实现盈亏 = 0（持仓中尚无价差利润）
-            pos['realized_pnl_bps'] = 0
-            pos['realized_pnl'] = 0
+            # 持仓中计入开仓费和已经发生的部分平仓费；未平余量费用只进入 projected_fee_bps。
+            executed_close_fee_cost = (
+                (_known_fee_cost(pos, 'spot_close') or 0.0)
+                + (_known_fee_cost(pos, 'future_close') or 0.0)
+            )
+            fee_cost_usdt = round(fee_cost_open - executed_close_fee_cost, 4)
+            incurred_fee_bps = round(
+                fee_bps_open - executed_close_fee_cost / open_notional * 10000.0,
+                2,
+            ) if open_notional else fee_bps_open
+            pos['fee_cost'] = fee_cost_usdt
+            pos['fee_bps'] = incurred_fee_bps
 
             # 总盈亏
             pos['total_pnl_bps'], pos['total_pnl'] = _calc_total_pnl(
-                pos['floating_pnl_bps'], 0, funding_pnl_bps, fee_bps_open,
-                pos['floating_pnl_total'], 0, funding_pnl, fee_cost_usdt
+                round(pos['floating_pnl_total'] / open_notional * 10000.0, 2)
+                if open_notional else pos['floating_pnl_bps'],
+                pos['realized_pnl_bps'], funding_pnl_bps, incurred_fee_bps,
+                pos['floating_pnl_total'], pos['realized_pnl'], funding_pnl, fee_cost_usdt
             )
 
             # ── 全仓模式下不再计算单仓逐仓强平价；账户级风险由 Gate 账户快照负责。
@@ -357,6 +461,8 @@ def calculate_realtime_pnl(positions: List[Dict], close_vwaps: Dict[str, Dict],
             pos['floating_pnl_bps'] = None
             pos['realized_pnl_bps'] = None
             pos['realized_pnl'] = None
+            pos['economic_spread_pnl_bps'] = None
+            pos['projected_fee_bps'] = None
             pos['total_pnl_bps'] = None
             pos['total_pnl'] = None
 

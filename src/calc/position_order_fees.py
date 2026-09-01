@@ -1,5 +1,5 @@
 # coding: utf-8
-"""按持仓汇总订单级执行手续费字段。"""
+"""按持仓汇总订单级成交与手续费字段。"""
 from typing import Dict, List
 
 from common.database import db_manager
@@ -13,6 +13,46 @@ def fetch_position_order_fee_summary(position_ids: List[int]) -> Dict[int, Dict]
     sql = f"""
         SELECT
             position_id,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'spot'
+                    THEN COALESCE(exec_amount, target_amount, 0)
+                ELSE 0
+            END) AS original_spot_open_amount,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'spot'
+                    THEN ABS(COALESCE(exec_qty, 0))
+                ELSE 0
+            END) AS original_spot_open_qty,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'future'
+                    THEN COALESCE(exec_amount, target_amount, 0)
+                ELSE 0
+            END) AS original_future_open_amount,
+            SUM(CASE
+                WHEN order_side = 'open' AND market_type = 'future'
+                    THEN ABS(COALESCE(exec_qty, 0))
+                ELSE 0
+            END) AS original_future_open_qty,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'spot'
+                    THEN COALESCE(exec_amount, 0)
+                ELSE 0
+            END) AS executed_spot_close_amount,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'spot'
+                    THEN ABS(COALESCE(exec_qty, 0))
+                ELSE 0
+            END) AS executed_spot_close_qty,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'future'
+                    THEN COALESCE(exec_amount, 0)
+                ELSE 0
+            END) AS executed_future_close_amount,
+            SUM(CASE
+                WHEN order_side = 'close' AND market_type = 'future'
+                    THEN ABS(COALESCE(exec_qty, 0))
+                ELSE 0
+            END) AS executed_future_close_qty,
             MAX(CASE WHEN order_side = 'open' AND market_type = 'future' THEN fee_rate END)
                 AS future_open_fee_rate,
             MAX(CASE WHEN order_side = 'close' AND market_type = 'future' THEN fee_rate END)

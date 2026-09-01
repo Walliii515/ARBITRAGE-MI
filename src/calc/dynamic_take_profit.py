@@ -98,7 +98,10 @@ def evaluate_dynamic_take_profit(
 ) -> DynamicTakeProfitEvaluation:
     open_basis = _as_float(position.get('open_spread_bps'), 0.0)
     funding_earned = _as_float(position.get('funding_pnl_bps'), 0.0)
-    spread_profit = open_basis - float(close_basis_bps)
+    spread_profit = _as_float(
+        position.get('economic_spread_pnl_bps'),
+        open_basis - float(close_basis_bps),
+    )
     net_profit = spread_profit + funding_earned - float(fee_full_bps or 0.0)
 
     close_threshold = _close_threshold_bps(close_threshold_meta, close_threshold_col)

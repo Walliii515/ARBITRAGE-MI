@@ -6607,6 +6607,50 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
             places=2,
         )
 
+    def test_take_profit_prefers_order_ledger_projected_fee_bps(self):
+        pos = {
+            'spot_open_amount': 10.0,
+            'spot_open_qty': 1.0,
+            'future_open_qty': 1.0,
+            'current_spot_price': 10.0,
+            'current_future_price': 10.0,
+            'projected_fee_bps': 25.33,
+        }
+
+        self.assertEqual(self.ce._estimated_full_fee_bps(pos), 25.33)
+
+    def test_dynamic_take_profit_uses_cumulative_partial_close_spread(self):
+        self.pos.update({
+            'open_spread_bps': 100.0,
+            'funding_pnl_bps': 10.0,
+            'economic_spread_pnl_bps': 12.0,
+            'projected_fee_bps': 20.0,
+            'funding_rate_24h': 0.0,
+            'asset_funding_history': [],
+        })
+
+        eval_ = self.ce._take_profit_eval(self.pos, 0.0, {})
+
+        self.assertEqual(eval_.spread_profit_bps, 12.0)
+        self.assertEqual(eval_.funding_earned_bps, 10.0)
+        self.assertEqual(eval_.fee_full_bps, 20.0)
+        self.assertEqual(eval_.net_profit_bps, 2.0)
+
+    def test_negative_funding_economics_use_cumulative_partial_close_pnl(self):
+        pos = {
+            'open_spread_bps': 100.0,
+            'funding_pnl_bps': -8.0,
+            'economic_spread_pnl_bps': -12.0,
+            'projected_fee_bps': 20.0,
+        }
+
+        components = self.ce._profit_components(pos, close_basis_bps=0.0)
+
+        self.assertEqual(components['spread_profit_bps'], -12.0)
+        self.assertEqual(components['funding_earned_bps'], -8.0)
+        self.assertEqual(components['fee_full_bps'], 20.0)
+        self.assertEqual(components['net_profit_bps'], -40.0)
+
     def test_dynamic_take_profit_uses_asset_funding_history_when_current_drops(self):
         self.ce.fixed_take_profit_bps = 200.0
         self.pos.update({
@@ -7273,6 +7317,101 @@ class TestMarginDangerPath(unittest.TestCase):
 
 
 class TestPositionPnlFees(unittest.TestCase):
+
+    def test_partial_close_keeps_original_notional_for_funding_and_total_spread(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        positions = [{
+            'status': 'holding',
+            'base_asset': 'SAPIEN',
+            'spot_open_price': 10.0,
+            'spot_open_qty': 6.0,
+            'spot_open_amount': 60.0,
+            'future_open_price': 10.1,
+            'future_open_qty': 6.0,
+            'open_spread_bps': 100.0,
+            'funding_total_pnl': 1.0,
+            'original_spot_open_amount': 100.0,
+            'original_spot_open_qty': 10.0,
+            'original_future_open_amount': 101.0,
+            'original_future_open_qty': 10.0,
+            'executed_spot_close_amount': 42.0,
+            'executed_spot_close_qty': 4.0,
+            'executed_future_close_amount': 39.2,
+            'executed_future_close_qty': 4.0,
+            'spot_open_fee_amount_usdt': 0.075,
+            'future_open_fee_amount_usdt': 0.0505,
+            'spot_close_fee_amount_usdt': 0.0315,
+            'future_close_fee_amount_usdt': 0.0196,
+            'future_open_fee_rate': 0.0005,
+            'future_close_fee_rate': 0.0005,
+        }]
+        cfg = PnlConfig(
+            open_amount_usdt=160.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            future_taker_open_fee=0.0005,
+            future_taker_close_fee=0.0005,
+            risk_relief_bps=0,
+            margin_default_mmr=0.005,
+        )
+
+        calculate_realtime_pnl(
+            positions,
+            {'SAPIEN': {'spot_close_vwap': 10.5, 'future_close_vwap': 9.8}},
+            {'SAPIEN': {}},
+            cfg,
+        )
+
+        pos = positions[0]
+        self.assertEqual(pos['funding_pnl_bps'], 100.0)
+        self.assertAlmostEqual(pos['realized_pnl'], 3.2)
+        self.assertAlmostEqual(pos['realized_pnl_bps'], 320.0)
+        self.assertAlmostEqual(pos['floating_pnl_total'], 4.8)
+        self.assertAlmostEqual(pos['economic_spread_pnl_bps'], 800.0)
+        self.assertAlmostEqual(pos['projected_fee_bps'], 25.32)
+        self.assertAlmostEqual(pos['fee_cost'], -0.1766)
+        self.assertAlmostEqual(pos['fee_bps'], -17.66)
+        self.assertAlmostEqual(pos['total_pnl_bps'], 882.34)
+
+    def test_partial_close_funding_bps_does_not_grow_as_remainder_shrinks(self):
+        from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl
+
+        cfg = PnlConfig(
+            open_amount_usdt=160.0,
+            spot_open_fee=0.00075,
+            spot_close_fee=0.00075,
+            future_open_fee=0.0002,
+            future_close_fee=0.0002,
+            future_taker_open_fee=0.0005,
+            future_taker_close_fee=0.0005,
+            risk_relief_bps=0,
+            margin_default_mmr=0.005,
+        )
+        positions = []
+        for remaining_qty in (9.0, 5.0, 1.0):
+            positions.append({
+                'status': 'holding',
+                'base_asset': f'SAPIEN{remaining_qty:g}',
+                'spot_open_price': 10.0,
+                'spot_open_qty': remaining_qty,
+                'spot_open_amount': remaining_qty * 10.0,
+                'future_open_price': 10.0,
+                'future_open_qty': remaining_qty,
+                'open_spread_bps': 0.0,
+                'funding_total_pnl': 1.0,
+                'original_spot_open_amount': 100.0,
+            })
+
+        close_vwaps = {
+            pos['base_asset']: {'spot_close_vwap': 10.0, 'future_close_vwap': 10.0}
+            for pos in positions
+        }
+        calculate_realtime_pnl(positions, close_vwaps, {}, cfg)
+
+        self.assertEqual([pos['funding_pnl_bps'] for pos in positions], [100.0, 100.0, 100.0])
 
     def test_holding_fee_uses_future_taker_when_open_fallback_fills(self):
         from calc.position_pnl_calculator import PnlConfig, calculate_realtime_pnl

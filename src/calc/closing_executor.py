@@ -1292,7 +1292,11 @@ class ClosingExecutor:
     def _profit_components(self, pos: Dict, close_basis_bps: float) -> Dict[str, float]:
         open_spread_bps = float(pos.get('open_spread_bps') or 0)
         funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
-        spread_profit_bps = open_spread_bps - float(close_basis_bps)
+        spread_profit_bps = float(
+            pos.get('economic_spread_pnl_bps')
+            if pos.get('economic_spread_pnl_bps') is not None
+            else open_spread_bps - float(close_basis_bps)
+        )
         gross_profit_bps = spread_profit_bps + funding_earned_bps
         fee_full_bps = self._estimated_full_fee_bps(pos)
         net_profit_bps = gross_profit_bps - fee_full_bps
@@ -1828,8 +1832,12 @@ class ClosingExecutor:
             return False  # 无历史数据或历史中位数也为负，不触发止盈
 
         open_spread_bps = float(pos.get('open_spread_bps') or 0)
-        # 基差收敛利润 = 开仓基差 - 当前基差（收敛则为正）
-        spread_profit_bps = open_spread_bps - current_spread_bps
+        # 部分平仓后使用原始本金上的已实现价差 + 剩余浮动价差。
+        spread_profit_bps = float(
+            pos.get('economic_spread_pnl_bps')
+            if pos.get('economic_spread_pnl_bps') is not None
+            else open_spread_bps - current_spread_bps
+        )
         # 已实现资金费收益(bps)
         funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
         # 总盈亏 = 基差收敛 + 已收资金费
@@ -1864,7 +1872,14 @@ class ClosingExecutor:
 
     def _estimated_full_fee_bps(self, pos: Dict) -> float:
         """按实际开仓费和当前待平名义金额估算完整往返手续费。"""
-        open_notional = _float_or_none(pos.get('spot_open_amount'))
+        projected_fee_bps = _float_or_none(pos.get('projected_fee_bps'))
+        if projected_fee_bps is not None and projected_fee_bps >= 0:
+            return projected_fee_bps
+
+        open_notional = (
+            _float_or_none(pos.get('original_spot_open_amount'))
+            or _float_or_none(pos.get('spot_open_amount'))
+        )
         if open_notional is None or open_notional <= 0:
             return self.fee_full_bps
 
@@ -2210,7 +2225,11 @@ class ClosingExecutor:
                 detail = f"高基差仓|{detail}"
         else:
             open_spread_bps = float(pos.get('open_spread_bps') or 0)
-            spread_profit_bps = open_spread_bps - current_spread_bps
+            spread_profit_bps = float(
+                pos.get('economic_spread_pnl_bps')
+                if pos.get('economic_spread_pnl_bps') is not None
+                else open_spread_bps - current_spread_bps
+            )
             funding_earned_bps = float(pos.get('funding_pnl_bps') or 0)
             total_pnl_bps = spread_profit_bps + funding_earned_bps
             funding_rate_p40 = self.funding_rate_p40_meta.get(ba, 0)
