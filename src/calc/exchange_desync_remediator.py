@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 from calc.order_fee_resolver import build_order_execution_fields
 from calc.orderbook_enricher import calc_vwap_basis_bps
-from calc.real_executor import RealExecutor
+from calc.real_executor import RealExecutor, GATE_CROSS_MARGIN_LEVERAGE
 from calc.asset_reduction_guard import asset_reduction_guard
 from calc.closed_position_pnl import (
     compute_closed_position_pnl,
@@ -24,6 +24,7 @@ from calc.closed_position_pnl import (
 )
 from common.database import db_manager
 from common.logger import get_logger
+from common.market_meta_safety import validate_position_multiplier, require_quanto_multiplier
 
 logger = get_logger(__name__)
 
@@ -184,6 +185,44 @@ class ExchangeDesyncRemediator:
             'results': results,
         }
 
+    @_guard_asset_reduction('reconciliation_gate_clear')
+    def remediate_gate_clear(self, base_asset: str, risk: Dict) -> Dict:
+        """Persist verified exchange settlement before reusing aggregate spot reduction."""
+        if not self.cfg.enabled or not self.cfg.remediate_binance_spot_position:
+            return {'attempted': False, 'reason': 'disabled'}
+        if any(p.get('base_asset') == base_asset and float(p.get('size') or 0) != 0
+               for p in self.executor.fetch_gate_futures_positions()):
+            return {'attempted': False, 'reason': 'gate_position_reappeared'}
+        size = float(risk.get('future_close_size') or 0)
+        price = float(risk.get('future_close_price') or 0)
+        if not math.isfinite(price) or not math.isfinite(size) or price <= 0 or size <= 0 or not risk.get('future_exchange_order_id'):
+            return {'attempted': False, 'reason': 'invalid_clear_fill'}
+        with db_manager.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM mi_trade_position WHERE base_asset=%s AND status='holding' FOR UPDATE", (base_asset,))
+            positions = cursor.fetchall()
+            if not positions:
+                return {'attempted': False, 'reason': 'no_matching_holding_positions'}
+            if any(pos['opened_at'] > risk['event_at'] for pos in positions):
+                raise ValueError('clear_position_identity_mismatch')
+            remaining = sum(float(p.get('future_open_contracts') or 0) for p in positions)
+            if remaining > 0:
+                if abs(remaining - size) > 1e-8:
+                    return {'attempted': False, 'reason': 'clear_quantity_mismatch'}
+                for pos in positions:
+                    multiplier = validate_position_multiplier(self.executor.contract_meta, pos)
+                    if pos['opened_at'] > risk['event_at'] or abs(float(pos['future_open_qty']) - float(pos['future_open_contracts']) * multiplier) > 1e-7:
+                        raise ValueError('clear_position_identity_mismatch')
+                    self._insert_synthetic_future_adl_order(
+                        pos, str(uuid.uuid4()), risk, risk['detail'], risk['event_at'], cursor=cursor,
+                    )
+                    cursor.execute("UPDATE mi_trade_position SET future_open_qty=0, future_open_contracts=0 WHERE id=%s", (pos['id'],))
+        spot_qty = min(self._load_binance_available_qty(base_asset),
+                       sum(float(pos.get('spot_open_qty') or 0) for pos in positions))
+        return self.remediate_binance_spot_desync(
+            base_asset, 0.0, spot_qty,
+            {**risk, 'type': 'binance_spot_excess'},
+        )
+
     def remediate_post_close_spot_dust(
         self,
         base_asset: str,
@@ -255,6 +294,8 @@ class ExchangeDesyncRemediator:
         self,
         binance_balances: List[Dict],
         gate_positions: List[Dict],
+        *,
+        skip_assets: Optional[set[str]] = None,
     ) -> Dict:
         """Manually close a fully reconstructed tiny hedge and convert its spot dust."""
         if not self.cfg.enabled:
@@ -265,14 +306,17 @@ class ExchangeDesyncRemediator:
         gate_by_asset = {
             str(row.get('base_asset') or '').upper(): row for row in (gate_positions or [])
         }
-        positions = self._load_holding_positions_with_execution_remainders()
+        excluded = {str(asset).upper() for asset in (skip_assets or set())}
+        positions = [pos for pos in self._load_holding_positions_with_execution_remainders()
+                     if str(pos.get('base_asset') or '').upper() not in excluded]
         settled = self._settle_spot_only_dust_positions(
             positions,
             balances_by_asset,
             gate_by_asset,
         )
         if settled:
-            positions = self._load_holding_positions_with_execution_remainders()
+            positions = [pos for pos in self._load_holding_positions_with_execution_remainders()
+                         if str(pos.get('base_asset') or '').upper() not in excluded]
 
         grouped: Dict[str, List[Dict]] = {}
         for pos in positions:
@@ -2161,56 +2205,11 @@ class ExchangeDesyncRemediator:
             )
 
         self._mark_positions_exchange_risk(positions, risk)
-        available_qty = self._load_binance_available_qty(base_asset)
-        remaining = min(spot_qty, available_qty)
-        if remaining <= max(float(self.cfg.min_spot_qty or 0), 1e-8):
-            return {
-                'attempted': True,
-                'success': False,
-                'action': 'sell_spot_only_binance_exposure',
-                'base_asset': base_asset,
-                'target_qty': spot_qty,
-                'available_qty': available_qty,
-                'reason': 'spot_available_qty_insufficient',
-            }
-
-        results = []
-        for pos in positions:
-            target_qty = min(_float(pos.get('spot_open_qty')), remaining)
-            if target_qty <= max(float(self.cfg.min_spot_qty or 0), 1e-8):
-                continue
-            min_notional_reason = self._below_spot_min_notional(pos, target_qty)
-            if min_notional_reason:
-                self._append_risk_detail(pos.get('id'), f"自动处置跳过|{min_notional_reason}")
-                results.append({
-                    'attempted': True,
-                    'success': False,
-                    'position_id': pos.get('id'),
-                    'reason': min_notional_reason,
-                })
-                continue
-            result = self._sell_spot_and_close_position(pos, target_qty, risk)
-            results.append(result)
-            remaining -= _float(result.get('spot_exec_qty'))
-            if not result.get('success'):
-                break
-            if remaining <= max(float(self.cfg.min_spot_qty or 0), 1e-8):
-                break
-
-        success_count = sum(1 for item in results if item.get('success'))
-        failure_count = sum(1 for item in results if item.get('attempted') and not item.get('success'))
-        return {
-            'attempted': True,
-            'success': failure_count == 0 and success_count > 0,
-            'action': 'sell_spot_only_binance_exposure',
-            'base_asset': base_asset,
-            'target_qty': spot_qty,
-            'available_qty': available_qty,
-            'positions': len(positions),
-            'success_count': success_count,
-            'failure_count': failure_count,
-            'results': results,
-        }
+        # Aggregate before applying Binance's notional floor; allocate only actual fills.
+        return self.remediate_binance_spot_desync(
+            base_asset=base_asset, local_qty=0.0, exchange_qty=spot_qty,
+            risk={**risk, 'type': 'binance_spot_excess'},
+        )
 
     def _estimate_binance_spot_price(self, base_asset: str, risk: Dict) -> float:
         spot_price = _float(risk.get('spot_price'))
@@ -2576,8 +2575,7 @@ class ExchangeDesyncRemediator:
     def _quanto_multiplier(self, base_asset: str) -> float:
         meta = getattr(self.executor, 'contract_meta', {}) or {}
         try:
-            multiplier = float((meta.get(base_asset) or {}).get('quanto_multiplier') or 0.0)
-            return multiplier if multiplier > 0 else 0.0
+            return require_quanto_multiplier(meta, base_asset)
         except (TypeError, ValueError):
             return 0.0
 
@@ -3037,7 +3035,7 @@ class ExchangeDesyncRemediator:
         else:
             cursor.execute(sql, payload)
 
-    def _insert_synthetic_future_adl_order(self, pos: Dict, order_uuid: str, risk: Dict, reason: str, now: datetime):
+    def _insert_synthetic_future_adl_order(self, pos: Dict, order_uuid: str, risk: Dict, reason: str, now: datetime, cursor=None):
         base_asset = str(pos.get('base_asset') or '').upper()
         future_qty = _float(pos.get('future_open_qty'))
         if future_qty <= 0:
@@ -3068,7 +3066,7 @@ class ExchangeDesyncRemediator:
             'order_side': 'close',
             'market_type': 'future',
             'trade_direction': 'buy',
-            'leverage': _float(pos.get('future_open_leverage'), 1.0),
+            'leverage': GATE_CROSS_MARGIN_LEVERAGE,
             'target_qty': future_qty,
             'target_amount': future_qty * future_price,
         }
@@ -3081,6 +3079,9 @@ class ExchangeDesyncRemediator:
             'fee_asset': 'USDT',
             'exchange_order_id': risk.get('future_exchange_order_id'),
         })
+        if risk.get('exchange_clear'):
+            fee = float(risk.get('future_fee') or 0) * float(pos['future_open_contracts']) / float(risk['future_close_size'])
+            fields.update(fee_amount=fee, fee_amount_usdt=fee)
         sql = """
             INSERT INTO mi_trade_order (
                 order_uuid, position_id, base_asset, spot_symbol, future_contract,
@@ -3101,7 +3102,7 @@ class ExchangeDesyncRemediator:
         """
         payload = {
             **order,
-            'reject_reason': f"{reason}|Gate腿由ADL成交记录补记",
+            'reject_reason': f"{reason}|Gate腿由交易所成交记录补记",
             'exec_price': future_exec['exec_price'],
             'exec_qty': future_exec['exec_qty'],
             'exec_amount': future_exec['exec_amount'],
@@ -3109,7 +3110,10 @@ class ExchangeDesyncRemediator:
             **fields,
             'executed_at': now,
         }
-        with db_manager.get_cursor() as cursor:
+        if cursor is None:
+            with db_manager.get_cursor() as db_cursor:
+                db_cursor.execute(sql, payload)
+        else:
             cursor.execute(sql, payload)
 
     def _execution_fields(self, market_key: str, order: Dict, exec_data: Dict, success: bool) -> Dict:

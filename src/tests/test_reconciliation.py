@@ -38,7 +38,8 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         reconciler._auto_cleanup_completed_asset_dust = MagicMock(
             side_effect=RuntimeError('dust cleanup unavailable')
         )
-        reconciler._build_combined_exposure_rows = MagicMock(return_value=[])
+        combined_row = {'base_asset': 'AI', 'detail': {}}
+        reconciler._build_combined_exposure_rows = MagicMock(return_value=[combined_row])
         reconciler._mark_combined_exposure_risks = MagicMock(return_value=[])
         reconciler._auto_remediate_combined_exposure_risks = MagicMock(return_value=[])
         reconciler._insert_rows = MagicMock()
@@ -50,7 +51,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         reconciler._build_combined_exposure_rows.assert_called_once()
         reconciler._mark_combined_exposure_risks.assert_called_once_with(
             unittest.mock.ANY,
-            [],
+            [combined_row],
         )
         reconciler._auto_remediate_combined_exposure_risks.assert_called_once()
 
@@ -791,9 +792,9 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(reconciler.mark_calls, [])
         self.assertFalse(row['detail']['exchange_risk']['confirmed'])
 
-    def test_gate_extra_success_pairs_binance_extra_spot_remediation(self):
+    def test_gate_extra_with_matching_spot_does_not_close_a_balanced_hedge(self):
         reconciler = Reconciler(
-            executor=object(),
+            executor=MagicMock(contract_meta={'BEL': {'quanto_multiplier': 1}}),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
         reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
@@ -832,13 +833,9 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
             }],
         )
 
-        self.assertTrue(result[0]['success'])
-        self.assertEqual(result[0]['paired_binance_spot_result']['action'], 'sell_extra_binance_spot')
-        reconciler.remediator.remediate_binance_spot_desync.assert_called_once()
-        kwargs = reconciler.remediator.remediate_binance_spot_desync.call_args.kwargs
-        self.assertEqual(kwargs['base_asset'], 'BEL')
-        self.assertEqual(kwargs['local_qty'], 2718.0)
-        self.assertEqual(kwargs['exchange_qty'], 2770.0)
+        self.assertEqual(result[0]['reason'], 'exchange_legs_balanced_local_ledger_stale')
+        reconciler.remediator.remediate_gate_extra_position.assert_not_called()
+        reconciler.remediator.remediate_binance_spot_desync.assert_not_called()
 
     def test_confirmed_gate_qty_mismatch_marks_position_risk(self):
         class TrackingReconciler(Reconciler):

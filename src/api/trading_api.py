@@ -1228,8 +1228,17 @@ def _reconciliation_latest_sql(ignore_sql: str) -> str:
     return """
         SELECT
             s.*,
-            c.quanto_multiplier
+            CASE WHEN p.minimum_multiplier=p.maximum_multiplier
+                      AND (c.quanto_multiplier IS NULL OR ABS(c.quanto_multiplier-p.minimum_multiplier)<1e-12)
+                 THEN p.minimum_multiplier
+                 WHEN p.minimum_multiplier IS NULL THEN c.quanto_multiplier
+                 ELSE NULL END AS quanto_multiplier
         FROM mi_recon_snapshot s
+        LEFT JOIN (SELECT base_asset, MIN(future_quanto_multiplier) minimum_multiplier,
+                          MAX(future_quanto_multiplier) maximum_multiplier
+                   FROM mi_trade_position WHERE status='holding' GROUP BY base_asset) p
+          ON UPPER(TRIM(p.base_asset)) COLLATE utf8mb4_unicode_ci
+           = UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci
         LEFT JOIN mi_gate_future_contracts c
           ON UPPER(TRIM(c.base_asset)) COLLATE utf8mb4_unicode_ci
            = UPPER(TRIM(s.base_asset)) COLLATE utf8mb4_unicode_ci

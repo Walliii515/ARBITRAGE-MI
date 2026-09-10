@@ -1206,8 +1206,9 @@ class TestClosingExecutorGateCrossRisk(unittest.TestCase):
         ce = make_closing_executor()
         ce._quarantine_executed_asset(_risk_position(id=11))
         replacement = _risk_position(id=12)
-
-        desynced_assets = ce._desynced_assets([replacement])
+        with patch('calc.closing_executor.db_manager.get_cursor') as db:
+            db.return_value.__enter__.return_value.fetchone.return_value = {'status': 'closed'}
+            desynced_assets = ce._desynced_assets([replacement])
 
         self.assertNotIn('TUT', desynced_assets)
         self.assertNotIn('TUT', ce._execution_quarantine_by_asset)

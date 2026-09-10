@@ -198,6 +198,8 @@ def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[D
 
     return {
         'open_notional': round(spot_open, 8),
+        'spot_close_amount': round(spot_close, 8),
+        'future_close_amount': round(future_close, 8),
         'realized_spot_pnl': round(realized_spot, 8),
         'realized_future_pnl': round(realized_future, 8),
         'realized_pnl': round(realized_pnl, 8),
@@ -247,6 +249,9 @@ def update_closed_position_pnl(cursor, position_id: int, pnl: Dict, columns: set
     }
     if pnl.get('close_spread_bps') is not None:
         candidate_values['close_spread_bps'] = pnl['close_spread_bps']
+    for field in ('spot_close_amount', 'future_close_amount'):
+        if pnl.get(field) is not None:
+            candidate_values[field] = pnl[field]
     values = {key: value for key, value in candidate_values.items() if key in columns}
     if not values:
         return False

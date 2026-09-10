@@ -63,6 +63,7 @@ def _risk_key(exchange: str, base_asset: str, risk_type: str) -> str:
 class DelistRiskMonitor:
     def __init__(self, cfg: Optional[DelistRiskConfig] = None):
         self.cfg = cfg or DelistRiskConfig()
+        self.source_errors = {}
 
     def get_monitored_assets(self) -> Set[str]:
         """Assets that may be displayed or traded: active assets plus holdings."""
@@ -82,16 +83,36 @@ class DelistRiskMonitor:
         with db_manager.get_cursor() as cursor:
             cursor.execute(sql)
             rows = cursor.fetchall()
-        return {
+        assets = {
             str(row.get('base_asset') or '').upper()
             for row in rows
             if row.get('base_asset')
         }
+        from common.config import config
+        if config.get_trade_mode() != 'virtual':
+            from calc.reconciliation import build_exchange_config, get_ignored_binance_spot_assets
+            from calc.real_executor import RealExecutor
+            executor = RealExecutor(build_exchange_config(), leverage=0)
+            ignored = get_ignored_binance_spot_assets() | {'USDT', 'USDC', 'FDUSD'}
+            for source, fetch in [('gate_positions', executor.fetch_gate_futures_positions),
+                                  ('binance_balances', executor.fetch_binance_account_balances)]:
+                try:
+                    for row in fetch():
+                        asset = str(row.get('base_asset') or row.get('asset') or '').upper()
+                        quantity = row.get('size') if source == 'gate_positions' else row.get('total')
+                        if quantity is None:
+                            quantity = float(row.get('free') or 0) + float(row.get('locked') or 0)
+                        if asset and asset not in ignored and abs(float(quantity or 0)) > 0:
+                            assets.add(asset)
+                except Exception as exc:
+                    self.source_errors[source] = str(exc)[:300]
+        return assets
 
     def build_report(self, assets: Optional[Iterable[str]] = None) -> Dict:
+        self.source_errors = {}
         monitored = {str(a or '').upper().strip() for a in (assets or self.get_monitored_assets()) if str(a or '').strip()}
         risks: List[Dict] = []
-        source_errors: Dict[str, str] = {}
+        source_errors = self.source_errors
 
         try:
             risks.extend(self._gate_risks(monitored))
@@ -137,6 +158,24 @@ class DelistRiskMonitor:
         resp.raise_for_status()
         payload = resp.json()
         rows = payload if isinstance(payload, list) else []
+        present = {str(row.get('name') or '').upper() for row in rows}
+        for asset in sorted(monitored):
+            contract = f'{asset}_{self.cfg.settle.upper()}'
+            if contract in present:
+                continue
+            try:
+                single = requests.get(
+                    f'https://api.gateio.ws/api/v4/futures/{self.cfg.settle.lower()}/contracts/{contract}',
+                    timeout=self.cfg.timeout_sec,
+                )
+                single.raise_for_status()
+                item = single.json()
+                if not isinstance(item, dict) or item.get('name') != contract:
+                    raise ValueError('contract response identity mismatch')
+                rows.append(item)
+            except Exception as exc:
+                self.source_errors[f'gate:{asset}'] = str(exc)[:300]
+                rows.append({'name': contract, 'status': 'unknown'})
         now = _now()
         cutoff = now + timedelta(days=max(int(self.cfg.lookahead_days or 30), 1))
         risks: List[Dict] = []
@@ -243,6 +282,22 @@ class DelistRiskMonitor:
         resp = requests.get('https://data-api.binance.vision/api/v3/exchangeInfo', timeout=self.cfg.timeout_sec)
         resp.raise_for_status()
         symbols = (resp.json() or {}).get('symbols', [])
+        present = {str(item.get('symbol') or '').upper() for item in symbols}
+        for asset in sorted(monitored):
+            symbol = f'{asset}USDT'
+            if symbol in present:
+                continue
+            try:
+                single = requests.get('https://data-api.binance.vision/api/v3/exchangeInfo',
+                                      params={'symbol': symbol}, timeout=self.cfg.timeout_sec)
+                single.raise_for_status()
+                matches = (single.json() or {}).get('symbols', [])
+                if not matches or any(item.get('symbol') != symbol for item in matches):
+                    raise ValueError('spot response identity mismatch')
+                symbols.extend(matches)
+            except Exception as exc:
+                self.source_errors[f'binance:{asset}'] = str(exc)[:300]
+                symbols.append({'symbol': symbol, 'baseAsset': asset, 'status': 'UNKNOWN'})
         risks: List[Dict] = []
         for item in symbols if isinstance(symbols, list) else []:
             symbol = str(item.get('symbol') or '').upper()
@@ -262,7 +317,7 @@ class DelistRiskMonitor:
                 'market_type': 'spot',
                 'symbol': symbol,
                 'risk_type': 'symbol_status',
-                'risk_level': 'critical',
+                'risk_level': 'warning' if status == 'UNKNOWN' else 'critical',
                 'status': status,
                 'delist_at': None,
                 'days_left': None,

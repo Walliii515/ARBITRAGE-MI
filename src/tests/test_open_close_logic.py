@@ -174,7 +174,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
         thin_bursty_max_book_skew_ms=1500.0,
     )
     te = TradingExecutor(
-        cfg, contract_meta=contract_meta or {}, spot_meta=spot_meta or {},
+        cfg, contract_meta=contract_meta if contract_meta is not None else {asset: {'quanto_multiplier': 1} for asset in ('BTC', 'ALLO', 'BEL', 'AI', 'ETH', 'BANK', 'ASR', 'NFP')}, spot_meta=spot_meta or {},
         vwap_threshold_meta=vwap_threshold_meta,
         close_vwap_threshold_meta=close_vwap_threshold_meta,
         asset_tier_meta=asset_tier_meta,
@@ -186,7 +186,7 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
 def make_closing_executor():
     """构造独立的 ClosingExecutor 实例（不依赖 DB；config 用真实 yaml 即可，本测试只关心方法逻辑）"""
     from calc.closing_executor import ClosingExecutor
-    return ClosingExecutor(contract_meta={}, spot_meta={}, funding_rate_p40_meta={})
+    return ClosingExecutor(contract_meta={asset: {'quanto_multiplier': 1} for asset in ('BTC', 'TUT', 'BEL', 'AI', 'EPIC', 'ABC')}, spot_meta={}, funding_rate_p40_meta={})
 
 
 def make_gate_cross_risk(
@@ -551,6 +551,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
             'trade_direction': 'buy',
             'target_qty': 200.0,
             'target_contracts': 2,
+            'future_quanto_multiplier': 100,
         })
 
         self.assertTrue(result['success'])
@@ -571,6 +572,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
             'trade_direction': 'buy',
             'target_qty': 250,
             'target_contracts': 2.5,
+            'future_quanto_multiplier': 100,
         })
 
         self.assertFalse(result['success'])
@@ -612,7 +614,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         multiplier, contracts, reason = executor._resolve_gate_order_sizing({
             'base_asset': 'TUT',
             'order_side': 'open',
-            'target_qty': 205,
+            'target_qty': 200,
             'target_contracts': 2,
         })
 
@@ -2856,6 +2858,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         self.te.executor_client.channel = 'Live'
         self.te.contract_meta = {
             'BTC': {
+                'quanto_multiplier': 1,
                 'funding_rate': 0.002,
                 'funding_rate_24h': 0.008,
                 'funding_interval': 21600,
@@ -2912,6 +2915,7 @@ class TestTradingExecutorPreExecutionGate(unittest.TestCase):
         self.te._holding_weighted_basis_by_asset['BTC'] = 20.0
         self.te.contract_meta = {
             'BTC': {
+                'quanto_multiplier': 1,
                 'funding_rate': 0.002,
                 'funding_rate_24h': 0.008,
                 'funding_interval': 28800,
@@ -4216,6 +4220,7 @@ class TestTradingExecutorFundingAdjustedEntry(unittest.TestCase):
 
     def test_funding_carry_allows_near_p20_before_standard_entry_floor(self):
         te = make_trading_executor(
+            contract_meta={'BANANA': {'quanto_multiplier': 1}},
             funding_carry_enabled=True,
             vwap_threshold_meta={'BANANA': {'p20': -18.0}},
             close_vwap_threshold_meta={'BANANA': {'close_basis_p20': -10.0}},
@@ -4969,7 +4974,7 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertEqual(reason, '')
 
     def test_delist_risk_exit_does_not_require_profit(self):
-        """临近下架退出复用风险平仓旁路，不被盈利性复核挡住。"""
+        """下架退出独立于盘口旁路，不被盈利性复核挡住。"""
         self._setup_books()
         self.ce.set_delist_risk_report({
             'items': [{
@@ -5004,7 +5009,7 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(execute_mock.call_args.args[1], 'delist_risk_exit')
         self.assertIn('下架风险退出', execute_mock.call_args.args[2])
-        self.assertIn('旁路✓', execute_mock.call_args.args[2])
+        self.assertNotIn('旁路✓', execute_mock.call_args.args[2])
         take_profit_mock.assert_not_called()
 
     def test_full_pass_writes_lag_cache(self):
@@ -5101,7 +5106,6 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
         })
         m_merge, m_hedge, m_vwap = self._patch_gate_chain(vwap_basis_bps=36)
         with (
-            patch.object(self.ce, '_check_funding_count', return_value=False),
             patch.object(self.ce, '_check_take_profit', return_value=True),
             patch.object(self.ce, '_pass_valley_check', return_value=True),
             patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
@@ -5160,7 +5164,6 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
 
         with (
             patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
-            patch.object(self.ce, '_check_funding_count', return_value=False),
             patch.object(self.ce, '_check_take_profit', return_value=True),
             patch.object(self.ce, '_pass_valley_check', return_value=True),
             patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
@@ -5227,7 +5230,6 @@ class TestClosingExecutorPreExecutionGate(unittest.TestCase):
 
         with (
             patch.object(self.ce, '_check_negative_funding_exit', return_value=False),
-            patch.object(self.ce, '_check_funding_count', return_value=False),
             patch.object(self.ce, '_check_take_profit', return_value=True),
             patch.object(self.ce, '_pass_valley_check', return_value=True),
             patch.object(self.ce, '_pass_close_resiliency_check', return_value=True),
@@ -5248,7 +5250,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     def setUp(self):
         self.ce = make_closing_executor()
         self.ce.fixed_take_profit_bps = 50.0
-        self.ce.contract_meta = {'BTC': {'funding_interval': 28800}}
+        self.ce.contract_meta = {'BTC': {'funding_interval': 28800, 'quanto_multiplier': 1}}
         self.pos = {
             'base_asset': 'BTC',
             'open_spread_bps': 120.0,
@@ -6552,6 +6554,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     def test_close_order_target_amount_uses_target_qty_and_close_vwap(self):
         pos = {
             'base_asset': 'TUT',
+            'future_quanto_multiplier': 100,
             'spot_open_qty': 2100.0,
             'spot_open_price': 0.01855,
             'future_open_qty': 2100.0,
@@ -6578,6 +6581,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
     def test_close_order_target_amount_falls_back_to_position_open_price(self):
         group = self.ce._build_close_order_group({
             'base_asset': 'TUT',
+            'future_quanto_multiplier': 100,
             'spot_open_qty': 2100.0,
             'spot_open_price': 0.01855,
             'future_open_qty': 2100.0,

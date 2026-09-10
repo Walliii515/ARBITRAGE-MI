@@ -22,6 +22,7 @@ from common.config import config
 from common.database import db_manager
 from common.logger import get_logger
 from common.meta_loader import fetch_contract_meta, fetch_spot_meta
+from common.market_meta_safety import require_quanto_multiplier
 from common.strategy_accounts import get_binance_credentials, get_gate_futures_credentials
 
 logger = get_logger(__name__)
@@ -223,7 +224,7 @@ class Reconciler:
             gate_risks: List[Dict] = []
             if self.cfg.mark_exchange_risk:
                 try:
-                    gate_risks = self._mark_gate_desync_risks(snapshot_at, gate_rows)
+                    gate_risks = self._collect_asset_risks(self._mark_gate_desync_risks, snapshot_at, gate_rows)
                 except Exception as e:
                     logger.error(f'Gate 风险标记失败，保留原始对账快照: {e}', exc_info=True)
             if self.cfg.auto_remediate_enabled:
@@ -235,9 +236,8 @@ class Reconciler:
                 )
                 try:
                     dust_results = self._auto_cleanup_completed_asset_dust(
-                        binance_balances,
-                        gate_positions,
-                    )
+                        binance_balances, gate_positions, skip_assets=gate_remediation_owned_assets,
+                    ) if binance_ok else []
                 except Exception as e:
                     logger.error(f'小额残余自动清理异常，等待下一轮对账: {e}', exc_info=True)
                 else:
@@ -254,7 +254,7 @@ class Reconciler:
                 binance_balances=binance_balances,
                 gate_positions=gate_positions,
             )
-            combined_risks = self._mark_combined_exposure_risks(snapshot_at, combined_rows)
+            combined_risks = self._collect_asset_risks(self._mark_combined_exposure_risks, snapshot_at, combined_rows)
             if self.cfg.auto_remediate_enabled:
                 remediation_results.extend(
                     self._auto_remediate_combined_exposure_risks(
@@ -298,6 +298,17 @@ class Reconciler:
         binance_balances = self.executor.fetch_binance_spot_balances()
         gate_positions = self.executor.fetch_gate_futures_positions()
         return self.remediator.cleanup_post_close_dust(binance_balances, gate_positions)
+
+    @staticmethod
+    def _collect_asset_risks(marker, snapshot_at: datetime, rows: List[Dict]) -> List[Dict]:
+        risks = []
+        for row in rows:
+            try:
+                risks.extend(marker(snapshot_at, [row]))
+            except Exception as exc:
+                row.setdefault('detail', {})['risk_processing_error'] = str(exc)
+                logger.exception('对账单币风险识别失败，保留快照并继续其他币种 | asset=%s', row.get('base_asset'))
+        return risks
 
     def run_with_fast_confirmation(self) -> Dict:
         """Run a second fresh reconciliation shortly after an unconfirmed mismatch."""
@@ -570,8 +581,7 @@ class Reconciler:
     def _quanto_multiplier(self, base_asset: str) -> float:
         meta = getattr(self.executor, 'contract_meta', {}) or {}
         try:
-            multiplier = float((meta.get(base_asset) or {}).get('quanto_multiplier') or 0.0)
-            return multiplier if multiplier > 0 else 0.0
+            return require_quanto_multiplier(meta, base_asset)
         except (TypeError, ValueError):
             return 0.0
 
@@ -683,21 +693,21 @@ class Reconciler:
         with db_manager.get_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id
+                SELECT is_match, JSON_UNQUOTE(JSON_EXTRACT(detail, '$.risk_type')) AS risk_type
                 FROM mi_recon_snapshot
                 WHERE exchange = 'combined'
                   AND dimension = 'exposure'
                   AND UPPER(base_asset) = %s
                   AND snapshot_at >= %s
-                  AND is_match = 0
-                  AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.risk_type')) = %s
-                ORDER BY snapshot_at DESC
+                ORDER BY snapshot_at DESC, id DESC
                 LIMIT %s
                 """,
-                (base_asset.upper(), cutoff, risk_type, confirm_runs - 1),
+                (base_asset.upper(), cutoff, confirm_runs - 1),
             )
             rows = cursor.fetchall()
-        return len(rows) >= confirm_runs - 1
+        return len(rows) >= confirm_runs - 1 and all(
+            not row.get('is_match') and row.get('risk_type') == risk_type for row in rows
+        )
 
     def _auto_remediate_combined_exposure_risks(
         self,
@@ -708,7 +718,6 @@ class Reconciler:
         results: List[Dict] = []
         skip_assets = {str(asset or '').upper() for asset in (skip_assets or set())}
         for item in risks:
-            risk = item.get('risk') or {}
             base_asset = str(item.get('base_asset') or '').upper()
             if base_asset in skip_assets:
                 result = {
@@ -725,54 +734,45 @@ class Reconciler:
                 results.append(result)
                 continue
 
-            risk_type = str(item.get('risk_type') or '')
-            binance_qty = float(item.get('binance_qty') or 0.0)
-            gate_qty = float(item.get('gate_qty') or 0.0)
             try:
-                multiplier = float(item.get('quanto_multiplier'))
-            except (TypeError, ValueError):
-                multiplier = 0.0
-            if multiplier <= 0:
+                result = self._remediate_confirmed_combined_risk(item)
+            except Exception as exc:
+                logger.exception('净敞口处置异常，等待新快照并继续其他币种 | asset=%s', base_asset)
                 result = {
-                    'attempted': False,
-                    'reason': 'missing_contract_multiplier',
-                    'base_asset': base_asset,
+                    'attempted': True, 'success': False, 'base_asset': base_asset,
+                    'exchange_order_state_unknown': True, 'retry_needed': True,
+                    'reason': f'combined_remediation_exception:{exc}',
                 }
-                self._record_reconciliation_risk_event(snapshot_at, item, result)
-                results.append(result)
-                continue
-            if risk_type == 'binance_spot_excess':
-                excess_qty = max(0.0, binance_qty - gate_qty)
-                if gate_qty <= self._combined_exposure_tolerance(str(item.get('base_asset') or ''), multiplier):
-                    result = self.remediator.remediate_binance_spot_only_exposure(
-                        base_asset=item.get('base_asset'),
-                        spot_qty=excess_qty,
-                        risk=risk,
-                    )
-                else:
-                    result = self.remediator.remediate_binance_spot_desync(
-                        base_asset=item.get('base_asset'),
-                        local_qty=gate_qty,
-                        exchange_qty=binance_qty,
-                        risk=risk,
-                    )
-            elif risk_type == 'gate_short_excess':
-                extra_qty = max(0.0, gate_qty - binance_qty)
-                extra_contracts = extra_qty / multiplier if multiplier > 0 else 0.0
-                result = self.remediator.remediate_gate_extra_position(
-                    base_asset=item.get('base_asset'),
-                    extra_contracts=extra_contracts,
-                    risk={
-                        **risk,
-                        'exchange_size': -float(item.get('gate_contracts') or 0.0),
-                    },
-                )
-            else:
-                result = {'attempted': False, 'reason': f'unsupported_combined_risk:{risk_type}'}
-
             self._record_reconciliation_risk_event(snapshot_at, item, result)
             results.append(result)
         return results
+
+    def _remediate_confirmed_combined_risk(self, item: Dict) -> Dict:
+        risk = item.get('risk') or {}
+        base_asset = str(item.get('base_asset') or '').upper()
+        risk_type = str(item.get('risk_type') or '')
+        binance_qty = float(item.get('binance_qty') or 0.0)
+        gate_qty = float(item.get('gate_qty') or 0.0)
+        try:
+            multiplier = require_quanto_multiplier({base_asset: {'quanto_multiplier': item.get('quanto_multiplier')}}, base_asset)
+        except ValueError:
+            return {'attempted': False, 'reason': 'missing_contract_multiplier', 'base_asset': base_asset}
+        if risk_type == 'binance_spot_excess':
+            excess_qty = max(0.0, binance_qty - gate_qty)
+            if gate_qty <= self._combined_exposure_tolerance(base_asset, multiplier):
+                return self.remediator.remediate_binance_spot_only_exposure(
+                    base_asset=base_asset, spot_qty=excess_qty, risk=risk,
+                )
+            return self.remediator.remediate_binance_spot_desync(
+                base_asset=base_asset, local_qty=gate_qty, exchange_qty=binance_qty, risk=risk,
+            )
+        if risk_type == 'gate_short_excess':
+            return self.remediator.remediate_gate_extra_position(
+                base_asset=base_asset,
+                extra_contracts=max(0.0, gate_qty - binance_qty) / multiplier,
+                risk={**risk, 'exchange_size': -float(item.get('gate_contracts') or 0.0)},
+            )
+        return {'attempted': False, 'reason': f'unsupported_combined_risk:{risk_type}'}
 
     @staticmethod
     def _gate_remediation_owned_assets(
@@ -916,10 +916,12 @@ class Reconciler:
         missing_contracts = max(0.0, local_contracts - exchange_contracts)
         started_at = snapshot_at - timedelta(seconds=max(int(self.cfg.adl_lookback_sec or 0), 60))
         adl_trades: List[Dict] = []
+        clear_trades: List[Dict] = []
         try:
             trades = self.executor.fetch_gate_futures_my_trades(
                 contract=contract,
-                start_time=int(started_at.timestamp()),
+                start_time=(None if (getattr(self.executor, 'contract_meta', {}).get(base_asset) or {}).get('position_only')
+                            else int(started_at.timestamp())),
                 end_time=int(snapshot_at.timestamp()),
                 limit=1000,
             )
@@ -928,8 +930,27 @@ class Reconciler:
                 close_size = float(trade.get('close_size') or 0)
                 if 'auto_deleveraging' in text and close_size > 0:
                     adl_trades.append(trade)
+                if text == 'clear' and close_size > 0 and str(trade.get('contract') or contract) == contract:
+                    clear_trades.append(trade)
         except Exception as e:
             logger.warning(f"Gate ADL 成交查询失败 | {contract} | {e}", exc_info=True)
+
+        if clear_trades and exchange_contracts == 0:
+            latest = max(clear_trades, key=lambda t: float(t.get('create_time') or 0))
+            fills = [t for t in clear_trades if str(t.get('order_id')) == str(latest.get('order_id'))]
+            size = sum(float(t.get('close_size') or 0) for t in fills)
+            if abs(size - missing_contracts) < 1e-8:
+                return {
+                    'status': 'desynced', 'type': 'missing_gate_position',
+                    'exchange_clear': True,
+                    'event_at': datetime.fromtimestamp(float(latest['create_time'])),
+                    'contract': contract, 'future_close_size': size,
+                    'future_close_price': sum(float(t['price']) * float(t['close_size']) for t in fills) / size,
+                    'future_exchange_order_id': str(latest['order_id']),
+                    'future_fee': sum(float(t.get('fee') or 0) for t in fills),
+                    'future_liquidity_role': str(latest.get('role') or 'taker'),
+                    'detail': f'Gate下架清算|contract={contract}|contracts={size:g}|order={latest["order_id"]}',
+                }
 
         if adl_trades:
             latest = max(adl_trades, key=lambda t: float(t.get('create_time') or 0))
@@ -1099,7 +1120,9 @@ class Reconciler:
     ) -> Dict:
         risk_type = str(risk.get('type') or '')
         base_asset = str(item.get('base_asset') or '').upper()
-        if risk_type in {'adl', 'liquidation', 'missing_gate_position', 'qty_mismatch'}:
+        if risk_type == 'extra_gate_position' and float(risk.get('exchange_size') or 0) >= 0:
+            return {'attempted': False, 'reason': 'extra_gate_position_not_confirmed_short'}
+        if risk_type in {'adl', 'liquidation', 'missing_gate_position', 'qty_mismatch', 'extra_gate_position'}:
             multiplier = self._quanto_multiplier(base_asset)
             binance_row = binance_by_asset.get(base_asset)
             if multiplier <= 0:
@@ -1128,6 +1151,8 @@ class Reconciler:
                 'quanto_multiplier': multiplier,
             }
             if spot_excess > tolerance:
+                if risk.get('exchange_clear') and gate_qty == 0:
+                    return self.remediator.remediate_gate_clear(base_asset, remediation_risk)
                 if gate_qty <= tolerance:
                     return self.remediator.remediate_binance_spot_only_exposure(
                         base_asset=base_asset,
@@ -1157,37 +1182,19 @@ class Reconciler:
                 'gate_qty': gate_qty,
             }
 
-        if risk_type == 'extra_gate_position':
-            result = self.remediator.remediate_gate_extra_position(
-                base_asset=base_asset,
-                extra_contracts=float(item.get('extra_contracts') or 0),
-                risk=risk,
-            )
-            spot_result = self._auto_remediate_binance_spot_for_gate_extra(
-                item,
-                risk,
-                result,
-                binance_by_asset,
-            )
-            if spot_result.get('attempted'):
-                return {
-                    **result,
-                    'paired_binance_spot_result': spot_result,
-                    'success': bool(result.get('success')) and bool(spot_result.get('success')),
-                }
-            return result
-
         return {'attempted': False, 'reason': f'unsupported_gate_risk:{risk_type}'}
 
     def _auto_cleanup_completed_asset_dust(
         self,
         binance_balances: List[Dict],
         gate_positions: List[Dict],
+        skip_assets: Optional[Set[str]] = None,
     ) -> List[Dict]:
         """Clean dust only when the shared remediator proves an asset has no active position."""
         result = self.remediator.cleanup_post_close_dust(
             binance_balances,
             gate_positions,
+            **({'skip_assets': skip_assets} if skip_assets else {}),
         )
         return [result] if result.get('attempted') else []
 
@@ -1203,36 +1210,13 @@ class Reconciler:
             assets.update(str(value or '').upper() for value in values if value)
         return assets
 
-    def _auto_remediate_binance_spot_for_gate_extra(
-        self,
-        item: Dict,
-        risk: Dict,
-        gate_result: Dict,
-        binance_by_asset: Dict[str, Dict],
-    ) -> Dict:
-        if not gate_result.get('success'):
-            return {'attempted': False, 'reason': 'gate_extra_remediation_not_successful'}
-        base_asset = str(item.get('base_asset') or '').upper()
-        row = binance_by_asset.get(base_asset)
-        if not row:
-            return {'attempted': False, 'reason': 'no_binance_position_row'}
-        local_qty = float(row.get('local_value') or 0)
-        exchange_qty = float(row.get('exchange_value') or 0)
-        if abs(exchange_qty - local_qty) <= BINANCE_SPOT_TOLERANCE:
-            return {'attempted': False, 'reason': 'binance_spot_already_match'}
-        if exchange_qty < local_qty:
-            return {
-                'attempted': False,
-                'reason': 'reduce_only_policy_does_not_buy_missing_spot',
-            }
-        return self.remediator.remediate_binance_spot_desync(
-            base_asset=base_asset,
-            local_qty=local_qty,
-            exchange_qty=exchange_qty,
-            risk=risk,
-        )
-
     def _record_reconciliation_risk_event(self, snapshot_at: datetime, item: Dict, result: Dict):
+        try:
+            self._write_reconciliation_risk_event(snapshot_at, item, result)
+        except Exception:
+            logger.exception('对账处置事件落库失败，保留执行结果并继续快照落库 | asset=%s', item.get('base_asset'))
+
+    def _write_reconciliation_risk_event(self, snapshot_at: datetime, item: Dict, result: Dict):
         risk = item.get('risk') or {}
         base_asset = str(item.get('base_asset') or '').upper()
         risk_type = str(risk.get('type') or 'unknown')[:40]

@@ -43,6 +43,7 @@ from calc.dynamic_take_profit import (
     format_dynamic_take_profit,
 )
 from calc.real_executor import GATE_CROSS_MARGIN_LEVERAGE
+from common.market_meta_safety import validate_position_multiplier, require_quanto_multiplier
 
 logger = get_logger(__name__)
 
@@ -94,7 +95,6 @@ class ClosingExecutor:
         self.high_basis_close_positive_funding_hold_enabled = config.get_bool(
             'trade.high_basis_open.close_positive_funding_hold_enabled', False
         )
-        self.max_funding_payments = config.get_int('trade.close.max_funding_payments', 30)
         self.positive_funding_hold_enabled = config.get_bool(
             'trade.close.positive_funding_hold_enabled', True
         )
@@ -871,13 +871,14 @@ class ClosingExecutor:
 
             current_spread_bps = pos.get('current_spread_bps')
 
-            if current_spread_bps is None:
+            delist_exit = self._check_delist_risk_exit(pos)
+            if current_spread_bps is None and not delist_exit:
                 continue  # 无盘口数据，跳过
             valley_key = self._valley_key(ba, pos)
 
             # ── 冷却期检查：平仓失败后 N 秒内不重试 ──
             cooldown_until = self._close_cooldown.get(ba)
-            if cooldown_until and (datetime.now() - cooldown_until).total_seconds() < self.close_cooldown_sec:
+            if not delist_exit and cooldown_until and (datetime.now() - cooldown_until).total_seconds() < self.close_cooldown_sec:
                 continue
 
             # ── 按优先级检查平仓条件 ──
@@ -887,7 +888,7 @@ class ClosingExecutor:
             negative_funding_exit_mode = None
             quality_guard_reason = None
 
-            if self._check_delist_risk_exit(pos):
+            if delist_exit:
                 close_reason = 'delist_risk_exit'
                 close_reason_detail = self._build_delist_risk_exit_detail(pos)
                 self._clear_position_close_state(ba, pos)
@@ -943,7 +944,7 @@ class ClosingExecutor:
                 continue
 
             # ── 最终风控旁路：止盈复核盈利性；风险平仓复核新鲜度/同步/深度 ──
-            guarded_reasons = {'take_profit', 'negative_funding_exit', 'delist_risk_exit'}
+            guarded_reasons = {'take_profit', 'negative_funding_exit'}
             if close_reason in guarded_reasons:
                 contract = pos.get('future_contract', '')
                 symbol = pos.get('spot_symbol') or f"{ba}USDT"
@@ -1037,13 +1038,15 @@ class ClosingExecutor:
                     future_protective_price=future_protective_price,
                 )
                 results.append(result)
+                if not result.get('success') or pos.get('exchange_risk_status') == 'desynced':
+                    desynced_assets.add(ba)
                 if result.get('success'):
                     # 平仓成功，清除谷底监控状态和冷却记录
                     self._clear_position_close_state(ba, pos)
                     self._close_cooldown.pop(ba, None)
                     logger.info(
                         f"平仓成功 | {ba} | reason={close_reason} | "
-                        f"spread_bps={current_spread_bps:.2f}"
+                        f"spread_bps={current_spread_bps}"
                     )
                     if quality_guard_reason:
                         self._update_close_quality_guard(
@@ -1074,6 +1077,7 @@ class ClosingExecutor:
                         f"冷却{self.close_cooldown_sec}s"
                     )
             except Exception as e:
+                desynced_assets.add(ba)
                 logger.error(f"平仓执行异常 {ba}: {e}", exc_info=True)
                 results.append({'base_asset': ba, 'success': False, 'message': str(e)})
 
@@ -1798,10 +1802,6 @@ class ClosingExecutor:
             parts.append("全仓风险触发")
         parts.append("全量市价平仓")
         return '|'.join(parts)
-
-    def _check_funding_count(self, pos: Dict) -> bool:
-        """兼容旧测试/外部调用：资金费次数不再作为强制平仓条件。"""
-        return False
 
     def _check_take_profit(
         self,
@@ -2624,6 +2624,7 @@ class ClosingExecutor:
         """
         order_uuid = str(uuid.uuid4())
         ba = pos.get('base_asset', '')
+        multiplier = validate_position_multiplier(self.contract_meta, pos)
         spot_symbol = pos.get('spot_symbol') or f"{ba}USDT"
         future_contract = pos.get('future_contract', '')
         spot_target_qty = float(pos.get('spot_open_qty') or 0)
@@ -2672,6 +2673,7 @@ class ClosingExecutor:
             'trade_direction': 'buy',
             'status': 'pending',
             'target_qty': future_target_qty,
+            'future_quanto_multiplier': multiplier,
             'target_amount': future_target_amount,
         }
         if target_contracts > 0:
@@ -2776,8 +2778,7 @@ class ClosingExecutor:
 
     def _get_quanto_multiplier(self, base_asset: str) -> float:
         try:
-            multiplier = float((self.contract_meta.get(base_asset) or {}).get('quanto_multiplier'))
-            return multiplier if multiplier > 0 else 0.0
+            return require_quanto_multiplier(self.contract_meta, base_asset)
         except (TypeError, ValueError):
             return 0.0
 
@@ -3311,8 +3312,6 @@ class ClosingExecutor:
         }
         rows_by_asset: Dict[str, Dict[str, Dict]] = {}
         for pos in rows:
-            if pos.get('status') != 'holding':
-                continue
             base_asset = str(pos.get('base_asset') or '').upper()
             if not base_asset:
                 continue
@@ -3324,15 +3323,25 @@ class ClosingExecutor:
                 unresolved_ids = set()
                 for position_id in position_ids:
                     if position_id == '*':
-                        unresolved = any(
-                            str(row.get('exchange_risk_status') or 'normal').lower()
-                            != 'resolved'
+                        unresolved = not asset_rows or any(
+                            row.get('status') == 'holding' and
+                            str(row.get('exchange_risk_status') or 'normal').lower() != 'resolved'
                             for row in asset_rows.values()
                         )
                     else:
                         row = asset_rows.get(position_id)
-                        unresolved = bool(
-                            row
+                        if row is None:
+                            try:
+                                with db_manager.get_cursor() as cursor:
+                                    cursor.execute(
+                                        'SELECT status, exchange_risk_status FROM mi_trade_position WHERE id=%s AND base_asset=%s',
+                                        (position_id, base_asset),
+                                    )
+                                    row = cursor.fetchone()
+                            except Exception:
+                                logger.warning('隔离持仓状态复核失败，继续禁止重复平仓 | %s:%s', base_asset, position_id, exc_info=True)
+                        unresolved = not row or bool(
+                            row.get('status') != 'closed'
                             and str(row.get('exchange_risk_status') or 'normal').lower()
                             != 'resolved'
                         )

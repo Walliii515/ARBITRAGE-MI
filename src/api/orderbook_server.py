@@ -836,6 +836,15 @@ def _refresh_delist_risk_report_once() -> Dict:
     report = DelistRiskMonitor(
         DelistRiskConfig(lookahead_days=lookahead_days, timeout_sec=timeout_sec)
     ).build_report()
+    # A missing list row or failed source must not erase an unresolved risk.
+    unresolved = [item for item in _delist_risk_report.get('items', [])
+                  if item.get('delist_at') or item.get('status') in {'delisting', 'delisted'}]
+    report['items'] = DelistRiskMonitor._dedupe_risks(report.get('items', []) + unresolved)
+    report['summary'] = {
+        'total': len(report['items']),
+        'critical': sum(item.get('risk_level') == 'critical' for item in report['items']),
+        'warning': sum(item.get('risk_level') == 'warning' for item in report['items']),
+    }
     _delist_risk_report = report
     _delist_risk_report_ts = time.time()
     summary = report.get('summary') or {}
@@ -2574,22 +2583,30 @@ def _run_close_position_check_once():
             and svc._binance_ws_connected()
         )
         if can_enrich_margin_economics:
-            margin_rows = _get_merged_rows()
-            close_vwaps = {}
-            for row in margin_rows or []:
-                asset = str(row.get('base_asset') or '').upper()
-                if not asset:
-                    continue
-                margin_orderbook_rows[asset] = row
-                spot_close = row.get('spot_close_vwap')
-                future_close = row.get('future_close_vwap')
-                if spot_close is not None and future_close is not None:
-                    close_vwaps[asset] = {
-                        'spot_close_vwap': float(spot_close),
-                        'future_close_vwap': float(future_close),
-                    }
-            tracker.attach_funding_histories(positions)
-            calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
+            try:
+                margin_rows = _get_merged_rows()
+                close_vwaps = {}
+                for row in margin_rows or []:
+                    asset = str(row.get('base_asset') or '').upper()
+                    if not asset:
+                        continue
+                    margin_orderbook_rows[asset] = row
+                    spot_close = row.get('spot_close_vwap')
+                    future_close = row.get('future_close_vwap')
+                    if spot_close is not None and future_close is not None:
+                        close_vwaps[asset] = {
+                            'spot_close_vwap': float(spot_close),
+                            'future_close_vwap': float(future_close),
+                        }
+                tracker.attach_funding_histories(positions)
+                calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
+            except Exception:
+                # Optional economics must not prevent emergency reduce-only execution.
+                margin_orderbook_rows.clear()
+                for pos in positions:
+                    pos.pop('current_spread_bps', None)
+                    pos.pop('net_pnl_bps', None)
+                logger.exception('保证金候选收益富化失败，保留独立危险平仓路径')
 
         emergency_results = _closing_executor.check_and_close_margin_danger(
             positions,
@@ -2599,6 +2616,12 @@ def _run_close_position_check_once():
             _publish_close_position_results(emergency_results)
             return
 
+        delist_positions = [pos for pos in positions if _closing_executor._check_delist_risk_exit(pos)]
+        if delist_positions:
+            delist_results = _closing_executor.check_and_close(delist_positions, {}, {})
+            _publish_close_position_results(delist_results)
+            # Keep failures owned by the same path, without a second attempt this cycle.
+            positions = [pos for pos in positions if pos not in delist_positions]
         # Everything below is the ordinary close path and may depend on live books.
         if not svc or svc.state != SERVICE_RUNNING:
             return

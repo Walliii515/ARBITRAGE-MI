@@ -1,6 +1,7 @@
 # coding: utf-8
 """Validation helpers for exchange metadata snapshots and contract sizing."""
 
+import math
 from typing import Dict, Iterable, Mapping, Optional
 
 from common.logger import get_logger
@@ -16,7 +17,7 @@ def _positive_float(value) -> Optional[float]:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if parsed > 0 else None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
 def _guard_snapshot_count(label: str, incoming_count: int, previous_count: int) -> None:
@@ -74,9 +75,50 @@ def validate_spot_records(records: Iterable[Dict], previous_count: int = 0) -> N
 
 def require_quanto_multiplier(contract_meta: Mapping[str, Dict], base_asset: str) -> float:
     asset = str(base_asset or '').strip().upper()
+    if (contract_meta.get(asset) or {}).get('multiplier_conflict'):
+        raise ValueError(f'Gate持仓与合约乘数不一致({asset})')
     multiplier = _positive_float((contract_meta.get(asset) or {}).get('quanto_multiplier'))
     if multiplier is None:
         raise ValueError(f'缺少有效Gate合约乘数({asset or "unknown"})')
+    return multiplier
+
+
+def merge_position_multipliers(metadata: Dict[str, Dict], positions: Iterable[Dict]) -> Dict[str, Dict]:
+    """Retain sizing for held contracts, without making missing contracts tradable."""
+    result = {asset: dict(row) for asset, row in metadata.items()}
+    for pos in positions:
+        asset = str(pos.get('base_asset') or '').upper()
+        saved = _positive_float(pos.get('future_quanto_multiplier'))
+        row = result.setdefault(asset, {'position_only': True})
+        current = _positive_float(row.get('quanto_multiplier'))
+        if saved is None or (current is not None and not math.isclose(current, saved, rel_tol=1e-9, abs_tol=0)):
+            row['multiplier_conflict'] = True
+            row['quanto_multiplier'] = None
+        elif not row.get('multiplier_conflict'):
+            row['quanto_multiplier'] = saved
+    return result
+
+
+def validate_position_multiplier(metadata: Mapping[str, Dict], position: Dict) -> float:
+    if 'future_quanto_multiplier' not in position:
+        return require_quanto_multiplier(metadata, position.get('base_asset'))
+    merged = merge_position_multipliers(dict(metadata), [position])
+    return require_quanto_multiplier(merged, position.get('base_asset'))
+
+
+def execution_position_multiplier(metadata: Mapping[str, Dict], asset: str, fill: Dict) -> float:
+    """Validate the unit snapshot before storing a newly executed position."""
+    multiplier = require_quanto_multiplier(metadata, asset)
+    if fill.get('quanto_multiplier') is not None:
+        multiplier = validate_position_multiplier(metadata, {
+            'base_asset': asset, 'future_quanto_multiplier': fill['quanto_multiplier'],
+        })
+    quantity = _positive_float(fill.get('exec_qty'))
+    contracts = _positive_float(fill.get('exec_contracts'))
+    if fill.get('exec_contracts') is not None and (contracts is None or not contracts.is_integer()):
+        raise ValueError(f'Gate成交合约张数无效({asset})')
+    if quantity is None or (contracts is not None and not math.isclose(quantity, contracts * multiplier, rel_tol=1e-9, abs_tol=1e-8)):
+        raise ValueError(f'Gate成交数量与持仓乘数不一致({asset})')
     return multiplier
 
 
@@ -89,6 +131,8 @@ def retain_healthy_contract_meta(
     try:
         _guard_snapshot_count('Gate合约元数据缓存', len(candidate), len(current))
         for asset in candidate:
+            if candidate[asset].get('multiplier_conflict'):
+                continue  # Keep the per-asset rejection visible, not an older valid cache.
             require_quanto_multiplier(candidate, asset)
     except ValueError as exc:
         logger.error('拒绝异常Gate合约元数据缓存，保留上一版本 | %s', exc)

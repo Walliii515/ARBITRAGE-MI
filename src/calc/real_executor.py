@@ -24,7 +24,7 @@ from urllib.parse import urlencode
 import requests
 
 from common.logger import get_logger
-from common.market_meta_safety import require_quanto_multiplier
+from common.market_meta_safety import require_quanto_multiplier, validate_position_multiplier
 from common.tools import truncate_to_precision
 
 logger = get_logger(__name__)
@@ -2201,6 +2201,7 @@ class RealExecutor:
             'exec_price': exec_price,
             'exec_qty': exec_qty,
             'exec_contracts': size,
+            'quanto_multiplier': quanto_multiplier,
             'exec_amount': exec_amount,
             'coverage_ratio': 0,
             'exchange_order_id': str(data.get('id', '')),
@@ -2436,6 +2437,14 @@ class RealExecutor:
     def _resolve_gate_order_sizing(self, order: Dict) -> Tuple[float, int, Optional[str]]:
         """Resolve a Gate order without side effects so concurrent opens can preflight."""
         base_asset = str(order.get('base_asset') or '').upper()
+        if order.get('order_side') == 'open' and (self.contract_meta.get(base_asset) or {}).get('position_only'):
+            return 0.0, 0, '合约仅保留持仓乘数，禁止新开仓'
+        try:
+            multiplier = (validate_position_multiplier(self.contract_meta, order)
+                          if 'future_quanto_multiplier' in order
+                          else self._get_quanto_multiplier(base_asset))
+        except ValueError as exc:
+            return 0.0, 0, str(exc)
         try:
             target_qty = float(order.get('target_qty') or 0)
         except (TypeError, ValueError):
@@ -2452,13 +2461,9 @@ class RealExecutor:
                 return 0.0, 0, f'Gate目标合约张数无效({explicit_contracts})'
             if target_qty <= 0:
                 return 0.0, 0, f'Gate目标标的数量无效({target_qty})'
-            if order.get('order_side') == 'open':
-                try:
-                    multiplier = self._get_quanto_multiplier(base_asset)
-                except ValueError as exc:
-                    return 0.0, 0, str(exc)
-                return multiplier, rounded_contracts, None
-            return target_qty / rounded_contracts, rounded_contracts, None
+            if abs(target_qty - rounded_contracts * multiplier) > max(1e-8, target_qty * 1e-9):
+                return 0.0, 0, 'Gate目标数量与合约乘数不一致'
+            return multiplier, rounded_contracts, None
 
         try:
             multiplier = self._get_quanto_multiplier(base_asset)

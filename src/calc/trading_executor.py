@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Set
 
 from common.database import db_manager
 from common.logger import get_logger
-from common.market_meta_safety import require_quanto_multiplier
+from common.market_meta_safety import require_quanto_multiplier, execution_position_multiplier
 
 logger = get_logger(__name__)
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps, calc_open_fee_bps
@@ -2039,6 +2039,13 @@ class TradingExecutor:
         """
         base_asset = row.get('base_asset', '')
 
+        try:
+            require_quanto_multiplier(self.contract_meta, base_asset)
+            if (self.contract_meta.get(base_asset) or {}).get('position_only'):
+                return False
+        except ValueError:
+            return False
+
         delist_ok, _delist_reason = self._check_delist_open_block(base_asset)
         if not delist_ok:
             return False
@@ -2542,6 +2549,12 @@ class TradingExecutor:
     
         最短链路：单标的盘口读取 → 新鲜度硬约束(lag_ms) → VWAP基差计算 → 统一入场门槛+覆盖率校验
         """
+        try:
+            require_quanto_multiplier(self.contract_meta, base_asset)
+            if (self.contract_meta.get(base_asset) or {}).get('position_only'):
+                return False, None, None, '合约仅保留持仓乘数，禁止新开仓'
+        except ValueError as exc:
+            return False, None, None, str(exc)
         # 未注入 manager 时退化为放行（兼容测试场景）
         if not self._gate_manager or not self._spot_manager:
             return True, None, None, ''
@@ -3043,6 +3056,12 @@ class TradingExecutor:
     def _get_risk_fail_reason(self, row: Dict) -> str:
         """识别风控失败的具体原因（用于信号日志）"""
         base_asset = row.get('base_asset', '')
+        try:
+            require_quanto_multiplier(self.contract_meta, base_asset)
+            if (self.contract_meta.get(base_asset) or {}).get('position_only'):
+                return '合约仅保留持仓乘数，禁止新开仓'
+        except ValueError as exc:
+            return str(exc)
 
         delist_ok, delist_reason = self._check_delist_open_block(base_asset)
         if not delist_ok:
@@ -3674,7 +3693,7 @@ class TradingExecutor:
                 order_uuid, base_asset, spot_symbol, future_contract,
                 status, opened_at,
                 spot_open_qty, spot_open_price, spot_open_amount,
-                future_open_qty, future_open_price, future_open_contracts,
+                future_open_qty, future_open_price, future_open_contracts, future_quanto_multiplier,
                 open_spread_bps, signal_basis_bps, pre_gate_basis_bps, actual_basis_bps, open_reason,
                 open_funding_rate_24h,
                 funding_rate_sum_bps, funding_payments_count, funding_total_pnl
@@ -3682,7 +3701,7 @@ class TradingExecutor:
                 %(order_uuid)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 'holding', %(opened_at)s,
                 %(spot_open_qty)s, %(spot_open_price)s, %(spot_open_amount)s,
-                %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s,
+                %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s, %(future_quanto_multiplier)s,
                 %(open_spread_bps)s, %(signal_basis_bps)s, %(pre_gate_basis_bps)s, %(actual_basis_bps)s, %(open_reason)s,
                 %(open_funding_rate_24h)s,
                 0, 0, 0
@@ -3690,6 +3709,7 @@ class TradingExecutor:
         """
         
         # 计算期货张数
+        quanto_multiplier = execution_position_multiplier(self.contract_meta, order_group['base_asset'], future_exec)
         exec_contracts = future_exec.get('exec_contracts')
         if exec_contracts not in (None, ''):
             future_contracts = int(round(abs(float(exec_contracts))))
@@ -3712,6 +3732,7 @@ class TradingExecutor:
             'future_open_qty': future_exec['exec_qty'],
             'future_open_price': future_exec['exec_price'],
             'future_open_contracts': future_contracts,
+            'future_quanto_multiplier': quanto_multiplier,
             'open_spread_bps': open_spread_bps,
             'signal_basis_bps': order_group.get('signal_basis_bps'),
             'pre_gate_basis_bps': order_group.get('pre_gate_basis_bps'),

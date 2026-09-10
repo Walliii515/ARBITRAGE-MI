@@ -291,6 +291,7 @@ CREATE TABLE `mi_trade_position` (
   `future_open_qty` decimal(20,8) NOT NULL COMMENT '期货开仓数量(标的资产)',
   `future_open_price` decimal(20,8) NOT NULL COMMENT '期货开仓VWAP',
   `future_open_contracts` int NOT NULL COMMENT '期货开仓张数',
+  `future_quanto_multiplier` decimal(30,15) NOT NULL CHECK (`future_quanto_multiplier` > 0),
   `open_spread_bps` decimal(10,2) NOT NULL COMMENT '开仓时价差(bps)',
   `open_funding_rate_24h` decimal(18,10) DEFAULT NULL COMMENT '开仓时刻实时折算24h资金费率',
   `signal_basis_bps` decimal(10,2) DEFAULT NULL COMMENT '触发时看到的开仓VWAP基差(bps)',

@@ -289,7 +289,6 @@ trade:
     protective_fok_min_notional_buffer_ratio: 1.2 # 分片/尾片至少为Binance最低名义的1.2倍
     take_profit_days_multiplier: 10         # legacy_p40模式止盈倍数
     # take_profit_days_multiplier: 2         # 止盈倍数（总盈亏bps >= percentile_40费率bps * 此值 + 手续费bps）
-    max_funding_payments: 30                # 已废弃：资金费次数不再强制平仓，改由 dynamic_take_profit aging_*_funding_count 接管
     max_orderbook_lag_ms: 500               # 旁路风控新鲜度硬约束：本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 谷底反弹策略（平仓确认） ───

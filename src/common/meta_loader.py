@@ -8,6 +8,7 @@ from typing import Dict
 
 from common.database import db_manager
 from common.logger import get_logger
+from common.market_meta_safety import merge_position_multipliers
 
 logger = get_logger(__name__)
 
@@ -59,7 +60,10 @@ def fetch_contract_meta() -> Dict[str, Dict]:
                 }
     except Exception as e:
         logger.error(f'加载合约元数据失败: {e}', exc_info=True)
-    return result
+    with db_manager.get_cursor() as cursor:
+        cursor.execute("SELECT base_asset, future_quanto_multiplier FROM mi_trade_position WHERE status='holding'")
+        positions = cursor.fetchall()
+    return merge_position_multipliers(result, positions)
 
 
 def fetch_spot_meta() -> Dict[str, Dict]:

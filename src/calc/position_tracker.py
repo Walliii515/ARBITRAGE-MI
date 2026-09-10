@@ -8,7 +8,7 @@ from typing import List, Dict, Optional, Tuple
 from common.database import db_manager
 from common.config import config
 from common.logger import get_logger
-from common.market_meta_safety import require_quanto_multiplier
+from common.market_meta_safety import require_quanto_multiplier, execution_position_multiplier
 from calc.orderbook_enricher import calc_vwap_basis_bps
 from calc.position_order_fees import attach_position_order_fee_summary
 
@@ -48,6 +48,7 @@ class PositionTracker:
         
         # 计算期货张数
         base_asset = order_group['base_asset']
+        quanto = execution_position_multiplier(self.contract_meta, base_asset, future_exec)
         exec_contracts = future_exec.get('exec_contracts')
         if exec_contracts not in (None, ''):
             future_contracts = int(round(abs(float(exec_contracts))))
@@ -74,13 +75,13 @@ class PositionTracker:
             INSERT INTO mi_trade_position (
                 order_uuid, base_asset, spot_symbol, future_contract, status, opened_at,
                 spot_open_qty, spot_open_price, spot_open_amount,
-                future_open_qty, future_open_price, future_open_contracts,
+                future_open_qty, future_open_price, future_open_contracts, future_quanto_multiplier,
                 open_spread_bps, open_funding_rate_24h, next_funding_time
             ) VALUES (
                 %(order_uuid)s, %(base_asset)s, %(spot_symbol)s, %(future_contract)s,
                 'holding', NOW(),
                 %(spot_open_qty)s, %(spot_open_price)s, %(spot_open_amount)s,
-                %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s,
+                %(future_open_qty)s, %(future_open_price)s, %(future_open_contracts)s, %(future_quanto_multiplier)s,
                 %(open_spread_bps)s, %(open_funding_rate_24h)s, %(next_funding_time)s
             )
         """
@@ -96,6 +97,7 @@ class PositionTracker:
             'future_open_qty': future_exec['exec_qty'],
             'future_open_price': future_exec['exec_price'],
             'future_open_contracts': future_contracts,
+            'future_quanto_multiplier': quanto,
             'open_spread_bps': round(open_spread_bps, 2),
             'open_funding_rate_24h': order_group.get('funding_rate_24h'),
             'next_funding_time': next_funding_time,
