@@ -4,6 +4,7 @@
 - 成交引擎通过 ExecutorClient (HTTP) 调用独立的执行器服务（虚拟/实盘），实现虚实分离
 """
 import math
+import json
 import time
 import uuid
 from collections import deque
@@ -25,6 +26,7 @@ from calc.orderbook_resiliency import (
 )
 from calc.execution_audit import format_execution_audit
 from calc.order_fee_resolver import build_order_execution_fields
+from calc.popup_notification_store import upsert_popup_notification
 from exchange_apis.get_gate_future_contracts import get_single_contract_funding_info
 
 REBOUND_STRONG_TRIGGER = 'rebound_strong'
@@ -329,6 +331,7 @@ class TradingExecutor:
         # 开仓拒单冷却：被交易所拒单后暂停该标的开仓，避免重复提交注定失败的订单
         self.reject_cooldown_sec = cfg.reject_cooldown_sec
         self._reject_cooldown_until: Dict[str, datetime] = {}  # base_asset -> 冷却截止时间
+        self._open_persistence_failed_assets: Set[str] = set()
 
         # 开仓冷却缓存：base_asset -> 上次成功开仓时间（DB 真理源 + 内存维护）
         # 仅本类 _save_orders 成功路径会写入，无外部入口，故可纯内存维护，避免每标的查 SQL
@@ -625,6 +628,11 @@ class TradingExecutor:
         for row in orderbook_rows:
             try:
                 base_asset = row.get('base_asset', '')
+
+                if str(base_asset or '').upper() in self._open_persistence_failed_assets:
+                    self._peak_state.pop(base_asset, None)
+                    self._open_resiliency.clear(base_asset)
+                    continue
 
                 if str(base_asset or '').upper() in exchange_risk_blocked_assets:
                     reason = '交易所仓位风险(desynced)暂停开仓'
@@ -3589,12 +3597,36 @@ class TradingExecutor:
 
     def _save_orders(self, order_group: Dict, exec_result: Dict):
         """持久化订单到数据库"""
+        try:
+            with db_manager.get_cursor() as cursor:
+                self._save_orders_in_transaction(order_group, exec_result, cursor)
+        except Exception as exc:
+            if exec_result.get('success'):
+                asset = str(order_group['base_asset']).upper()
+                # Never re-open on the next tick using exposure that failed to reach the ledger.
+                self._open_persistence_failed_assets.add(asset)
+                receipt = {'order_group': order_group, 'exec_result': exec_result}
+                message = f'开仓已成交但本地落账失败，暂停同币开仓，需核对成交后修复账本: {exc}'
+                logger.critical('%s | %s | receipt=%s', asset, message,
+                                json.dumps(receipt, ensure_ascii=False, default=str), exc_info=True)
+                try:
+                    upsert_popup_notification(
+                        title=f'开仓成交落账失败: {asset}', message=message,
+                        type='error', source='open_persistence',
+                        dedup_key=f"open_persistence:{order_group['order_uuid']}",
+                        payload=receipt, event_at=datetime.now(),
+                    )
+                except Exception:
+                    logger.exception('开仓落账失败通知写入失败 | %s', asset)
+            raise
+
+    def _save_orders_in_transaction(self, order_group: Dict, exec_result: Dict, cursor):
         self._attach_actual_basis_audit(order_group, exec_result)
 
         # 开仓成功时，先创建持仓记录，获取 position_id
         position_id = None
         if exec_result['success'] and order_group['spot_order']['order_side'] == 'open':
-            position_id = self._create_position(order_group, exec_result)
+            position_id = self._create_position(order_group, exec_result, cursor=cursor)
         
         sql = """
             INSERT INTO mi_trade_order (
@@ -3675,10 +3707,9 @@ class TradingExecutor:
                 order['exchange_order_id'] = None
                 order['executed_at'] = None
             
-            with db_manager.get_cursor() as cursor:
-                cursor.execute(sql, order)
+            cursor.execute(sql, order)
 
-    def _create_position(self, order_group: Dict, exec_result: Dict) -> int:
+    def _create_position(self, order_group: Dict, exec_result: Dict, cursor=None) -> int:
         """创建持仓记录，返回 position_id"""
         spot_exec = exec_result['spot_order']
         future_exec = exec_result['future_order']
@@ -3741,9 +3772,12 @@ class TradingExecutor:
             'open_funding_rate_24h': order_group.get('funding_rate_24h'),
         }
         
-        with db_manager.get_cursor() as cursor:
+        if cursor is not None:
             cursor.execute(sql, params)
             return cursor.lastrowid
+        with db_manager.get_cursor() as position_cursor:
+            position_cursor.execute(sql, params)
+            return position_cursor.lastrowid
     
     def _get_spot_qty_precision(self, base_asset: str) -> int:
         if base_asset in self.spot_meta:

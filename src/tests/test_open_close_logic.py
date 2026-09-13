@@ -852,6 +852,8 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                 'success': True,
                 'exec_price': 0.018692,
                 'exec_qty': 1000.0,
+                'exec_contracts': 10,
+                'quanto_multiplier': 100.0,
                 'exec_amount': 18.692,
                 'coverage_ratio': 0,
                 'exchange_order_id': 'maker-10',
@@ -871,6 +873,8 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                 'success': True,
                 'exec_price': 0.018700,
                 'exec_qty': 1600.0,
+                'exec_contracts': 16,
+                'quanto_multiplier': 100.0,
                 'exec_amount': 29.92,
                 'coverage_ratio': 0,
                 'exchange_order_id': 'fallback-16',
@@ -915,6 +919,8 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         hedge_order = executor._place_binance_spot_order.call_args.args[0]
         self.assertEqual(hedge_order['target_qty'], 2600)
         self.assertEqual(result['future_order']['exec_qty'], 2600)
+        self.assertEqual(result['future_order']['exec_contracts'], 26)
+        self.assertEqual(result['future_order']['quanto_multiplier'], 100.0)
         self.assertEqual(
             result['execution_stats']['future_maker']['fallback_remaining_contracts'],
             16,

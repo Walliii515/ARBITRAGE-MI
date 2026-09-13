@@ -724,8 +724,12 @@ class RealExecutor:
         merged = dict(second)
         merged['success'] = True
         merged['exec_qty'] = total_qty
+        merged['exec_contracts'] = first['exec_contracts'] + second['exec_contracts']
         merged['exec_amount'] = total_amount
-        merged['exec_price'] = total_amount / total_qty if total_qty > 0 else 0
+        # exec_amount is rounded to cents by the Gate parser; it is not a VWAP numerator.
+        merged['exec_price'] = (
+            float(first['exec_price']) * qty1 + float(second['exec_price']) * qty2
+        ) / total_qty if total_qty > 0 else 0
         ids = [
             str(value)
             for value in (first.get('exchange_order_id'), second.get('exchange_order_id'))
@@ -737,13 +741,12 @@ class RealExecutor:
         maker_stats = stats.setdefault('future_maker', {})
         maker_stats['fallback_exchange_order_id'] = second.get('exchange_order_id')
         merged['execution_stats'] = stats
-        fees = [
-            float(value)
-            for value in (first.get('fee_amount_usdt'), second.get('fee_amount_usdt'))
-            if value is not None
-        ]
-        if fees:
-            merged['fee_amount_usdt'] = sum(fees)
+        for field in ('fee_amount', 'fee_amount_usdt'):
+            fees = (first.get(field), second.get(field))
+            # A known fee on only one fill must not masquerade as the full fee.
+            merged[field] = sum(float(fee) for fee in fees) if all(
+                fee is not None for fee in fees
+            ) else None
         return merged
 
     @staticmethod
