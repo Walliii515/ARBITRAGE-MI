@@ -1,4 +1,6 @@
-import { themeQuartz, colorSchemeDarkBlue } from 'ag-grid-community'
+import { themeQuartz, colorSchemeDarkBlue, ModuleRegistry, AllCommunityModule } from 'ag-grid-community'
+
+ModuleRegistry.registerModules([AllCommunityModule])
 
 /** 贴近交易终端的深色紧凑表格主题 */
 export const orderbookGridTheme = themeQuartz

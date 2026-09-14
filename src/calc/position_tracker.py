@@ -3,6 +3,7 @@
 - PositionTracker: 持仓创建、资金费累加、盈亏计算
 """
 from datetime import datetime, timedelta
+import time
 from typing import List, Dict, Optional, Tuple
 
 from common.database import db_manager
@@ -21,13 +22,14 @@ DEFAULT_FUNDING_INTERVAL_SEC = 8 * 3600
 class PositionTracker:
     """持仓管理器"""
     
-    def __init__(self, contract_meta: Dict = None):
+    def __init__(self, contract_meta: Dict = None, *, funding_history_cache: Optional[Dict] = None):
         """
         Args:
             contract_meta: base_asset -> {quanto_multiplier, ...} (可选，用于计算张数)
         """
         self.contract_meta = contract_meta or {}
         self._real_executor = None
+        self._funding_history_cache = funding_history_cache
     
     def create_position(self, order_group: Dict, exec_result: Dict):
         """
@@ -570,6 +572,20 @@ class PositionTracker:
         if not position_ids and not assets:
             return
 
+        # The close worker owns this cache. Ledger changes invalidate it immediately;
+        # the short TTL also covers backfilled histories from other processes.
+        cache = self._funding_history_cache
+        cache_key = tuple(sorted(
+            (int(p.get('id') or 0), str(p.get('base_asset') or ''),
+             str(p.get('funding_payments_count')), str(p.get('funding_total_pnl')),
+             str(p.get('funding_rate_sum_bps')), str(p.get('updated_at')))
+            for p in positions
+        ))
+        if (cache is not None and cache.get('key') == cache_key
+                and time.monotonic() - cache.get('at', 0) < 5.0):
+            self._attach_cached_funding(positions, cache)
+            return
+
         where_parts = []
         params = []
         if position_ids:
@@ -609,11 +625,20 @@ class PositionTracker:
                     seen.add(key)
                     by_asset.setdefault(ba, []).append(item)
 
+        snapshot = {'key': cache_key, 'at': time.monotonic(),
+                    'by_position': by_position, 'by_asset': by_asset}
+        if cache is not None:
+            cache.clear()
+            cache.update(snapshot)
+        self._attach_cached_funding(positions, snapshot)
+
+    @staticmethod
+    def _attach_cached_funding(positions: List[Dict], cache: Dict) -> None:
         for pos in positions:
             pid = int(pos.get('id') or 0)
             ba = str(pos.get('base_asset') or '').strip().upper()
-            pos['funding_history'] = by_position.get(pid, [])
-            pos['asset_funding_history'] = by_asset.get(ba, [])
+            pos['funding_history'] = [dict(item) for item in cache['by_position'].get(pid, [])]
+            pos['asset_funding_history'] = [dict(item) for item in cache['by_asset'].get(ba, [])]
 
     def _serialize_funding_history_row(self, row: Dict) -> Dict:
         settled_at = row.get('settled_at')

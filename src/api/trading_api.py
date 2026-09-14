@@ -1768,7 +1768,7 @@ async def get_gate_cross_risk_summary(
 
 
 @router.get('/capital/latest')
-async def get_capital_latest():
+def get_capital_latest():
     """返回最新资金快照汇总。"""
     sql = """
         SELECT
@@ -1827,9 +1827,11 @@ async def get_capital_latest():
         FROM mi_capital_snapshot
         WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
           AND snapshot_at = (
-              SELECT MAX(snapshot_at)
-              FROM mi_capital_snapshot
+              SELECT snapshot_at
+              FROM mi_capital_snapshot FORCE INDEX (idx_snapshot_at)
               WHERE JSON_UNQUOTE(JSON_EXTRACT(detail, '$.source')) = 'exchange_api'
+              ORDER BY snapshot_at DESC
+              LIMIT 1
           )
         ORDER BY FIELD(exchange, 'binance', 'gate', 'total')
     """

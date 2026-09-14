@@ -1,9 +1,9 @@
 # coding: utf-8
 """
 统一日志工具
-- 默认输出目录: <repo>/src/log/app.log
-- 文件按天滚动 (TimedRotatingFileHandler, when='midnight')，保留 30 天
-- 同时输出到 stdout（保留终端体验）和文件
+- 默认输出目录: <repo>/src/log/app.<pid>.log
+- 文件按大小滚动，默认每进程 20 MiB x 5 个归档
+- LOG_OUTPUT=stdout 用于 systemd，由 journal 统一保存并限制总量
 - 仅依赖 Python 标准库 logging，无第三方依赖
 - 默认级别 INFO，可通过环境变量 LOG_LEVEL/LOG_DIR/LOG_FILENAME/LOG_BACKUP_COUNT 覆盖
 
@@ -42,8 +42,8 @@ def setup_logging(level: str = None,
     Args:
         level: 日志级别（DEBUG/INFO/WARNING/ERROR/CRITICAL），默认读取 LOG_LEVEL，否则 INFO
         log_dir: 日志目录，默认读取 LOG_DIR，否则 <repo>/src/log
-        filename: 日志文件名，默认读取 LOG_FILENAME，否则 app.log
-        backup_count: 保留多少个历史归档，默认读取 LOG_BACKUP_COUNT，否则 30
+        filename: 日志文件名，默认读取 LOG_FILENAME，否则 app.<pid>.log
+        backup_count: 历史归档数，默认读取 LOG_BACKUP_COUNT，否则 5
         force: 是否强制重建 handler（用于在测试或 reload 时重置）
     """
     global _INITIALIZED
@@ -54,11 +54,15 @@ def setup_logging(level: str = None,
     level_value = getattr(logging, level_name, logging.INFO)
 
     log_dir_path = Path(log_dir or os.getenv("LOG_DIR") or _project_log_dir())
-    log_dir_path.mkdir(parents=True, exist_ok=True)
-
-    file_name = filename or os.getenv("LOG_FILENAME", "app.log")
+    output = os.getenv('LOG_OUTPUT', 'both').lower()
+    if output not in ('stdout', 'file', 'both'):
+        raise ValueError('LOG_OUTPUT must be stdout, file, or both')
+    file_name = filename or os.getenv("LOG_FILENAME", f"app.{os.getpid()}.log")
     backup = int(backup_count if backup_count is not None
-                 else os.getenv("LOG_BACKUP_COUNT", "30"))
+                 else os.getenv("LOG_BACKUP_COUNT", "5"))
+    max_bytes = int(os.getenv('LOG_MAX_BYTES', str(20 * 1024 * 1024)))
+    if backup < 1 or max_bytes < 1:
+        raise ValueError('LOG_BACKUP_COUNT and LOG_MAX_BYTES must be positive')
 
     formatter = logging.Formatter(_DEFAULT_FORMAT, _DEFAULT_DATEFMT)
 
@@ -67,29 +71,28 @@ def setup_logging(level: str = None,
 
     if force:
         for h in list(root.handlers):
-            root.removeHandler(h)
+            if getattr(h, '_arb_console', False) or getattr(h, '_arb_file', False):
+                root.removeHandler(h)
+                h.close()
 
     # 终端 handler（stdout）
-    if not any(getattr(h, "_arb_console", False) for h in root.handlers):
+    if output in ('stdout', 'both') and not any(getattr(h, "_arb_console", False) for h in root.handlers):
         console = logging.StreamHandler(stream=sys.stdout)
         console.setLevel(level_value)
         console.setFormatter(formatter)
         console._arb_console = True  # 标记，便于幂等判断
         root.addHandler(console)
 
-    # 文件 handler（按天滚动，保留 backup_count 天）
-    if not any(getattr(h, "_arb_file", False) for h in root.handlers):
+    if output in ('file', 'both') and not any(getattr(h, "_arb_file", False) for h in root.handlers):
+        log_dir_path.mkdir(parents=True, exist_ok=True)
         file_path = log_dir_path / file_name
-        file_handler = logging.handlers.TimedRotatingFileHandler(
+        file_handler = logging.handlers.RotatingFileHandler(
             filename=str(file_path),
-            when="midnight",
-            interval=1,
+            maxBytes=max_bytes,
             backupCount=backup,
             encoding="utf-8",
             delay=False,
-            utc=False,
         )
-        file_handler.suffix = "%Y-%m-%d"
         file_handler.setLevel(level_value)
         file_handler.setFormatter(formatter)
         file_handler._arb_file = True

@@ -2518,12 +2518,16 @@ def _publish_close_position_results(results: List[Dict]) -> None:
     asyncio.run_coroutine_threadsafe(broadcast_queue.put(order_payload), event_loop)
 
 
+_close_funding_history_cache: Dict = {}
+
+
 def _run_close_position_check_once():
     """Run emergency account-risk exits before the ordinary orderbook close path."""
     global _negative_funding_watch_assets
     start = time.monotonic()
     try:
-        tracker = PositionTracker(_contract_meta)
+        tracker = PositionTracker(_contract_meta, funding_history_cache=_close_funding_history_cache)
+        funding_loaded = False
         positions = tracker.get_holding_positions()
         if not positions:
             _negative_funding_watch_assets = set()
@@ -2599,6 +2603,7 @@ def _run_close_position_check_once():
                             'future_close_vwap': float(future_close),
                         }
                 tracker.attach_funding_histories(positions)
+                funding_loaded = True
                 calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
             except Exception:
                 # Optional economics must not prevent emergency reduce-only execution.
@@ -2651,7 +2656,8 @@ def _run_close_position_check_once():
                     'future_close_vwap': float(future_cv),
                 }
 
-        tracker.attach_funding_histories(positions)
+        if not funding_loaded:
+            tracker.attach_funding_histories(positions)
         calculate_realtime_pnl(positions, close_vwaps, _contract_meta, _pnl_cfg)
         results = _closing_executor.check_and_close(
             positions, _close_vwap_threshold_meta, orderbook_rows_by_asset

@@ -917,7 +917,7 @@ class ClosingExecutor:
                         close_basis_for_resiliency = orderbook_row.get('close_vwap_basis_bps')
                         if close_basis_for_resiliency is None:
                             close_basis_for_resiliency = current_spread_bps
-                        self._close_resiliency.observe_shock(ba, orderbook_row)
+                        self._close_resiliency.observe_shock(self._valley_key(ba, pos), orderbook_row)
                     if self._pass_valley_check(ba, current_spread_bps, pos):
                         if orderbook_row is not None and not self._pass_close_resiliency_check(
                             ba, orderbook_row, float(close_basis_for_resiliency), pos
@@ -1215,7 +1215,21 @@ class ClosingExecutor:
         key = self._valley_key(base_asset, pos)
         self._valley_state.pop(key, None)
         self._last_take_profit_eval.pop(key, None)
-        self._close_resiliency.clear(base_asset)
+        self._close_resiliency.clear(key)
+
+    def _log_close_observation(self, position_key, event: str, message: str) -> None:
+        # Keep throttles across state resets so a rejected candidate cannot flood logs.
+        if not hasattr(self, '_close_observation_logs'):
+            self._close_observation_logs = {}
+        key = (position_key, event)
+        now = time.monotonic()
+        previous = self._close_observation_logs.get(key)
+        if previous is not None and now - previous < 60:
+            return
+        if len(self._close_observation_logs) >= 4096:
+            self._close_observation_logs.pop(next(iter(self._close_observation_logs)))
+        self._close_observation_logs[key] = now
+        logger.info(message)
 
     def _annotate_resiliency_row(self, row: Dict, base_asset: str) -> None:
         row['_future_qty_multiplier'] = self._get_quanto_multiplier(base_asset)
@@ -1225,7 +1239,7 @@ class ClosingExecutor:
     ) -> bool:
         open_spread_bps = float(pos.get('open_spread_bps') or 0)
         result = self._close_resiliency.check(
-            base_asset,
+            self._valley_key(base_asset, pos),
             row,
             basis_bps=close_basis_bps,
             coverage_threshold=self._close_resiliency_coverage_threshold,
@@ -1245,9 +1259,12 @@ class ClosingExecutor:
             return True
         if result.terminal:
             self._clear_position_close_state(base_asset, pos)
-            logger.info(f"平仓盘口恢复终止 | {base_asset} | reason={result.reason} | {metric_text}")
+            self._log_close_observation(self._valley_key(base_asset, pos),
+                'terminal:' + result.reason.split('(')[0],
+                f"平仓盘口恢复终止 | {base_asset} | position_id={self._valley_key(base_asset, pos)} | reason={result.reason} | {metric_text}")
             return False
-        logger.info(f"平仓盘口恢复等待 | {base_asset} | reason={result.reason} | {metric_text}")
+        self._log_close_observation(self._valley_key(base_asset, pos), 'resiliency_wait',
+            f"平仓盘口恢复等待 | {base_asset} | position_id={self._valley_key(base_asset, pos)} | reason={result.reason} | {metric_text}")
         return False
 
     # ──────────────────────────────────────────────────────────────────
@@ -2142,7 +2159,7 @@ class ClosingExecutor:
                 'open_spread_bps': open_spread_bps,
                 'trigger': None,
             }
-            logger.info(
+            self._log_close_observation(state_key, 'valley_start',
                 f"止盈谷底监控开始 | {base_asset} | "
                 f"position_id={state_key} | "
                 f"spread={current_spread_bps:.2f}bps | open_spread={open_spread_bps:.2f}bps | "
@@ -2158,8 +2175,8 @@ class ClosingExecutor:
         elapsed_sec = (now - state['start_time']).total_seconds()
         if elapsed_sec >= self.valley_monitor_timeout_sec:
             state['trigger'] = 'timeout'
-            logger.info(
-                f"止盈谷底监控超时，直接平仓 | {base_asset} | "
+            self._log_close_observation(state_key, 'valley_timeout',
+                f"止盈谷底监控超时，进入盘口复核 | {base_asset} | "
                 f"position_id={state_key} | "
                 f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
                 f"elapsed={elapsed_sec:.1f}s≥{self.valley_monitor_timeout_sec}s | "
@@ -2177,8 +2194,8 @@ class ClosingExecutor:
             rebound_threshold = state['valley_bps'] + convergence_range * self.valley_rebound_pct
         else:
             # 异常: 谷底高于开仓基差，直接平仓（罕见场景，仍打详细日志）
-            logger.info(
-                f"止盈谷底异常(谷底>=开仓基差)，直接平仓 | {base_asset} | "
+            self._log_close_observation(state_key, 'valley_nonconvergent',
+                f"止盈谷底未收敛(谷底>=开仓基差)，进入盘口复核 | {base_asset} | "
                 f"position_id={state_key} | "
                 f"valley={state['valley_bps']:.2f} | open_spread={open_spread_bps:.2f} | "
                 f"current={current_spread_bps:.2f}"
@@ -2188,8 +2205,8 @@ class ClosingExecutor:
     
         if current_spread_bps >= rebound_threshold:
             state['trigger'] = 'rebound'
-            logger.info(
-                f"止盈谷底反弹确认，执行平仓 | {base_asset} | "
+            self._log_close_observation(state_key, 'valley_rebound',
+                f"止盈谷底反弹确认，进入盘口复核 | {base_asset} | "
                 f"position_id={state_key} | "
                 f"valley={state['valley_bps']:.2f}bps | current={current_spread_bps:.2f}bps | "
                 f"rebound_thr={rebound_threshold:.2f}bps | "
