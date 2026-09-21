@@ -22,6 +22,13 @@ from calc.exchange_desync_remediator import (
 
 
 class TestReconciliationIgnoreAssets(unittest.TestCase):
+    @staticmethod
+    def _snapshot_executor(asset, spot, contracts, multiplier=1):
+        executor = MagicMock(contract_meta={asset: {'quanto_multiplier': multiplier}})
+        executor.fetch_binance_spot_balances.return_value = [{'asset': asset, 'total': spot, 'locked': 0}]
+        executor.fetch_gate_futures_positions.return_value = [{'base_asset': asset, 'size': -contracts}]
+        return executor
+
     def test_gate_post_processing_failure_does_not_skip_combined_exposure_check(self):
         executor = MagicMock()
         executor.fetch_binance_spot_balances.return_value = []
@@ -230,7 +237,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         )
 
     def test_gate_local_mismatch_does_not_trade_when_exchange_legs_are_balanced(self):
-        executor = MagicMock()
+        executor = self._snapshot_executor('TUT', 200, 2)
         executor.contract_meta = {'TUT': {'quanto_multiplier': 100.0}}
         reconciler = Reconciler(
             executor=executor,
@@ -269,7 +276,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         reconciler.remediator.remediate_gate_extra_position.assert_not_called()
 
     def test_gate_local_mismatch_sells_only_actual_binance_excess(self):
-        executor = MagicMock()
+        executor = self._snapshot_executor('TUT', 19300, 2)
         executor.contract_meta = {'TUT': {'quanto_multiplier': 100.0}}
         reconciler = Reconciler(
             executor=executor,
@@ -306,7 +313,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(kwargs['exchange_qty'], 19300.0)
 
     def test_gate_local_mismatch_closes_only_actual_gate_excess(self):
-        executor = MagicMock()
+        executor = self._snapshot_executor('TUT', 0, 2)
         executor.contract_meta = {'TUT': {'quanto_multiplier': 100.0}}
         reconciler = Reconciler(
             executor=executor,
@@ -344,7 +351,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
     def test_combined_binance_excess_uses_spot_only_reduction_when_gate_is_flat(self):
         reconciler = Reconciler(
-            executor=object(),
+            executor=self._snapshot_executor('AI', 11, 0),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
         reconciler.remediator.remediate_binance_spot_only_exposure = MagicMock(return_value={
@@ -377,7 +384,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
     def test_combined_gate_excess_uses_reduce_only_gate_close(self):
         reconciler = Reconciler(
-            executor=object(),
+            executor=self._snapshot_executor('BICO', 8, 100, 0.1),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
         reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
@@ -435,7 +442,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
     def test_same_run_skip_is_per_asset_and_does_not_block_other_assets(self):
         reconciler = Reconciler(
-            executor=object(),
+            executor=self._snapshot_executor('TUT', 100, 90),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
         reconciler.remediator.remediate_binance_spot_desync = MagicMock(return_value={
@@ -501,7 +508,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
     def test_gate_noop_does_not_block_combined_gate_short_recovery(self):
         reconciler = Reconciler(
-            executor=object(),
+            executor=self._snapshot_executor('TUT', 0, 2, 100),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
         reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={
@@ -573,7 +580,8 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
         self.assertEqual(owned, {'BEL'})
 
     def test_gate_remediation_exception_isolated_and_reserves_only_failed_asset(self):
-        executor = MagicMock()
+        executor = self._snapshot_executor('TUT', 0, 2)
+        executor.fetch_gate_futures_positions.return_value.append({'base_asset': 'BEL', 'size': -2})
         executor.contract_meta = {
             'TUT': {'quanto_multiplier': 100.0},
             'BEL': {'quanto_multiplier': 1.0},
@@ -794,7 +802,7 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
     def test_gate_extra_with_matching_spot_does_not_close_a_balanced_hedge(self):
         reconciler = Reconciler(
-            executor=MagicMock(contract_meta={'BEL': {'quanto_multiplier': 1}}),
+            executor=self._snapshot_executor('BEL', 2770, 2770),
             cfg=ReconciliationConfig(auto_remediate_enabled=True),
         )
         reconciler.remediator.remediate_gate_extra_position = MagicMock(return_value={

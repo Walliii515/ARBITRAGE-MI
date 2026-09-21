@@ -12,6 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Dict, List, Optional, Set
 
 from calc.exchange_desync_remediator import (
@@ -34,6 +35,33 @@ logger = get_logger(__name__)
 BINANCE_SPOT_TOLERANCE = 1e-6
 GATE_FUTURE_CONTRACT_TOLERANCE = 1.0
 DIFF_RATIO_EPSILON = 1e-12
+
+
+def _revalidate_remediation_snapshot(method):
+    @wraps(method)
+    def guarded(self, item, *args, **kwargs):
+        asset = str(item.get('base_asset') or '').upper()
+        with asset_reduction_guard.claim(asset, 'reconciliation_revalidation') as acquired:
+            if not acquired:
+                return {'attempted': False, 'reason': 'asset_reduction_inflight', 'base_asset': asset}
+            # Keep the same lock through dispatch and local persistence. Nested
+            # remediator claims are reentrant on this thread.
+            try:
+                if 'binance_qty' in item:
+                    spot_qty = item['binance_qty']
+                    contracts = item['gate_contracts']
+                else:
+                    rows = args[1] if len(args) > 1 else kwargs['binance_by_asset']
+                    spot_qty = rows[asset]['exchange_value']
+                    contracts = item['exchange_contracts']
+                reason = self._remediation_snapshot_changed(asset, spot_qty, contracts)
+            except Exception as exc:
+                logger.warning('对账兜底锁内复核失败，未下单 | asset=%s | %s', asset, exc)
+                reason = 'remediation_snapshot_unavailable'
+            if reason:
+                return {'attempted': False, 'reason': reason, 'base_asset': asset, 'retry_needed': True}
+            return method(self, item, *args, **kwargs)
+    return guarded
 
 
 @dataclass
@@ -900,6 +928,31 @@ class Reconciler:
             results.append(result)
         return results
 
+    def _remediation_snapshot_changed(self, asset: str, spot_qty: float, contracts: float) -> Optional[str]:
+        started = time.monotonic()
+        balances = self.executor.fetch_binance_spot_balances()
+        futures = self.executor.fetch_gate_futures_positions()
+        if not isinstance(balances, list) or not isinstance(futures, list):
+            return 'remediation_snapshot_unavailable'
+        if time.monotonic() - started > 5.0:
+            return 'remediation_snapshot_stale'
+        spot = [row for row in balances if str(row.get('asset') or '').upper() == asset]
+        gate = [row for row in futures if str(row.get('base_asset') or '').upper() == asset]
+        if len(spot) > 1 or len(gate) > 1:
+            return 'remediation_snapshot_ambiguous'
+        actual_spot = float(spot[0]['total']) if spot else 0.0
+        signed_size = float(gate[0]['size']) if gate else 0.0
+        locked = float(spot[0].get('locked') or 0.0) if spot else 0.0
+        values = (actual_spot, signed_size, locked, float(spot_qty), float(contracts))
+        if not all(math.isfinite(value) for value in values) or min(actual_spot, locked, float(spot_qty), float(contracts)) < 0:
+            return 'remediation_snapshot_invalid'
+        if signed_size > 0 or locked > BINANCE_SPOT_TOLERANCE:
+            return 'remediation_snapshot_unsettled'
+        if abs(actual_spot - float(spot_qty)) > BINANCE_SPOT_TOLERANCE or abs(abs(signed_size) - float(contracts)) > 1e-6:
+            return 'remediation_snapshot_changed'
+        return None
+
+    @_revalidate_remediation_snapshot
     def _remediate_confirmed_combined_risk(self, item: Dict) -> Dict:
         risk = item.get('risk') or {}
         base_asset = str(item.get('base_asset') or '').upper()
@@ -1148,7 +1201,7 @@ class Reconciler:
         }
 
     def _is_gate_risk_confirmed(self, base_asset: str, risk_type: str, snapshot_at: datetime) -> bool:
-        """要求当前异常在历史快照中至少出现过，避免单次 API 抖动触发实盘动作。"""
+        """Require consecutive recent mismatches, not an older mismatch across a recovery."""
         confirm_runs = max(int(self.cfg.auto_remediate_confirm_runs or 1), 1)
         if confirm_runs <= 1:
             return True
@@ -1161,14 +1214,13 @@ class Reconciler:
         with db_manager.get_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT local_value, exchange_value
+                SELECT local_value, exchange_value, is_match
                 FROM mi_recon_snapshot
                 WHERE exchange = 'gate'
                   AND dimension = 'position'
                   AND UPPER(base_asset) = %s
                   AND snapshot_at >= %s
-                  AND is_match = 0
-                ORDER BY snapshot_at DESC
+                ORDER BY snapshot_at DESC, id DESC
                 LIMIT %s
                 """,
                 (base_asset.upper(), cutoff, confirm_runs - 1),
@@ -1178,6 +1230,8 @@ class Reconciler:
         if len(rows) < confirm_runs - 1:
             return False
         for row in rows:
+            if row.get('is_match'):
+                return False
             previous_type = self._gate_risk_type_from_values(
                 float(row.get('local_value') or 0),
                 float(row.get('exchange_value') or 0),
@@ -1265,6 +1319,7 @@ class Reconciler:
             results.append(result)
         return results
 
+    @_revalidate_remediation_snapshot
     def _remediate_confirmed_gate_risk(
         self,
         item: Dict,
