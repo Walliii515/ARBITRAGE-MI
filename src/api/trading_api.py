@@ -1525,8 +1525,9 @@ def _sync_recent_popup_notifications() -> Dict[str, int]:
     return {'listing_events': listing_synced, 'risk': risk_synced}
 
 
+# Synchronous DB-backed notification routes run in FastAPI's worker pool.
 @router.get('/risk-notifications/recent')
-async def get_recent_risk_notifications(
+def get_recent_risk_notifications(
     hours: int = Query(24, ge=1, le=168, description="回看最近N小时风险事件"),
     limit: int = Query(50, ge=1, le=200, description="最多返回事件数"),
 ):
@@ -1544,7 +1545,7 @@ async def get_recent_risk_notifications(
 
 
 @router.get('/notifications')
-async def get_popup_notifications(
+def get_popup_notifications(
     read_status: str = Query('unread', description="读取状态：unread/read/all"),
     source: Optional[str] = Query(None, description="消息来源过滤"),
     page: int = Query(1, ge=1),
@@ -1568,13 +1569,13 @@ async def get_popup_notifications(
 
 
 @router.get('/notifications/unread-count')
-async def get_popup_notification_unread_count():
+def get_popup_notification_unread_count():
     """返回铃铛未读数量。"""
     return {'unread_count': count_unread_popup_notifications()}
 
 
 @router.post('/notifications', dependencies=[Depends(verify_token_dependency)])
-async def create_popup_notification(payload: PopupNotificationCreateRequest):
+def create_popup_notification(payload: PopupNotificationCreateRequest):
     """写入一条持久化铃铛消息。"""
     row = upsert_popup_notification(
         title=payload.title,
@@ -1589,14 +1590,14 @@ async def create_popup_notification(payload: PopupNotificationCreateRequest):
 
 
 @router.post('/notifications/mark-read', dependencies=[Depends(verify_token_dependency)])
-async def mark_popup_notification_read(payload: PopupNotificationMarkReadRequest):
+def mark_popup_notification_read(payload: PopupNotificationMarkReadRequest):
     """将指定消息或全部未读消息标记为已读。"""
     affected = mark_popup_notifications_read(ids=payload.ids)
     return {'success': True, 'affected': affected, 'unread_count': count_unread_popup_notifications()}
 
 
 @router.post('/notifications/{notification_id}/read', dependencies=[Depends(verify_token_dependency)])
-async def mark_one_popup_notification_read(notification_id: int):
+def mark_one_popup_notification_read(notification_id: int):
     """将单条铃铛消息标记为已读。"""
     affected = mark_popup_notifications_read(ids=[notification_id])
     return {'success': True, 'affected': affected, 'unread_count': count_unread_popup_notifications()}
