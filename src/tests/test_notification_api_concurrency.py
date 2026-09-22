@@ -145,3 +145,17 @@ def test_notification_writes_keep_authentication_dependencies():
     for route in writes:
         assert not inspect.iscoroutinefunction(route.endpoint)
         assert any(dep.call is api.verify_token_dependency for dep in route.dependant.dependencies)
+
+
+def test_previous_snapshot_query_uses_asset_history_index(monkeypatch):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    cursor.fetchone.return_value = {'latest_snapshot_at': None}
+    context = MagicMock()
+    context.__enter__.return_value = cursor
+    monkeypatch.setattr(api.db_manager, 'get_cursor', lambda: context)
+    assert api._build_recent_risk_notification_items(hours=24, limit=50) == []
+    sql, params = cursor.execute.call_args.args
+    assert 'FROM mi_recon_snapshot prev FORCE INDEX (idx_recon_history)' in sql
+    assert 'prev.snapshot_at < r.snapshot_at' in sql
+    assert params[-1] == 250

@@ -1426,7 +1426,7 @@ def _build_recent_risk_notification_items(hours: int = 24, limit: int = 50) -> L
             r.local_value, r.exchange_value, r.diff_value, r.diff_ratio, r.detail,
             (
                 SELECT prev.is_match
-                FROM mi_recon_snapshot prev
+                FROM mi_recon_snapshot prev FORCE INDEX (idx_recon_history)
                 WHERE prev.exchange = r.exchange
                   AND prev.base_asset = r.base_asset
                   AND prev.dimension = r.dimension
