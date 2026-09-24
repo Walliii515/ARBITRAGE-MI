@@ -11,6 +11,12 @@ from tests.test_closing_executor_cross_margin_risk import _risk_position
 
 def reconciler():
     executor = MagicMock(contract_meta={'AI': {'quanto_multiplier': 1}, 'TUT': {'quanto_multiplier': 100}})
+    executor.fetch_binance_spot_balances.return_value = [
+        {'asset': asset, 'total': 100, 'locked': 0} for asset in ('AI', 'TUT')
+    ]
+    executor.fetch_gate_futures_positions.return_value = [
+        {'base_asset': asset, 'size': -90} for asset in ('AI', 'TUT')
+    ]
     rec = Reconciler(executor, ReconciliationConfig(auto_remediate_enabled=True))
     rec._write_reconciliation_risk_event = MagicMock()
     return rec
@@ -81,6 +87,8 @@ def test_gate_extra_remediates_only_real_unhedged_quantity(multiplier, spot_cont
     item = dict(base_asset='AI', confirmed=True, local_contracts=80, exchange_contracts=100,
                 extra_contracts=20, risk={'type': 'extra_gate_position', 'exchange_size': -100})
     spot = {'AI': {'exchange_value': spot_contract_equivalent * multiplier}}
+    rec.executor.fetch_binance_spot_balances.return_value = [{'asset': 'AI', 'total': spot_contract_equivalent * multiplier}]
+    rec.executor.fetch_gate_futures_positions.return_value = [{'base_asset': 'AI', 'size': -100}]
     rec.remediator.remediate_gate_extra_position = MagicMock(return_value={'success': True})
     rec.remediator.remediate_binance_spot_desync = MagicMock(return_value={'success': True})
     result = rec._remediate_confirmed_gate_risk(item, item['risk'], spot)
@@ -102,9 +110,11 @@ def test_gate_extra_never_trades_without_binance_snapshot_or_with_gate_long():
     rec.remediator.remediate_gate_extra_position = MagicMock()
     item = dict(base_asset='AI', exchange_contracts=100, local_contracts=80)
     result = rec._remediate_confirmed_gate_risk(item, {'type': 'extra_gate_position', 'exchange_size': -100}, {})
-    assert result['reason'] == 'missing_binance_position_snapshot'
+    assert result['reason'] == 'remediation_snapshot_unavailable'
+    rec.executor.fetch_binance_spot_balances.return_value = []
+    rec.executor.fetch_gate_futures_positions.return_value = [{'base_asset': 'AI', 'size': 100}]
     result = rec._remediate_confirmed_gate_risk(item, {'type': 'extra_gate_position', 'exchange_size': 100}, {'AI': {'exchange_value': 0}})
-    assert result['reason'] == 'extra_gate_position_not_confirmed_short'
+    assert result['reason'] == 'remediation_snapshot_unsettled'
     rec.remediator.remediate_gate_extra_position.assert_not_called()
 
 

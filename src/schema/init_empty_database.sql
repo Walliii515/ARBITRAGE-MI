@@ -445,7 +445,9 @@ CREATE TABLE `mi_recon_snapshot` (
   `detail` json DEFAULT NULL COMMENT '原始字段或错误摘要',
   PRIMARY KEY (`id`),
   KEY `idx_snapshot_at` (`snapshot_at`),
-  KEY `idx_asset` (`base_asset`,`exchange`)
+  KEY `idx_asset` (`base_asset`,`exchange`),
+  KEY `idx_recon_history` (`base_asset`,`exchange`,`dimension`,`snapshot_at`,`is_match`),
+  KEY `idx_recon_mismatch_time` (`is_match`,`snapshot_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='交易所持仓对账快照';
 /*!40101 SET character_set_client = @saved_cs_client */;
 DROP TABLE IF EXISTS `mi_capital_snapshot`;
