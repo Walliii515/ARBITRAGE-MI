@@ -1274,6 +1274,7 @@ class ExchangeDesyncRemediator:
         return (
             '部分平仓保留剩余' in reason
             or '低名义残仓跳过平仓' in reason
+            or '普通平仓部分成交且两腿不一致' in reason
         )
 
     @staticmethod

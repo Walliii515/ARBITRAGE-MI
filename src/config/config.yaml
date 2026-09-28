@@ -387,6 +387,10 @@ account_capital:
 # 基础持仓对账配置（Binance 现货 + Gate 期货；可识别 Gate ADL/断腿并标记持仓风险）
 reconciliation:
   enabled: true
+  spot_residual_close:
+    enabled: true                         # 已核验微量现货残差只放行退出，不放行开仓
+    max_usdt: 1.0
+    max_bps: 1.0
   interval_sec: 60
   retention_days: 3                         # 只清理3天前的一致快照；不一致快照永久保留用于追溯
   ignored_binance_spot_assets: [BNB]        # BNB 用作 Binance 手续费抵扣燃料，不参与套利持仓对账

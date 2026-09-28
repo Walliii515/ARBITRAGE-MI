@@ -23,6 +23,7 @@ from common.config import config
 from common.logger import get_logger
 from calc.executor_client import ExecutorClient
 from calc.asset_reduction_guard import asset_reduction_guard
+from calc.spot_residual import VERIFIED_SPOT_RESIDUAL, decimal_value, proportional_spot_slice
 from calc.orderbook_enricher import calc_vwap_basis_bps, calc_full_fee_bps
 from calc.orderbook_resiliency import (
     BookSideSpec,
@@ -2547,6 +2548,14 @@ class ClosingExecutor:
                     'close_basis_slip_bps': None,
                 }
 
+            residual_error = self._verify_residual_close(pos)
+            if residual_error:
+                self._trigger_reconciliation('spot_residual_close_blocked', ba)
+                return {
+                    'base_asset': ba, 'success': False, 'order_uuid': None,
+                    'close_reason': close_reason, 'message': residual_error,
+                    'execution_reduction_consumed': False, 'gate_reduction_consumed': False,
+                }
             order_group = self._build_close_order_group(
                 pos,
                 close_reason=close_reason,
@@ -2627,6 +2636,33 @@ class ClosingExecutor:
                 'actual_close_basis_bps': actual_close_basis_bps,
                 'close_basis_slip_bps': close_basis_slip_bps,
             }
+
+    def _verify_residual_close(self, pos: Dict) -> Optional[str]:
+        """Check the whole asset so a normal sibling cannot bypass its residual guard."""
+        try:
+            with db_manager.get_cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, exchange_risk_status, exchange_risk_type
+                    FROM mi_trade_position FORCE INDEX (idx_base_asset)
+                    WHERE base_asset=%s AND status='holding'
+                      AND (exchange_risk_status='desynced' OR exchange_risk_type=%s)
+                    ORDER BY (exchange_risk_status='desynced') DESC LIMIT 1
+                """, (pos.get('base_asset'), VERIFIED_SPOT_RESIDUAL))
+                marked = cursor.fetchone()
+            if marked and marked.get('exchange_risk_status') == 'desynced':
+                return '同币种仍有未解除的交易所风险，未下单'
+            if not marked and pos.get('exchange_risk_type') != VERIFIED_SPOT_RESIDUAL:
+                return None
+            from calc.reconciliation import build_default_reconciler
+            checker = build_default_reconciler()
+            count = checker._recover_matched_quantity_risk(
+                datetime.now(), str(pos.get('base_asset') or '').upper(),
+                allow_residual=True, dry_run=True, expected_position=pos,
+            )
+            return None if count else '微量现货残差退出暂缓：' + checker._quantity_recovery_note
+        except Exception:
+            logger.warning('微量现货残差下单前复核失败 | %s', pos.get('base_asset'), exc_info=True)
+            return '微量现货残差复核异常，未下单'
 
     def _build_close_order_group(
         self,
@@ -2761,10 +2797,15 @@ class ClosingExecutor:
         if 0 < remaining_notional + 1e-9 < buffered_min_notional:
             slice_contracts = rounded_contracts
 
-        ratio = slice_contracts / rounded_contracts
+        spot_step = (self.spot_meta.get(base_asset) or {}).get('step_size')
+        if not spot_step:
+            raise ValueError('missing_spot_slice_step_size')
+        slice_spot_qty = proportional_spot_slice(spot_qty, slice_contracts, rounded_contracts, spot_step)
+        if slice_spot_qty <= 0 or slice_spot_qty * price < min_notional:
+            raise ValueError('spot_slice_below_min_notional')
         return (
-            spot_qty * ratio,
-            future_qty * ratio,
+            slice_spot_qty,
+            float(decimal_value(future_qty) * slice_contracts / rounded_contracts),
             float(slice_contracts),
         )
 

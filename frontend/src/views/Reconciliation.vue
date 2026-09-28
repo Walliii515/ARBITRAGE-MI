@@ -27,7 +27,7 @@ interface ReconRow {
 interface ExposureRow {
   base_asset: string
   snapshot_at: string
-  status: 'matched' | 'local_desynced' | 'binance_spot_excess' | 'gate_short_excess' | 'missing_leg'
+  status: 'matched' | 'residual' | 'local_desynced' | 'binance_spot_excess' | 'gate_short_excess' | 'missing_leg'
   risk_type: string | null
   binance_exchange_value: number | null
   gate_exchange_contracts: number | null
@@ -110,6 +110,14 @@ function exchangeRenderer(params: ICellRendererParams<ReconRow>) {
 }
 
 function matchRenderer(params: ICellRendererParams<ReconRow>) {
+  if (String(params.colDef?.field) === 'exchange_match') {
+    const row = params.data as unknown as ExposureRow | undefined
+    if (row?.status === 'residual') return '<span style="color:#e6a23c;font-weight:600">容差内残差</span>'
+  }
+  if (params.data?.exchange === 'combined' && typeof params.data.detail === 'object'
+    && params.data.detail?.status === 'residual') {
+    return '<span style="color:#e6a23c;font-weight:600">容差内残差</span>'
+  }
   const matched = params.value === true || params.value === 1
   return matched
     ? '<span style="color:#67c23a;font-weight:600">一致</span>'
@@ -119,6 +127,7 @@ function matchRenderer(params: ICellRendererParams<ReconRow>) {
 function exposureRenderer(params: ICellRendererParams<ExposureRow>) {
   const value = params.data?.status || params.value as ExposureRow['status']
   if (value === 'matched') return '<span style="color:#67c23a;font-weight:600">一致</span>'
+  if (value === 'residual') return '<span style="color:#e6a23c;font-weight:600">容差内残差</span>'
   if (value === 'local_desynced') return '<span style="color:#e6a23c;font-weight:600">本地账不一致</span>'
   if (value === 'binance_spot_excess') return '<span style="color:#f56c6c;font-weight:600">Binance现货多余</span>'
   if (value === 'gate_short_excess') return '<span style="color:#f56c6c;font-weight:600">Gate空头多余</span>'
@@ -330,7 +339,9 @@ const exposureRows = computed<ExposureRow[]>(() => {
         gate_exchange_value: toNumber(detail.gate_qty),
         gate_quanto_multiplier: toNumber(detail.quanto_multiplier),
         exchange_diff: toNumber(detail.exchange_diff),
-        exposure_side: status === 'matched'
+        exposure_side: status === 'residual'
+          ? ((toNumber(detail.exchange_diff) ?? 0) > 0 ? 'spot_long' : 'gate_short')
+          : status === 'matched'
           ? 'balanced'
           : status === 'binance_spot_excess'
             ? 'spot_long'

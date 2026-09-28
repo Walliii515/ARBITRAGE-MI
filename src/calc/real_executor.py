@@ -1594,14 +1594,14 @@ class RealExecutor:
             return None
         return fee_amount * price
 
-    def _get_binance_usdt_price(self, asset: str) -> Optional[float]:
+    def _get_binance_usdt_price(self, asset: str, max_age_sec: float = 60) -> Optional[float]:
         asset = str(asset or '').upper()
         if not asset or asset == 'USDT':
             return 1.0
         symbol = f'{asset}USDT'
         now = time.time()
         cached = self._binance_price_cache.get(symbol)
-        if cached and now - cached[1] <= 60:
+        if cached and max_age_sec > 0 and now - cached[1] <= max_age_sec:
             return cached[0]
 
         url = f"{self.config.binance_base_url}/api/v3/ticker/price"

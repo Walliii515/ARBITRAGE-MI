@@ -112,6 +112,87 @@ def test_partial_close_display_tolerance_does_not_erase_real_residual(recovery):
     assert not updates(cursor)
 
 
+@pytest.fixture
+def residual_recovery(recovery):
+    r, now, positions, current, previous, cursor = recovery
+    r.executor.spot_meta = {'G': {'step_size': .1, 'min_notional': 5}}
+    r.executor._get_binance_usdt_price.return_value = 1
+    positions[0]['spot_open_qty'] = 1000.1
+    positions[0]['exchange_risk_detail'] = '普通平仓部分成交且两腿不一致|asset=G'
+    r.executor.fetch_binance_spot_balances.return_value[0].update(total=2000.1, free=2000.1)
+    r.executor.fetch_gate_futures_positions.return_value[0]['mark_price'] = 1
+    for row in (current, previous):
+        row['detail'].update(local_spot_qty=2000.1, binance_qty=2000.1)
+        row['detail']['gate_detail']['mark_price'] = 1
+    ledger = [dict(position_id=p['id'], market_type=market, qty=p[field])
+              for p in positions for market, field in [('spot', 'spot_open_qty'), ('future', 'future_open_qty')]]
+    cursor.fetchall.side_effect = [positions, [], ledger]
+    return recovery, ledger
+
+
+def test_verified_residual_changes_permission_only(residual_recovery):
+    import copy
+    from calc.spot_residual import VERIFIED_SPOT_RESIDUAL
+    (r, now, positions, current, _, cursor), _ = residual_recovery
+    original = copy.deepcopy(positions)
+    assert r._recover_matched_quantity_risks(now, [current]) > 0
+    assert positions == original
+    for call in updates(cursor):
+        assert call.args[1][0] == VERIFIED_SPOT_RESIDUAL
+        assert 'spot_open_qty =' not in call.args[0]
+        assert 'realized_pnl' not in call.args[0]
+    r.executor.execute.assert_not_called()
+
+
+@pytest.mark.parametrize('case', ['ledger', 'spot_api', 'price', 'stale', 'unknown', 'event', 'opposite', 'slow', 'quantity_changed', 'price_changed'])
+def test_residual_recovery_never_erases_uncertainty(residual_recovery, case):
+    (r, now, positions, current, previous, cursor), ledger = residual_recovery
+    if case == 'ledger': ledger[0]['qty'] += 1
+    if case == 'spot_api': r.executor.fetch_binance_spot_balances.side_effect = RuntimeError('offline')
+    if case == 'price': r.executor._get_binance_usdt_price.return_value = None
+    if case == 'stale': previous['snapshot_at'] = now - timedelta(minutes=10)
+    if case == 'unknown': cursor.fetchall.side_effect = [positions, [{'status': 'pending'}]]
+    if case == 'event': cursor.fetchone.side_effect = [previous, {'id': 1}]
+    if case == 'opposite': positions[1]['spot_open_qty'] = 999.9
+    if case == 'quantity_changed': r.executor.fetch_binance_spot_balances.return_value[0]['total'] += 1
+    if case == 'price_changed': r.executor._get_binance_usdt_price.return_value = 11
+    with patch('calc.reconciliation.time.monotonic', side_effect=[0, 6 if case == 'slow' else 1, 2]):
+        assert r._recover_matched_quantity_risks(now, [current]) == 0
+    assert not updates(cursor)
+
+
+def test_residual_shadow_mode_never_updates(residual_recovery):
+    (r, now, _, _, _, cursor), _ = residual_recovery
+    assert r._recover_matched_quantity_risk(now, 'G', allow_residual=True, dry_run=True) == 2
+    assert not updates(cursor)
+
+
+def test_stale_position_after_partial_fill_cannot_be_reused(residual_recovery):
+    (r, now, positions, _, _, cursor), _ = residual_recovery
+    expected = dict(positions[0], spot_open_qty=2000)
+    assert r._recover_matched_quantity_risk(now, 'G', allow_residual=True, dry_run=True,
+                                          expected_position=expected) == 0
+    assert not updates(cursor)
+
+
+def test_disable_switch_blocks_already_verified_residual(residual_recovery):
+    (r, now, positions, _, _, cursor), _ = residual_recovery
+    with patch('calc.reconciliation.residual_enabled', return_value=False):
+        assert r._recover_matched_quantity_risk(now, 'G', allow_residual=True, dry_run=True,
+                                              expected_position=positions[0]) == 0
+    assert not updates(cursor)
+
+
+def test_repeated_residual_verification_does_not_rewrite_history(residual_recovery):
+    from calc.spot_residual import VERIFIED_SPOT_RESIDUAL, RESIDUAL_DETAIL_PREFIX
+    (r, now, positions, current, _, cursor), _ = residual_recovery
+    for p in positions:
+        p.update(exchange_risk_status='resolved', exchange_risk_type=VERIFIED_SPOT_RESIDUAL,
+                 exchange_risk_detail=RESIDUAL_DETAIL_PREFIX + '{}')
+    assert r._recover_matched_quantity_risks(now, [current]) == 0
+    assert not updates(cursor)
+
+
 @pytest.mark.parametrize('field,value', [
     ('exchange_risk_type', 'adl'), ('exchange_risk_type', 'liquidation'),
     ('exchange_risk_type', 'close_persistence_failed'),

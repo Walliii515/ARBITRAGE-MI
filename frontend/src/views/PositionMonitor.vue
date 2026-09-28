@@ -457,10 +457,12 @@ const exchangeRiskFormatter = (params: ValueFormatterParams) => {
   const hasDelistRisk = !!(row.delist_risks && row.delist_risks.length > 0)
   if (
     (!row.exchange_risk_status || ['normal', 'resolved'].includes(row.exchange_risk_status))
+    && row.exchange_risk_type !== 'verified_spot_residual'
     && !hasDelistRisk
   ) return ''
   const postCloseDustRisk = isPostCloseDustRisk(row)
   const typeMap: Record<string, string> = {
+    verified_spot_residual: '微量残差·退出前复核',
     adl: 'ADL自动减仓',
     delist_risk: '下架风险',
     missing_gate_position: postCloseDustRisk ? '尘埃待清理' : 'Gate缺腿',

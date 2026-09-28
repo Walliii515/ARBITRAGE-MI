@@ -22,6 +22,10 @@ from calc.exchange_desync_remediator import (
 )
 from calc.real_executor import ExchangeConfig, GATE_CROSS_MARGIN_LEVERAGE, RealExecutor
 from calc.asset_reduction_guard import asset_reduction_guard
+from calc.spot_residual import (
+    VERIFIED_SPOT_RESIDUAL, RESIDUAL_DETAIL_PREFIX, EPSILON,
+    decimal_value, residual_enabled, residual_quantity,
+)
 from common.config import config
 from common.database import db_manager
 from common.logger import get_logger
@@ -36,6 +40,7 @@ BINANCE_SPOT_TOLERANCE = 1e-6
 GATE_FUTURE_CONTRACT_TOLERANCE = 1.0
 DIFF_RATIO_EPSILON = 1e-12
 RECOVERABLE_QUANTITY_RISK_PREFIXES = {
+    VERIFIED_SPOT_RESIDUAL: RESIDUAL_DETAIL_PREFIX,
     'qty_mismatch': ('Gate实仓不匹配|', '普通平仓部分成交且两腿不一致|'),
     'missing_gate_position': (
         'Gate实仓不匹配|', '普通平仓部分成交且两腿不一致|', '本地holding缺腿|',
@@ -610,6 +615,9 @@ class Reconciler:
                 'binance_detail': binance_detail.get(asset, {}),
                 'gate_detail': gate_detail.get(asset, {}),
             }
+            if status == 'matched' and abs(exchange_diff) > float(EPSILON):
+                detail['status'] = 'residual'
+                detail['residual_qty'] = exchange_diff
             rows.append({
                 'snapshot_at': snapshot_at,
                 'exchange': 'combined',
@@ -654,10 +662,18 @@ class Reconciler:
         recovered = 0
         for row in rows:
             asset = str(row.get('base_asset') or '').upper()
-            if not self._exact_recovery_match(row):
+            is_exact = self._exact_recovery_match(row)
+            allow_residual = residual_enabled() and residual_quantity(
+                row.get('detail') or {}, (self.executor.spot_meta or {}).get(asset) or {},
+            ) is not None
+            if not is_exact and not allow_residual:
                 continue
             try:
-                recovered += self._recover_matched_quantity_risk(snapshot_at, asset)
+                if is_exact:
+                    recovered += self._recover_matched_quantity_risk(snapshot_at, asset)
+                else:
+                    recovered += self._recover_matched_quantity_risk(snapshot_at, asset, allow_residual=True)
+                    row['detail']['residual_recovery_note'] = self._quantity_recovery_note
             except Exception:
                 logger.warning('数量风险恢复复核失败，保留隔离 | %s', asset, exc_info=True)
         return recovered
@@ -673,8 +689,12 @@ class Reconciler:
             reason, re.IGNORECASE,
         ))
 
-    def _recover_matched_quantity_risk(self, snapshot_at: datetime, asset: str) -> int:
-        if asset_reduction_guard.owner(asset) is not None:
+    def _recover_matched_quantity_risk(
+        self, snapshot_at: datetime, asset: str, *, allow_residual: bool = False,
+        dry_run: bool = False, expected_position: Optional[Dict] = None,
+    ) -> int:
+        self._quantity_recovery_note = '等待币种执行锁'
+        if asset_reduction_guard.owner(asset) is not None and expected_position is None:
             return 0
         with asset_reduction_guard.claim(asset, 'reconciliation_recovery') as acquired:
             if not acquired:
@@ -687,7 +707,19 @@ class Reconciler:
                     ORDER BY id FOR UPDATE
                 """, (asset,))
                 positions = list(cursor.fetchall())
-                candidates = [p for p in positions if p.get('exchange_risk_status') == 'desynced']
+                self._quantity_recovery_note = '持仓已变化或残差退出开关已关闭'
+                if expected_position is not None:
+                    if not residual_enabled():
+                        return 0
+                    current = next((p for p in positions if p['id'] == expected_position.get('id')), None)
+                    if current is None or any(
+                        decimal_value(current.get(k)) != decimal_value(expected_position.get(k))
+                        for k in ('spot_open_qty', 'future_open_qty', 'future_open_contracts')
+                    ):
+                        return 0
+                candidates = [p for p in positions if p.get('exchange_risk_status') == 'desynced'
+                              or p.get('exchange_risk_type') == VERIFIED_SPOT_RESIDUAL]
+                self._quantity_recovery_note = '无待恢复数量风险或存在其他执行风险'
                 if not candidates or any(
                     p.get('exchange_risk_type') not in RECOVERABLE_QUANTITY_RISK_PREFIXES
                     or not str(p.get('exchange_risk_detail') or '').startswith(
@@ -698,6 +730,7 @@ class Reconciler:
                 ):
                     return 0
                 risk_at = max(p['exchange_risk_at'] for p in candidates)
+                self._quantity_recovery_note = '等待连续两轮有效对账'
                 cursor.execute("""
                     SELECT snapshot_at, is_match, detail FROM mi_recon_snapshot
                     WHERE exchange = 'combined' AND dimension = 'exposure'
@@ -712,9 +745,14 @@ class Reconciler:
                     return 0
                 if isinstance(previous.get('detail'), str):
                     previous['detail'] = json.loads(previous['detail'])
-                if not self._exact_recovery_match(previous):
+                if not self._exact_recovery_match(previous) and not (
+                    allow_residual and residual_quantity(
+                        previous.get('detail') or {}, self.executor.spot_meta.get(asset) or {},
+                    ) is not None
+                ):
                     return 0
                 # A rejected HTTP request is not proof of an unfilled exchange order.
+                self._quantity_recovery_note = '存在未完成或结果不明订单'
                 cursor.execute("""
                     SELECT status, reject_reason FROM mi_trade_order
                     WHERE base_asset = %s AND created_at >= %s
@@ -722,6 +760,7 @@ class Reconciler:
                 """, (asset, min(p['opened_at'] for p in positions)))
                 if any(self._order_execution_uncertain(o) for o in cursor.fetchall()):
                     return 0
+                self._quantity_recovery_note = '存在未解决ADL、强平或未知成交事件'
                 cursor.execute("""
                     SELECT id FROM mi_exchange_risk_event
                     WHERE base_asset = %s AND status IN ('received', 'failed')
@@ -732,6 +771,7 @@ class Reconciler:
                 if cursor.fetchone():
                     return 0
                 spot_qty = contracts = 0.0
+                self._quantity_recovery_note = '逐笔持仓数量或合约乘数不一致'
                 for pos in positions:
                     multiplier = validate_position_multiplier(self.executor.contract_meta, pos)
                     spot = float(pos['spot_open_qty'])
@@ -739,10 +779,19 @@ class Reconciler:
                     size = float(pos['future_open_contracts'])
                     if not all(math.isfinite(v) and v > 0 for v in (spot, future, size)):
                         return 0
-                    if abs(spot - future) > BINANCE_SPOT_TOLERANCE or abs(future - size * multiplier) > BINANCE_SPOT_TOLERANCE:
+                    if (
+                        (not allow_residual and abs(spot - future) > BINANCE_SPOT_TOLERANCE)
+                        or abs(future - size * multiplier) > BINANCE_SPOT_TOLERANCE
+                    ):
+                        return 0
+                    if allow_residual and spot < future - float(EPSILON):
                         return 0
                     spot_qty += spot
                     contracts += size
+                self._quantity_recovery_note = '真实成交账本无法解释剩余数量'
+                if allow_residual and not self._residual_ledger_matches(cursor, positions):
+                    return 0
+                self._quantity_recovery_note = '双边实仓或实时价格复核不通过、超时或残差超限'
                 started = time.monotonic()
                 balances = self.executor.fetch_binance_spot_balances()
                 futures = self.executor.fetch_gate_futures_positions()
@@ -751,8 +800,37 @@ class Reconciler:
                 fresh = self._build_combined_exposure_rows(
                     datetime.now(), {asset: spot_qty}, {asset: contracts}, balances, futures,
                 )
-                if not any(r.get('base_asset') == asset and self._exact_recovery_match(r) for r in fresh):
+                fresh_row = next((r for r in fresh if r.get('base_asset') == asset), {})
+                if allow_residual:
+                    price = self.executor._get_binance_usdt_price(asset, max_age_sec=0)
+                    if decimal_value(price) is None or decimal_value(price) <= 0:
+                        return 0
+                    residual = residual_quantity(fresh_row.get('detail') or {},
+                                                 self.executor.spot_meta.get(asset) or {}, price)
+                    if residual is None or time.monotonic() - started > 5:
+                        return 0
+                elif not self._exact_recovery_match(fresh_row):
                     return 0
+                self._quantity_recovery_note = 'verified'
+                if dry_run:
+                    return len(candidates)
+                if allow_residual:
+                    changed = 0
+                    for p in candidates:
+                        if p.get('exchange_risk_type') == VERIFIED_SPOT_RESIDUAL:
+                            continue
+                        cursor.execute("""
+                            UPDATE mi_trade_position SET exchange_risk_status='resolved',
+                                exchange_risk_type=%s, exchange_risk_detail=%s
+                            WHERE id=%s AND status='holding' AND exchange_risk_status='desynced'
+                        """, (VERIFIED_SPOT_RESIDUAL, RESIDUAL_DETAIL_PREFIX + json.dumps({
+                            'verified_at': str(snapshot_at), 'asset_residual_qty': str(residual),
+                            'price': price, 'previous_detail': p.get('exchange_risk_detail'),
+                        }, ensure_ascii=False, default=str), p['id']))
+                        changed += int(cursor.rowcount)
+                    if changed:
+                        logger.info('微量现货残差退出资格已恢复 | %s | positions=%s residual=%s', asset, changed, residual)
+                    return changed
                 ids = [p['id'] for p in candidates]
                 placeholders = ','.join(['%s'] * len(ids))
                 risk_types = list(RECOVERABLE_QUANTITY_RISK_PREFIXES)
@@ -764,12 +842,33 @@ class Reconciler:
                             '|对账恢复:连续账实一致且锁内双边复核通过'),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id IN ({placeholders}) AND status = 'holding'
-                      AND exchange_risk_status = 'desynced'
+                      AND (exchange_risk_status = 'desynced' OR exchange_risk_type = 'verified_spot_residual')
                       AND exchange_risk_type IN ({risk_placeholders})
                 """, ids + risk_types)
                 count = int(cursor.rowcount)
             logger.info('对账数量风险已恢复 | %s | positions=%s', asset, count)
             return count
+
+    @staticmethod
+    def _residual_ledger_matches(cursor, positions: List[Dict]) -> bool:
+        """Only executed, attributable inventory may receive residual permission."""
+        ids = [p['id'] for p in positions]
+        cursor.execute(f"""
+            SELECT position_id, market_type,
+                SUM(CASE WHEN order_side='open' THEN exec_qty ELSE -exec_qty END) qty
+            FROM mi_trade_order WHERE status='executed'
+              AND position_id IN ({','.join(['%s'] * len(ids))})
+            GROUP BY position_id, market_type
+        """, ids)
+        inventory = {(r['position_id'], r['market_type']): decimal_value(r['qty'])
+                     for r in cursor.fetchall()}
+        for p in positions:
+            for market, field in [('spot', 'spot_open_qty'), ('future', 'future_open_qty')]:
+                qty = inventory.get((p['id'], market))
+                local = decimal_value(p.get(field))
+                if qty is None or local is None or abs(qty - local) > EPSILON:
+                    return False
+        return True
 
     def _combined_exposure_tolerance(self, base_asset: str, multiplier: float) -> float:
         return max(BINANCE_SPOT_TOLERANCE, GATE_FUTURE_CONTRACT_TOLERANCE * max(multiplier, 1e-12), 1e-8)

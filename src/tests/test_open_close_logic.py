@@ -186,7 +186,10 @@ def make_trading_executor(sustain_sec=2.0, peak_pullback_pct=0.10,
 def make_closing_executor():
     """构造独立的 ClosingExecutor 实例（不依赖 DB；config 用真实 yaml 即可，本测试只关心方法逻辑）"""
     from calc.closing_executor import ClosingExecutor
-    return ClosingExecutor(contract_meta={asset: {'quanto_multiplier': 1} for asset in ('BTC', 'TUT', 'BEL', 'AI', 'EPIC', 'ABC')}, spot_meta={}, funding_rate_p40_meta={})
+    executor = ClosingExecutor(contract_meta={asset: {'quanto_multiplier': 1} for asset in ('BTC', 'TUT', 'BEL', 'AI', 'EPIC', 'ABC')}, spot_meta={}, funding_rate_p40_meta={})
+    # Execution tests isolate persistence/transport; residual permission has its own DB tests.
+    executor._verify_residual_close = MagicMock(return_value=None)
+    return executor
 
 
 def make_gate_cross_risk(
@@ -6831,7 +6834,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(group['execution_sequence'], 'future_then_spot')
 
     def test_protective_fok_uses_buffered_tradeable_slice(self):
-        self.ce.spot_meta = {'BTC': {'min_notional': 5.0}}
+        self.ce.spot_meta = {'BTC': {'min_notional': 5.0, 'step_size': 0.1}}
         self.ce.protective_fok_chunk_notional_usdt = 10.0
         self.ce.protective_fok_min_notional_buffer_ratio = 1.2
         group = self.ce._build_close_order_group({
@@ -6850,7 +6853,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(group['future_order']['time_in_force'], 'fok')
 
     def test_protective_fok_absorbs_tail_below_buffered_min_notional(self):
-        self.ce.spot_meta = {'BTC': {'min_notional': 5.0}}
+        self.ce.spot_meta = {'BTC': {'min_notional': 5.0, 'step_size': 0.1}}
         self.ce.protective_fok_chunk_notional_usdt = 10.0
         self.ce.protective_fok_min_notional_buffer_ratio = 1.2
         group = self.ce._build_close_order_group({
@@ -6868,7 +6871,7 @@ class TestClosingExecutorFundingAwareClose(unittest.TestCase):
         self.assertEqual(group['future_order']['target_contracts'], 15.0)
 
     def test_protective_fok_rounds_slice_to_whole_gate_contracts(self):
-        self.ce.spot_meta = {'BTC': {'min_notional': 5.0}}
+        self.ce.spot_meta = {'BTC': {'min_notional': 5.0, 'step_size': 0.1}}
         self.ce.protective_fok_chunk_notional_usdt = 10.0
         group = self.ce._build_close_order_group({
             'base_asset': 'BTC',

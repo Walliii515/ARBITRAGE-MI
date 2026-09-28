@@ -924,7 +924,8 @@ class TradingExecutor:
             SELECT DISTINCT UPPER(base_asset) AS base_asset
             FROM mi_trade_position
             WHERE status = 'holding'
-              AND exchange_risk_status = 'desynced'
+              AND (exchange_risk_status = 'desynced'
+                   OR exchange_risk_type = 'verified_spot_residual')
         """
         try:
             with db_manager.get_cursor() as cursor:
