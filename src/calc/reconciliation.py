@@ -35,6 +35,13 @@ logger = get_logger(__name__)
 BINANCE_SPOT_TOLERANCE = 1e-6
 GATE_FUTURE_CONTRACT_TOLERANCE = 1.0
 DIFF_RATIO_EPSILON = 1e-12
+RECOVERABLE_QUANTITY_RISK_PREFIXES = {
+    'qty_mismatch': 'Gate实仓不匹配|',
+    'missing_gate_position': 'Gate实仓不匹配|',
+    'extra_gate_position': 'Gate多余实仓|',
+    'binance_spot_excess': '交易所实仓不一致|',
+    'gate_short_excess': '交易所实仓不一致|',
+}
 
 
 def _revalidate_remediation_snapshot(method):
@@ -679,8 +686,10 @@ class Reconciler:
                 positions = list(cursor.fetchall())
                 candidates = [p for p in positions if p.get('exchange_risk_status') == 'desynced']
                 if not candidates or any(
-                    p.get('exchange_risk_type') != 'qty_mismatch'
-                    or not str(p.get('exchange_risk_detail') or '').startswith('Gate实仓不匹配|')
+                    p.get('exchange_risk_type') not in RECOVERABLE_QUANTITY_RISK_PREFIXES
+                    or not str(p.get('exchange_risk_detail') or '').startswith(
+                        RECOVERABLE_QUANTITY_RISK_PREFIXES.get(p.get('exchange_risk_type'), '')
+                    )
                     or not p.get('exchange_risk_at')
                     for p in candidates
                 ):
@@ -743,6 +752,8 @@ class Reconciler:
                     return 0
                 ids = [p['id'] for p in candidates]
                 placeholders = ','.join(['%s'] * len(ids))
+                risk_types = list(RECOVERABLE_QUANTITY_RISK_PREFIXES)
+                risk_placeholders = ','.join(['%s'] * len(risk_types))
                 cursor.execute(f"""
                     UPDATE mi_trade_position
                     SET exchange_risk_status = 'resolved', exchange_risk_type = NULL,
@@ -750,8 +761,9 @@ class Reconciler:
                             '|对账恢复:连续账实一致且锁内双边复核通过'),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id IN ({placeholders}) AND status = 'holding'
-                      AND exchange_risk_status = 'desynced' AND exchange_risk_type = 'qty_mismatch'
-                """, ids)
+                      AND exchange_risk_status = 'desynced'
+                      AND exchange_risk_type IN ({risk_placeholders})
+                """, ids + risk_types)
                 count = int(cursor.rowcount)
             logger.info('对账数量风险已恢复 | %s | positions=%s', asset, count)
             return count

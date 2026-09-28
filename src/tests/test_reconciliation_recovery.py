@@ -61,7 +61,7 @@ def test_recovers_only_status_after_two_matches_and_fresh_locked_check(recovery)
     previous['detail'] = json.dumps(previous['detail'])
     assert r._recover_matched_quantity_risks(now, [current]) == 2
     sql, ids = updates(cursor)[0].args
-    assert ids == [811, 812]
+    assert ids[:2] == [811, 812]
     assert "exchange_risk_status = 'resolved'" in sql
     assert 'spot_open_qty =' not in sql
     assert 'realized_pnl' not in sql
@@ -70,6 +70,30 @@ def test_recovers_only_status_after_two_matches_and_fresh_locked_check(recovery)
     r.executor.fetch_gate_futures_positions.assert_called_once()
     r.executor.execute.assert_not_called()
     assert asset_reduction_guard.owner('G') is None
+
+
+@pytest.mark.parametrize('risk_type,prefix', [
+    ('qty_mismatch', 'Gate实仓不匹配|'),
+    ('missing_gate_position', 'Gate实仓不匹配|'),
+    ('extra_gate_position', 'Gate多余实仓|'),
+    ('binance_spot_excess', '交易所实仓不一致|'),
+    ('gate_short_excess', '交易所实仓不一致|'),
+])
+def test_all_reconciled_quantity_risks_recover(recovery, risk_type, prefix):
+    r, now, positions, current, _, cursor = recovery
+    positions[1]['exchange_risk_type'] = risk_type
+    positions[1]['exchange_risk_detail'] = prefix + 'asset=G'
+    assert r._recover_matched_quantity_risks(now, [current]) == 2
+    assert risk_type in updates(cursor)[0].args[1][2:]
+    r.executor.execute.assert_not_called()
+
+
+def test_missing_position_from_delisting_clear_is_not_quantity_recovery(recovery):
+    r, now, positions, current, _, cursor = recovery
+    positions[1]['exchange_risk_type'] = 'missing_gate_position'
+    positions[1]['exchange_risk_detail'] = 'Gate下架清算|contract=G_USDT'
+    assert r._recover_matched_quantity_risks(now, [current]) == 0
+    assert not updates(cursor)
 
 
 @pytest.mark.parametrize('field,value', [
