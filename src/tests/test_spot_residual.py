@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from calc.closing_executor import ClosingExecutor
-from calc.spot_residual import residual_quantity, proportional_spot_slice, VERIFIED_SPOT_RESIDUAL
+from calc.spot_residual import residual_quantity, proportional_spot_slice
 
 
 @pytest.fixture

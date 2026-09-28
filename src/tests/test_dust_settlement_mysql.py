@@ -184,3 +184,41 @@ def test_unique_receipt_per_asset_enforced_by_database(database):
             c.execute("""INSERT INTO mi_dust_conversion_task
                 (batch_uuid,base_asset,status,requested_at,positions_json,expected_qty,transaction_id)
                 VALUES ('other-batch','TST','confirmed',NOW(),'[]',0.1,'123456')""")
+
+
+@pytest.mark.parametrize('event_ms', [
+    1788000000000,  # Event between the day's first and last snapshots.
+    1788019230000,  # 00:00:30, before the day's first snapshot.
+    1788105599000,  # 23:59:59, after the day's last snapshot.
+])
+def test_daily_summary_event_attribution_and_equity_preserved(database, event_ms):
+    from api.trading_api import _dust_day_open_adjustment
+
+    service, original, at = seed(database, event_ms=event_ms)
+    day = at.replace(hour=0, minute=0, second=0, microsecond=0)
+    with database() as c:
+        for offset in (-1, 0, 1):
+            date = day + timedelta(days=offset)
+            c.execute("""INSERT INTO mi_capital_daily_summary
+                (summary_date,first_snapshot_at,last_snapshot_at,first_equity_usdt,
+                 last_equity_usdt,equity_sum_usdt,sample_count,first_gross_pnl_usdt,last_gross_pnl_usdt)
+                VALUES (%s,%s,%s,100,101,201,2,0.1,0.1)""",
+                (date.date(),date+timedelta(minutes=1),date+timedelta(hours=23,minutes=59)))
+    service._account(original)
+    service._account(original)
+    prefix = _dust_day_open_adjustment('d.first_snapshot_at')
+    with database() as c:
+        c.execute(f"SELECT d.*,{prefix} AS prefix FROM mi_capital_daily_summary d ORDER BY summary_date")
+        rows = c.fetchall()
+        for row in rows:
+            first_delta = Decimal('0.02') if row['first_snapshot_at'] >= at else Decimal(0)
+            last_delta = Decimal('0.02') if row['last_snapshot_at'] >= at else Decimal(0)
+            assert row['first_gross_pnl_usdt'] == Decimal('0.1') + first_delta
+            assert row['last_gross_pnl_usdt'] == Decimal('0.1') + last_delta
+            assert row['first_equity_usdt'] == 100
+            assert row['last_equity_usdt'] == 101
+            assert row['equity_sum_usdt'] == 201 and row['sample_count'] == 2
+        # The midnight prefix belongs only to the event's calendar day.
+        assert [r['prefix'] for r in rows] == [0, Decimal('0.02') if at < day+timedelta(minutes=1) else 0, 0]
+        c.execute('SELECT equity_usdt,funding_pnl_usdt FROM mi_capital_snapshot')
+        assert all(r['equity_usdt'] == 100 and r['funding_pnl_usdt'] == 0 for r in c.fetchall())

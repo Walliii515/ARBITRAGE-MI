@@ -863,9 +863,9 @@ class Reconciler:
         inventory = {(r['position_id'], r['market_type']): decimal_value(r['qty'])
                      for r in cursor.fetchall()}
         for p in positions:
-            for market, field in [('spot', 'spot_open_qty'), ('future', 'future_open_qty')]:
+            for market, quantity_field in [('spot', 'spot_open_qty'), ('future', 'future_open_qty')]:
                 qty = inventory.get((p['id'], market))
-                local = decimal_value(p.get(field))
+                local = decimal_value(p.get(quantity_field))
                 if qty is None or local is None or abs(qty - local) > EPSILON:
                     return False
         return True

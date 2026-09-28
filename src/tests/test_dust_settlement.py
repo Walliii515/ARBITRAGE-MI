@@ -1,6 +1,6 @@
 """Durable conversion fault injection. No exchange orders are sent by these tests."""
 from contextlib import nullcontext
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from unittest.mock import MagicMock
 
