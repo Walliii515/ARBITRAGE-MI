@@ -36,8 +36,11 @@ BINANCE_SPOT_TOLERANCE = 1e-6
 GATE_FUTURE_CONTRACT_TOLERANCE = 1.0
 DIFF_RATIO_EPSILON = 1e-12
 RECOVERABLE_QUANTITY_RISK_PREFIXES = {
-    'qty_mismatch': 'Gate实仓不匹配|',
-    'missing_gate_position': 'Gate实仓不匹配|',
+    'qty_mismatch': ('Gate实仓不匹配|', '普通平仓部分成交且两腿不一致|'),
+    'missing_gate_position': (
+        'Gate实仓不匹配|', '普通平仓部分成交且两腿不一致|', '本地holding缺腿|',
+    ),
+    'missing_binance_position': ('普通平仓部分成交且两腿不一致|', '本地holding缺腿|'),
     'extra_gate_position': 'Gate多余实仓|',
     'binance_spot_excess': '交易所实仓不一致|',
     'gate_short_excess': '交易所实仓不一致|',

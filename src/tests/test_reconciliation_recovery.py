@@ -78,6 +78,11 @@ def test_recovers_only_status_after_two_matches_and_fresh_locked_check(recovery)
     ('extra_gate_position', 'Gate多余实仓|'),
     ('binance_spot_excess', '交易所实仓不一致|'),
     ('gate_short_excess', '交易所实仓不一致|'),
+    ('qty_mismatch', '普通平仓部分成交且两腿不一致|'),
+    ('missing_gate_position', '普通平仓部分成交且两腿不一致|'),
+    ('missing_binance_position', '普通平仓部分成交且两腿不一致|'),
+    ('missing_gate_position', '本地holding缺腿|'),
+    ('missing_binance_position', '本地holding缺腿|'),
 ])
 def test_all_reconciled_quantity_risks_recover(recovery, risk_type, prefix):
     r, now, positions, current, _, cursor = recovery
@@ -92,6 +97,17 @@ def test_missing_position_from_delisting_clear_is_not_quantity_recovery(recovery
     r, now, positions, current, _, cursor = recovery
     positions[1]['exchange_risk_type'] = 'missing_gate_position'
     positions[1]['exchange_risk_detail'] = 'Gate下架清算|contract=G_USDT'
+    assert r._recover_matched_quantity_risks(now, [current]) == 0
+    assert not updates(cursor)
+
+
+def test_partial_close_display_tolerance_does_not_erase_real_residual(recovery):
+    r, now, positions, current, _, cursor = recovery
+    positions[0]['exchange_risk_detail'] = '普通平仓部分成交且两腿不一致|asset=G'
+    positions[0]['spot_open_qty'] += 0.1
+    current['detail']['local_spot_qty'] += 0.1
+    current['detail']['binance_qty'] += 0.1
+    assert current['is_match']
     assert r._recover_matched_quantity_risks(now, [current]) == 0
     assert not updates(cursor)
 
