@@ -140,7 +140,8 @@ def test_dust_does_not_use_failed_or_consumed_exchange_snapshots(gate_submitted,
         assert rec._auto_cleanup_completed_asset_dust.call_args.kwargs['skip_assets'] == {'AI'}
 
 
-def test_dust_skips_only_consumed_asset_even_after_reloading_positions():
+def test_dust_skips_only_consumed_asset_even_after_reloading_positions(monkeypatch):
+    monkeypatch.setattr('calc.dust_settlement.DustSettlement.recover', lambda self: [])
     rem = ExchangeDesyncRemediator(MagicMock(), ExchangeDesyncRemediationConfig())
     rows = [dict(base_asset=asset) for asset in ('AI', 'TUT')]
     rem._load_holding_positions_with_execution_remainders = MagicMock(return_value=rows)

@@ -818,13 +818,18 @@ class ReverseSignalMonitor:
                 'target_amount': self.cfg.open_amount_usdt,
             },
         }
-        exec_result = self.executor_client.execute_reverse_open(order_group, row)
-        persisted = record_reverse_open_execution(
-            signal_id=state['id'],
-            order_group=order_group,
-            orderbook_row=row,
-            result=exec_result,
-        )
+        from calc.dust_settlement import asset_lock_name, has_unsettled_dust
+        from common.database_lock import database_lock
+        with database_lock(asset_lock_name(base_asset)) as acquired:
+            if not acquired or has_unsettled_dust(base_asset):
+                exec_result = {'success': False, 'message': '小额兑换核销中，暂停该币开仓'}
+                persisted = {}
+            else:
+                exec_result = self.executor_client.execute_reverse_open(order_group, row)
+                persisted = record_reverse_open_execution(
+                    signal_id=state['id'], order_group=order_group,
+                    orderbook_row=row, result=exec_result,
+                )
 
         if exec_result.get('success'):
             reason = self._build_signal_reason(

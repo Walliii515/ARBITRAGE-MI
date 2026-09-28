@@ -287,7 +287,7 @@ CREATE TABLE `mi_trade_position` (
   `close_reason` text COMMENT '平仓原因/交易所仓位风险摘要',
   `spot_open_qty` decimal(20,8) NOT NULL COMMENT '现货开仓数量',
   `spot_open_price` decimal(20,8) NOT NULL COMMENT '现货开仓VWAP',
-  `spot_open_amount` decimal(20,2) NOT NULL COMMENT '现货开仓金额',
+  `spot_open_amount` decimal(28,8) NOT NULL COMMENT '现货开仓金额',
   `future_open_qty` decimal(20,8) NOT NULL COMMENT '期货开仓数量(标的资产)',
   `future_open_price` decimal(20,8) NOT NULL COMMENT '期货开仓VWAP',
   `future_open_contracts` int NOT NULL COMMENT '期货开仓张数',
@@ -306,14 +306,14 @@ CREATE TABLE `mi_trade_position` (
   `next_funding_time` datetime DEFAULT NULL COMMENT '下次资金费结算时间',
   `spot_close_price` decimal(20,8) DEFAULT NULL COMMENT '现货平仓VWAP',
   `future_close_price` decimal(20,8) DEFAULT NULL COMMENT '期货平仓VWAP',
-  `spot_close_amount` decimal(20,4) DEFAULT NULL COMMENT '现货平仓成交金额(USDT)',
-  `future_close_amount` decimal(20,4) DEFAULT NULL COMMENT '期货平仓成交金额(USDT)',
+  `spot_close_amount` decimal(28,8) DEFAULT NULL COMMENT '现货平仓成交金额(USDT)',
+  `future_close_amount` decimal(28,8) DEFAULT NULL COMMENT '期货平仓成交金额(USDT)',
   `close_spread_bps` decimal(10,2) DEFAULT NULL COMMENT '平仓时价差(bps)',
   `close_funding_rate_24h` decimal(18,10) DEFAULT NULL COMMENT '平仓时刻实时折算24h资金费率',
-  `realized_pnl_spot` decimal(20,4) DEFAULT NULL COMMENT '现货实现盈亏',
-  `realized_pnl_future` decimal(20,4) DEFAULT NULL COMMENT '期货实现盈亏',
-  `realized_pnl_total` decimal(20,4) DEFAULT NULL COMMENT '总实现盈亏',
-  `total_pnl` decimal(20,4) DEFAULT NULL COMMENT '总盈亏',
+  `realized_pnl_spot` decimal(28,8) DEFAULT NULL COMMENT '现货实现盈亏',
+  `realized_pnl_future` decimal(28,8) DEFAULT NULL COMMENT '期货实现盈亏',
+  `realized_pnl_total` decimal(28,8) DEFAULT NULL COMMENT '总实现盈亏',
+  `total_pnl` decimal(28,8) DEFAULT NULL COMMENT '总盈亏',
   `total_pnl_bps` decimal(10,2) DEFAULT NULL COMMENT '总盈亏(bps)',
   `fee_cost` decimal(24,8) DEFAULT NULL COMMENT '订单级手续费成本，负数展示(USDT)',
   `fee_bps` decimal(12,4) DEFAULT NULL COMMENT '订单级手续费成本(bps，负数)',
@@ -354,10 +354,10 @@ CREATE TABLE `mi_trade_order` (
   `channel` enum('Mock','SimTrade','Live') NOT NULL DEFAULT 'Mock' COMMENT '渠道: Mock=模拟成交, SimTrade=模拟盘, Live=实盘',
   `reject_reason` text COMMENT '订单复盘原因/拒单原因/执行审计',
   `target_qty` decimal(20,8) NOT NULL COMMENT '目标数量(标的资产)',
-  `target_amount` decimal(20,2) NOT NULL COMMENT '目标金额(USDT)',
+  `target_amount` decimal(28,8) NOT NULL COMMENT '目标金额(USDT)',
   `exec_price` decimal(20,8) DEFAULT NULL COMMENT '成交VWAP价格',
   `exec_qty` decimal(20,8) DEFAULT NULL COMMENT '实际成交数量',
-  `exec_amount` decimal(20,2) DEFAULT NULL COMMENT '实际成交金额(USDT)',
+  `exec_amount` decimal(28,8) DEFAULT NULL COMMENT '实际成交金额(USDT)',
   `coverage_ratio` decimal(10,4) DEFAULT NULL COMMENT '盘口覆盖率',
   `open_coverage` decimal(10,4) DEFAULT NULL COMMENT '开仓盘口覆盖',
   `open_vwap_basis_bps` decimal(10,2) DEFAULT NULL COMMENT '开仓VWAP基差(bps)',
@@ -919,6 +919,30 @@ CREATE TABLE `mi_fund_transfer_task` (
   KEY `idx_fund_transfer_status` (`status`,`updated_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
+-- Persist the intent before calling Binance; an unknown request is never retried.
+CREATE TABLE IF NOT EXISTS mi_dust_conversion_task (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    batch_uuid VARCHAR(36) NOT NULL,
+    base_asset VARCHAR(20) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    requested_at DATETIME(3) NOT NULL,
+    positions_json JSON NOT NULL,
+    expected_qty DECIMAL(28,8) NOT NULL,
+    conversion_json JSON DEFAULT NULL,
+    transaction_id VARCHAR(80) DEFAULT NULL,
+    event_at DATETIME(3) DEFAULT NULL,
+    accounted_at DATETIME(3) DEFAULT NULL,
+    accounting_json JSON DEFAULT NULL,
+    net_delta_usdt DECIMAL(28,8) DEFAULT NULL,
+    last_error TEXT,
+    last_checked_at DATETIME DEFAULT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_batch_asset (batch_uuid, base_asset),
+    UNIQUE KEY uk_receipt_asset (transaction_id, base_asset),
+    KEY idx_status_asset (status, base_asset),
+    KEY idx_event_at (event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
 
 /*!40101 SET SQL_MODE=@OLD_SQL_MODE */;

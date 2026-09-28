@@ -953,6 +953,20 @@ class TestReconciliationIgnoreAssets(unittest.TestCase):
 
 
 class TestExchangeDesyncRemediator(unittest.TestCase):
+    def setUp(self):
+        # This suite tests candidate collection; durable execution has its own suite.
+        patcher = patch('calc.dust_settlement.DustSettlement')
+        self.dust_class = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.dust = self.dust_class.return_value
+        self.dust.recover.return_value = []
+        self.dust.execute.side_effect = lambda items: {
+            'success': True, 'attempted': True, 'action': 'cleanup_post_close_dust_batch',
+            'positions': sum(len(p['positions']) for p in items),
+            'asset_count': len(items), 'base_assets': [p['base_asset'] for p in items],
+            'spot_qty': items[0]['spot_qty'], 'base_asset': items[0]['base_asset'],
+        }
+
     def test_remediation_skips_asset_owned_by_close_thread(self):
         from calc.asset_reduction_guard import asset_reduction_guard
 
@@ -1491,11 +1505,9 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             require_desynced=True,
         )
 
-        self.assertTrue(result['success'])
-        self.assertEqual(result['action'], 'convert_binance_dust_to_bnb')
-        self.assertEqual(result['success_count'], 2)
-        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
-        remediator._close_positions_after_dust_conversion.assert_called_once()
+        self.assertFalse(result['success'])
+        self.assertEqual(result['reason'], 'dust_waiting_execution_ledger')
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
 
     def test_post_close_full_asset_dust_converts_to_bnb_and_closes_normal_positions(self):
         class FakeExecutor:
@@ -1541,9 +1553,8 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         )
 
         self.assertTrue(result['success'])
-        self.assertEqual(result['success_count'], 2)
-        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('FRAX')
-        remediator._close_positions_after_dust_conversion.assert_called_once()
+        self.assertEqual(result['positions'], 2)
+        self.assertEqual(self.dust.execute.call_args.args[0][0]['base_asset'], 'FRAX')
 
     def test_post_close_dust_does_not_convert_unrelated_exchange_spot(self):
         class FakeExecutor:
@@ -1821,15 +1832,8 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['base_asset'], 'BICO')
         self.assertEqual(result['positions'], 2)
-        self.assertEqual(result['gate_contracts_closed'], 6.0)
-        remediator.remediate_gate_extra_position.assert_called_once()
-        self.assertEqual(
-            remediator.remediate_gate_extra_position.call_args.kwargs['extra_contracts'],
-            6.0,
-        )
-        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
-        remediator._zero_local_future_dust.assert_called_once()
-        remediator._close_positions_after_dust_conversion.assert_called_once()
+        self.assertEqual(self.dust.execute.call_args.args[0][0]['gate_contracts'], 6.0)
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
 
     def test_aggregate_low_notional_hedge_is_cleaned_without_residual_marker(self):
         class FakeExecutor:
@@ -1899,17 +1903,8 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['base_asset'], 'BICO')
         self.assertEqual(result['positions'], 2)
-        self.assertEqual(result['gate_contracts_closed'], 5.0)
-        self.assertEqual(
-            remediator.remediate_gate_extra_position.call_args.kwargs['extra_contracts'],
-            5.0,
-        )
-        executor.convert_binance_spot_dust_to_bnb.assert_called_once_with('BICO')
-        remediator._close_positions_after_dust_conversion.assert_called_once_with(
-            positions,
-            unittest.mock.ANY,
-            unittest.mock.ANY,
-        )
+        self.assertEqual(self.dust.execute.call_args.args[0][0]['gate_contracts'], 5.0)
+        executor.convert_binance_spot_dust_to_bnb.assert_not_called()
 
     def test_aggregate_low_notional_hedge_requires_exact_exchange_balance(self):
         executor = MagicMock()
@@ -2212,7 +2207,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
             'calc.exchange_desync_remediator.db_manager.get_cursor',
             return_value=context,
         ):
-            updated = remediator._mark_spot_dust_pending(position, 0.1, 0.04)
+            updated = remediator._mark_spot_dust_pending_locked(position, 0.1, 0.04)
 
         self.assertTrue(updated)
         sql, params = cursor.execute.call_args.args
@@ -2221,8 +2216,8 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertEqual(params['pending_type'], 'post_close_spot_dust_pending')
         self.assertEqual(params['closed_at'], datetime(2026, 8, 10, 0, 11, 39))
         pnl = update_pnl.call_args.args[2]
-        self.assertAlmostEqual(pnl['realized_pnl'], 0.3)
-        self.assertAlmostEqual(pnl['total_pnl'], 0.8)
+        self.assertAlmostEqual(pnl['realized_pnl'], 0.4)
+        self.assertAlmostEqual(pnl['total_pnl'], 0.9)
 
     def test_pending_dust_waits_for_active_position_before_conversion(self):
         executor = MagicMock()
@@ -2344,8 +2339,8 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['asset_count'], 2)
         self.assertEqual(result['positions'], 2)
-        executor.convert_binance_spot_dust_to_bnb_batch.assert_called_once_with(['BICO', 'FRAX'])
-        self.assertEqual(remediator._close_positions_after_dust_conversion.call_count, 2)
+        self.assertEqual([r['base_asset'] for r in self.dust.execute.call_args.args[0]], ['BICO', 'FRAX'])
+        executor.convert_binance_spot_dust_to_bnb_batch.assert_not_called()
 
     def test_manual_dust_cleanup_rejects_unexplained_gate_position(self):
         class FakeExecutor:
@@ -2425,17 +2420,7 @@ class TestExchangeDesyncRemediator(unittest.TestCase):
                 patch('calc.exchange_desync_remediator.fetch_executed_position_orders', return_value=orders), \
                 patch('calc.exchange_desync_remediator.update_closed_position_pnl') as update_pnl, \
                 patch('calc.exchange_desync_remediator.db_manager.get_cursor', return_value=context):
-            remediator._close_positions_after_dust_conversion(
-                [position],
-                {
-                    'asset': 'BICO',
-                    'source_qty': 0.1,
-                    'bnb_qty': 0.00001,
-                    'transaction_id': 'dust-bico',
-                    'gross_exec_price_usdt': 0.0565,
-                },
-                {'type': 'post_close_dust'},
-            )
+            remediator._finalize_dust_positions([position], 'legacy recorded conversion')
 
         status_sql, status_params = cursor.execute.call_args_list[0].args
         self.assertIn("status = 'closed'", status_sql)

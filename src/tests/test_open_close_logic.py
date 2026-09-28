@@ -657,6 +657,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                 'transferedAmount': '0.00000955',
                 'serviceChargeAmount': '0.00000019',
                 'tranId': 12345,
+                'operateTime': 1788000000000,
             }],
         })
         executor._get_binance_usdt_price = MagicMock(return_value=800.0)
@@ -664,13 +665,11 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         result = executor.convert_binance_spot_dust_to_bnb('bico')
 
         self.assertTrue(result['success'])
-        self.assertEqual(result['source_qty'], 0.2)
+        self.assertEqual(result['source_qty'], '0.2')
         self.assertEqual(result['transaction_id'], '12345')
-        self.assertAlmostEqual(result['exec_amount_usdt'], 0.00764)
-        self.assertAlmostEqual(result['exec_price_usdt'], 0.0382)
-        self.assertAlmostEqual(result['service_charge_usdt'], 0.000152)
-        self.assertAlmostEqual(result['gross_exec_amount_usdt'], 0.007792)
-        self.assertAlmostEqual(result['gross_exec_price_usdt'], 0.03896)
+        self.assertNotIn('exec_amount_usdt', result)
+        self.assertEqual(result['operate_time_ms'], 1788000000000)
+        executor._get_binance_usdt_price.assert_not_called()
         executor._binance_signed_post.assert_called_once_with(
             '/sapi/v1/asset/dust-convert/convert',
             {'asset': ['BICO'], 'accountType': 'SPOT', 'targetAsset': 'BNB'},
@@ -688,6 +687,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                     'transferedAmount': '0.00000955',
                     'serviceChargeAmount': '0.00000019',
                     'tranId': 12345,
+                    'operateTime': 1788000000000,
                 },
                 {
                     'fromAsset': 'FRAX',
@@ -695,6 +695,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
                     'transferedAmount': '0.000006',
                     'serviceChargeAmount': '0.00000012',
                     'tranId': 12346,
+                    'operateTime': 1788000000000,
                 },
             ],
         })
@@ -705,7 +706,7 @@ class TestRealExecutorGateParsing(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['converted_assets'], ['BICO', 'FRAX'])
         self.assertEqual(result['results']['BICO']['transaction_id'], '12345')
-        self.assertEqual(result['results']['FRAX']['source_qty'], 0.18)
+        self.assertEqual(result['results']['FRAX']['source_qty'], '0.18')
         executor._binance_signed_post.assert_called_once_with(
             '/sapi/v1/asset/dust-convert/convert',
             {'asset': ['BICO', 'FRAX'], 'accountType': 'SPOT', 'targetAsset': 'BNB'},

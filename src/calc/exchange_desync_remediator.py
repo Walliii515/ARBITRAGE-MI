@@ -18,6 +18,7 @@ from calc.real_executor import RealExecutor, GATE_CROSS_MARGIN_LEVERAGE
 from calc.asset_reduction_guard import asset_reduction_guard
 from calc.closed_position_pnl import (
     compute_closed_position_pnl,
+    compute_executed_close_pnl,
     existing_position_columns,
     fetch_executed_position_orders,
     update_closed_position_pnl,
@@ -300,6 +301,12 @@ class ExchangeDesyncRemediator:
         """Manually close a fully reconstructed tiny hedge and convert its spot dust."""
         if not self.cfg.enabled:
             return {'success': False, 'attempted': False, 'reason': 'disabled'}
+        from calc.dust_settlement import DustSettlement
+        recovered_tasks = DustSettlement(self).recover()
+        if recovered_tasks:
+            return {'success': True, 'attempted': True, 'action': 'recover_dust_settlement',
+                    'results': recovered_tasks, 'base_assets': [r['base_asset'] for r in recovered_tasks],
+                    'message': '历史小额兑换已完成核销'}
         balances_by_asset = {
             str(row.get('asset') or '').upper(): row for row in (binance_balances or [])
         }
@@ -465,13 +472,28 @@ class ExchangeDesyncRemediator:
         return settled
 
     def _mark_spot_dust_pending(self, pos: Dict, spot_qty: float, price: float) -> bool:
+        from common.database_lock import database_lock
+        from calc.dust_settlement import asset_lock_name
+        asset = pos['base_asset']
+        with asset_reduction_guard.claim(asset, 'dust_pending') as acquired:
+            if not acquired:
+                return False
+            with database_lock(asset_lock_name(asset)) as owned:
+                if not owned:
+                    return False
+                with database_lock('mi_capital_accounting', timeout=10) as accounting:
+                    return self._mark_spot_dust_pending_locked(pos, spot_qty, price) if accounting else False
+
+    def _mark_spot_dust_pending_locked(self, pos: Dict, spot_qty: float, price: float) -> bool:
         position_id = int(pos['id'])
         orders = fetch_executed_position_orders(position_id)
         close_values = self._close_execution_values(
             orders,
             str(pos.get('base_asset') or ''),
         )
-        pnl_values = compute_closed_position_pnl(pos, orders)
+        pnl_values = compute_closed_position_pnl({**pos, 'exchange_risk_type': POST_CLOSE_SPOT_DUST_PENDING}, orders)
+        if pnl_values is None:
+            return False
         closed_at = next((
             order.get('executed_at')
             for order in reversed(orders)
@@ -486,7 +508,7 @@ class ExchangeDesyncRemediator:
         ), None)
         reason = (
             f'低名义现货残差待兑换|qty={spot_qty:g}|price={price:g}|'
-            f'notional={spot_qty * price:.4f}USDT|暂按0回收价值结算'
+            f'notional={spot_qty * price:.4f}USDT|残差成本待真实兑换核销'
         )
         sql = """
             UPDATE mi_trade_position SET
@@ -529,6 +551,13 @@ class ExchangeDesyncRemediator:
                     position_id,
                     pnl_values,
                     self._position_columns(),
+                )
+                from calc.dust_settlement import DustSettlement
+                before = compute_executed_close_pnl(pos, orders) or {}
+                DustSettlement._correct_snapshots(
+                    cursor, closed_at,
+                    pnl_values['realized_spot_pnl'] - float(before.get('realized_spot_pnl') or 0), 0,
+                    pnl_values['realized_future_pnl'] - float(before.get('realized_future_pnl') or 0),
                 )
         return bool(updated)
 
@@ -665,147 +694,8 @@ class ExchangeDesyncRemediator:
         }
 
     def _execute_dust_cleanup_batch(self, prepared_items: List[Dict]) -> Dict:
-        ready: List[Dict] = []
-        results: List[Dict] = []
-        for prepared in sorted(prepared_items, key=lambda item: str(item.get('base_asset') or '')):
-            gate_result = self._close_gate_dust_before_conversion(prepared)
-            if gate_result.get('failed'):
-                results.append(gate_result['result'])
-                continue
-            prepared['_gate_result'] = gate_result.get('gate_result')
-            prepared['_cleanup_reason'] = gate_result.get('reason')
-            ready.append(prepared)
-
-        if not ready:
-            return {
-                'success': False,
-                'attempted': True,
-                'action': 'cleanup_post_close_dust_batch',
-                'reason': 'no_dust_ready_for_conversion',
-                'results': results,
-                'success_count': 0,
-                'failure_count': len(results),
-            }
-
-        conversions = self._convert_binance_dust_assets([
-            str(item.get('base_asset') or '').upper()
-            for item in ready
-        ])
-        if not conversions.get('success') and not conversions.get('results'):
-            failure = {
-                'success': False,
-                'attempted': True,
-                'action': 'convert_binance_dust_to_bnb_batch',
-                'base_assets': [item.get('base_asset') for item in ready],
-                'reason': conversions.get('reason') or 'dust_conversion_failed',
-                'conversion': conversions,
-            }
-            results.append(failure)
-            return {
-                'success': False,
-                'attempted': True,
-                'action': 'cleanup_post_close_dust_batch',
-                'reason': failure['reason'],
-                'results': results,
-                'success_count': 0,
-                'failure_count': len(results),
-            }
-
-        conversion_by_asset = conversions.get('results') or {}
-        for prepared in ready:
-            base_asset = str(prepared.get('base_asset') or '').upper()
-            conversion = conversion_by_asset.get(base_asset)
-            gate_result = prepared.get('_gate_result')
-            if not conversion or not conversion.get('success'):
-                results.append({
-                    'success': False,
-                    'attempted': True,
-                    'action': 'convert_binance_dust_to_bnb',
-                    'base_asset': base_asset,
-                    'reason': (
-                        (conversion or {}).get('reason')
-                        or 'dust_conversion_missing_transfer_result'
-                    ),
-                    'gate_result': gate_result,
-                    'conversion': conversion,
-                })
-                continue
-            if abs(_float(conversion.get('source_qty')) - _float(prepared.get('spot_qty'))) > 1e-8:
-                results.append({
-                    'success': False,
-                    'attempted': True,
-                    'action': 'convert_binance_dust_to_bnb',
-                    'base_asset': base_asset,
-                    'reason': 'dust_conversion_qty_mismatch',
-                    'gate_result': gate_result,
-                    'conversion': conversion,
-                })
-                continue
-
-            self._close_positions_after_dust_conversion(
-                prepared['positions'],
-                conversion,
-                {
-                    'type': prepared.get('risk_type') or 'post_close_dust',
-                    'detail': prepared.get('_cleanup_reason'),
-                },
-            )
-            results.append({
-                'success': True,
-                'attempted': True,
-                'action': 'cleanup_post_close_dust',
-                'base_asset': base_asset,
-                'positions': len(prepared['positions']),
-                'spot_qty': conversion.get('source_qty'),
-                'bnb_qty': conversion.get('bnb_qty'),
-                'gate_contracts_closed': _float(prepared.get('gate_contracts')),
-                'transaction_id': conversion.get('transaction_id'),
-                'gate_result': gate_result,
-            })
-
-        success_results = [item for item in results if item.get('success')]
-        failure_results = [item for item in results if item.get('attempted') and not item.get('success')]
-        closed_positions = sum(int(item.get('positions') or 0) for item in success_results)
-        if success_results and failure_results:
-            message = (
-                f"小额残余批量部分完成，成功资产 {len(success_results)} 个/"
-                f"持仓 {closed_positions} 笔，失败 {len(failure_results)} 个"
-            )
-        elif success_results:
-            message = (
-                f"小额残余批量清理完成，资产 {len(success_results)} 个，"
-                f"持仓 {closed_positions} 笔"
-            )
-        else:
-            message = '小额残余批量清理失败'
-        summary = {
-            'success': bool(success_results) and not failure_results,
-            'attempted': True,
-            'action': 'cleanup_post_close_dust_batch',
-            'base_assets': [item.get('base_asset') for item in success_results],
-            'asset_count': len(success_results),
-            'positions': closed_positions,
-            'success_count': closed_positions,
-            'asset_success_count': len(success_results),
-            'failure_count': len(failure_results),
-            'results': results,
-            'message': message,
-        }
-        if len(success_results) == 1:
-            summary.update({
-                'base_asset': success_results[0].get('base_asset'),
-                'spot_qty': success_results[0].get('spot_qty'),
-                'bnb_qty': success_results[0].get('bnb_qty'),
-                'gate_contracts_closed': success_results[0].get('gate_contracts_closed'),
-                'transaction_id': success_results[0].get('transaction_id'),
-                'message': (
-                    f"{success_results[0].get('base_asset')} 小额残余已清理，"
-                    f"共关闭 {success_results[0].get('positions')} 笔持仓"
-                ),
-            })
-        if failure_results:
-            summary['reason'] = failure_results[0].get('reason') or 'dust_cleanup_partial_failed'
-        return summary
+        from calc.dust_settlement import DustSettlement
+        return DustSettlement(self).execute(prepared_items)
 
     def _close_gate_dust_before_conversion(self, prepared: Dict) -> Dict:
         base_asset = prepared['base_asset']
@@ -873,28 +763,6 @@ class ExchangeDesyncRemediator:
             'reason': reason,
         }
 
-    def _convert_binance_dust_assets(self, assets: List[str]) -> Dict:
-        batch_converter = getattr(self.executor, 'convert_binance_spot_dust_to_bnb_batch', None)
-        if callable(batch_converter):
-            return batch_converter(assets)
-        single_converter = getattr(self.executor, 'convert_binance_spot_dust_to_bnb', None)
-        if not callable(single_converter):
-            return {'success': False, 'reason': 'dust_converter_missing', 'results': {}}
-        results: Dict[str, Dict] = {}
-        failures: List[Dict] = []
-        for asset in assets:
-            conversion = single_converter(asset)
-            if conversion.get('success'):
-                results[str(asset or '').upper()] = conversion
-            else:
-                failures.append({'asset': asset, 'reason': conversion.get('reason')})
-        return {
-            'success': bool(results) and not failures,
-            'results': results,
-            'failures': failures,
-            'reason': failures[0]['reason'] if failures else None,
-        }
-
     def _try_remediate_full_asset_dust(
         self,
         base_asset: str,
@@ -937,106 +805,10 @@ class ExchangeDesyncRemediator:
         if min_notional <= 0 or price <= 0 or available_qty * price + 1e-9 >= min_notional:
             return None
 
-        conversion = converter(base_asset)
-        if not conversion.get('success'):
-            reason = conversion.get('reason') or 'dust_conversion_failed'
-            for pos in positions:
-                self._append_risk_detail(pos.get('id'), f"尘埃转换失败|{reason}")
-            return {
-                'attempted': True,
-                'success': False,
-                'action': 'convert_binance_dust_to_bnb',
-                'base_asset': base_asset,
-                'positions': len(positions),
-                'matching_positions': len(positions),
-                'success_count': 0,
-                'failure_count': len(positions),
-                'reason': reason,
-                'results': [],
-            }
-
-        converted_qty = _float(conversion.get('source_qty'))
-        if abs(converted_qty - available_qty) > qty_tolerance:
-            reason = f'dust_conversion_qty_mismatch:{converted_qty:g}!={available_qty:g}'
-            for pos in positions:
-                self._append_risk_detail(pos.get('id'), reason)
-            return {
-                'attempted': True,
-                'success': False,
-                'action': 'convert_binance_dust_to_bnb',
-                'base_asset': base_asset,
-                'positions': len(positions),
-                'matching_positions': len(positions),
-                'success_count': 0,
-                'failure_count': len(positions),
-                'reason': reason,
-                'results': [],
-            }
-
-        self._close_positions_after_dust_conversion(positions, conversion, risk)
-        logger.warning(
-            "尘埃处置完成 | %s | type=%s | positions=%s | spot_qty=%s | bnb=%s | tran_id=%s",
-            base_asset, risk_type,
-            len(positions), conversion.get('source_qty'),
-            conversion.get('bnb_qty'), conversion.get('transaction_id'),
-        )
-        results = [
-            {'attempted': True, 'success': True, 'position_id': pos.get('id')}
-            for pos in positions
-        ]
-        return {
-            'attempted': True,
-            'success': True,
-            'action': 'convert_binance_dust_to_bnb',
-            'base_asset': base_asset,
-            'positions': len(positions),
-            'matching_positions': len(positions),
-            'success_count': len(positions),
-            'failure_count': 0,
-            'source_qty': conversion.get('source_qty'),
-            'bnb_qty': conversion.get('bnb_qty'),
-            'transaction_id': conversion.get('transaction_id'),
-            'results': results,
-        }
-
-    def _close_positions_after_dust_conversion(
-        self,
-        positions: List[Dict],
-        conversion: Dict,
-        risk: Dict,
-    ) -> None:
-        ids = [int(pos['id']) for pos in positions if pos.get('id') is not None]
-        if not ids:
-            return
-        reason_prefix = (
-            '平仓残余尘埃处置'
-            if str(risk.get('type') or '') in {'post_close_spot_dust', 'post_close_dust'}
-            else '交易所断腿尘埃处置'
-        )
-        reason = (
-            f"{reason_prefix}|Binance小额资产转BNB|"
-            f"asset={conversion.get('asset')}|qty={conversion.get('source_qty')}|"
-            f"bnb={conversion.get('bnb_qty')}|tran_id={conversion.get('transaction_id')}|"
-            f"关联风险={risk.get('type', 'unknown')}"
-        )
-        gross_price = (
-            _float(conversion.get('gross_exec_price_usdt'))
-            or _float(conversion.get('exec_price_usdt'))
-        )
-        self._record_allocated_dust_orders(
-            positions,
-            market_type='spot',
-            total_qty=_float(conversion.get('source_qty')),
-            exec_price=gross_price,
-            exchange_order_id=f"dust:{conversion.get('transaction_id') or ''}",
-            liquidity_role='unknown',
-            fee_amount=_float(conversion.get('service_charge_bnb')),
-            fee_amount_usdt=_float(conversion.get('service_charge_usdt')),
-            fee_asset='BNB',
-            reason=reason,
-        )
-
-        self._finalize_dust_positions(positions, reason)
+        # Never create an unjournaled conversion from an unexplained missing Gate leg.
+        return {'attempted': False, 'success': False, 'base_asset': base_asset,
+                'reason': 'dust_waiting_execution_ledger',
+                'message': '小额残仓等待完整双腿成交账本，统一由持久化兑换任务处理'}
 
     def _finalize_dust_positions(self, positions: List[Dict], reason: str) -> None:
         """Close local history from the already complete executed-order ledger."""

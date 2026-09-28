@@ -308,6 +308,9 @@ def test_reverse_execution_capacity_rejects_when_position_limit_reached(monkeypa
 
 
 def test_reverse_execute_open_calls_executor_and_marks_opened(monkeypatch):
+    from contextlib import nullcontext
+    monkeypatch.setattr('common.database_lock.database_lock', lambda *a, **k: nullcontext(True))
+    monkeypatch.setattr('calc.dust_settlement.has_unsettled_dust', lambda asset: False)
     executed = {}
     updates = []
 

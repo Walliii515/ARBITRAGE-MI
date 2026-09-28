@@ -1236,7 +1236,7 @@ class RealExecutor:
             'raw': result.get('raw'),
         }
 
-    def convert_binance_spot_dust_to_bnb_batch(self, base_assets: List[str]) -> Dict:
+    def convert_binance_spot_dust_to_bnb_batch(self, base_assets: List[str], client_id: Optional[str] = None) -> Dict:
         """将多个现货小额资产一次性转换为 BNB。"""
         assets = sorted({
             str(asset or '').strip().upper()
@@ -1252,11 +1252,14 @@ class RealExecutor:
             )
             return {'success': False, 'reason': reason, 'results': {}}
         try:
-            data = self._binance_signed_post('/sapi/v1/asset/dust-convert/convert', {
+            params = {
                 'asset': assets,
                 'accountType': 'SPOT',
                 'targetAsset': 'BNB',
-            })
+            }
+            if client_id:
+                params['clientId'] = client_id
+            data = self._binance_signed_post('/sapi/v1/asset/dust-convert/convert', params)
         except Exception as exc:
             logger.warning("Binance 批量尘埃转换失败 | %s | %s", ','.join(assets), exc)
             return {
@@ -1267,45 +1270,23 @@ class RealExecutor:
             }
 
         transfers = data.get('transferResult') if isinstance(data, dict) else None
-        bnb_price = self._get_binance_usdt_price('BNB') or 0.0
+        from calc.dust_conversion import receipt
         results: Dict[str, Dict] = {}
+        duplicates = set()
         for item in (transfers or []):
             asset = str(item.get('fromAsset') or '').upper()
             if asset not in assets:
                 continue
-            source_qty = self._float_or_none(item.get('amount')) or 0.0
-            if source_qty <= 0:
+            try:
+                normalized = receipt(item)
+            except (ValueError, TypeError):
                 continue
-            bnb_qty = self._float_or_none(item.get('transferedAmount')) or 0.0
-            service_charge_bnb = self._float_or_none(item.get('serviceChargeAmount')) or 0.0
-            exec_amount = bnb_qty * bnb_price if bnb_price > 0 else None
-            exec_price = exec_amount / source_qty if exec_amount is not None and source_qty > 0 else None
-            service_charge_usdt = service_charge_bnb * bnb_price if bnb_price > 0 else None
-            gross_exec_amount = (
-                exec_amount + service_charge_usdt
-                if exec_amount is not None and service_charge_usdt is not None
-                else None
-            )
-            gross_exec_price = (
-                gross_exec_amount / source_qty
-                if gross_exec_amount is not None and source_qty > 0
-                else None
-            )
-            results[asset] = {
-                'success': True,
-                'asset': asset,
-                'source_qty': source_qty,
-                'bnb_qty': bnb_qty,
-                'service_charge_bnb': service_charge_bnb,
-                'service_charge_usdt': service_charge_usdt,
-                'bnb_price_usdt': bnb_price or None,
-                'transaction_id': str(item.get('tranId') or ''),
-                'exec_price_usdt': exec_price,
-                'exec_amount_usdt': exec_amount,
-                'gross_exec_price_usdt': gross_exec_price,
-                'gross_exec_amount_usdt': gross_exec_amount,
-                'raw': data,
-            }
+            if asset in results or asset in duplicates:
+                results.pop(asset, None)
+                duplicates.add(asset)
+                continue
+            # Persist the raw receipt before any valuation request can fail.
+            results[asset] = {**normalized, 'success': True, 'raw': data}
         if not results:
             return {
                 'success': False,
@@ -1319,9 +1300,36 @@ class RealExecutor:
             'assets': assets,
             'converted_assets': sorted(results),
             'results': results,
-            'bnb_price_usdt': bnb_price or None,
             'raw': data,
         }
+
+    def fetch_binance_dust_history(self, start_ms: int, end_ms: int) -> List[Dict]:
+        from calc.dust_conversion import receipt
+        data = self._binance_signed_get('/sapi/v1/asset/dribblet', {
+            'accountType': 'SPOT', 'startTime': start_ms, 'endTime': end_ms,
+        })
+        groups = data.get('userAssetDribblets')
+        if not isinstance(groups, list):
+            raise ValueError('invalid_dust_history_response')
+        if len(groups) >= 100 or int(data.get('total') or 0) > 100:
+            raise ValueError('dust_history_window_truncated')
+        return [receipt(item) for group in groups
+                for item in group.get('userAssetDribbletDetails', [])
+                if item.get('targetAsset', 'BNB') == 'BNB']
+
+    def fetch_binance_bnb_event_price(self, event_ms: int) -> float:
+        from calc.dust_conversion import number
+        minute = int(event_ms) // 60000 * 60000
+        response = self._session.get(
+            f'{self.config.binance_base_url}/api/v3/klines',
+            params={'symbol': 'BNBUSDT', 'interval': '1m', 'startTime': minute, 'limit': 1},
+            timeout=self.config.timeout_sec,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or int(rows[0][0]) != minute:
+            raise ValueError('missing_dust_historical_bnb_price')
+        return float(number(rows[0][1], positive=True))
 
     def place_gate_futures_order(self, order: Dict) -> Dict:
         """公开的 Gate 合约单腿执行入口，用于交易所断腿 reduce-only 处置。"""

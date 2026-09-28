@@ -326,6 +326,17 @@ class AccountCapitalSnapshotter:
         self._binance_bnb_notifier = BinanceBnbBalanceNotifier(self.cfg)
 
     def run_once(self, strategy_pnl_summary: Optional[Dict] = None) -> Dict:
+        from common.database_lock import database_lock
+        with database_lock('mi_capital_accounting', timeout=10) as acquired:
+            if not acquired:
+                raise RuntimeError('capital_accounting_busy')
+            # Realized values must be read after acquiring the settlement lock.
+            live = {k: v for k, v in (strategy_pnl_summary or {}).items()
+                    if k in ('binance_spot_floating_pnl', 'gate_future_floating_pnl', 'floating_pnl',
+                             'position_count', 'pnl_rows', 'missing_realtime_rows')}
+            return self._run_once_locked(live)
+
+    def _run_once_locked(self, strategy_pnl_summary: Optional[Dict] = None) -> Dict:
         snapshot_at = datetime.now()
         pnl = self._load_exchange_pnl_summary(snapshot_at, strategy_pnl_summary)
         binance = self._build_binance_row(snapshot_at, pnl)
@@ -754,7 +765,11 @@ class AccountCapitalSnapshotter:
                 # 最终关仓（含尘埃核销）以已经持久化的结算口径为准。
                 spot_open = _float(pos.get('spot_open_amount'))
                 spot_close = _float(pos.get('spot_close_amount'))
-                spot_pnl = spot_close - spot_open
+                spot_pnl = (
+                    _float(pos.get('realized_pnl_spot'))
+                    if pos.get('exchange_risk_type') == 'post_close_spot_dust_pending'
+                    else spot_close - spot_open
+                )
                 realized = self._position_strategy_realized_pnl(pos)
             else:
                 pnl = (
@@ -836,7 +851,7 @@ class AccountCapitalSnapshotter:
 
     def _load_strategy_positions(self, start_at: datetime, end_at: datetime) -> List[Dict]:
         sql = """
-            SELECT id, status, opened_at, closed_at,
+            SELECT id, status, opened_at, closed_at, exchange_risk_type, realized_pnl_spot,
                    base_asset, spot_open_qty, spot_open_price,
                    spot_open_amount, spot_close_amount,
                    future_contract, future_open_qty, future_open_price, future_close_amount,

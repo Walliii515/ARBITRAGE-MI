@@ -168,8 +168,9 @@ def compute_executed_close_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Di
 
 
 def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[Dict]:
-    """用全量成交额结算最终已关闭持仓，兼容尘埃按零回收价值核销。"""
-    values = _execution_values(pos, orders, allow_position_fallback=True)
+    """Settle actual executions; unconverted dust retains its attributable cost."""
+    pending = pos.get('exchange_risk_type') == 'post_close_spot_dust_pending'
+    values = _execution_values(pos, orders, allow_position_fallback=not pending)
     if values is None:
         return None
 
@@ -178,7 +179,7 @@ def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[D
     future_open = values['future_open']
     future_close = values['future_close']
 
-    if spot_open <= 0 or spot_close <= 0 or future_open <= 0 or future_close <= 0:
+    if spot_open <= 0 or (spot_close <= 0 and not pending) or future_open <= 0 or future_close <= 0:
         return None
 
     spot_close_qty = values['spot_close_qty']
@@ -189,7 +190,14 @@ def compute_closed_position_pnl(pos: Dict, orders: Iterable[Dict]) -> Optional[D
             spot_close / spot_close_qty,
             future_close / future_close_qty,
         )
-    realized_spot = spot_close - spot_open
+    spot_cost = spot_open
+    if pending:
+        if values['spot_open_qty'] <= 0 or spot_close_qty > values['spot_open_qty'] + 1e-8:
+            return None
+        if abs(values['future_open_qty'] - future_close_qty) > 1e-8:
+            return None
+        spot_cost *= spot_close_qty / values['spot_open_qty']
+    realized_spot = spot_close - spot_cost
     realized_future = future_open - future_close
     realized_pnl = realized_spot + realized_future
     fee_cost = sum(_fee_cost(order) for order in values['orders'])

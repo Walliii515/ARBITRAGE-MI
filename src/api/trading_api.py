@@ -822,6 +822,14 @@ def _capital_history_select_columns(metric: str) -> str:
     return ',\n            '.join(columns)
 
 
+def _dust_day_open_adjustment(snapshot_sql: str, exchange_sql: str = "'total'") -> str:
+    # The first sample can already include a conversion just after midnight.
+    # Add only that day's prefix, never the following day's opening balance.
+    return f"""COALESCE((SELECT SUM(t.net_delta_usdt) FROM mi_dust_conversion_task t
+        WHERE t.status='accounted' AND {exchange_sql} IN ('binance','total')
+          AND t.event_at >= DATE({snapshot_sql}) AND t.event_at <= {snapshot_sql}),0)"""
+
+
 def _load_capital_daily_return_rows(
     days: int,
     exchange: Optional[str],
@@ -837,16 +845,17 @@ def _load_capital_daily_return_rows(
         params.append(exchange)
     where_sql = " AND ".join(where)
     force_index = 'FORCE INDEX (idx_exchange_snapshot)' if exchange else ''
+    dust_prefix = _dust_day_open_adjustment('first_row.snapshot_at', 'grouped.exchange')
     sql = f"""
         SELECT
             DATE_FORMAT(grouped.summary_date, '%%Y-%%m-%%d 00:00:00') AS snapshot_at,
             grouped.exchange,
             first_row.equity_usdt,
-            last_row.total_pnl_usdt - first_row.total_pnl_usdt AS daily_realized_pnl_usdt,
+            last_row.total_pnl_usdt - first_row.total_pnl_usdt + {dust_prefix} AS daily_realized_pnl_usdt,
             CASE
                 WHEN first_row.equity_usdt IS NULL OR ABS(first_row.equity_usdt) < 0.000000001
                     THEN NULL
-                ELSE (last_row.total_pnl_usdt - first_row.total_pnl_usdt) / first_row.equity_usdt * 100
+                ELSE (last_row.total_pnl_usdt - first_row.total_pnl_usdt + {dust_prefix}) / first_row.equity_usdt * 100
             END AS daily_return_pct
         FROM (
             SELECT
@@ -999,12 +1008,13 @@ def _load_today_position_activity_summary() -> Dict[str, Any]:
 
 
 def _load_today_realized_pnl_summary() -> Dict[str, Any]:
-    sql = """
+    dust_prefix = _dust_day_open_adjustment('first_row.snapshot_at')
+    sql = f"""
         SELECT
             first_row.snapshot_at AS first_snapshot_at,
             last_row.snapshot_at AS last_snapshot_at,
             first_row.equity_usdt AS first_equity_usdt,
-            first_row.total_pnl_usdt AS first_total_pnl_usdt,
+            first_row.total_pnl_usdt - {dust_prefix} AS first_total_pnl_usdt,
             last_row.total_pnl_usdt AS last_total_pnl_usdt
         FROM (
             SELECT MIN(id) AS first_id, MAX(id) AS last_id
@@ -1849,14 +1859,15 @@ async def get_capital_annualized_return(
     """Return compounded annualized strategy return from daily capital summaries."""
     if days not in _CAPITAL_ANNUALIZED_PERIODS:
         raise HTTPException(status_code=400, detail='不支持的年化收益统计周期')
-    sql = """
+    dust_prefix = _dust_day_open_adjustment('d.first_snapshot_at')
+    sql = f"""
         SELECT
             d.summary_date,
             d.first_snapshot_at,
             d.last_snapshot_at,
             d.equity_sum_usdt,
             d.sample_count,
-            d.first_gross_pnl_usdt,
+            d.first_gross_pnl_usdt - {dust_prefix} AS first_gross_pnl_usdt,
             d.last_gross_pnl_usdt,
             (
                 SELECT s.total_pnl_usdt
@@ -1865,7 +1876,7 @@ async def get_capital_annualized_return(
                   AND s.snapshot_at = d.first_snapshot_at
                 ORDER BY s.id ASC
                 LIMIT 1
-            ) AS first_realized_pnl_usdt,
+            ) - {dust_prefix} AS first_realized_pnl_usdt,
             (
                 SELECT s.total_pnl_usdt
                 FROM mi_capital_snapshot s

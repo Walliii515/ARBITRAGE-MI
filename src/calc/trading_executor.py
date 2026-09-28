@@ -837,10 +837,7 @@ class TradingExecutor:
                 order_group['open_reason'] = open_reason
                 
                 # 6. 调用成交引擎服务（虚拟/实盘）
-                exec_result = self.executor_client.execute(order_group, row)
-                
-                # 7. 持久化订单
-                self._save_orders(order_group, exec_result)
+                exec_result = self._execute_and_save_open(order_group, row)
                 self._maybe_start_execution_drift_cooldown(base_asset, order_group)
                 
                 # 8. 更新信号状态
@@ -918,6 +915,17 @@ class TradingExecutor:
         
         return results
 
+    def _execute_and_save_open(self, order_group: Dict, row: Dict) -> Dict:
+        from calc.dust_settlement import asset_lock_name, has_unsettled_dust
+        from common.database_lock import database_lock
+        asset = order_group['spot_order']['base_asset']
+        with database_lock(asset_lock_name(asset)) as acquired:
+            if not acquired or has_unsettled_dust(asset):
+                return {'success': False, 'message': '小额兑换核销中，暂停该币开仓'}
+            result = self.executor_client.execute(order_group, row)
+            self._save_orders(order_group, result)
+            return result
+
     def _load_exchange_risk_blocked_assets(self) -> Set[str]:
         """仍处于交易所断腿风险的资产禁止新增开仓。"""
         sql = """
@@ -926,6 +934,9 @@ class TradingExecutor:
             WHERE status = 'holding'
               AND (exchange_risk_status = 'desynced'
                    OR exchange_risk_type = 'verified_spot_residual')
+            UNION
+            SELECT base_asset FROM mi_dust_conversion_task
+            WHERE status IN ('pending','submitted','confirmed','review')
         """
         try:
             with db_manager.get_cursor() as cursor:
