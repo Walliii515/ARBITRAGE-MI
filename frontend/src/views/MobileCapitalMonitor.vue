@@ -171,10 +171,7 @@ const annualizedValue = computed(() => {
 
 const annualizedHint = computed(() => {
   if (!annualized.value?.realized_data_available) return '暂无已实现收益数据'
-  if (!annualized.value.realized_sufficient_data) {
-    return `${annualized.value.realized_available_days || 0}/${annualized.value.period_days} 天有效数据`
-  }
-  return `近 ${annualized.value.period_days} 天`
+  return `按 ${annualized.value.realized_available_days || 0}/${annualized.value.period_days} 个有效日年化，不含今天`
 })
 
 const reconciliationState = computed<'matched' | 'mismatched' | 'unknown'>(() => {

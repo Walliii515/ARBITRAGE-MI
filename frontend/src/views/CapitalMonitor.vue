@@ -93,6 +93,9 @@ interface AnnualizedReturnSummary {
   realized_annualized_return_pct?: number | null
   realized_period_return_pct?: number | null
   realized_period_pnl_usdt?: number | null
+  realized_average_equity_usdt?: number | null
+  realized_start_date?: string | null
+  realized_end_date?: string | null
   average_equity_usdt?: number | null
   today_realized_pnl_usdt?: number | null
   today_return_pct?: number | null
@@ -570,6 +573,7 @@ function formatWholePercent(value: number | null | undefined): string {
 }
 
 function annualizedValueClass(value: number | null | undefined): string {
+  if (value == null) return 'risk-idle'
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return 'risk-idle'
   return numeric >= 0 ? 'pnl-positive' : 'pnl-negative'
@@ -577,21 +581,23 @@ function annualizedValueClass(value: number | null | undefined): string {
 
 function formatAnnualizedReturnValue(
   value: number | null | undefined,
-  sufficient: boolean | null | undefined,
+  availableDays: number | null | undefined,
 ): string {
   if (annualizedReturnLoading.value && !annualizedReturn.value) return '-'
-  if (!sufficient) return '数据不足'
+  if (!annualizedReturn.value) return '-'
+  if (!availableDays) return '暂无有效数据'
+  if (value == null || !Number.isFinite(Number(value))) return '无法计算'
   return formatPercent(value)
 }
 
 function annualizedReturnMeta(): string {
   const summary = annualizedReturn.value
   if (!summary) return annualizedReturnRequestError.value || '暂无收益汇总'
-  if (!summary.sufficient_data) {
-    return `已有 ${summary.available_days} / ${summary.period_days} 天有效数据`
-  }
+  if (!summary.available_days) return '暂无有效收益数据（不含今天）'
   return [
-    `截至 ${summary.end_date || '昨日'}`,
+    `${summary.start_date} 至 ${summary.end_date}`,
+    `所选 ${summary.period_days} 天，按实际 ${summary.available_days} 个有效日年化（不含今天）`,
+    '逐日收益复利后，按 365 / 有效天数折算；缺失日不计为零收益',
     `区间收益 ${formatPercent(summary.period_return_pct)}`,
     `总盈亏 ${formatAmount(summary.period_pnl_usdt)} USDT`,
     `日均总资产 ${formatAmount(summary.average_equity_usdt)} USDT`,
@@ -602,14 +608,13 @@ function realizedAnnualizedReturnMeta(): string {
   const summary = annualizedReturn.value
   if (!summary) return annualizedReturnRequestError.value || '暂无收益汇总'
   if (!summary.realized_data_available) return '暂无已实现收益数据'
-  if (!summary.realized_sufficient_data) {
-    return `已有 ${summary.realized_available_days || 0} / ${summary.period_days} 天有效数据`
-  }
   return [
-    `截至 ${summary.end_date || '昨日'}`,
+    `${summary.realized_start_date || summary.start_date} 至 ${summary.realized_end_date || summary.end_date}`,
+    `所选 ${summary.period_days} 天，按实际 ${summary.realized_available_days} 个有效日年化（不含今天）`,
+    '逐日收益复利后，按 365 / 有效天数折算；缺失日不计为零收益',
     `区间收益 ${formatPercent(summary.realized_period_return_pct)}`,
     `净已实现收益 ${formatAmount(summary.realized_period_pnl_usdt)} USDT`,
-    `日均总资产 ${formatAmount(summary.average_equity_usdt)} USDT`,
+    `日均总资产 ${formatAmount(summary.realized_average_equity_usdt)} USDT`,
   ].join(' · ')
 }
 
@@ -1758,7 +1763,7 @@ onBeforeUnmount(() => {
                 </el-popover>
               </span>
               <strong class="insight-value" :class="annualizedValueClass(annualizedReturn?.annualized_return_pct)">
-                {{ formatAnnualizedReturnValue(annualizedReturn?.annualized_return_pct, annualizedReturn?.sufficient_data) }}
+                {{ formatAnnualizedReturnValue(annualizedReturn?.annualized_return_pct, annualizedReturn?.available_days) }}
               </strong>
             </div>
             <div class="insight-metric">
@@ -1784,7 +1789,7 @@ onBeforeUnmount(() => {
                 </el-popover>
               </span>
               <strong class="insight-value" :class="annualizedValueClass(annualizedReturn?.realized_annualized_return_pct)">
-                {{ formatAnnualizedReturnValue(annualizedReturn?.realized_annualized_return_pct, annualizedReturn?.realized_sufficient_data) }}
+                {{ formatAnnualizedReturnValue(annualizedReturn?.realized_annualized_return_pct, annualizedReturn?.realized_available_days) }}
               </strong>
             </div>
             <div class="insight-metric">

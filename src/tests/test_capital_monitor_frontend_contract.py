@@ -73,12 +73,22 @@ def test_annualized_return_defaults_to_seven_days_and_supports_all_periods():
     assert '/api/trading/capital/annualized-return?days=${period}' in CAPITAL_MONITOR_SOURCE
     for label in ('1天', '3天', '7天', '1个月', '3个月', '半年', '1年'):
         assert f"label: '{label}'" in CAPITAL_MONITOR_SOURCE
-    assert '已有 ${summary.available_days} / ${summary.period_days} 天有效数据' in CAPITAL_MONITOR_SOURCE
+    assert '所选 ${summary.period_days} 天，按实际 ${summary.available_days} 个有效日年化（不含今天）' in CAPITAL_MONITOR_SOURCE
     assert '当日已实现' in CAPITAL_MONITOR_SOURCE
     assert '策略表现' in CAPITAL_MONITOR_SOURCE
     assert '今日开仓/平仓' in CAPITAL_MONITOR_SOURCE
     assert 'formatOpenCloseCount(annualizedReturn?.today_opened_count, annualizedReturn?.today_closed_count)' in CAPITAL_MONITOR_SOURCE
     assert 'class="insight-metric-grid performance-metric-grid"' in CAPITAL_MONITOR_SOURCE
+
+
+def test_partial_annualized_return_is_not_hidden_by_full_window_coverage():
+    assert 'if (!sufficient)' not in CAPITAL_MONITOR_SOURCE
+    assert 'formatAnnualizedReturnValue(annualizedReturn?.realized_annualized_return_pct, annualizedReturn?.realized_available_days)' in CAPITAL_MONITOR_SOURCE
+    assert 'summary.realized_average_equity_usdt' in CAPITAL_MONITOR_SOURCE
+    assert 'summary.realized_start_date' in CAPITAL_MONITOR_SOURCE
+    mobile = (REPO_ROOT / 'frontend/src/views/MobileCapitalMonitor.vue').read_text(encoding='utf-8')
+    assert 'if (!annualized.value.realized_sufficient_data)' not in mobile
+    assert '个有效日年化，不含今天' in mobile
 
 
 def test_mmr_and_gate_risk_share_card_beside_annualized_card():

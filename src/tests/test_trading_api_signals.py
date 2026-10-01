@@ -451,17 +451,62 @@ class CapitalAnnualizedReturnTests(unittest.TestCase):
         self.assertAlmostEqual(result['average_equity_usdt'], 1000)
         self.assertEqual(result['window_end_policy'], 'previous_calendar_day')
 
-    def test_incomplete_period_reports_coverage_without_annualizing(self):
+    def test_incomplete_period_annualizes_actual_valid_days(self):
         result = _calculate_capital_annualized_return(self._daily_rows(15), 30)
 
         self.assertFalse(result['sufficient_data'])
         self.assertEqual(result['available_days'], 15)
-        self.assertIsNone(result['annualized_return_pct'])
+        self.assertAlmostEqual(result['annualized_return_pct'], ((1.01 ** 365) - 1) * 100)
         self.assertIsNotNone(result['period_return_pct'])
         self.assertFalse(result['realized_sufficient_data'])
         self.assertEqual(result['realized_available_days'], 15)
-        self.assertIsNone(result['realized_annualized_return_pct'])
+        self.assertAlmostEqual(result['realized_annualized_return_pct'], ((1.005 ** 365) - 1) * 100)
         self.assertIsNotNone(result['realized_period_return_pct'])
+        self.assertEqual(result['annualization_day_basis'], 'available_days')
+
+    def test_month_with_29_realized_days_does_not_count_missing_day_as_zero(self):
+        rows = self._daily_rows(30)
+        rows[0]['first_realized_pnl_usdt'] = None
+        rows[0]['equity_sum_usdt'] = Decimal('900000')
+        result = _calculate_capital_annualized_return(rows, 30)
+        self.assertTrue(result['sufficient_data'])
+        self.assertFalse(result['realized_sufficient_data'])
+        self.assertEqual(result['realized_available_days'], 29)
+        self.assertEqual(result['realized_start_date'], '2026-07-02')
+        self.assertEqual(result['realized_end_date'], '2026-07-30')
+        self.assertEqual(result['realized_average_equity_usdt'], 1000)
+        self.assertEqual(result['realized_period_pnl_usdt'], 145)
+        self.assertAlmostEqual(result['realized_annualized_return_pct'], ((1.005 ** 365) - 1) * 100)
+
+    def test_single_valid_day_zero_negative_and_invalid_returns(self):
+        for pnl in (Decimal('0'), Decimal('-5'), Decimal('5')):
+            with self.subTest(pnl=pnl):
+                result = _calculate_capital_annualized_return(self._daily_rows(1, daily_realized_pnl=pnl), 365)
+                self.assertEqual(result['realized_available_days'], 1)
+                self.assertAlmostEqual(result['realized_annualized_return_pct'],
+                                       ((1 + float(pnl) / 1000) ** 365 - 1) * 100)
+        for pnl in (Decimal('-1000'), Decimal('1000000')):
+            with self.subTest(pnl=pnl):
+                result = _calculate_capital_annualized_return(self._daily_rows(1, daily_realized_pnl=pnl), 30)
+                self.assertIsNone(result['realized_annualized_return_pct'])
+
+    def test_missing_days_and_invalid_equity_are_excluded_independently(self):
+        rows = self._daily_rows(7)
+        rows[1]['last_realized_pnl_usdt'] = None
+        rows[3]['sample_count'] = 0
+        rows[5]['equity_sum_usdt'] = Decimal('0')
+        result = _calculate_capital_annualized_return(rows, 7)
+        self.assertEqual(result['available_days'], 5)
+        self.assertEqual(result['realized_available_days'], 4)
+        self.assertAlmostEqual(result['realized_annualized_return_pct'], ((1.005 ** 365) - 1) * 100)
+
+    def test_no_valid_days_does_not_fabricate_zero_return(self):
+        result = _calculate_capital_annualized_return([], 30)
+        self.assertEqual(result['available_days'], 0)
+        self.assertEqual(result['realized_available_days'], 0)
+        self.assertIsNone(result['annualized_return_pct'])
+        self.assertIsNone(result['realized_annualized_return_pct'])
+        self.assertIsNone(result['realized_start_date'])
 
     def test_realized_metric_is_optional_for_legacy_rows(self):
         rows = self._daily_rows(7)

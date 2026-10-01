@@ -902,16 +902,13 @@ def _calculate_capital_annualized_return(
             ),
         })
 
-    available_days = len(valid_rows)
-    sufficient = available_days >= period_days
-    total_samples = sum(int(row.get('sample_count') or 0) for row in valid_rows)
-    total_equity = sum(float(row.get('equity_sum_usdt') or 0) for row in valid_rows)
-    average_equity = total_equity / total_samples if total_samples > 0 else None
-
     def _metric_result(delta_key: str) -> Dict[str, Any]:
         metric_rows = [
             row for row in valid_rows
-            if row.get(delta_key) is not None and row.get('average_equity_usdt')
+            if row.get(delta_key) is not None
+            and math.isfinite(float(row[delta_key]))
+            and math.isfinite(row['average_equity_usdt'])
+            and row['average_equity_usdt'] > 0
         ]
         period_pnl = sum(float(row[delta_key]) for row in metric_rows)
         compound_factor = 1.0
@@ -922,21 +919,35 @@ def _calculate_capital_annualized_return(
                 factor_valid = False
                 break
             compound_factor *= daily_factor
+            if not math.isfinite(compound_factor * 100):
+                factor_valid = False
+                break
         period_return_pct = (
             (compound_factor - 1.0) * 100.0
             if factor_valid
             else None
         )
-        annualized_return_pct = (
-            (compound_factor ** (365.0 / period_days) - 1.0) * 100.0
-            if sufficient and len(metric_rows) >= period_days and factor_valid
-            else None
-        )
+        annualized_return_pct = None
+        if factor_valid:
+            try:
+                # Missing days are excluded, not treated as zero-return observations.
+                value = (compound_factor ** (365.0 / len(metric_rows)) - 1.0) * 100.0
+                if math.isfinite(value):
+                    annualized_return_pct = value
+            except OverflowError:
+                pass
+        metric_samples = sum(int(row['sample_count']) for row in metric_rows)
         return {
             'available_days': len(metric_rows),
             'annualized_return_pct': annualized_return_pct,
             'period_return_pct': period_return_pct,
             'period_pnl_usdt': period_pnl if metric_rows else None,
+            'average_equity_usdt': (
+                sum(float(row['equity_sum_usdt']) for row in metric_rows) / metric_samples
+                if metric_samples else None
+            ),
+            'start_date': str(metric_rows[0]['summary_date']) if metric_rows else None,
+            'end_date': str(metric_rows[-1]['summary_date']) if metric_rows else None,
         }
 
     strategy = _metric_result('gross_pnl_delta_usdt')
@@ -949,8 +960,8 @@ def _calculate_capital_annualized_return(
     )
     return {
         'period_days': period_days,
-        'available_days': available_days,
-        'sufficient_data': sufficient,
+        'available_days': strategy['available_days'],
+        'sufficient_data': strategy['available_days'] >= period_days,
         'annualized_return_pct': strategy['annualized_return_pct'],
         'period_return_pct': strategy['period_return_pct'],
         'period_pnl_usdt': strategy['period_pnl_usdt'],
@@ -960,10 +971,14 @@ def _calculate_capital_annualized_return(
         'realized_annualized_return_pct': realized['annualized_return_pct'],
         'realized_period_return_pct': realized['period_return_pct'],
         'realized_period_pnl_usdt': realized['period_pnl_usdt'],
-        'average_equity_usdt': average_equity,
-        'start_date': str(valid_rows[0].get('summary_date')) if valid_rows else None,
-        'end_date': str(valid_rows[-1].get('summary_date')) if valid_rows else None,
+        'realized_average_equity_usdt': realized['average_equity_usdt'],
+        'realized_start_date': realized['start_date'],
+        'realized_end_date': realized['end_date'],
+        'average_equity_usdt': strategy['average_equity_usdt'],
+        'start_date': strategy['start_date'],
+        'end_date': strategy['end_date'],
         'window_end_policy': 'previous_calendar_day',
+        'annualization_day_basis': 'available_days',
         'realized_formula_supported': realized_supported,
         'formula': 'daily_gross_pnl_delta_over_daily_average_equity_compounded',
         'realized_formula': 'daily_realized_pnl_delta_over_daily_average_equity_compounded',
