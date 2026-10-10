@@ -75,7 +75,7 @@ trade:
     positive_funding_guard:
       enabled: true                         # 极端正funding只限制新开仓，不触发已有仓位平仓
       max_open_24h_bps: 300                 # 达到该值后禁止所有正向新开仓通道
-    max_orderbook_lag_ms: 500             # 本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
+    max_orderbook_lag_ms: 800             # 本地最近一次 WS 盘口距下单时刻的最大允许延迟（ms）
 
   # ─── 开仓过滤 ───
   filter:
@@ -148,7 +148,7 @@ trade:
     enabled: true
     funding_capture_ratio: 0.5              # 只把 24h funding 的一部分计入本轮预期，避免高估收益
     min_expected_edge_bps: 0                # funding + basis - 手续费 - 滑点缓冲 至少为 0
-    slippage_buffer_bps: 10                 # 统一预留成交滑点/冲击缓冲
+    slippage_buffer_bps: 5                  # 统一预留成交滑点/冲击缓冲
     strong_funding_24h_bps: 50              # funding≥该值才允许低于 p20 少量入场
     discount_ratio: 0.2                     # funding 对 p20 的折扣比例
     max_funding_discount_bps: 10            # 最多比 p20 放宽 10bps，避免开在太差位置
